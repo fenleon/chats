@@ -1,0 +1,27 @@
+# Android
+.gradle/
+.kotlin/
+**/build/
+local.properties
+keystore.properties
+*.jks
+*.keystore
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Misc
+captures/
+.externalNativeBuild/
+.cxx/
+.DS_Store
+**/.DS_Store
+
+# Agent instructions (kept local, not published)
+AGENTS.md
+# Session plan doc (kept local, not published)
+PLAN.md

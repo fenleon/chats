@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- The companion holds the persistent Matrix connection (Phase 2) and posts
+         new-message notifications; everything the tool runtime forbids. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- sdk:ui merges CAMERA for its QR scanner; the companion is a chat server. -->
+    <uses-permission
+        android:name="android.permission.CAMERA"
+        tools:node="remove" />
+
+    <application
+        android:name=".ServerApplication"
+        android:allowBackup="false"
+        android:icon="@android:mipmap/sym_def_app_icon"
+        android:label="Chats Server"
+        android:theme="@android:style/Theme.Black.NoTitleBar"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- sdk:client merges its UnifiedPush service + file-share provider;
+             the companion is a local Matrix server and uses neither. -->
+        <service
+            android:name="com.thelightphone.sdk.LightPushService"
+            tools:node="remove" />
+        <provider
+            android:name="com.thelightphone.sdk.LightFileProvider"
+            tools:node="remove" />
+    </application>
+
+</manifest>

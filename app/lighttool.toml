@@ -1,0 +1,12 @@
+[tool]
+id = "com.lightphone.chats"
+label = "Chats"
+versionCode = 1
+versionName = "0.1.0"
+permissions = ["android.permission.INTERNET"]
+# The tool is a thin UI; the companion (:server) hosts the SDK service, the
+# persistent Matrix connection (sync loop), storage, and notifications. Point
+# serverPackage at com.lightos on a real LP3 only if Light ships chat methods
+# there.
+serverPackage = "com.lightphone.chats.server"
+orientation = "portrait"
