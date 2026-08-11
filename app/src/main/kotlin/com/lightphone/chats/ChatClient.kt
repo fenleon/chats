@@ -129,4 +129,14 @@ object ChatClient {
             is LightResult.Success -> if (r.data.ok) null else r.data.error ?: "verification failed"
             is LightResult.Error -> r.extra ?: "verification action failed"
         }
+
+    /** Non-interactive verification with the account's recovery key. @return null on success, else the error. */
+    suspend fun recoverWithKey(recoveryKey: String): String? =
+        when (val r = callRemoteServiceMethod(
+            LightServiceMethod.RecoverWithKey,
+            LightServiceMethod.RecoverWithKey.Request(recoveryKey),
+        )) {
+            is LightResult.Success -> if (r.data.ok) null else r.data.error ?: "recovery failed"
+            is LightResult.Error -> r.extra ?: "recovery failed"
+        }
 }

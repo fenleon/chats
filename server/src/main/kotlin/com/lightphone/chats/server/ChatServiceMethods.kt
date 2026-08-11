@@ -153,6 +153,18 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.VerifyAction.encodeResponse(response))
                 }
 
+                LightServiceMethod.RecoverWithKey.id -> {
+                    val request = LightServiceMethod.RecoverWithKey.decodeRequest(payload!!)
+                    val result = runBlocking { MatrixRepository.recoverWithKey(request.recoveryKey) }
+                    val response = result.fold(
+                        onSuccess = { LightServiceMethod.RecoverWithKey.Response(ok = true) },
+                        onFailure = { error ->
+                            LightServiceMethod.RecoverWithKey.Response(ok = false, error = error.message)
+                        },
+                    )
+                    LightResult.Success(LightServiceMethod.RecoverWithKey.encodeResponse(response))
+                }
+
                 else -> LightResult.Error(
                     LightResult.ErrorCode.Unknown,
                     "unknown method: $methodId",

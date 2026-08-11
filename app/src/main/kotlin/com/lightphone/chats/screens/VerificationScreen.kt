@@ -46,16 +46,18 @@ import kotlinx.coroutines.launch
 class VerificationViewModel : LightViewModel<Unit>() {
 
     val state = MutableStateFlow<LightServiceMethod.GetVerificationState.Response?>(null)
+    val e2ee = MutableStateFlow<LightServiceMethod.GetE2eeState.Response?>(null)
     val busy = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
         // Poll while the screen is up; the companion's state machine updates as
-        // the other device answers.
+        // the other device answers (and the recovery key updates e2ee state).
         viewModelScope.launch {
             while (true) {
                 state.value = ChatClient.verificationState()
+                e2ee.value = ChatClient.e2eeState()
                 delay(POLL_MS)
             }
         }
@@ -71,6 +73,23 @@ class VerificationViewModel : LightViewModel<Unit>() {
             if (response?.started != true) {
                 error.value = response?.error ?: "couldn't start verification"
             } else {
+                state.value = ChatClient.verificationState()
+            }
+        }
+    }
+
+    /** Non-interactive verification with the account's recovery key. */
+    fun recover(recoveryKey: String) {
+        if (busy.value) return
+        viewModelScope.launch {
+            busy.value = true
+            error.value = null
+            val failure = ChatClient.recoverWithKey(recoveryKey)
+            busy.value = false
+            if (failure != null) {
+                error.value = failure
+            } else {
+                e2ee.value = ChatClient.e2eeState()
                 state.value = ChatClient.verificationState()
             }
         }
@@ -104,6 +123,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
     @Composable
     override fun Content() {
         val state by viewModel.state.collectAsState()
+        val e2ee by viewModel.e2ee.collectAsState()
         val error by viewModel.error.collectAsState()
         val busy by viewModel.busy.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
@@ -126,70 +146,90 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                     Column(
                         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
                     ) {
-                        when (state?.state) {
-                            "none" -> {
-                                Body("This device isn't verified yet, so encrypted messages stay locked. Verify with another device signed into your Beeper account (e.g. the Beeper app on your phone) to unlock them.")
-                                ActionRow(
-                                    text = if (busy) "…" else "START VERIFICATION",
-                                    enabled = !busy,
-                                    onClick = viewModel::start,
-                                )
-                            }
-
-                            "waiting" -> {
-                                Body("Waiting for your other device… Open the Beeper app and accept the verification there.")
-                                ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                            }
-
-                            "accept" -> {
-                                Body("Your other device wants to verify. Accept?")
-                                ActionRow("ACCEPT", enabled = !busy) { viewModel.act("accept") }
-                                ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                            }
-
-                            "start" -> {
-                                Body("Both devices are ready. Start the verification.")
-                                ActionRow("START", enabled = !busy) { viewModel.act("start") }
-                                ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                            }
-
-                            "compare" -> {
-                                Body("Compare the emojis on this device with the ones on your other device.")
-                                Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                                // Three per row so a full SAS set (7 emojis) never
-                                // spills off the screen.
-                                state?.emoji.orEmpty().chunked(3).forEach { rowEmojis ->
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceEvenly,
-                                    ) {
-                                        rowEmojis.forEach { emoji ->
-                                            LightText(text = emoji, variant = LightTextVariant.Title)
-                                        }
-                                    }
-                                }
-                                Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                                ActionRow("MATCH", enabled = !busy) { viewModel.act("match") }
-                                ActionRow("DON'T MATCH", enabled = !busy) { viewModel.act("no_match") }
-                                ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                            }
-
-                            "done" -> {
+                        when {
+                            // The recovery key verifies without a state machine —
+                            // the e2ee flag flipping to verified is the signal.
+                            e2ee?.verified == true -> {
                                 Body("Verified. Encrypted messages can now decrypt — open a conversation to load them.")
                                 ActionRow("DONE") { goBack() }
                             }
 
-                            "cancelled" -> {
-                                Body("Verification was cancelled or failed.")
-                                ActionRow("START OVER", enabled = !busy) { viewModel.act("reset") }
-                            }
+                            else -> when (state?.state) {
+                                "none" -> {
+                                    Body("This device isn't verified yet, so encrypted messages stay locked. Verify with another device signed into your Beeper account (e.g. the Beeper app on your phone), or use your account's recovery key.")
+                                    ActionRow(
+                                        text = if (busy) "…" else "START VERIFICATION",
+                                        enabled = !busy,
+                                        onClick = viewModel::start,
+                                    )
+                                    ActionRow(
+                                        text = if (busy) "…" else "USE RECOVERY KEY",
+                                        enabled = !busy,
+                                        onClick = {
+                                            navigateTo(screenFactory = {
+                                                FieldEditorScreen(it, "Recovery key", "")
+                                            }) { key ->
+                                                if (key != null && key.isNotBlank()) viewModel.recover(key)
+                                            }
+                                        },
+                                    )
+                                }
 
-                            "error" -> {
-                                Body(state?.detail ?: "Verification failed.")
-                                ActionRow("START OVER", enabled = !busy) { viewModel.act("reset") }
-                            }
+                                "waiting" -> {
+                                    Body("Waiting for your other device… Open the Beeper app and accept the verification there.")
+                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
+                                }
 
-                            else -> Body("Checking…")
+                                "accept" -> {
+                                    Body("Your other device wants to verify. Accept?")
+                                    ActionRow("ACCEPT", enabled = !busy) { viewModel.act("accept") }
+                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
+                                }
+
+                                "start" -> {
+                                    Body("Both devices are ready. Start the verification.")
+                                    ActionRow("START", enabled = !busy) { viewModel.act("start") }
+                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
+                                }
+
+                                "compare" -> {
+                                    Body("Compare the emojis on this device with the ones on your other device.")
+                                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                                    // Three per row so a full SAS set (7 emojis) never
+                                    // spills off the screen.
+                                    state?.emoji.orEmpty().chunked(3).forEach { rowEmojis ->
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceEvenly,
+                                        ) {
+                                            rowEmojis.forEach { emoji ->
+                                                LightText(text = emoji, variant = LightTextVariant.Title)
+                                            }
+                                        }
+                                    }
+                                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                                    ActionRow("MATCH", enabled = !busy) { viewModel.act("match") }
+                                    ActionRow("DON'T MATCH", enabled = !busy) { viewModel.act("no_match") }
+                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
+                                }
+
+                                "done" -> {
+                                    Body("Verified. Encrypted messages can now decrypt — open a conversation to load them.")
+                                    ActionRow("DONE") { goBack() }
+                                }
+
+                                "cancelled" -> {
+                                    Body("Verification was cancelled or failed.")
+                                    ActionRow("START OVER", enabled = !busy) { viewModel.act("reset") }
+                                }
+
+                                "error" -> {
+                                    Body(state?.detail ?: "Verification failed.")
+                                    ActionRow("START OVER", enabled = !busy) { viewModel.act("reset") }
+                                }
+
+                                else -> Body("Checking…")
+                            }
                         }
                         error?.let { message ->
                             LightText(

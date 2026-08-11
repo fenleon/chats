@@ -42,6 +42,8 @@ import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -71,6 +73,33 @@ class SettingsViewModel : LightViewModel<Unit>() {
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
         refreshStatus()
+        startPolling()
+    }
+
+    override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
+        super.onScreenHide(screen)
+        stopPolling()
+    }
+
+    override fun onAppPause() {
+        super.onAppPause()
+        stopPolling()
+    }
+
+    /** Keeps the status fresh while Settings is visible (sync state, rooms). */
+    private fun startPolling() {
+        if (pollJob?.isActive == true) return
+        pollJob = viewModelScope.launch {
+            while (true) {
+                delay(POLL_INTERVAL_MS)
+                refreshStatus()
+            }
+        }
+    }
+
+    private fun stopPolling() {
+        pollJob?.cancel()
+        pollJob = null
     }
 
     fun refreshStatus() {
@@ -160,6 +189,12 @@ class SettingsViewModel : LightViewModel<Unit>() {
     fun toggleTokenLogin() {
         tokenLogin.value = !tokenLogin.value
     }
+
+    private var pollJob: Job? = null
+
+    private companion object {
+        const val POLL_INTERVAL_MS = 5_000L
+    }
 }
 
 class SettingsScreen(sealedActivity: SealedLightActivity) :
@@ -217,6 +252,23 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                 },
                             )
                         } else {
+                            // Logged out: if the session just expired, say so
+                            // instead of showing a bare login form (the user
+                            // should re-login directly, not hunt for LOG OUT).
+                            val conn = connection
+                            if (conn?.state == "offline" &&
+                                conn.detail?.startsWith("session expired") == true
+                            ) {
+                                LightText(
+                                    text = "Your session expired — sign in again.",
+                                    variant = LightTextVariant.Detail,
+                                    lighten = true,
+                                    modifier = Modifier.padding(
+                                        horizontal = 2f.gridUnitsAsDp(),
+                                        vertical = 0.5f.gridUnitsAsDp(),
+                                    ),
+                                )
+                            }
                             LoginModeRow(
                                 beeperMode = beeperMode,
                                 onSelect = viewModel::setLoginMode,

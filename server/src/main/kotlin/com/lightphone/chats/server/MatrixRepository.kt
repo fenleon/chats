@@ -314,6 +314,30 @@ object MatrixRepository {
         client!!
     }
 
+    /**
+     * Verifies this device non-interactively with the account's recovery key
+     * (Beeper's interactive verification is unreliable — Beeper4LightOS's own
+     * README says to use a recovery code instead). Restores the cross-signing
+     * keys, making the device trusted; [e2eeState] then reports verified and
+     * kicks the megolm key-backup restore.
+     */
+    suspend fun recoverWithKey(recoveryKey: String): Result<Unit> = runCatching {
+        val c = client ?: error("not logged in")
+        val methods = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.verification.getSelfVerificationMethods().first()
+        } ?: error("no self-verification methods available")
+        if (methods !is net.folivo.trixnity.client.verification.VerificationService.SelfVerificationMethods.CrossSigningEnabled) {
+            error("cross-signing is not set up on this account")
+        }
+        val method = methods.methods
+            .filterIsInstance<net.folivo.trixnity.client.verification.SelfVerificationMethod.AesHmacSha2RecoveryKey>()
+            .firstOrNull() ?: error("no recovery-key method available")
+        val key = recoveryKey.trim()
+        if (key.replace("-", "").length < 48) error("that doesn't look like a recovery key")
+        method.verify(key).getOrThrow()
+        android.util.Log.d(TAG, "recoverWithKey: recovery-key verification succeeded")
+    }
+
     // --- E2EE (Trixnity crypto in the companion; SAS device verification) -----
 
     /** UI-facing shape of the interactive verification, serialized over the binder. */
@@ -589,7 +613,9 @@ object MatrixRepository {
         val c = client
         val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return com.thelightphone.sdk.shared.LightServiceMethod.GetAccountState.Response(
-            loggedIn = c != null,
+            // An expired session counts as logged out for the UI: the user
+            // should land on the login form, not on LOG OUT.
+            loggedIn = c != null && !sessionExpired,
             userId = c?.userId?.full ?: prefs?.getString(KEY_USER_ID, null),
             homeserver = prefs?.getString(KEY_HOMESERVER, null),
             loginMode = prefs?.getString(KEY_LOGIN_MODE, null),

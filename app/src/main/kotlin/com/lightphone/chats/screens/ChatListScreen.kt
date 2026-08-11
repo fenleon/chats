@@ -129,7 +129,10 @@ class ChatListViewModel : LightViewModel<Unit>() {
                 // empty) keeps refetching.
                 val settled = account != null && (
                     (account.loggedIn == true && result.isNotEmpty()) ||
-                        (account.userId == null && result.isEmpty())
+                        (account.userId == null && result.isEmpty()) ||
+                        // An expired session is a settled state, not a transient
+                        // restore — don't keep refetching for 10s.
+                        (account.loggedIn == false && account.userId != null && connection?.state == "offline")
                     )
                 if (settled) return@repeat
                 delay(REFRESH_RETRY_DELAY_MS)
@@ -242,7 +245,11 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                     }
                                 }
                                 account?.loggedIn != true -> StatusText(
-                                    "No account. Open Settings to sign in with Beeper or a Matrix homeserver.",
+                                    if (connection?.state == "offline") {
+                                        "Sign in again — open Settings."
+                                    } else {
+                                        "No account. Open Settings to sign in with Beeper or a Matrix homeserver."
+                                    },
                                 )
                                 else -> StatusText("No conversations.")
                             }
