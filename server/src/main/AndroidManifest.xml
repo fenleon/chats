@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- sdk:ui merges CAMERA for its QR scanner; the companion is a chat server. -->
@@ -20,7 +21,8 @@
         android:icon="@android:mipmap/sym_def_app_icon"
         android:label="Chats Server"
         android:theme="@android:style/Theme.Black.NoTitleBar"
-        android:hardwareAccelerated="true">
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"
@@ -32,6 +34,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Keeps the Matrix sync loop alive in the background. Uses cleartext
+             HTTP so a self-hosted LAN homeserver (e.g. 10.0.2.2 in dev) works. -->
+        <service
+            android:name=".ChatSyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- sdk:client merges its UnifiedPush service + file-share provider;
              the companion is a local Matrix server and uses neither. -->

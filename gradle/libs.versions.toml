@@ -3,11 +3,24 @@ agp = "8.12.3"
 kotlin = "2.3.20"
 compose-activity = "1.13.0"
 kotlinx-coroutines = "1.10.2"
+ktor = "3.4.2"
+room = "2.7.0"
+trixnity = "4.22.7"
 sdk = "0.1.0"
 
 [libraries]
 compose-activity = { module = "androidx.activity:activity-compose", version.ref = "compose-activity" }
 kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinx-coroutines" }
+# Trixnity Matrix SDK — the companion's protocol layer (login/sync, Room repos, media).
+# Version pair proven by the Beeper4LightOS bootstrap (see chats/PLAN.md).
+trixnity-client = { module = "net.folivo:trixnity-client", version.ref = "trixnity" }
+trixnity-repository-room = { module = "net.folivo:trixnity-client-repository-room", version.ref = "trixnity" }
+trixnity-media-okio = { module = "net.folivo:trixnity-client-media-okio", version.ref = "trixnity" }
+ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
+ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
+ktor-serialization-json = { module = "io.ktor:ktor-serialization-kotlinx-json", version.ref = "ktor" }
+androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
+androidx-room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
 # Consumed from the included ../light-sdk build via dependencySubstitution;
 # versions must match light-sdk/gradle.properties sdkGroup/sdkVersion.
 sdk-ui = { module = "com.thelightphone:sdk-ui", version.ref = "sdk" }

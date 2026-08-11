@@ -3,7 +3,6 @@ plugins {
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
-
 android {
     namespace = "com.lightphone.chats.server"
     compileSdk = 36
@@ -60,4 +59,16 @@ dependencies {
     implementation(libs.sdk.ui)       // Light design system for the status screen
     implementation(libs.compose.activity)
     implementation(libs.kotlinx.coroutines)
+
+    // Trixnity Matrix SDK (the protocol layer: login/sync, room repositories, media).
+    // Version pair proven by the Beeper4LightOS bootstrap on LightOS (see chats/PLAN.md).
+    implementation(libs.trixnity.client)
+    implementation(libs.trixnity.repository.room)
+    implementation(libs.trixnity.media.okio)
+    implementation(libs.ktor.client.okhttp)
+    implementation(libs.ktor.client.content.negotiation)
+    implementation(libs.ktor.serialization.json)
+    // Room runtime for Trixnity's TrixnityRoomDatabase (session + event store).
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
 }

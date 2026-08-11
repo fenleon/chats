@@ -17,8 +17,8 @@ private const val LIGHTSDK_DEV_CERT_SHA256 =
 
 /**
  * The Chats companion: hosts the SDK's [LightSdkService] so the tool can bind
- * to it. Phase 2 adds the persistent Matrix connection (sync loop), storage,
- * and notifications.
+ * to it, and owns the persistent Matrix connection — session restore, the sync
+ * loop in [ChatSyncService], storage, and notifications.
  */
 class ServerApplication : Application() {
 
@@ -32,6 +32,8 @@ class ServerApplication : Application() {
                 ChatServiceMethods.dispatch(methodId, payload)
             }
         }
+        // Restores a stored session (if any) and starts the sync service.
+        MatrixRepository.init(this)
     }
 
     private fun Context.checkLightSdkCert(callingPackage: String): ClientCertType {
