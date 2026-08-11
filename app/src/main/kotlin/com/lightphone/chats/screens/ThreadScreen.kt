@@ -52,6 +52,8 @@ class ThreadViewModel(
     val jumpToBottom = MutableStateFlow(true)
     /** Whether this device is E2EE-verified (false = encrypted rooms can't decrypt yet). */
     val e2eeVerified = MutableStateFlow<Boolean?>(null)
+    /** Whether the room needs decryption (set from the first getMessages response). */
+    val roomEncrypted = MutableStateFlow(false)
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
@@ -76,6 +78,7 @@ class ThreadViewModel(
             loading.value = true
             val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
             val loaded = page?.messages.orEmpty()
+            roomEncrypted.value = page?.encrypted ?: false
             // A failed reload (e.g. brief disconnect) must not wipe what's shown.
             if (loaded.isNotEmpty() || messages.value.isEmpty()) {
                 messages.value = loaded
@@ -131,13 +134,13 @@ class ThreadScreen(
         val hasMore by viewModel.hasMore.collectAsState()
         val jumpToBottom by viewModel.jumpToBottom.collectAsState()
         val e2eeVerified by viewModel.e2eeVerified.collectAsState()
+        val roomEncrypted by viewModel.roomEncrypted.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
         val scrollState = rememberScrollState()
 
-        // An unverified device cannot decrypt this room's messages — say so
-        // plainly instead of leaving the user staring at "[Encrypted]".
-        val needsDecryptionNotice = e2eeVerified == false &&
-            messages.any { it.body.startsWith("[Encrypted") }
+        // An unverified device cannot decrypt an encrypted room — say so
+        // plainly (and immediately, no spinner) instead of "Loading…" forever.
+        val needsDecryptionNotice = e2eeVerified == false && roomEncrypted
 
         LightTheme(colors = themeColors) {
             Column(
@@ -156,12 +159,13 @@ class ThreadScreen(
                 )
                 Box(modifier = Modifier.weight(1f)) {
                     when {
+                        needsDecryptionNotice -> LightScrollView(scrollState = scrollState) {
+                            DecryptionNotice()
+                            messages.forEach { message -> MessageRow(message) }
+                        }
                         loading && messages.isEmpty() -> StatusText("Loading messages…")
                         messages.isEmpty() -> StatusText("No messages yet.")
                         else -> LightScrollView(scrollState = scrollState) {
-                            if (needsDecryptionNotice) {
-                                DecryptionNotice()
-                            }
                             if (hasMore) {
                                 LoadEarlierRow(
                                     loadingMore = loadingMore,

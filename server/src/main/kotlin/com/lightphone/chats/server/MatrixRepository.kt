@@ -627,11 +627,13 @@ object MatrixRepository {
      * A page of a room's messages (oldest first) plus whether older messages
      * exist beyond it. [hasMore] is computed from the raw timeline page, not
      * the message-filtered list, so a page full of state events or
-     * still-encrypted events doesn't end pagination early.
+     * still-encrypted events doesn't end pagination early. [encrypted] is set
+     * without fetching when the room needs decryption the device can't do.
      */
     data class MessagesPage(
         val messages: List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>,
         val hasMore: Boolean,
+        val encrypted: Boolean = false,
     )
 
     /**
@@ -645,6 +647,17 @@ object MatrixRepository {
     ): MessagesPage {
         val c = client ?: return MessagesPage(emptyList(), false)
         val matrixRoomId = RoomId(roomId)
+
+        // Fast path: an encrypted room on an unverified device can't decrypt —
+        // say so immediately instead of fetching events and waiting on
+        // decryption that can never land.
+        val roomEncrypted = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getAll().first()[matrixRoomId]?.filterNotNull()?.first()?.encrypted
+        } == true
+        if (roomEncrypted && !isDeviceVerified(c)) {
+            android.util.Log.d(TAG, "getMessages: $matrixRoomId is encrypted and device is unverified — returning immediately")
+            return MessagesPage(emptyList(), false, encrypted = true)
+        }
 
         // Lazy per-room decrypt: load any undecrypted events' megolm sessions
         // first, then re-read. Decryption lands asynchronously once the session
@@ -738,11 +751,22 @@ object MatrixRepository {
         return events
     }
 
-    /**
-     * Loads the megolm sessions for the given events' undecrypted content from
+    /** Whether this device is cross-signing verified (so E2EE rooms can decrypt). */
+    private suspend fun isDeviceVerified(c: MatrixClient): Boolean {
+        val trust = withTimeoutOrNull(KEY_BACKUP_VERIFY_TIMEOUT_MS) {
+            c.key.getTrustLevel(c.userId, c.deviceId).firstOrNull()
+        }
+        return trust is net.folivo.trixnity.crypto.key.DeviceTrustLevel.CrossSigned && trust.verified
+    }
+
+    /** Loads the megolm sessions for the given events' undecrypted content from
      * the key backup. Returns how many sessions were loaded — 0 means the
      * account has no usable backup key (e.g. an unverified device), so the
      * caller can skip pointless decrypt retries.
+     *
+     * Never blocks a getMessages call: an unverified device skips the restore
+     * outright (it has no backup key) and each load is bounded by a timeout
+     * (loadMegolmSession can hang waiting for a key that never arrives).
      */
     private suspend fun restoreRoomSessions(
         c: MatrixClient,
@@ -755,6 +779,14 @@ object MatrixRepository {
         android.util.Log.d(TAG, "restoreRoomSessions: $matrixRoomId — ${events.size} events, ${sessionIds.size} megolm sessions, " +
             "encrypted classes: ${events.map { it.event.content::class.simpleName }.distinct()}")
         if (sessionIds.isEmpty()) return 0
+
+        // The key backup is only reachable once the device is verified — check
+        // first so an unverified device returns instantly instead of hanging.
+        if (!isDeviceVerified(c)) {
+            android.util.Log.d(TAG, "restoreRoomSessions: device not verified — no key-backup access, skipping restore")
+            return 0
+        }
+
         val keyBackup = runCatching {
             c.di.get<net.folivo.trixnity.client.key.KeyBackupService>(
                 org.koin.core.qualifier.named<net.folivo.trixnity.client.key.KeyBackupService>(),
@@ -767,8 +799,12 @@ object MatrixRepository {
         var loaded = 0
         sessionIds.forEach { sessionId ->
             try {
-                keyBackup.loadMegolmSession(matrixRoomId, sessionId)
-                loaded++
+                val ok = withTimeoutOrNull(KEY_BACKUP_LOAD_TIMEOUT_MS) {
+                    keyBackup.loadMegolmSession(matrixRoomId, sessionId)
+                }
+                if (ok != null) loaded++ else {
+                    android.util.Log.w(TAG, "restoreRoomSessions: loadMegolmSession timed out for $matrixRoomId / $sessionId")
+                }
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "restoreRoomSessions: loadMegolmSession failed for $matrixRoomId / $sessionId: ${e.message}")
             }
@@ -1412,6 +1448,10 @@ object MatrixRepository {
     private const val ROOM_LIST_ROOM_BUDGET_MS = 500L
     /** Delay before stopping the sync service after an expiry detection. */
     private const val SYNC_STOP_DELAY_MS = 3_000L
+    /** Bound for the device-verification check before key-backup work. */
+    private const val KEY_BACKUP_VERIFY_TIMEOUT_MS = 1_000L
+    /** Bound for a single megolm-session load (can hang waiting for a key). */
+    private const val KEY_BACKUP_LOAD_TIMEOUT_MS = 2_000L
 
     private const val TAG = "MatrixRepository"
 }

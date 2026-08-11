@@ -65,6 +65,7 @@ object ChatServiceMethods {
                     val response = LightServiceMethod.GetMessages.Response(
                         messages = page.messages,
                         hasMore = page.hasMore,
+                        encrypted = page.encrypted,
                     )
                     LightResult.Success(LightServiceMethod.GetMessages.encodeResponse(response))
                 }

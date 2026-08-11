@@ -491,9 +491,16 @@ private fun AccountStatus(
             variant = LightTextVariant.Copy,
         )
         connection?.let { state ->
+            val allSynced = state.state == "syncing" &&
+                state.roomsTotal > 0 && state.roomsResolved >= state.roomsTotal
+            val statusText = when {
+                allSynced -> "Synced"
+                state.state == "syncing" -> "Syncing"
+                else -> state.state.replaceFirstChar { it.uppercase() } +
+                    state.detail?.let { " — $it" }.orEmpty()
+            }
             LightText(
-                text = state.state.replaceFirstChar { it.uppercase() } +
-                    state.detail?.let { " — $it" }.orEmpty(),
+                text = statusText,
                 variant = LightTextVariant.Detail,
                 lighten = true,
                 modifier = Modifier.padding(top = 2.dp),
