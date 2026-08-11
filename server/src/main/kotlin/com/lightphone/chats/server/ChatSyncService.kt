@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import net.folivo.trixnity.clientserverapi.client.SyncState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -41,13 +42,46 @@ class ChatSyncService : Service() {
                 syncedClient = c
                 Log.d(TAG, "sync loop started for ${c.userId.full}")
             }
+            if (watchdogClient !== c) {
+                watchdogClient = c
+                startSyncWatchdog(c)
+            }
         }
         return START_STICKY
+    }
+
+    /**
+     * Trixnity's sync loop already retries internally after a drop, but a
+     * watchdog still guards against a loop that has died without resuming:
+     * if the client stays in ERROR/TIMEOUT for a while (no RUNNING in
+     * between), stop and restart the loop. Skipped for an expired session
+     * (login state != LOGGED_IN) — retrying a dead token would just hammer
+     * the server; that case is handled by [MatrixRepository].
+     */
+    private suspend fun startSyncWatchdog(c: net.folivo.trixnity.client.MatrixClient) {
+        var stuckSinceMs = 0L
+        c.syncState.collect { state ->
+            val running = state == SyncState.RUNNING || state == SyncState.STARTED ||
+                state == SyncState.INITIAL_SYNC
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (running || c.loginState.value != net.folivo.trixnity.client.MatrixClient.LoginState.LOGGED_IN) {
+                stuckSinceMs = 0L
+                return@collect
+            }
+            if (stuckSinceMs == 0L) stuckSinceMs = now
+            if (syncedClient === c && now - stuckSinceMs >= SYNC_RESTART_AFTER_MS) {
+                Log.w(TAG, "sync stuck in $state for ${SYNC_RESTART_AFTER_MS / 1000}s — restarting sync loop")
+                runCatching { c.stopSync() }
+                c.startSync()
+                stuckSinceMs = 0L
+            }
+        }
     }
 
     override fun onDestroy() {
         serviceScope.cancel()
         syncedClient = null
+        watchdogClient = null
         Log.d(TAG, "sync service stopped")
         super.onDestroy()
     }
@@ -73,9 +107,16 @@ class ChatSyncService : Service() {
         private const val NOTIFICATION_ID = 71
         private const val TAG = "ChatSyncService"
 
+        /** Restart the sync loop after this long stuck in ERROR/TIMEOUT. */
+        private const val SYNC_RESTART_AFTER_MS = 120_000L
+
         /** The client instance the sync loop is currently running on. */
         @Volatile
         private var syncedClient: net.folivo.trixnity.client.MatrixClient? = null
+
+        /** The client the sync watchdog is currently attached to. */
+        @Volatile
+        private var watchdogClient: net.folivo.trixnity.client.MatrixClient? = null
 
         /** Starts the service; safe to call when it is already running. */
         fun start(context: Context) {

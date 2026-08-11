@@ -54,15 +54,21 @@ object ChatClient {
         callRemoteServiceMethod(LightServiceMethod.GetRooms, Unit)
             .getOrNull()?.rooms.orEmpty()
 
+    /**
+     * A page of messages, oldest first; [beforeEventId] pages further back.
+     * The response carries [LightServiceMethod.GetMessages.Response.hasMore],
+     * which the thread uses instead of page-size heuristics (a page of mostly
+     * state events would otherwise end pagination early).
+     */
     suspend fun getMessages(
         roomId: String,
         beforeEventId: String? = null,
         limit: Int = 30,
-    ): List<LightServiceMethod.GetMessages.Message> =
+    ): LightServiceMethod.GetMessages.Response? =
         callRemoteServiceMethod(
             LightServiceMethod.GetMessages,
             LightServiceMethod.GetMessages.Request(roomId, beforeEventId, limit),
-        ).getOrNull()?.messages.orEmpty()
+        ).getOrNull()
 
     suspend fun sendMessage(
         roomId: String,

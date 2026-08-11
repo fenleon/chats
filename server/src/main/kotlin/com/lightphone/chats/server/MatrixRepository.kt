@@ -16,8 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -130,6 +129,21 @@ object MatrixRepository {
     private var observedClient: MatrixClient? = null
     private val notificationWatcherJobs = java.util.concurrent.ConcurrentHashMap.newKeySet<Job>()
 
+    /**
+     * True while [logout] is running, so the login-state observer doesn't
+     * misread the logout's own LOGGED_OUT transition as an expired session.
+     */
+    @Volatile
+    private var manualLogout = false
+
+    /**
+     * The session was invalidated server-side (expired token / logged out
+     * elsewhere). Sync is stopped and the UI reports it; the stored session is
+     * kept until the user logs out so their data isn't wiped behind them.
+     */
+    @Volatile
+    private var sessionExpired = false
+
     private val _connectionState = MutableStateFlow<ChatConnectionState>(ChatConnectionState.LoggedOut)
     val connectionState: StateFlow<ChatConnectionState> = _connectionState.asStateFlow()
 
@@ -175,6 +189,9 @@ object MatrixRepository {
             )
             val newClient = loginResult.getOrThrow()
             client = newClient
+            sessionExpired = false
+            manualLogout = false
+            resetRoomList()
             observeClient(newClient)
             restoreAttempted = false
 
@@ -277,6 +294,9 @@ object MatrixRepository {
             )
             val newClient = loginResult.getOrThrow()
             client = newClient
+            sessionExpired = false
+            manualLogout = false
+            resetRoomList()
             observeClient(newClient)
             restoreAttempted = false
 
@@ -513,12 +533,14 @@ object MatrixRepository {
     suspend fun logout() {
         val ctx = appContext ?: return
         initMutex.withLock {
+            manualLogout = true
             val old = client
             client = null
             observedClient = null
             resetVerification()
             activeRoomId = null
             pendingNotifyRoomId = null
+            resetRoomList()
             ChatNotifier.clearAll(ctx)
             runCatching { old?.logout() } // API logout + clears Trixnity's store
             runCatching { old?.closeSuspending() }
@@ -526,6 +548,8 @@ object MatrixRepository {
             ctx.deleteDatabase(DB_NAME)
             ctx.cacheDir.resolve(MEDIA_DIR).deleteRecursively()
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+            sessionExpired = false
+            manualLogout = false
             _connectionState.value = ChatConnectionState.LoggedOut
         }
     }
@@ -582,39 +606,26 @@ object MatrixRepository {
         )
     }
 
-    /** Newest activity first. */
+    /** Newest activity first — a pure read of the background-refreshed cache. */
     suspend fun getRooms(): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
-        val c = client ?: return emptyList()
-        // The Beeper account has 1000+ rooms; resolve them in parallel (the
-        // store cache coalesces concurrent loads) so a warm cache is instant
-        // and a cold one finishes within the budget. The tool retries an empty
-        // result, and the notification observer's background loads warm the
-        // cache, so a cold start converges on the next call.
-        val started = android.os.SystemClock.elapsedRealtime()
-        val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) {
-            val roomsMap = c.room.getAll().first()
-            kotlinx.coroutines.coroutineScope {
-                val scope = this
-                roomsMap.map { (roomId, roomFlow) ->
-                    scope.async {
-                        val room = withTimeoutOrNull(ROOM_BUDGET_MS) {
-                            roomFlow.filterNotNull().first()
-                        } ?: return@async null
-                        com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room(
-                            id = roomId.full,
-                            name = roomDisplayName(c, roomId, room),
-                            lastMessage = lastMessagePreview(c, roomId, room),
-                            unreadCount = room.unreadMessageCount,
-                            lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
-                            lastEventId = room.lastRelevantEventId?.full,
-                        )
-                    }
-                }.awaitAll().filterNotNull().sortedByDescending { it.lastTimestampMs }
-            }
-        } ?: emptyList()
-        android.util.Log.d(TAG, "getRooms: ${rooms.size} rooms in ${android.os.SystemClock.elapsedRealtime() - started}ms")
-        return rooms
+        if (client == null) return emptyList()
+        // The resolver seeds the cache promptly at attach and refreshes it in
+        // the background; a binder call never triggers a 1284-room resolution
+        // burst. On a cold process the first calls may return empty until the
+        // resolver's first pass lands — the tool's refresh retries cover that.
+        return _roomList.value
     }
+
+    /**
+     * A page of a room's messages (oldest first) plus whether older messages
+     * exist beyond it. [hasMore] is computed from the raw timeline page, not
+     * the message-filtered list, so a page full of state events or
+     * still-encrypted events doesn't end pagination early.
+     */
+    data class MessagesPage(
+        val messages: List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>,
+        val hasMore: Boolean,
+    )
 
     /**
      * Messages of a room, oldest first. [beforeEventId] pages further back;
@@ -624,8 +635,8 @@ object MatrixRepository {
         roomId: String,
         beforeEventId: String?,
         limit: Int,
-    ): List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message> {
-        val c = client ?: return emptyList()
+    ): MessagesPage {
+        val c = client ?: return MessagesPage(emptyList(), false)
         val matrixRoomId = RoomId(roomId)
 
         // Lazy per-room decrypt: load any undecrypted events' megolm sessions
@@ -642,13 +653,21 @@ object MatrixRepository {
             events = collectTimelineEvents(c, matrixRoomId, beforeEventId, limit + 1)
         }
 
+        // A full raw page (limit + 1, including the cursor event for older
+        // pages) means older messages exist beyond this one.
+        val hasMore = events.size >= limit + 1
+        android.util.Log.d(
+            TAG,
+            "getMessages: room=$matrixRoomId before=$beforeEventId limit=$limit rawPage=${events.size} hasMore=$hasMore",
+        )
+
         val result = mutableListOf<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>()
         val startIndex = if (beforeEventId == null) 0 else 1 // drop the cursor event
         for (i in startIndex until events.size) {
             if (result.size >= limit) break
             messageFrom(c, matrixRoomId, events[i])?.let { result.add(it) }
         }
-        return result.reversed() // oldest first
+        return MessagesPage(messages = result.reversed(), hasMore = hasMore) // oldest first
     }
 
     /** Collects a room's timeline events (newest first), null cursor = newest page. */
@@ -894,6 +913,232 @@ object MatrixRepository {
         )
     }
 
+    // --- Room-list cache (Phase 5) ------------------------------------------
+    // The tool's chat list is served from an in-memory cache refreshed in the
+    // background, newest-first. A binder call never triggers the 1284-room
+    // resolution burst (whose parallel lookups timed out and previews snapshotted
+    // before decryption); the list shows placeholders immediately and fills in
+    // as the resolver works, pass by pass.
+
+    /** One cache row: the room's snapshot plus internal resolution flags. */
+    private data class RoomListEntry(
+        val room: com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room,
+        val nameResolved: Boolean,
+        val previewResolved: Boolean,
+        /** A "[Encrypted]" preview retries no earlier than this (elapsedRealtime). */
+        val previewRetryAtMs: Long,
+    )
+
+    private val roomListCache = java.util.concurrent.ConcurrentHashMap<String, RoomListEntry>()
+    private val _roomList = MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>(emptyList())
+
+    @Volatile
+    private var roomListJob: Job? = null
+
+    private fun resetRoomList() {
+        roomListCache.clear()
+        _roomList.value = emptyList()
+        roomListJob?.cancel()
+        roomListJob = null
+    }
+
+    /**
+     * Background resolver for the room list. Runs continuously while a client
+     * is attached: seeds every room with a placeholder row first (so the list
+     * shows instantly), then resolves names + previews newest-first within a
+     * per-pass time budget, publishing the snapshot after each pass.
+     */
+    private fun startRoomListResolver(c: MatrixClient) {
+        roomListJob?.cancel()
+        roomListJob = scope.launch {
+            android.util.Log.d(TAG, "room list resolver starting for ${c.userId.full}")
+            // Hero-name memo: the profile store is warm, but resolving names for
+            // every room sequentially still benefits from not re-reading the
+            // same hero (WhatsApp DMs reuse the same few profiles).
+            val nameMemo = HashMap<String, String>()
+            while (true) {
+                try {
+                    val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
+                        ?: emptyMap()
+                    val passDeadline = android.os.SystemClock.elapsedRealtime() + ROOM_LIST_PASS_BUDGET_MS
+                    // Collect each room's current state (the store cache is warm,
+                    // so these emit immediately) newest-first; rooms still loading
+                    // are retried on the next pass.
+                    val loaded = mutableListOf<Pair<RoomId, MatrixRoom>>()
+                    for ((roomId, roomFlow) in rooms) {
+                        if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
+                        val room = withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
+                            roomFlow.filterNotNull().first()
+                        }
+                        if (room != null) loaded += roomId to room
+                    }
+                    loaded.sortByDescending { it.second.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L }
+                    seedRoomList(loaded)
+                    for ((roomId, room) in loaded) {
+                        if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
+                        resolveRoomListEntry(c, roomId, room, nameMemo)
+                    }
+                    publishRoomList()
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "room list resolver pass failed: ${e.message}")
+                }
+                kotlinx.coroutines.delay(ROOM_LIST_REFRESH_DELAY_MS)
+            }
+        }
+    }
+
+    /** Inserts a placeholder row for every room not yet in the cache. */
+    private fun seedRoomList(rooms: List<Pair<RoomId, MatrixRoom>>) {
+        var seeded = 0
+        for ((roomId, room) in rooms) {
+            val key = roomId.full
+            if (roomListCache.containsKey(key)) continue
+            roomListCache[key] = RoomListEntry(
+                room = com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room(
+                    id = key,
+                    name = ROOM_NAME_PLACEHOLDER, // filled in by the resolver
+                    lastMessage = "",
+                    unreadCount = room.unreadMessageCount,
+                    lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
+                    lastEventId = room.lastRelevantEventId?.full,
+                ),
+                nameResolved = false,
+                previewResolved = false,
+                previewRetryAtMs = 0L,
+            )
+            seeded++
+        }
+        if (seeded > 0) android.util.Log.d(TAG, "room list: seeded $seeded placeholder rows")
+    }
+
+    /**
+     * Refreshes one room's cache row. Names resolve sequentially from the warm
+     * profile store (no parallel contention); previews read the newest event
+     * with a bounded decrypt-wait. Rows whose state hasn't changed keep their
+     * resolved name/preview, so steady-state passes are cheap.
+     */
+    private suspend fun resolveRoomListEntry(
+        c: MatrixClient,
+        roomId: RoomId,
+        room: MatrixRoom,
+        nameMemo: MutableMap<String, String>,
+    ) {
+        val key = roomId.full
+        val prev = roomListCache[key]
+        val ts = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L
+        val lastEventId = room.lastRelevantEventId?.full
+        val unread = room.unreadMessageCount
+        val stateChanged = prev == null ||
+            prev.room.lastEventId != lastEventId ||
+            prev.room.unreadCount != unread ||
+            prev.room.lastTimestampMs != ts
+
+        val nameResolved = prev?.nameResolved == true && !stateChanged
+        val name = if (nameResolved) {
+            prev.room.name
+        } else {
+            resolveRoomName(c, roomId, room, nameMemo)
+        }
+
+        val preview: String
+        val previewResolved: Boolean
+        val previewRetryAtMs: Long
+        when {
+            prev != null && prev.previewResolved && !stateChanged -> {
+                preview = prev.room.lastMessage
+                previewResolved = true
+                previewRetryAtMs = 0L
+            }
+            lastEventId == null -> {
+                preview = ""
+                previewResolved = true
+                previewRetryAtMs = 0L
+            }
+            android.os.SystemClock.elapsedRealtime() < (prev?.previewRetryAtMs ?: 0L) -> {
+                preview = prev?.room?.lastMessage.orEmpty()
+                previewResolved = false
+                previewRetryAtMs = prev!!.previewRetryAtMs
+            }
+            else -> {
+                val resolved = resolveRoomPreview(c, roomId, lastEventId)
+                preview = resolved.first
+                previewResolved = resolved.second
+                previewRetryAtMs = resolved.third
+            }
+        }
+
+        roomListCache[key] = RoomListEntry(
+            room = com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room(
+                id = key,
+                name = name,
+                lastMessage = preview,
+                unreadCount = unread,
+                lastTimestampMs = ts,
+                lastEventId = lastEventId,
+            ),
+            nameResolved = true,
+            previewResolved = previewResolved,
+            previewRetryAtMs = previewRetryAtMs,
+        )
+    }
+
+    /** The room's display name: explicit name → heroes (memoized) → "Chat". */
+    private suspend fun resolveRoomName(
+        c: MatrixClient,
+        roomId: RoomId,
+        room: MatrixRoom,
+        nameMemo: MutableMap<String, String>,
+    ): String {
+        room.name?.explicitName?.takeIf { it.isNotBlank() }?.let { return it }
+        val heroes = room.name?.heroes.orEmpty()
+        if (heroes.isNotEmpty()) {
+            val names = heroes.mapNotNull { hero ->
+                nameMemo.getOrPut(hero.full) {
+                    withTimeoutOrNull(ROOM_BUDGET_MS) {
+                        c.user.getById(roomId, hero).firstOrNull()?.name ?: hero.localpart
+                    } ?: hero.localpart
+                }
+            }.filter { it.isNotBlank() }
+            if (names.isNotEmpty()) return names.joinToString(", ")
+        }
+        return "Chat"
+    }
+
+    /**
+     * Bounded read of the room's newest event. Returns (preview, resolved,
+     * retryAtMs): an "[Encrypted]" preview is unresolved and retried after
+     * [ROOM_LIST_ENCRYPTED_RETRY_MS] (the key-backup restore reaches rooms
+     * over time and decrypts them).
+     */
+    private suspend fun resolveRoomPreview(
+        c: MatrixClient,
+        roomId: RoomId,
+        lastEventId: String,
+    ): Triple<String, Boolean, Long> {
+        val te = withTimeoutOrNull(PREVIEW_BUDGET_MS) {
+            c.room.getTimelineEvent(roomId, EventId(lastEventId)).filterNotNull().firstOrNull {
+                it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
+            }
+        }
+        if (te == null) {
+            return Triple("", false, android.os.SystemClock.elapsedRealtime() + ROOM_LIST_ENCRYPTED_RETRY_MS)
+        }
+        val text = previewText(te) ?: ""
+        val encrypted = text.startsWith("[Encrypted")
+        return Triple(
+            text,
+            !encrypted,
+            if (encrypted) android.os.SystemClock.elapsedRealtime() + ROOM_LIST_ENCRYPTED_RETRY_MS else 0L,
+        )
+    }
+
+    /** Publishes the cache as the sorted, SDK-shaped list. */
+    private fun publishRoomList() {
+        _roomList.value = roomListCache.values
+            .map { it.room }
+            .sortedByDescending { it.lastTimestampMs }
+    }
+
     // --- internals -----------------------------------------------------------
 
     private val httpClientEngine = OkHttp.create { }
@@ -941,22 +1186,11 @@ object MatrixRepository {
         notificationWatcherJobs.forEach { it.cancel() }
         notificationWatcherJobs.clear()
         observeSyncState(c)
+        observeLoginState(c)
         observeNotifications(c)
-        warmRoomCache(c)
-    }
-
-    /**
-     * Triggers the store's full room-map load in the background. `getAll()`
-     * cold-scans + deserializes every room (~19s on a 1284-room account, well
-     * past the binder budget), so `getRooms` would time out empty on a fresh
-     * process; warming it here makes the tool's first getRooms fast.
-     */
-    private fun warmRoomCache(c: MatrixClient) {
-        scope.launch {
-            val started = android.os.SystemClock.elapsedRealtime()
-            runCatching { c.room.getAll().first() }
-            android.util.Log.d(TAG, "room cache warmed in ${android.os.SystemClock.elapsedRealtime() - started}ms")
-        }
+        // The room-list resolver's first pass seeds + warms the full room map,
+        // so the tool's getRooms (a pure cache read) returns instantly.
+        startRoomListResolver(c)
     }
 
     private fun observeSyncState(c: MatrixClient) {
@@ -966,13 +1200,32 @@ object MatrixRepository {
                     SyncState.INITIAL_SYNC -> ChatConnectionState.Connecting
                     SyncState.STARTED, SyncState.RUNNING -> ChatConnectionState.Syncing
                     SyncState.ERROR, SyncState.TIMEOUT -> ChatConnectionState.Offline("sync $state")
-                    SyncState.STOPPED ->
-                        if (c.loginState.value == MatrixClient.LoginState.LOGGED_IN) {
-                            ChatConnectionState.Offline("sync stopped")
-                        } else {
-                            ChatConnectionState.LoggedOut
-                        }
+                    SyncState.STOPPED -> when {
+                        c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> ChatConnectionState.Offline("sync stopped")
+                        sessionExpired -> ChatConnectionState.Offline("session expired — sign in again")
+                        else -> ChatConnectionState.LoggedOut
+                    }
                 }
+            }
+        }
+    }
+
+    /**
+     * Watches the session's login state. When the server invalidates the
+     * session (expired token, logged out on another device) Trixnity drops to
+     * LOGGED_OUT/LOGGED_OUT_SOFT; we stop the sync service (no point retrying
+     * a dead token) and surface "session expired" instead of the generic
+     * offline state. [logout]'s own transition is excluded via [manualLogout].
+     */
+    private fun observeLoginState(c: MatrixClient) {
+        scope.launch {
+            c.loginState.collect { state ->
+                if (state == MatrixClient.LoginState.LOGGED_IN || manualLogout) return@collect
+                if (sessionExpired) return@collect
+                sessionExpired = true
+                android.util.Log.w(TAG, "session no longer logged in ($state) — treating as expired")
+                _connectionState.value = ChatConnectionState.Offline("session expired — sign in again")
+                appContext?.stopService(android.content.Intent(appContext, ChatSyncService::class.java))
             }
         }
     }
@@ -989,15 +1242,6 @@ object MatrixRepository {
             if (names.isNotEmpty()) return names.joinToString(", ")
         }
         return "Chat"
-    }
-
-    /** Short preview of the room's newest message ("" when there is none). */
-    private suspend fun lastMessagePreview(c: MatrixClient, roomId: RoomId, room: MatrixRoom): String {
-        val startId = room.lastRelevantEventId ?: return ""
-        val te = withTimeoutOrNull(ROOM_BUDGET_MS) {
-            c.room.getTimelineEvent(roomId, startId).filterNotNull().firstOrNull()
-        } ?: return ""
-        return previewText(te) ?: ""
     }
 
     private suspend fun messageFrom(
@@ -1064,6 +1308,19 @@ object MatrixRepository {
     private const val DECRYPT_RETRIES = 3
     private const val DECRYPT_RETRY_DELAY_MS = 1_500L
     private const val DECRYPT_WAIT_MS = 3_000L
+
+    // Room-list resolver (Phase 5).
+    private const val ROOM_NAME_PLACEHOLDER = "…"
+    /** Per-pass time budget; the resolver loops until the list is settled. */
+    private const val ROOM_LIST_PASS_BUDGET_MS = 12_000L
+    /** Breather between passes; a settled pass itself takes milliseconds. */
+    private const val ROOM_LIST_REFRESH_DELAY_MS = 2_000L
+    /** A "[Encrypted]" preview is retried no sooner than this. */
+    private const val ROOM_LIST_ENCRYPTED_RETRY_MS = 10_000L
+    /** Bounded decrypt-wait per room preview. */
+    private const val PREVIEW_BUDGET_MS = 1_500L
+    /** Per-room state collect in the resolver (the store cache emits instantly). */
+    private const val ROOM_LIST_ROOM_BUDGET_MS = 500L
 
     private const val TAG = "MatrixRepository"
 }

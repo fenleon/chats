@@ -305,7 +305,7 @@ private fun ThreadView(roomId: String, onBack: () -> Unit) {
     var editingComposer by remember { mutableStateOf(false) }
 
     LaunchedEffect(roomId) {
-        messages = MatrixRepository.getMessages(roomId, null, 30)
+        messages = MatrixRepository.getMessages(roomId, null, 30).messages
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(2f.gridUnitsAsDp())) {
@@ -368,7 +368,7 @@ private fun ThreadView(roomId: String, onBack: () -> Unit) {
                         scope.launch {
                             runCatching { MatrixRepository.sendMessage(roomId, composer.trim(), null) }
                             composer = ""
-                            messages = MatrixRepository.getMessages(roomId, null, 30)
+                            messages = MatrixRepository.getMessages(roomId, null, 30).messages
                         }
                     }
                 },

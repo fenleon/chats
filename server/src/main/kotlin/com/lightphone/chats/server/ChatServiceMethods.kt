@@ -59,10 +59,13 @@ object ChatServiceMethods {
 
                 LightServiceMethod.GetMessages.id -> {
                     val request = LightServiceMethod.GetMessages.decodeRequest(payload!!)
-                    val messages = runBlocking {
+                    val page = runBlocking {
                         MatrixRepository.getMessages(request.roomId, request.beforeEventId, request.limit)
                     }
-                    val response = LightServiceMethod.GetMessages.Response(messages)
+                    val response = LightServiceMethod.GetMessages.Response(
+                        messages = page.messages,
+                        hasMore = page.hasMore,
+                    )
                     LightResult.Success(LightServiceMethod.GetMessages.encodeResponse(response))
                 }
 

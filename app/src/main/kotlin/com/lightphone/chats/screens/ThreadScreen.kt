@@ -70,16 +70,17 @@ class ThreadViewModel(
         viewModelScope.launch {
             loading.value = true
             val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
+            val loaded = page?.messages.orEmpty()
             // A failed reload (e.g. brief disconnect) must not wipe what's shown.
-            if (page.isNotEmpty() || messages.value.isEmpty()) {
-                messages.value = page
-                hasMore.value = page.size >= PAGE_SIZE
+            if (loaded.isNotEmpty() || messages.value.isEmpty()) {
+                messages.value = loaded
+                hasMore.value = page?.hasMore ?: false
             }
             loading.value = false
             jumpToBottom.value = true
             // Opening the thread marks it read up to the newest event; the room
             // list's unread count drops on its next refresh.
-            val markEventId = page.lastOrNull()?.id ?: room.lastEventId ?: return@launch
+            val markEventId = loaded.lastOrNull()?.id ?: room.lastEventId ?: return@launch
             ChatClient.markRead(room.id, markEventId)
         }
     }
@@ -90,13 +91,14 @@ class ThreadViewModel(
         if (loadingMore.value || !hasMore.value) return
         viewModelScope.launch {
             loadingMore.value = true
-            val older = ChatClient.getMessages(room.id, oldest.id, PAGE_SIZE)
+            val page = ChatClient.getMessages(room.id, oldest.id, PAGE_SIZE)
+            val older = page?.messages.orEmpty()
             if (older.isNotEmpty()) {
-                messages.value = older + messages.value
-                hasMore.value = older.size >= PAGE_SIZE
-            } else {
-                hasMore.value = false
+                // distinctBy guards the page boundary: if the timeline changed
+                // between calls, the cursor event can appear at both edges.
+                messages.value = (older + messages.value).distinctBy { it.id }
             }
+            hasMore.value = page?.hasMore ?: hasMore.value
             loadingMore.value = false
         }
     }
