@@ -1,18 +1,20 @@
 package com.lightphone.chats.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -27,7 +29,6 @@ import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
-import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
@@ -38,6 +39,8 @@ import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 class ThreadViewModel(
@@ -113,9 +116,12 @@ class ThreadViewModel(
     }
 
     private companion object {
-        const val PAGE_SIZE = 30
+        const val PAGE_SIZE = 20
     }
 }
+
+/** Load the next older page when the topmost visible message is within this many of the end. */
+private const val OLDER_LOAD_THRESHOLD = 3
 
 class ThreadScreen(
     sealedActivity: SealedLightActivity,
@@ -131,17 +137,32 @@ class ThreadScreen(
     override fun Content() {
         val messages by viewModel.messages.collectAsState()
         val loading by viewModel.loading.collectAsState()
-        val loadingMore by viewModel.loadingMore.collectAsState()
-        val hasMore by viewModel.hasMore.collectAsState()
         val jumpToBottom by viewModel.jumpToBottom.collectAsState()
         val e2eeVerified by viewModel.e2eeVerified.collectAsState()
         val roomEncrypted by viewModel.roomEncrypted.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
-        val scrollState = rememberScrollState()
+        val listState = rememberLazyListState()
 
         // An unverified device cannot decrypt an encrypted room — say so
         // plainly (and immediately, no spinner) instead of "Loading…" forever.
         val needsDecryptionNotice = e2eeVerified == false && roomEncrypted
+
+        // Infinite scroll: the list is newest-at-the-bottom (reverseLayout), so
+        // reaching the top (the highest indices, i.e. older messages) loads the
+        // next page automatically — no "Earlier messages" tap. New items are
+        // appended above the viewport, so the reading position stays put.
+        LaunchedEffect(listState) {
+            snapshotFlow {
+                val info = listState.layoutInfo
+                if (info.totalItemsCount == 0) -1
+                else info.visibleItemsInfo.firstOrNull()?.index ?: 0
+            }.distinctUntilChanged().collect { topIndex ->
+                val total = listState.layoutInfo.totalItemsCount
+                if (total > 0 && topIndex >= total - OLDER_LOAD_THRESHOLD) {
+                    viewModel.loadOlder()
+                }
+            }
+        }
 
         LightTheme(colors = themeColors) {
             Column(
@@ -160,21 +181,20 @@ class ThreadScreen(
                 )
                 Box(modifier = Modifier.weight(1f)) {
                     when {
-                        needsDecryptionNotice -> LightScrollView(scrollState = scrollState) {
-                            DecryptionNotice()
-                            messages.forEach { message -> MessageRow(message) }
-                        }
                         loading && messages.isEmpty() -> StatusText("Loading messages…")
                         messages.isEmpty() -> StatusText("No messages yet.")
-                        else -> LightScrollView(scrollState = scrollState) {
-                            if (hasMore) {
-                                LoadEarlierRow(
-                                    loadingMore = loadingMore,
-                                    onLoadEarlier = viewModel::loadOlder,
-                                )
-                            }
-                            messages.forEach { message ->
-                                MessageRow(message)
+                        else -> Column(modifier = Modifier.fillMaxSize()) {
+                            if (needsDecryptionNotice) DecryptionNotice()
+                            LazyColumn(
+                                state = listState,
+                                reverseLayout = true,
+                                modifier = Modifier.fillMaxSize(),
+                            ) {
+                                // reverseLayout puts index 0 at the bottom, so feed
+                                // newest-first; the view model keeps oldest-first.
+                                items(messages.reversed(), key = { it.id }) { message ->
+                                    MessageRow(message)
+                                }
                             }
                         }
                     }
@@ -198,8 +218,7 @@ class ThreadScreen(
         // pages, which arrive while the user is reading further up.
         LaunchedEffect(jumpToBottom, messages.size) {
             if (jumpToBottom && messages.isNotEmpty()) {
-                withFrameNanos { }
-                scrollState.scrollTo(scrollState.maxValue)
+                listState.scrollToItem(0) // index 0 = the bottom in reverseLayout
                 viewModel.jumpToBottom.value = false
             }
         }
@@ -222,29 +241,6 @@ private fun DecryptionNotice() {
             .fillMaxWidth()
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 12.dp),
     )
-}
-
-@Composable
-private fun LoadEarlierRow(
-    loadingMore: Boolean,
-    onLoadEarlier: () -> Unit,
-) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .lightClickable(
-                enabled = !loadingMore,
-                onClick = onLoadEarlier,
-            )
-            .padding(vertical = 12.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        LightText(
-            text = if (loadingMore) "Loading…" else "Earlier messages",
-            variant = LightTextVariant.Fine,
-            lighten = true,
-        )
-    }
 }
 
 @Composable

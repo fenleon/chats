@@ -283,7 +283,9 @@ private fun RoomRow(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onOpen)
-            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 14.dp),
+            // Left matches the built-in messaging margin; the right is trimmed
+            // so the time/unread sit right against the scrollbar.
+            .padding(start = 2f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 14.dp, bottom = 14.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -293,6 +295,9 @@ private fun RoomRow(
                 LightText(
                     text = room.name,
                     variant = LightTextVariant.Copy,
+                    // One line, like the built-in titles — no wrapping.
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 if (room.lastMessage.isNotBlank()) {
                     LightText(
