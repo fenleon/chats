@@ -42,6 +42,7 @@ import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.launch
 
 private const val TAG = "ChatsDev"
+private const val DEV_ROOM_CAP = 50
 
 /**
  * Development status/control screen for the companion. The real chat UI is the
@@ -273,22 +274,34 @@ private fun RoomsSection(
     when {
         rooms == null -> LightText(text = "loading…", variant = LightTextVariant.Fine, lighten = true)
         rooms!!.isEmpty() -> LightText(text = "no rooms yet", variant = LightTextVariant.Fine, lighten = true)
-        else -> rooms!!.forEach { room ->
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 0.75f.gridUnitsAsDp())
-                    .lightClickable {
-                        room.lastEventId?.let { onMarkRead(room.id, it) }
-                        onOpenRoom(room.id)
-                    },
-            ) {
-                LightText(text = room.name, variant = LightTextVariant.Copy)
+        else -> {
+            // Dev-only view: cap at 50 rows — the 1284-room account ANRs the
+            // LP3 if composed eagerly (the real UI is the tool's lazy list).
+            val shown = rooms!!.take(DEV_ROOM_CAP)
+            shown.forEach { room ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 0.75f.gridUnitsAsDp())
+                        .lightClickable {
+                            room.lastEventId?.let { onMarkRead(room.id, it) }
+                            onOpenRoom(room.id)
+                        },
+                ) {
+                    LightText(text = room.name, variant = LightTextVariant.Copy)
+                    LightText(
+                        text = buildString {
+                            if (room.lastMessage.isNotBlank()) append(room.lastMessage)
+                            if (room.unreadCount > 0) append("  (${room.unreadCount} new)")
+                        },
+                        variant = LightTextVariant.Fine,
+                        lighten = true,
+                    )
+                }
+            }
+            if (rooms!!.size > shown.size) {
                 LightText(
-                    text = buildString {
-                        if (room.lastMessage.isNotBlank()) append(room.lastMessage)
-                        if (room.unreadCount > 0) append("  (${room.unreadCount} new)")
-                    },
+                    text = "… ${rooms!!.size - shown.size} more (dev shows $DEV_ROOM_CAP)",
                     variant = LightTextVariant.Fine,
                     lighten = true,
                 )

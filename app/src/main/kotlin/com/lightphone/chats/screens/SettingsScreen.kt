@@ -498,6 +498,19 @@ private fun AccountStatus(
                 lighten = true,
                 modifier = Modifier.padding(top = 2.dp),
             )
+            // Sync progress: how many rooms have been synced/resolved so far.
+            if (state.roomsTotal > 0) {
+                LightText(
+                    text = if (state.roomsResolved >= state.roomsTotal) {
+                        "${state.roomsTotal} rooms"
+                    } else {
+                        "${state.roomsResolved} of ${state.roomsTotal} rooms"
+                    },
+                    variant = LightTextVariant.Fine,
+                    lighten = true,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
         }
     }
 }

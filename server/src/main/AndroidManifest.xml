@@ -22,7 +22,8 @@
         android:label="Chats Server"
         android:theme="@android:style/Theme.Black.NoTitleBar"
         android:hardwareAccelerated="true"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="true"
+        android:largeHeap="true">
 
         <activity
             android:name=".MainActivity"
@@ -49,6 +50,23 @@
             tools:node="remove" />
         <provider
             android:name="com.thelightphone.sdk.LightFileProvider"
+            tools:node="remove" />
+
+        <!-- sdk:server merges the UnifiedPush distributor (an EXPORTED receiver —
+             any app can start the process with it) and the connector's
+             receiver/activity/foreground service; the chats companion delivers
+             messages via its own sync loop, so strip them all. -->
+        <receiver
+            android:name="com.thelightphone.sdk.server.LightPushDistributor"
+            tools:node="remove" />
+        <receiver
+            android:name="org.unifiedpush.android.connector.internal.MessagingReceiverImpl"
+            tools:node="remove" />
+        <activity
+            android:name="org.unifiedpush.android.connector.internal.LinkActivity"
+            tools:node="remove" />
+        <service
+            android:name="org.unifiedpush.android.connector.internal.RaiseToForegroundService"
             tools:node="remove" />
     </application>
 

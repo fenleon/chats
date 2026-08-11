@@ -103,6 +103,9 @@ object MatrixRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val initMutex = Mutex()
 
+    /** Main-thread handler for the delayed sync-service stop (see [scheduleSyncStop]). */
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     @Volatile
     private var client: MatrixClient? = null
 
@@ -595,6 +598,8 @@ object MatrixRepository {
 
     fun connectionState(): com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response {
         val state = _connectionState.value
+        val roomsTotal = roomListCache.size
+        val roomsResolved = roomListCache.values.count { it.nameResolved }
         return com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response(
             state = when (state) {
                 ChatConnectionState.LoggedOut -> "logged_out"
@@ -603,6 +608,8 @@ object MatrixRepository {
                 is ChatConnectionState.Offline -> "offline"
             },
             detail = (state as? ChatConnectionState.Offline)?.detail,
+            roomsTotal = roomsTotal,
+            roomsResolved = roomsResolved,
         )
     }
 
@@ -974,9 +981,20 @@ object MatrixRepository {
                     }
                     loaded.sortByDescending { it.second.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L }
                     seedRoomList(loaded)
+                    // YAGNI: previews (timeline reads + decrypt waits) only for
+                    // the newest rooms the user actually sees; names resolve for
+                    // every room (cheap profile lookups). The long tail fills in
+                    // as it scrolls into the window or a room gets opened.
+                    val previewWindow = loaded
+                        .take(PREVIEW_WINDOW_SIZE)
+                        .map { it.first.full }
+                        .toHashSet()
                     for ((roomId, room) in loaded) {
                         if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
-                        resolveRoomListEntry(c, roomId, room, nameMemo)
+                        resolveRoomListEntry(
+                            c, roomId, room, nameMemo,
+                            resolvePreview = roomId.full in previewWindow,
+                        )
                     }
                     publishRoomList()
                 } catch (e: Exception) {
@@ -1014,14 +1032,17 @@ object MatrixRepository {
     /**
      * Refreshes one room's cache row. Names resolve sequentially from the warm
      * profile store (no parallel contention); previews read the newest event
-     * with a bounded decrypt-wait. Rows whose state hasn't changed keep their
-     * resolved name/preview, so steady-state passes are cheap.
+     * with a bounded decrypt-wait, but only for rooms inside the preview window
+     * (the newest ones the user sees — see [startRoomListResolver]). Rows whose
+     * state hasn't changed keep their resolved name/preview, so steady-state
+     * passes are cheap.
      */
     private suspend fun resolveRoomListEntry(
         c: MatrixClient,
         roomId: RoomId,
         room: MatrixRoom,
         nameMemo: MutableMap<String, String>,
+        resolvePreview: Boolean,
     ) {
         val key = roomId.full
         val prev = roomListCache[key]
@@ -1044,6 +1065,13 @@ object MatrixRepository {
         val previewResolved: Boolean
         val previewRetryAtMs: Long
         when {
+            !resolvePreview && prev?.previewResolved != true -> {
+                // Outside the preview window and never resolved: keep the name
+                // row without a preview. Opening the thread fills it in.
+                preview = ""
+                previewResolved = false
+                previewRetryAtMs = 0L
+            }
             prev != null && prev.previewResolved && !stateChanged -> {
                 preview = prev.room.lastMessage
                 previewResolved = true
@@ -1213,21 +1241,46 @@ object MatrixRepository {
     /**
      * Watches the session's login state. When the server invalidates the
      * session (expired token, logged out on another device) Trixnity drops to
-     * LOGGED_OUT/LOGGED_OUT_SOFT; we stop the sync service (no point retrying
-     * a dead token) and surface "session expired" instead of the generic
-     * offline state. [logout]'s own transition is excluded via [manualLogout].
+     * LOGGED_OUT/LOGGED_OUT_SOFT; we surface "session expired" and stop the
+     * sync service (no point retrying a dead token). [logout]'s own transition
+     * is excluded via [manualLogout].
+     *
+     * Only fires on a runtime transition AWAY from LOGGED_IN: a restored
+     * session that was already dead (persisted soft/locked state) never
+     * triggers it — such a session errors out on sync instead. This guards
+     * against misreading a transient initial state as expiry.
      */
     private fun observeLoginState(c: MatrixClient) {
         scope.launch {
+            var sawLoggedIn = false
             c.loginState.collect { state ->
-                if (state == MatrixClient.LoginState.LOGGED_IN || manualLogout) return@collect
-                if (sessionExpired) return@collect
+                if (state == MatrixClient.LoginState.LOGGED_IN) {
+                    sawLoggedIn = true
+                    return@collect
+                }
+                if (!sawLoggedIn || manualLogout || sessionExpired) return@collect
                 sessionExpired = true
                 android.util.Log.w(TAG, "session no longer logged in ($state) — treating as expired")
                 _connectionState.value = ChatConnectionState.Offline("session expired — sign in again")
-                appContext?.stopService(android.content.Intent(appContext, ChatSyncService::class.java))
+                scheduleSyncStop()
             }
         }
+    }
+
+    /**
+     * Stops the sync service shortly after an expiry is detected. The delay
+     * matters: stopping a just-started foreground service (the start from
+     * `ensureClient` can race this) crashes it with
+     * ForegroundServiceDidNotStartInTimeException. The re-check also skips the
+     * stop if a re-login already reset the flag and started a fresh service.
+     */
+    private fun scheduleSyncStop() {
+        val ctx = appContext ?: return
+        mainHandler.postDelayed({
+            if (sessionExpired) {
+                ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
+            }
+        }, SYNC_STOP_DELAY_MS)
     }
 
     private suspend fun roomDisplayName(c: MatrixClient, roomId: RoomId, room: MatrixRoom): String {
@@ -1316,11 +1369,20 @@ object MatrixRepository {
     /** Breather between passes; a settled pass itself takes milliseconds. */
     private const val ROOM_LIST_REFRESH_DELAY_MS = 2_000L
     /** A "[Encrypted]" preview is retried no sooner than this. */
-    private const val ROOM_LIST_ENCRYPTED_RETRY_MS = 10_000L
+    private const val ROOM_LIST_ENCRYPTED_RETRY_MS = 60_000L
     /** Bounded decrypt-wait per room preview. */
     private const val PREVIEW_BUDGET_MS = 1_500L
+    /**
+     * Preview resolution is YAGNI-scoped: only the newest rooms inside this
+     * window get previews (timeline reads + decrypt waits are the expensive
+     * part). Names resolve for every room; the rest of the list shows name +
+     * unread + timestamp and fills its preview when opened.
+     */
+    private const val PREVIEW_WINDOW_SIZE = 30
     /** Per-room state collect in the resolver (the store cache emits instantly). */
     private const val ROOM_LIST_ROOM_BUDGET_MS = 500L
+    /** Delay before stopping the sync service after an expiry detection. */
+    private const val SYNC_STOP_DELAY_MS = 3_000L
 
     private const val TAG = "MatrixRepository"
 }
