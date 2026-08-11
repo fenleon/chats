@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -22,6 +23,7 @@ import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
+import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
@@ -162,17 +164,6 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                                         enabled = !busy,
                                         onClick = viewModel::start,
                                     )
-                                    ActionRow(
-                                        text = if (busy) "…" else "USE RECOVERY KEY",
-                                        enabled = !busy,
-                                        onClick = {
-                                            navigateTo(screenFactory = {
-                                                FieldEditorScreen(it, "Recovery key", "")
-                                            }) { key ->
-                                                if (key != null && key.isNotBlank()) viewModel.recover(key)
-                                            }
-                                        },
-                                    )
                                 }
 
                                 "waiting" -> {
@@ -241,7 +232,33 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                         }
                     }
                 }
+                // The recovery key is the dependable (non-interactive) unlock —
+                // keep it as a persistent bottom-bar action while the device is
+                // unverified, rather than buried in the scrolling content.
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        null,
+                        if (e2ee?.verified == true || busy) {
+                            null
+                        } else {
+                            LightBarButton.Text(
+                                text = "USE RECOVERY KEY",
+                                onClick = { openRecoveryEditor() },
+                            )
+                        },
+                        null,
+                    ),
+                )
             }
+        }
+    }
+
+    private fun openRecoveryEditor() {
+        navigateTo(screenFactory = {
+            FieldEditorScreen(it, "Recovery key", "")
+        }) { key ->
+            if (key != null && key.isNotBlank()) viewModel.recover(key)
         }
     }
 }
