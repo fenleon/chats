@@ -50,12 +50,17 @@ class ThreadViewModel(
     val hasMore = MutableStateFlow(false)
     /** True until the newest page has been shown scrolled to the bottom. */
     val jumpToBottom = MutableStateFlow(true)
+    /** Whether this device is E2EE-verified (false = encrypted rooms can't decrypt yet). */
+    val e2eeVerified = MutableStateFlow<Boolean?>(null)
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
         // While this room is on screen the companion suppresses its
         // new-message notifications.
         viewModelScope.launch { ChatClient.setActiveRoom(room.id) }
+        viewModelScope.launch {
+            e2eeVerified.value = ChatClient.e2eeState()?.verified
+        }
         loadNewest()
     }
 
@@ -125,8 +130,14 @@ class ThreadScreen(
         val loadingMore by viewModel.loadingMore.collectAsState()
         val hasMore by viewModel.hasMore.collectAsState()
         val jumpToBottom by viewModel.jumpToBottom.collectAsState()
+        val e2eeVerified by viewModel.e2eeVerified.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
         val scrollState = rememberScrollState()
+
+        // An unverified device cannot decrypt this room's messages — say so
+        // plainly instead of leaving the user staring at "[Encrypted]".
+        val needsDecryptionNotice = e2eeVerified == false &&
+            messages.any { it.body.startsWith("[Encrypted") }
 
         LightTheme(colors = themeColors) {
             Column(
@@ -148,6 +159,9 @@ class ThreadScreen(
                         loading && messages.isEmpty() -> StatusText("Loading messages…")
                         messages.isEmpty() -> StatusText("No messages yet.")
                         else -> LightScrollView(scrollState = scrollState) {
+                            if (needsDecryptionNotice) {
+                                DecryptionNotice()
+                            }
                             if (hasMore) {
                                 LoadEarlierRow(
                                     loadingMore = loadingMore,
@@ -191,6 +205,18 @@ class ThreadScreen(
             if (sent == true) viewModel.loadNewest()
         }
     }
+}
+
+@Composable
+private fun DecryptionNotice() {
+    LightText(
+        text = "Encrypted — verify this device to read messages (Settings → Encrypted messages)",
+        variant = LightTextVariant.Detail,
+        lighten = true,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp, vertical = 12.dp),
+    )
 }
 
 @Composable

@@ -650,10 +650,18 @@ object MatrixRepository {
         // first, then re-read. Decryption lands asynchronously once the session
         // is in the store, so re-read up to a few times before giving up.
         val firstPass = collectTimelineEvents(c, matrixRoomId, beforeEventId, limit + 1)
-        restoreRoomSessions(c, matrixRoomId, firstPass)
+        val sessionsLoaded = restoreRoomSessions(c, matrixRoomId, firstPass)
 
-        var events = collectTimelineEvents(c, matrixRoomId, beforeEventId, limit + 1)
+        // If no megolm session could be loaded (e.g. an unverified device with
+        // no key-backup access), the events stay encrypted no matter how often
+        // we re-read — return the first pass as-is instead of burning retries.
+        var events = if (sessionsLoaded > 0) {
+            collectTimelineEvents(c, matrixRoomId, beforeEventId, limit + 1)
+        } else {
+            firstPass
+        }
         repeat(DECRYPT_RETRIES) {
+            if (sessionsLoaded == 0) return@repeat
             val stillEncrypted = events.any { it.content?.isFailure == true }
             if (!stillEncrypted) return@repeat
             kotlinx.coroutines.delay(DECRYPT_RETRY_DELAY_MS)
@@ -696,12 +704,18 @@ object MatrixRepository {
             } else {
                 c.room.getTimelineEvents(matrixRoomId, EventId(beforeEventId), Direction.BACKWARDS, config)
             }
+            // Decryption is all-or-nothing per room: if the first event can't
+            // decrypt (no megolm session / unverified device), the rest can't
+            // either — don't burn DECRYPT_WAIT_MS per event on an undecryptable
+            // room (31 events × 3s blows the whole fetch budget). Once one
+            // event decrypts, the session is loaded and the rest follow fast.
+            var waitForDecrypt = true
             eventFlows.collect { eventFlow ->
                 // Reading a timeline triggers decryption; the event flow re-emits
                 // once the content resolves (first emission may carry null or a
                 // failure while the decrypt is pending), so wait for the
                 // decrypted emission (bounded), falling back to the first.
-                val resolved = withTimeoutOrNull(DECRYPT_WAIT_MS) {
+                val resolved = withTimeoutOrNull(if (waitForDecrypt) DECRYPT_WAIT_MS else QUICK_DECRYPT_WAIT_MS) {
                     eventFlow.filterNotNull().firstOrNull {
                         it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
                     }
@@ -712,25 +726,35 @@ object MatrixRepository {
                         val ex = content.exceptionOrNull()
                         android.util.Log.w(TAG, "collect: event ${resolved.event.id.full} still encrypted: ${ex?.javaClass?.simpleName}: ${ex?.message}")
                     }
+                    waitForDecrypt = resolved.content?.getOrNull() != null ||
+                        resolved.event.content !is EncryptedMessageEventContent
                     events.add(resolved)
                 }
             }
         }
-        return if (collected == null) emptyList() else events
+        // Even if the budget expires mid-collect, hand back what we got (the
+        // encrypted events are still worth showing — "[Encrypted]" is more
+        // useful than an empty thread).
+        return events
     }
 
-    /** Loads the megolm sessions for the given events' undecrypted content from the key backup. */
+    /**
+     * Loads the megolm sessions for the given events' undecrypted content from
+     * the key backup. Returns how many sessions were loaded — 0 means the
+     * account has no usable backup key (e.g. an unverified device), so the
+     * caller can skip pointless decrypt retries.
+     */
     private suspend fun restoreRoomSessions(
         c: MatrixClient,
         matrixRoomId: RoomId,
         events: List<TimelineEvent>,
-    ) {
+    ): Int {
         val sessionIds = events.mapNotNull { te ->
             (te.event.content as? EncryptedMessageEventContent.MegolmEncryptedMessageEventContent)?.sessionId
         }.distinct()
         android.util.Log.d(TAG, "restoreRoomSessions: $matrixRoomId — ${events.size} events, ${sessionIds.size} megolm sessions, " +
             "encrypted classes: ${events.map { it.event.content::class.simpleName }.distinct()}")
-        if (sessionIds.isEmpty()) return
+        if (sessionIds.isEmpty()) return 0
         val keyBackup = runCatching {
             c.di.get<net.folivo.trixnity.client.key.KeyBackupService>(
                 org.koin.core.qualifier.named<net.folivo.trixnity.client.key.KeyBackupService>(),
@@ -738,16 +762,19 @@ object MatrixRepository {
         }.getOrNull()
         if (keyBackup == null) {
             android.util.Log.e(TAG, "restoreRoomSessions: KeyBackupService not available via DI")
-            return
+            return 0
         }
+        var loaded = 0
         sessionIds.forEach { sessionId ->
             try {
                 keyBackup.loadMegolmSession(matrixRoomId, sessionId)
+                loaded++
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "restoreRoomSessions: loadMegolmSession failed for $matrixRoomId / $sessionId: ${e.message}")
             }
         }
-        android.util.Log.d(TAG, "restoreRoomSessions: loaded ${sessionIds.size} sessions for $matrixRoomId")
+        android.util.Log.d(TAG, "restoreRoomSessions: loaded $loaded/${sessionIds.size} sessions for $matrixRoomId")
+        return loaded
     }
 
     suspend fun sendMessage(
@@ -1361,6 +1388,8 @@ object MatrixRepository {
     private const val DECRYPT_RETRIES = 3
     private const val DECRYPT_RETRY_DELAY_MS = 1_500L
     private const val DECRYPT_WAIT_MS = 3_000L
+    /** Peek budget for events after the first one failed to decrypt. */
+    private const val QUICK_DECRYPT_WAIT_MS = 100L
 
     // Room-list resolver (Phase 5).
     private const val ROOM_NAME_PLACEHOLDER = "…"
