@@ -216,12 +216,12 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
-                        null,
                         LightBarButton.LightIcon(
                             icon = LightIcons.SETTINGS,
                             onClick = { openSettings() },
                             contentDescription = "Settings",
                         ),
+                        null,
                         null,
                     ),
                 )
