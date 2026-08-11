@@ -203,77 +203,11 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                 )
                 Box(modifier = Modifier.weight(1f)) {
                     LightScrollView {
-                        LoginModeRow(
-                            beeperMode = beeperMode,
-                            onSelect = viewModel::setLoginMode,
-                        )
-                        if (beeperMode) {
-                            LightTextField(
-                                label = "Beeper email:",
-                                value = beeperEmail,
-                                placeholder = "you@example.com",
-                                onClick = { editField("Beeper email", viewModel.beeperEmail) },
-                                modifier = Modifier.padding(
-                                    horizontal = 1f.gridUnitsAsDp(),
-                                    vertical = 0.75f.gridUnitsAsDp(),
-                                ),
-                            )
-                            RequestCodeRow(
-                                enabled = !busy,
-                                status = codeStatus,
-                                onRequest = viewModel::requestCode,
-                            )
-                            if (codeStatus != null || beeperCode.isNotEmpty()) {
-                                LightTextField(
-                                    label = "Code:",
-                                    value = beeperCode,
-                                    placeholder = "6-digit code",
-                                    onClick = { editField("Code", viewModel.beeperCode) },
-                                    modifier = Modifier.padding(
-                                        horizontal = 1f.gridUnitsAsDp(),
-                                        vertical = 0.75f.gridUnitsAsDp(),
-                                    ),
-                                )
-                            }
-                        } else {
-                            LightTextField(
-                                label = "Homeserver:",
-                                value = homeserver,
-                                placeholder = "matrix.example.org",
-                                onClick = { editField("Homeserver", viewModel.homeserver) },
-                                modifier = Modifier.padding(
-                                    horizontal = 1f.gridUnitsAsDp(),
-                                    vertical = 0.75f.gridUnitsAsDp(),
-                                ),
-                            )
-                            LightTextField(
-                                label = "Username:",
-                                value = user,
-                                placeholder = "@user:server",
-                                onClick = { editField("Username", viewModel.user) },
-                                modifier = Modifier.padding(
-                                    horizontal = 1f.gridUnitsAsDp(),
-                                    vertical = 0.75f.gridUnitsAsDp(),
-                                ),
-                            )
-                            LightTextField(
-                                label = if (tokenLogin) "Access token:" else "Password:",
-                                value = password,
-                                placeholder = if (tokenLogin) "syt_…" else "password",
-                                onClick = { editField("Password", viewModel.password) },
-                                modifier = Modifier.padding(
-                                    horizontal = 1f.gridUnitsAsDp(),
-                                    vertical = 0.75f.gridUnitsAsDp(),
-                                ),
-                            )
-                            TokenToggleRow(
-                                tokenLogin = tokenLogin,
-                                onToggle = viewModel::toggleTokenLogin,
-                            )
-                        }
-                        account?.takeIf { it.loggedIn }?.let { state ->
+                        if (account?.loggedIn == true) {
+                            // Logged in: just the account status + actions — the
+                            // login form (email/code) would be dead weight here.
                             AccountStatus(
-                                userId = state.userId,
+                                userId = account?.userId,
                                 connection = connection,
                             )
                             EncryptionRow(
@@ -282,22 +216,91 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                     navigateTo(screenFactory = { VerificationScreen(it) })
                                 },
                             )
-                        }
-                        error?.let { message ->
+                        } else {
+                            LoginModeRow(
+                                beeperMode = beeperMode,
+                                onSelect = viewModel::setLoginMode,
+                            )
+                            if (beeperMode) {
+                                LightTextField(
+                                    label = "Beeper email:",
+                                    value = beeperEmail,
+                                    placeholder = "you@example.com",
+                                    onClick = { editField("Beeper email", viewModel.beeperEmail) },
+                                    modifier = Modifier.padding(
+                                        horizontal = 1f.gridUnitsAsDp(),
+                                        vertical = 0.75f.gridUnitsAsDp(),
+                                    ),
+                                )
+                                RequestCodeRow(
+                                    enabled = !busy,
+                                    status = codeStatus,
+                                    onRequest = viewModel::requestCode,
+                                )
+                                if (codeStatus != null || beeperCode.isNotEmpty()) {
+                                    LightTextField(
+                                        label = "Code:",
+                                        value = beeperCode,
+                                        placeholder = "6-digit code",
+                                        onClick = { editField("Code", viewModel.beeperCode) },
+                                        modifier = Modifier.padding(
+                                            horizontal = 1f.gridUnitsAsDp(),
+                                            vertical = 0.75f.gridUnitsAsDp(),
+                                        ),
+                                    )
+                                }
+                            } else {
+                                LightTextField(
+                                    label = "Homeserver:",
+                                    value = homeserver,
+                                    placeholder = "matrix.example.org",
+                                    onClick = { editField("Homeserver", viewModel.homeserver) },
+                                    modifier = Modifier.padding(
+                                        horizontal = 1f.gridUnitsAsDp(),
+                                        vertical = 0.75f.gridUnitsAsDp(),
+                                    ),
+                                )
+                                LightTextField(
+                                    label = "Username:",
+                                    value = user,
+                                    placeholder = "@user:server",
+                                    onClick = { editField("Username", viewModel.user) },
+                                    modifier = Modifier.padding(
+                                        horizontal = 1f.gridUnitsAsDp(),
+                                        vertical = 0.75f.gridUnitsAsDp(),
+                                    ),
+                                )
+                                LightTextField(
+                                    label = if (tokenLogin) "Access token:" else "Password:",
+                                    value = password,
+                                    placeholder = if (tokenLogin) "syt_…" else "password",
+                                    onClick = { editField("Password", viewModel.password) },
+                                    modifier = Modifier.padding(
+                                        horizontal = 1f.gridUnitsAsDp(),
+                                        vertical = 0.75f.gridUnitsAsDp(),
+                                    ),
+                                )
+                                TokenToggleRow(
+                                    tokenLogin = tokenLogin,
+                                    onToggle = viewModel::toggleTokenLogin,
+                                )
+                            }
+                            error?.let { message ->
+                                LightText(
+                                    text = message,
+                                    variant = LightTextVariant.Detail,
+                                    lighten = true,
+                                    modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
+                                )
+                            }
                             LightText(
-                                text = message,
-                                variant = LightTextVariant.Detail,
+                                text = "Sign in with your Beeper account for WhatsApp and other networks, " +
+                                    "or with a Matrix homeserver.",
+                                variant = LightTextVariant.Fine,
                                 lighten = true,
-                                modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
+                                modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
                             )
                         }
-                        LightText(
-                            text = "Sign in with your Beeper account for WhatsApp and other networks, " +
-                                "or with a Matrix homeserver.",
-                            variant = LightTextVariant.Fine,
-                            lighten = true,
-                            modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
-                        )
                     }
                 }
                 LightBottomBar(
