@@ -35,6 +35,7 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
+import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -219,7 +220,7 @@ private fun DecryptionNotice() {
         lighten = true,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 12.dp),
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 12.dp),
     )
 }
 
@@ -253,7 +254,7 @@ private fun MessageRow(message: LightServiceMethod.GetMessages.Message) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 6.dp),
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 6.dp),
         horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start,
     ) {
         if (!message.isMine && message.senderName.isNotBlank()) {
@@ -283,6 +284,6 @@ private fun StatusText(text: String) {
         text = text,
         variant = LightTextVariant.Copy,
         lighten = true,
-        modifier = Modifier.padding(24.dp),
+        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 24.dp),
     )
 }

@@ -37,6 +37,7 @@ import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
+import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -282,7 +283,7 @@ private fun RoomRow(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onOpen)
-            .padding(horizontal = 24.dp, vertical = 14.dp),
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 14.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -330,7 +331,7 @@ private fun OfflineBanner(text: String) {
         lighten = true,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 10.dp),
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 10.dp),
     )
 }
 
@@ -340,6 +341,6 @@ private fun StatusText(text: String) {
         text = text,
         variant = LightTextVariant.Copy,
         lighten = true,
-        modifier = Modifier.padding(24.dp),
+        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 24.dp),
     )
 }
