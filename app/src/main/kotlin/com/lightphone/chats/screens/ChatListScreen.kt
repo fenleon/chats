@@ -9,10 +9,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -39,7 +41,12 @@ import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+
+/** Grow the list slice when the last visible row is within this many of the end. */
+private const val REVEAL_THRESHOLD = 4
 
 class ChatListViewModel : LightViewModel<Unit>() {
 
@@ -47,6 +54,11 @@ class ChatListViewModel : LightViewModel<Unit>() {
     val loading = MutableStateFlow(true)
     val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
     val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
+    /**
+     * How many rooms the list currently shows. Starts small (the user only ever
+     * reads the newest few) and grows as the list is scrolled to the bottom.
+     */
+    val visibleCount = MutableStateFlow(INITIAL_VISIBLE_COUNT)
     /**
      * Room to open after a notification tap (set from the companion's
      * pending-notify-room handoff); consumed by the screen.
@@ -137,12 +149,20 @@ class ChatListViewModel : LightViewModel<Unit>() {
         }
     }
 
+    /** Grows the visible slice as the user scrolls toward the list's end. */
+    fun showMore() {
+        visibleCount.value = (visibleCount.value + REVEAL_STEP)
+            .coerceAtMost(rooms.value.size.coerceAtLeast(INITIAL_VISIBLE_COUNT))
+    }
+
     private companion object {
         // Wide enough to outlast a cold session restore (1284 Beeper rooms),
         // which can take several seconds after a fresh boot/reinstall.
         const val REFRESH_RETRIES = 10
         const val REFRESH_RETRY_DELAY_MS = 1_000L
         const val POLL_INTERVAL_MS = 5_000L
+        const val INITIAL_VISIBLE_COUNT = 20
+        const val REVEAL_STEP = 20
     }
 }
 
@@ -161,14 +181,28 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         val loading by viewModel.loading.collectAsState()
         val account by viewModel.account.collectAsState()
         val connection by viewModel.connection.collectAsState()
+        val visibleCount by viewModel.visibleCount.collectAsState()
         val pendingRoom by viewModel.openRoom.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
+        val listState = rememberLazyListState()
 
         // A notification tap lands here; open the pending room's thread.
         LaunchedEffect(pendingRoom) {
             val room = pendingRoom ?: return@LaunchedEffect
             viewModel.openRoom.value = null
             openThread(room)
+        }
+
+        // Reveal more rooms when the user scrolls near the end of the current
+        // slice — the list grows instead of showing all 1284 at once.
+        LaunchedEffect(listState, visibleCount) {
+            snapshotFlow {
+                listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            }.distinctUntilChanged().collect { lastVisible ->
+                if (lastVisible >= visibleCount - REVEAL_THRESHOLD) {
+                    viewModel.showMore()
+                }
+            }
         }
 
         // Offline: the list still shows cached rooms, with a status line on top
@@ -197,8 +231,9 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                     // Rows are ~70dp; a uniform estimate keeps the lazy
                                     // scrollbar sane (the SDK computes it per-item).
                                     uniformItemHeightGridUnits = 4.6f,
+                                    listState = listState,
                                 ) {
-                                    items(rooms, key = { it.id }) { room ->
+                                    items(rooms.take(visibleCount), key = { it.id }) { room ->
                                         RoomRow(
                                             room = room,
                                             onOpen = { openThread(room) },
