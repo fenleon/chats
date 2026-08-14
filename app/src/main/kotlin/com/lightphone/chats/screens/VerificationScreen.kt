@@ -2,6 +2,7 @@ package com.lightphone.chats.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -144,21 +145,24 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                     ),
                     center = LightTopBarCenter.Text("Verify"),
                 )
-                LightScrollView {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
-                    ) {
-                        when {
+                // The scroll body sits in a weighted Box (like Settings) so the
+                // greedy scroll view can't squeeze the bottom bar to zero height.
+                Box(modifier = Modifier.weight(1f)) {
+                    LightScrollView {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
+                        ) {
+                            when {
                             // The recovery key verifies without a state machine —
                             // the e2ee flag flipping to verified is the signal.
                             e2ee?.verified == true -> {
+                                // The bottom bar carries DONE; no duplicate row here.
                                 Body("Verified. Encrypted messages can now decrypt — open a conversation to load them.")
-                                ActionRow("DONE") { goBack() }
                             }
 
                             else -> when (state?.state) {
                                 "none" -> {
-                                    Body("This device isn't verified yet, so encrypted messages stay locked. Verify with another device signed into your Beeper account (e.g. the Beeper app on your phone), or use your account's recovery key.")
+                                    Body("This device isn't verified yet — encrypted messages stay locked. Verify with another Beeper device or your recovery key.")
                                     ActionRow(
                                         text = if (busy) "…" else "START VERIFICATION",
                                         enabled = !busy,
@@ -186,15 +190,16 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                                 "compare" -> {
                                     Body("Compare the emojis on this device with the ones on your other device.")
                                     Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                                    // Three per row so a full SAS set (7 emojis) never
-                                    // spills off the screen.
-                                    state?.emoji.orEmpty().chunked(3).forEach { rowEmojis ->
+                                    // All seven on one line so the SAS set reads
+                                    // as a single comparison (Heading keeps them
+                                    // small enough to fit).
+                                    state?.emoji.orEmpty().chunked(7).forEach { rowEmojis ->
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
                                             horizontalArrangement = Arrangement.SpaceEvenly,
                                         ) {
                                             rowEmojis.forEach { emoji ->
-                                                LightText(text = emoji, variant = LightTextVariant.Title)
+                                                LightText(text = emoji, variant = LightTextVariant.Heading)
                                             }
                                         }
                                     }
@@ -205,8 +210,8 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                                 }
 
                                 "done" -> {
+                                    // The bottom bar carries DONE; no duplicate row here.
                                     Body("Verified. Encrypted messages can now decrypt — open a conversation to load them.")
-                                    ActionRow("DONE") { goBack() }
                                 }
 
                                 "cancelled" -> {
@@ -232,19 +237,25 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                         }
                     }
                 }
-                // The recovery key is the dependable (non-interactive) unlock —
-                // keep it as a persistent bottom-bar action while the device is
-                // unverified, rather than buried in the scrolling content.
+                }
+                // The bottom bar always stays visible with the screen's action
+                // (design rule): the recovery key is the dependable unlock while
+                // unverified; DONE once verified. Hidden during an active
+                // verification — the flow's actions live in the body.
+                val inVerification = state?.state in setOf("waiting", "accept", "start", "compare")
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
                         null,
-                        if (e2ee?.verified == true || busy) {
-                            null
-                        } else {
-                            LightBarButton.Text(
-                                text = "USE RECOVERY KEY",
-                                onClick = { openRecoveryEditor() },
+                        when {
+                            e2ee?.verified == true -> LightBarButton.Text(
+                                text = "DONE",
+                                onClick = { goBack() },
+                            )
+                            inVerification -> null
+                            else -> LightBarButton.Text(
+                                text = if (busy) "…" else "USE RECOVERY KEY",
+                                onClick = if (busy) null else ({ openRecoveryEditor() }),
                             )
                         },
                         null,
@@ -256,7 +267,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
 
     private fun openRecoveryEditor() {
         navigateTo(screenFactory = {
-            FieldEditorScreen(it, "Recovery key", "")
+            RecoveryKeyEditorScreen(it)
         }) { key ->
             if (key != null && key.isNotBlank()) viewModel.recover(key)
         }

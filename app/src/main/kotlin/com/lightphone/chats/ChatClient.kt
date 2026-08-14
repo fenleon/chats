@@ -70,14 +70,19 @@ object ChatClient {
             LightServiceMethod.GetMessages.Request(roomId, beforeEventId, limit),
         ).getOrNull()
 
+    /**
+     * Sends [body] to [roomId]. The response carries the outbox transaction id
+     * plus the timeline event id once the homeserver acked (null until then) —
+     * the thread uses it for an optimistic row the sync echo replaces.
+     */
     suspend fun sendMessage(
         roomId: String,
         body: String,
         replyToEventId: String? = null,
-    ): Boolean = callRemoteServiceMethod(
+    ): LightServiceMethod.SendMessage.Response? = callRemoteServiceMethod(
         LightServiceMethod.SendMessage,
         LightServiceMethod.SendMessage.Request(roomId, body, replyToEventId),
-    ) is LightResult.Success
+    ).getOrNull()
 
     suspend fun markRead(roomId: String, eventId: String) {
         callRemoteServiceMethod(
@@ -101,16 +106,15 @@ object ChatClient {
         )
     }
 
-    /**
-     * One-shot: the room a posted notification belongs to (so a notification
-     * tap can open the right thread); null when there is none pending.
-     */
-    suspend fun takeNotifyRoom(): String? =
-        callRemoteServiceMethod(LightServiceMethod.TakeNotifyRoom, Unit)
-            .getOrNull()?.roomId
-
     suspend fun connectionState(): LightServiceMethod.GetConnectionState.Response? =
         callRemoteServiceMethod(LightServiceMethod.GetConnectionState, Unit).getOrNull()
+
+    /** Pauses/resumes the companion's sync loop (Settings → Sync, audit 2026-08-14). */
+    suspend fun setSyncEnabled(enabled: Boolean): Boolean =
+        callRemoteServiceMethod(
+            LightServiceMethod.SetSyncEnabled,
+            LightServiceMethod.SetSyncEnabled.Request(enabled),
+        ).getOrNull()?.ok == true
 
     suspend fun e2eeState(): LightServiceMethod.GetE2eeState.Response? =
         callRemoteServiceMethod(LightServiceMethod.GetE2eeState, Unit).getOrNull()
@@ -139,4 +143,52 @@ object ChatClient {
             is LightResult.Success -> if (r.data.ok) null else r.data.error ?: "recovery failed"
             is LightResult.Error -> r.extra ?: "recovery failed"
         }
+
+    /**
+     * Starts the attach-a-photo flow for [roomId]. @return the flattened
+     * component name of the companion's photo-picker activity, which the tool
+     * launches via `SimpleLightScreen.startServerActivity` (the tool runtime
+     * forbids startActivity).
+     */
+    suspend fun startPhotoSend(roomId: String): String? =
+        callRemoteServiceMethod(
+            LightServiceMethod.StartPhotoSend,
+            LightServiceMethod.StartPhotoSend.Request(roomId),
+        ).getOrNull()?.activityComponent
+
+    /**
+     * Display-ready JPEG bytes for an image message, or null when unavailable.
+     * [allowMobileData] false + a cellular connection = the companion skips
+     * the download (Settings → Mobile data downloads).
+     */
+    suspend fun getMessageMedia(
+        roomId: String,
+        eventId: String,
+        allowMobileData: Boolean,
+    ): ByteArray? =
+        callRemoteServiceMethod(
+            LightServiceMethod.GetMessageMedia,
+            LightServiceMethod.GetMessageMedia.Request(roomId, eventId, allowMobileData),
+        ).getOrNull()?.bytes
+
+    /**
+     * Toggles voice-note playback in the companion: plays [eventId], or stops
+     * it if it is already the one playing. @return whether it is now playing.
+     */
+    suspend fun playVoiceNote(roomId: String, eventId: String): Boolean =
+        callRemoteServiceMethod(
+            LightServiceMethod.PlayVoiceNote,
+            LightServiceMethod.PlayVoiceNote.Request(roomId, eventId),
+        ).getOrNull()?.playing == true
+
+    /**
+     * Starts the record-a-voice-note flow for [roomId]. @return the flattened
+     * component name of the companion's recording activity, which the tool
+     * launches via `SimpleLightScreen.startServerActivity`.
+     */
+    suspend fun startVoiceNoteSend(roomId: String): String? =
+        callRemoteServiceMethod(
+            LightServiceMethod.StartVoiceNoteSend,
+            LightServiceMethod.StartVoiceNoteSend.Request(roomId),
+        ).getOrNull()?.activityComponent
 }

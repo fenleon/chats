@@ -55,6 +55,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Dev toggle for the companion's verbose logging (Trixnity FINE +
+        // HTTP-TRAFFIC): `--es debugLog 1` persists the flag before init, so
+        // it applies from the very first log call. Default off (efficiency
+        // audit 2026-08-14 — both were always-on and burned standby CPU).
+        intent?.getStringExtra("debugLog")?.let {
+            getSharedPreferences("chats_account", MODE_PRIVATE).edit()
+                .putBoolean("debug_logging", it == "1" || it.equals("true", ignoreCase = true)).apply()
+        }
         MatrixRepository.init(this)
         setContent { DevScreen() }
     }

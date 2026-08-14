@@ -9,6 +9,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Media downloads are gated on the connection type (Settings toggle). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Voice notes are recorded in the companion (the tool runtime forbids
+         media APIs; RECORD_AUDIO is granted at runtime by VoiceNoteActivity). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- sdk:ui merges CAMERA for its QR scanner; the companion is a chat server. -->
     <uses-permission
@@ -35,6 +40,28 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Shows the system photo picker and sends the chosen photo; started
+             by the tool via StartPhotoSend + startServerActivity (the tool
+             runtime forbids startActivity, the companion can't launch
+             activities from the background). -->
+        <activity
+            android:name=".PhotoSendActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- Records a voice note (AAC/m4a) and sends it as an m.audio message;
+             started by the tool via StartVoiceNoteSend + startServerActivity. -->
+        <activity
+            android:name=".VoiceNoteActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Black.NoTitleBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
 
         <!-- Keeps the Matrix sync loop alive in the background. Uses cleartext
              HTTP so a self-hosted LAN homeserver (e.g. 10.0.2.2 in dev) works. -->

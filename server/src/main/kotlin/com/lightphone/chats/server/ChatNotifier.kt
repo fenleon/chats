@@ -29,6 +29,9 @@ object ChatNotifier {
     private const val TOOL_PACKAGE = "com.lightphone.chats"
     private const val TOOL_ACTIVITY = "com.thelightphone.sdk.LightActivity"
 
+    /** Launch-intent extra carrying the room a notification tap should open. */
+    const val EXTRA_NOTIFY_ROOM = "chats.notifyRoomId"
+
     /** Base offset so message ids never collide with the sync FGS notification (71). */
     private const val ID_BASE = 1000
 
@@ -70,6 +73,10 @@ object ChatNotifier {
             Intent().apply {
                 setComponent(ComponentName(TOOL_PACKAGE, TOOL_ACTIVITY))
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                // The tool reads this once per launch (takeLaunchExtra) so a
+                // notification tap can open the right thread — and only a tap
+                // does: returning from a thread or a list poll never sees it.
+                putExtra(EXTRA_NOTIFY_ROOM, roomId)
             },
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )

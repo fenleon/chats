@@ -33,14 +33,25 @@ class ChatSyncService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Settings → Sync pause (audit 2026-08-14): never start the loop or
+        // hold the FGS while paused — a sticky restart must not defeat the
+        // user's choice.
+        if (!MatrixRepository.isSyncEnabled) {
+            Log.d(TAG, "sync disabled by user — not starting")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        running = true
         startForeground(NOTIFICATION_ID, buildNotification(this))
         serviceScope.launch {
             val c = MatrixRepository.ensureClient() ?: return@launch
-            if (syncedClient !== c) {
+            if (syncedClient !== c && !MatrixRepository.isInProcessSyncRunning) {
                 runCatching { syncedClient?.stopSync() }
                 c.startSync()
                 syncedClient = c
                 Log.d(TAG, "sync loop started for ${c.userId.full}")
+            } else if (syncedClient !== c) {
+                Log.d(TAG, "in-process sync loop already running for ${c.userId.full} — service is keep-alive only")
             }
             if (watchdogClient !== c) {
                 watchdogClient = c
@@ -79,6 +90,7 @@ class ChatSyncService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         serviceScope.cancel()
         syncedClient = null
         watchdogClient = null
@@ -118,14 +130,23 @@ class ChatSyncService : Service() {
         @Volatile
         private var watchdogClient: net.folivo.trixnity.client.MatrixClient? = null
 
-        /** Starts the service; safe to call when it is already running. */
-        fun start(context: Context) {
-            val appContext = context.applicationContext
-            try {
-                appContext.startForegroundService(Intent(appContext, ChatSyncService::class.java))
-            } catch (e: RuntimeException) {
-                Log.e(TAG, "could not start sync service", e)
-            }
+        /** True while this service is running. */
+        @Volatile
+        private var running = false
+
+        val isRunning: Boolean get() = running
+
+        /** Starts the service; returns false if Android blocked the start
+         *  (background FGS restriction — [MatrixRepository.startSyncLoop]
+         *  retries with backoff and runs an in-process loop meanwhile). */
+        fun tryStart(context: Context): Boolean = try {
+            context.applicationContext.startForegroundService(
+                android.content.Intent(context.applicationContext, ChatSyncService::class.java),
+            )
+            true
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "sync service start blocked (background FGS restriction): ${e.message}")
+            false
         }
 
         private fun buildNotification(context: Context): Notification {

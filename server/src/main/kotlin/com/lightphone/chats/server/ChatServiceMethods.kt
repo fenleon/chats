@@ -66,6 +66,8 @@ object ChatServiceMethods {
                         messages = page.messages,
                         hasMore = page.hasMore,
                         encrypted = page.encrypted,
+                        audioPlayingEventId = MatrixRepository.audioPlayingEventId(),
+                        audioPositionMs = MatrixRepository.audioPositionMs(),
                     )
                     LightResult.Success(LightServiceMethod.GetMessages.encodeResponse(response))
                 }
@@ -165,12 +167,67 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.RecoverWithKey.encodeResponse(response))
                 }
 
+                LightServiceMethod.StartPhotoSend.id -> {
+                    val request = LightServiceMethod.StartPhotoSend.decodeRequest(payload!!)
+                    val response = LightServiceMethod.StartPhotoSend.Response(
+                        MatrixRepository.startPhotoSend(request.roomId),
+                    )
+                    LightResult.Success(LightServiceMethod.StartPhotoSend.encodeResponse(response))
+                }
+
+                LightServiceMethod.GetMessageMedia.id -> {
+                    val request = LightServiceMethod.GetMessageMedia.decodeRequest(payload!!)
+                    val bytes = runBlocking {
+                        MatrixRepository.getMessageMedia(
+                            request.roomId,
+                            request.eventId,
+                            request.allowMobileData,
+                        )
+                    }
+                    LightResult.Success(
+                        LightServiceMethod.GetMessageMedia.encodeResponse(
+                            LightServiceMethod.GetMessageMedia.Response(bytes),
+                        ),
+                    )
+                }
+
+                LightServiceMethod.PlayVoiceNote.id -> {
+                    val request = LightServiceMethod.PlayVoiceNote.decodeRequest(payload!!)
+                    val (playing, error) = runBlocking {
+                        MatrixRepository.playVoiceNote(request.roomId, request.eventId)
+                    }
+                    LightResult.Success(
+                        LightServiceMethod.PlayVoiceNote.encodeResponse(
+                            LightServiceMethod.PlayVoiceNote.Response(playing, error),
+                        ),
+                    )
+                }
+
+                LightServiceMethod.StartVoiceNoteSend.id -> {
+                    val request = LightServiceMethod.StartVoiceNoteSend.decodeRequest(payload!!)
+                    val response = LightServiceMethod.StartVoiceNoteSend.Response(
+                        MatrixRepository.startVoiceNoteSend(request.roomId),
+                    )
+                    LightResult.Success(LightServiceMethod.StartVoiceNoteSend.encodeResponse(response))
+                }
+
+                LightServiceMethod.SetSyncEnabled.id -> {
+                    val request = LightServiceMethod.SetSyncEnabled.decodeRequest(payload!!)
+                    runBlocking { MatrixRepository.setSyncEnabled(request.enabled) }
+                    LightResult.Success(
+                        LightServiceMethod.SetSyncEnabled.encodeResponse(
+                            LightServiceMethod.SetSyncEnabled.Response(ok = true),
+                        ),
+                    )
+                }
+
                 else -> LightResult.Error(
                     LightResult.ErrorCode.Unknown,
                     "unknown method: $methodId",
                 )
             }
         } catch (e: Exception) {
+            android.util.Log.e("ChatServiceMethods", "dispatch failed for $methodId", e)
             LightResult.Error(LightResult.ErrorCode.Unknown, e.message ?: "error handling $methodId")
         }
 

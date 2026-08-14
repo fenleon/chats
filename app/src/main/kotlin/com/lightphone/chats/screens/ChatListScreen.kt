@@ -14,6 +14,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,7 +22,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
-import com.lightphone.chats.formatTimestamp
+import com.lightphone.chats.formatRelativeTimestamp
 import com.thelightphone.sdk.InitialScreen
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -37,6 +38,8 @@ import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
+import com.thelightphone.sdk.ui.LightTopBar
+import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Job
@@ -48,6 +51,13 @@ import kotlinx.coroutines.launch
 
 /** Grow the list slice when the last visible row is within this many of the end. */
 private const val REVEAL_THRESHOLD = 4
+
+/**
+ * Launch-intent extra carrying the room a notification tap should open
+ * (matches the companion's ChatNotifier.EXTRA_NOTIFY_ROOM; the app cannot
+ * reference the server's class).
+ */
+private const val EXTRA_NOTIFY_ROOM = "chats.notifyRoomId"
 
 class ChatListViewModel : LightViewModel<Unit>() {
 
@@ -61,10 +71,21 @@ class ChatListViewModel : LightViewModel<Unit>() {
      */
     val visibleCount = MutableStateFlow(INITIAL_VISIBLE_COUNT)
     /**
-     * Room to open after a notification tap (set from the companion's
-     * pending-notify-room handoff); consumed by the screen.
+     * Room to open after a notification tap (set from the screen's
+     * notifyWillShow, which reads the launch-intent extra); consumed by the
+     * view model once the room is loaded.
      */
     val openRoom = MutableStateFlow<LightServiceMethod.GetRooms.Room?>(null)
+    /**
+     * Room id a notification tap asked to open (from the launch-intent extra —
+     * consume-once). Only a real tap carries it: returning from a thread or a
+     * plain list refresh never sets it, so the list never auto-opens a room.
+     */
+    var pendingNotifyRoomId: String? = null
+    /** Unread-only filter (bottom-bar toggle, Phase 7): shows only rooms with unreadCount > 0. */
+    val unreadOnly = MutableStateFlow(false)
+    /** Selected bridged-network label (Phase 7); null = all networks. */
+    val networkFilter = MutableStateFlow<String?>(null)
 
     private var refreshJob: Job? = null
     private var pollJob: Job? = null
@@ -143,14 +164,28 @@ class ChatListViewModel : LightViewModel<Unit>() {
             this@ChatListViewModel.account.value = account
             rooms.value = result
             this@ChatListViewModel.connection.value = connection
-            // A notification tap leaves a pending room with the companion; open
-            // its thread when it matches a room on the list.
-            val notifyRoomId = ChatClient.takeNotifyRoom()
-            if (notifyRoomId != null) {
-                openRoom.value = result.firstOrNull { it.id == notifyRoomId }
-            }
+            // A notification tap asked for a thread; open it once its room is
+            // loaded (a cold start may have to wait for the first room-list pass).
+            consumeNotifyRoom(result)
             if (!quiet) loading.value = false
         }
+    }
+
+    /**
+     * Opens the thread a notification tap requested, when the room is loaded.
+     * Waits for a settled list (rooms arrived, or a genuine logged-out state)
+     * so a cold start doesn't drop the request while rooms are still restoring.
+     */
+    fun consumeNotifyRoom(rooms: List<LightServiceMethod.GetRooms.Room>) {
+        val pending = pendingNotifyRoomId ?: return
+        val settled = account.value?.let {
+            (it.loggedIn == true && rooms.isNotEmpty()) ||
+                (it.userId == null) ||
+                (it.loggedIn == false && it.userId != null && connection.value?.state == "offline")
+        } ?: false
+        if (!settled) return
+        pendingNotifyRoomId = null
+        openRoom.value = rooms.firstOrNull { it.id == pending }
     }
 
     /** Grows the visible slice as the user scrolls toward the list's end. */
@@ -179,6 +214,20 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
 
     override fun createViewModel(): ChatListViewModel = ChatListViewModel()
 
+    /** For consume-once launch-extras (notification-tap handoff). */
+    private val activityRef = sealedActivity
+
+    override fun willShow() {
+        super.willShow()
+        // A notification tap arrives with its room in the launch intent
+        // (consume-once). Only a real tap carries the extra — returning from a
+        // thread and plain list refreshes never set it, so the list never
+        // auto-opens a room on its own.
+        activityRef.takeLaunchExtra(EXTRA_NOTIFY_ROOM)?.let {
+            viewModel.pendingNotifyRoomId = it
+        }
+    }
+
     @Composable
     override fun Content() {
         val rooms by viewModel.rooms.collectAsState()
@@ -187,8 +236,25 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         val connection by viewModel.connection.collectAsState()
         val visibleCount by viewModel.visibleCount.collectAsState()
         val pendingRoom by viewModel.openRoom.collectAsState()
+        val unreadOnly by viewModel.unreadOnly.collectAsState()
+        val networkFilter by viewModel.networkFilter.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
         val listState = rememberLazyListState()
+
+        // Phase 7 filters: the unread toggle and the network selector both
+        // narrow the list; the full room set stays in the ViewModel.
+        val filteredRooms = remember(rooms, unreadOnly, networkFilter) {
+            rooms.filter { room ->
+                (networkFilter == null || room.network == networkFilter) &&
+                    (!unreadOnly || room.unreadCount > 0)
+            }
+        }
+        // Network labels for the Networks panel, from the rooms the companion
+        // tagged (Beeper account spaces only — group chats are excluded
+        // server-side).
+        val networks = remember(rooms) {
+            rooms.mapNotNull { it.network }.distinct().sorted()
+        }
 
         // A notification tap lands here; open the pending room's thread.
         LaunchedEffect(pendingRoom) {
@@ -209,6 +275,15 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
             }
         }
 
+        // Feedback pass: switching the filter (unread toggle / account
+        // selection) returns the list to the top — the user expects the
+        // newest conversations, not a stale scroll position from the previous
+        // filter. requestScrollToItem is safe before the new list is composed
+        // (e.g. an empty unread view); the scroll lands when the list appears.
+        LaunchedEffect(unreadOnly, networkFilter) {
+            listState.requestScrollToItem(0)
+        }
+
         // Offline: the list still shows cached rooms, with a status line on top
         // ("Can't reach server"); an expired session points at Settings instead.
         val offlineText = connection?.takeIf { it.state == "offline" }?.let { state ->
@@ -225,25 +300,36 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                // Feedback pass: with a network filter active the list gets a
+                // context top bar naming the network ("WhatsApp"); on "All"
+                // it stays a bare list home. The null left/right slots render
+                // as spacers, so the title stays centered.
+                val activeAccount = networkFilter
+                if (activeAccount != null) {
+                    LightTopBar(
+                        center = LightTopBarCenter.Text(activeAccount),
+                    )
+                }
                 Box(modifier = Modifier.weight(1f)) {
                     Column(modifier = Modifier.fillMaxSize()) {
                         offlineText?.let { OfflineBanner(it) }
                         Box(modifier = Modifier.weight(1f)) {
                             when {
                                 loading && rooms.isEmpty() -> StatusText("Loading…")
-                                rooms.isNotEmpty() -> LightLazyScrollView(
+                                filteredRooms.isNotEmpty() -> LightLazyScrollView(
                                     // Rows are ~70dp; a uniform estimate keeps the lazy
                                     // scrollbar sane (the SDK computes it per-item).
                                     uniformItemHeightGridUnits = 4.6f,
                                     listState = listState,
                                 ) {
-                                    items(rooms.take(visibleCount), key = { it.id }) { room ->
+                                    items(filteredRooms.take(visibleCount), key = { it.id }) { room ->
                                         RoomRow(
                                             room = room,
                                             onOpen = { openThread(room) },
                                         )
                                     }
                                 }
+                                rooms.isNotEmpty() -> StatusText("No conversations.")
                                 account?.loggedIn != true -> StatusText(
                                     if (connection?.state == "offline") {
                                         "Sign in again — open Settings."
@@ -264,8 +350,26 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                             onClick = { openSettings() },
                             contentDescription = "Settings",
                         ),
-                        null,
-                        null,
+                        // Phase 7: unread toggle — the label names the action
+                        // it triggers, so it reads as the state too.
+                        LightBarButton.Text(
+                            text = if (unreadOnly) "ALL" else "VIEW UNREAD",
+                            onClick = { viewModel.unreadOnly.value = !viewModel.unreadOnly.value },
+                        ),
+                        // Feedback pass: the network filter lives behind the
+                        // bottom-right menu (3-dash) which opens the Networks
+                        // panel; the active network shows in the context top bar.
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.LIST,
+                            onClick = {
+                                navigateTo(
+                                    screenFactory = { AccountsScreen(it, networks, networkFilter) },
+                                ) { choice ->
+                                    viewModel.networkFilter.value = choice?.label
+                                }
+                            },
+                            contentDescription = "Networks",
+                        ),
                     ),
                 )
             }
@@ -319,7 +423,7 @@ private fun RoomRow(
             }
             Column(horizontalAlignment = Alignment.End) {
                 LightText(
-                    text = formatTimestamp(room.lastTimestampMs),
+                    text = formatRelativeTimestamp(room.lastTimestampMs),
                     variant = LightTextVariant.Fine,
                     lighten = true,
                 )
