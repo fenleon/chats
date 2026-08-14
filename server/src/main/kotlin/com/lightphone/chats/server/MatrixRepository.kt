@@ -323,16 +323,19 @@ object MatrixRepository {
     }
 
     /**
-     * Runtime opt-in for the verbose debug logging (Trixnity FINE + the
-     * HTTP-TRAFFIC interceptor). Off by default — works even on debug APKs
-     * (the LP3 runs DEBUGGABLE builds, so a BuildConfig.DEBUG gate alone
-     * wouldn't quiet it). Toggle:
+     * Verbose debug logging (Trixnity FINE + the HTTP-TRAFFIC interceptor).
+     * Debug builds only — the release APK never enables it, even if the pref
+     * is set (a release shipped with the pref enabled would log full message
+     * bodies). The runtime pref still applies on debug builds (the LP3 runs
+     * DEBUGGABLE APKs, so a plain BuildConfig.DEBUG gate couldn't quiet it
+     * there). Toggle on debug:
      * `adb shell am start -n com.lightphone.chats.server/.MainActivity --es debugLog 1`
      * The flag persists (survives reboots) until toggled back.
      */
     private fun debugLogging(): Boolean =
-        appContext?.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
-            ?.getBoolean("debug_logging", false) ?: false
+        BuildConfig.DEBUG &&
+            (appContext?.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+                ?.getBoolean("debug_logging", false) ?: false)
 
     private class TrixnityLogcatHandler : java.util.logging.Handler() {
         override fun publish(record: java.util.logging.LogRecord) {
