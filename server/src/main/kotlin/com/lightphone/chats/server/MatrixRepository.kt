@@ -262,13 +262,20 @@ object MatrixRepository {
         // no sync loop and no foreground service — the battery escape hatch.
         syncEnabled = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_SYNC_ENABLED, true)
-        if (!syncEnabled) {
-            android.util.Log.d(TAG, "sync disabled by preference — not starting sync loop")
-            return
-        }
         scope.launch {
+            // Restore the session regardless of the sync toggle. GetAccountState
+            // reads the live client, so a paused companion that skips the restore
+            // makes the tool report "Not signed in" while the session is fine
+            // (2026-08-14, user-verified on the LP3). Only the sync loop (and
+            // its FGS) is gated on the toggle; the restored client's observers
+            // stay dormant without sync (room flows never emit).
             if (ensureClient() != null) {
-                startSyncLoop(app)
+                if (syncEnabled) {
+                    startSyncLoop(app)
+                } else {
+                    _connectionState.value = ChatConnectionState.Offline("sync paused")
+                    android.util.Log.d(TAG, "sync disabled by preference — session restored, no sync loop")
+                }
             }
         }
     }
@@ -3048,6 +3055,11 @@ object MatrixRepository {
                     SyncState.STARTED, SyncState.RUNNING -> ChatConnectionState.Syncing
                     SyncState.ERROR, SyncState.TIMEOUT -> ChatConnectionState.Offline("sync $state")
                     SyncState.STOPPED -> when {
+                        // The sync toggle is the source of truth while paused —
+                        // the restored client reports STOPPED until resumed, and
+                        // that must read as "paused", not "stopped" (or, worse,
+                        // the race with init's explicit assignment).
+                        !syncEnabled -> ChatConnectionState.Offline("sync paused")
                         c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> ChatConnectionState.Offline("sync stopped")
                         sessionExpired -> ChatConnectionState.Offline("session expired — sign in again")
                         else -> ChatConnectionState.LoggedOut

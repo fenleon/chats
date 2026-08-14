@@ -18,12 +18,13 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 # Screenshots
 
-The chat list, a 1:1 thread, a group thread, and settings on a Light Phone III (light-on-black):
+The chat list, a 1:1 thread, a group thread, the networks panel, and settings on a Light Phone III (light-on-black):
 
 <p align="center">
   <img src="screenshots/list.png" width="32%" alt="Chat list" />
   <img src="screenshots/thread.png" width="32%" alt="1:1 thread" />
   <img src="screenshots/group.png" width="32%" alt="Group thread" />
+  <img src="screenshots/networks.png" width="32%" alt="Networks" />
   <img src="screenshots/settings.png" width="32%" alt="Settings" />
 </p>
 
