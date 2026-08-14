@@ -33,8 +33,8 @@ android {
             signingConfig = signingConfigs.getByName("lightsdkDev")
         }
         getByName("release") {
-            isMinifyEnabled = false
-            isShrinkResources = false
+            isMinifyEnabled = true      // R8: dead-code elimination + obfuscation
+            isShrinkResources = true    // drop unused resources
             signingConfig = signingConfigs.getByName("lightsdkDev")
         }
     }
@@ -53,6 +53,10 @@ kotlin {
 
 dependencies {
     // SDK modules come from the included ../light-sdk build (see settings.gradle.kts).
-    implementation(libs.sdk.client)   // LightScreen, LightActivity, callRemoteServiceMethod
+    // The QR scanner + CameraX come transitively via sdk:ui; the chat tool never scans codes.
+    implementation(libs.sdk.client) {   // LightScreen, LightActivity, callRemoteServiceMethod
+        exclude(group = "com.google.mlkit")
+        exclude(group = "androidx.camera")
+    }
     implementation(libs.kotlinx.coroutines)
 }

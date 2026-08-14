@@ -25,3 +25,8 @@ captures/
 AGENTS.md
 # Session plan doc (kept local, not published)
 PLAN.md
+# Dev/verification screenshots (real account content — keep local)
+screenshots/phase*.png
+screenshots/verify-*.png
+screenshots/reaction-labels.png
+screenshots/settings-subtitle-detail.png

@@ -21,14 +21,17 @@ android {
         applicationId = "com.lightphone.chats.server"
         minSdk = 34
         targetSdk = 36
-        versionCode = 1
+        // First public release. versionCode tracks the repo's commit count
+        // (15 commits at release); keep +1 per release like audiobooks.
+        versionCode = 15
         versionName = "0.1.0"
     }
 
     buildTypes {
         getByName("release") {
-            isMinifyEnabled = false
-            isShrinkResources = false
+            isMinifyEnabled = true      // R8: dead-code elimination + obfuscation
+            isShrinkResources = true    // drop unused resources
+            proguardFiles("proguard-rules.pro")
             signingConfig = signingConfigs.getByName("lightsdkDev")
         }
         getByName("debug") {
@@ -54,9 +57,17 @@ kotlin {
 
 dependencies {
     // SDK modules come from the included ../light-sdk build (see settings.gradle.kts).
+    // The QR scanner + CameraX come transitively via sdk:ui; the companion is a chat
+    // server and never scans codes (its manifest even strips CAMERA).
     implementation(libs.sdk.server)   // LightSdkServer + LightSdkService (the binder)
-    implementation(libs.sdk.client)   // binder client + service connection
-    implementation(libs.sdk.ui)       // Light design system for the status screen
+    implementation(libs.sdk.client) { // binder client + service connection
+        exclude(group = "com.google.mlkit")
+        exclude(group = "androidx.camera")
+    }
+    implementation(libs.sdk.ui) {     // Light design system for the status screen
+        exclude(group = "com.google.mlkit")
+        exclude(group = "androidx.camera")
+    }
     implementation(libs.compose.activity)
     implementation(libs.kotlinx.coroutines)
 

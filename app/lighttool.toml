@@ -1,7 +1,7 @@
 [tool]
 id = "com.lightphone.chats"
 label = "Chats"
-versionCode = 1
+versionCode = 15
 versionName = "0.1.0"
 permissions = ["android.permission.INTERNET"]
 # The tool is a thin UI; the companion (:server) hosts the SDK service, the
