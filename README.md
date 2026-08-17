@@ -1,10 +1,10 @@
 # Chats
 
-*WhatsApp, Instagram, and your other chats — on your Light Phone III.*
+*WhatsApp, Instagram, and your other chats on your Light Phone III.*
 
-Chats brings **WhatsApp to your Light Phone III** — along with **Instagram DMs** and other networks — through your Beeper account. Log in once and your existing conversations arrive on the phone in a quiet, text-first interface inspired by the philosophy of Light OS. No browser workarounds, no extra device, no accounts to juggle: just your chats.
+Chats brings **WhatsApp to your Light Phone III**, along with **Instagram DMs** and other networks, through your Beeper account. Log in once and your existing conversations arrive on the phone in a quiet, text-first interface inspired by the philosophy of Light OS.
 
-Under the hood it runs on **Matrix**, the open, encrypted messaging standard behind Beeper's bridges, so every conversation is end-to-end encrypted — but you don't need to know anything about Matrix to use Chats. If you'd rather not use Beeper, Chats speaks plain Matrix and works with any Matrix homeserver.
+Under the hood it runs on **Matrix**, the open, encrypted messaging standard behind Beeper's bridges, so every conversation is end-to-end encrypted. If you'd rather not use Beeper, Chats speaks plain Matrix and works with any Matrix homeserver.
 
 Chats is a **real LightOS tool**: a thin interface built on the Light SDK design system, launched from the LightOS toolbox, with a companion app hosting the persistent encrypted connection, storage, and notifications — the same tool + companion architecture Light's own messaging tool uses, so messages keep arriving and notifying even after the tool closes.
 
@@ -43,7 +43,7 @@ The chat list, a 1:1 thread, a group thread, the networks panel, and settings on
 - **Delivery status** — a "delivered" tag on your newest message once it reaches the room, and a "not delivered" marker when it fails
 - **Read state** — opening a thread marks it read server-side
 - **Day-grouped timestamps** — time-of-day for today, "yesterday", weekday names, then dates
-- **Instant re-open** — room list and threads are cached to disk, so returning to a chat is immediate
+- **Instant re-open** — room list and threads are cached to disk
 - **Battery-conscious sync** — with the screen off, sync stretches to a slow idle cadence (push-wake keeps delivery instant); a Settings toggle pauses sync entirely (and the foreground service) when you don't need it
 - **Optional Wi-Fi-only media downloads**
 
