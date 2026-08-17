@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import net.folivo.trixnity.clientserverapi.client.SyncState
+import net.folivo.trixnity.core.model.events.m.Presence
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,13 +46,13 @@ class ChatSyncService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification(this))
         serviceScope.launch {
             val c = MatrixRepository.ensureClient() ?: return@launch
-            if (syncedClient !== c && !MatrixRepository.isInProcessSyncRunning) {
+            if (syncedClient !== c && !MatrixRepository.isInProcessSyncRunning && !MatrixRepository.isSlowSyncing) {
                 runCatching { syncedClient?.stopSync() }
-                c.startSync()
+                c.startSync(Presence.OFFLINE)
                 syncedClient = c
                 Log.d(TAG, "sync loop started for ${c.userId.full}")
             } else if (syncedClient !== c) {
-                Log.d(TAG, "in-process sync loop already running for ${c.userId.full} — service is keep-alive only")
+                Log.d(TAG, "in-process/slow sync loop already running for ${c.userId.full} — service is keep-alive only")
             }
             if (watchdogClient !== c) {
                 watchdogClient = c
@@ -72,6 +73,12 @@ class ChatSyncService : Service() {
     private suspend fun startSyncWatchdog(c: net.folivo.trixnity.client.MatrixClient) {
         var stuckSinceMs = 0L
         c.syncState.collect { state ->
+            // Slow sync owns sync while it runs (STOPPED between rounds) —
+            // never restart a long-poll then; MatrixRepository does on wake.
+            if (MatrixRepository.isSlowSyncing) {
+                stuckSinceMs = 0L
+                return@collect
+            }
             val running = state == SyncState.RUNNING || state == SyncState.STARTED ||
                 state == SyncState.INITIAL_SYNC
             val now = android.os.SystemClock.elapsedRealtime()
@@ -83,7 +90,7 @@ class ChatSyncService : Service() {
             if (syncedClient === c && now - stuckSinceMs >= SYNC_RESTART_AFTER_MS) {
                 Log.w(TAG, "sync stuck in $state for ${SYNC_RESTART_AFTER_MS / 1000}s — restarting sync loop")
                 runCatching { c.stopSync() }
-                c.startSync()
+                c.startSync(Presence.OFFLINE)
                 stuckSinceMs = 0L
             }
         }

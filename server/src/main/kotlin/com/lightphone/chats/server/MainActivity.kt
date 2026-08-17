@@ -63,6 +63,25 @@ class MainActivity : ComponentActivity() {
             getSharedPreferences("chats_account", MODE_PRIVATE).edit()
                 .putBoolean("debug_logging", it == "1" || it.equals("true", ignoreCase = true)).apply()
         }
+        // Dev-only push channel overrides (2026-08-16, chats/push/README.md):
+        // --es pushsse <url>    the SSE subscription URL (from the phone's side)
+        // --es pushnotify <url> the pusher data.url (from the homeserver's side)
+        // --es pushkey <url>    the pusher pushkey — ntfy routing needs it to
+        //                       be https://ntfy.sh/<topic>; default = random UUID.
+        // Unset: a private ntfy.sh channel is auto-provisioned on first start
+        // (PushChannel) — push works with zero setup after login.
+        intent?.getStringExtra("pushsse")?.let {
+            getSharedPreferences("chats_account", MODE_PRIVATE).edit()
+                .putString("push_sse_url", it).apply()
+        }
+        intent?.getStringExtra("pushnotify")?.let {
+            getSharedPreferences("chats_account", MODE_PRIVATE).edit()
+                .putString("push_notify_url", it).apply()
+        }
+        intent?.getStringExtra("pushkey")?.let {
+            getSharedPreferences("chats_account", MODE_PRIVATE).edit()
+                .putString("push_key", it).apply()
+        }
         MatrixRepository.init(this)
         setContent { DevScreen() }
     }
@@ -81,6 +100,7 @@ private fun DevScreen() {
     //   --es password alicepass [--es sendTo <roomId> --es sendBody <text>]
     // Runs even when a session is restored, so the send can use the existing client.
     val launchExtras = (LocalContext.current as? MainActivity)?.intent?.extras
+    val devContext = LocalContext.current
     LaunchedEffect(Unit) {
         if (launchExtras?.getString("homeserver") != null) {
             val result = MatrixRepository.login(

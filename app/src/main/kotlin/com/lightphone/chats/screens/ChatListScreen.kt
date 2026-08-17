@@ -315,7 +315,19 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                         offlineText?.let { OfflineBanner(it) }
                         Box(modifier = Modifier.weight(1f)) {
                             when {
-                                loading && rooms.isEmpty() -> StatusText("Loading…")
+                                // First login / restored session: the initial sync
+                                // pulls the whole account (all rooms + history) and
+                                // can take minutes on a large bridged account —
+                                // say so instead of a blank "Loading…", and never
+                                // flash "No conversations" while it's still running
+                                // (the retry budget can exhaust before rooms land).
+                                loading && rooms.isEmpty() -> StatusText(
+                                    if (connection?.state == "connecting") {
+                                        "Downloading your chat history…"
+                                    } else {
+                                        "Loading…"
+                                    },
+                                )
                                 filteredRooms.isNotEmpty() -> LightLazyScrollView(
                                     // Rows are ~70dp; a uniform estimate keeps the lazy
                                     // scrollbar sane (the SDK computes it per-item).
@@ -337,6 +349,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                         "No account. Open Settings to sign in with Beeper or a Matrix homeserver."
                                     },
                                 )
+                                connection?.state == "connecting" -> StatusText("Downloading your chat history…")
                                 else -> StatusText("No conversations.")
                             }
                         }
@@ -410,16 +423,8 @@ private fun RoomRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                if (room.lastMessage.isNotBlank()) {
-                    LightText(
-                        text = room.lastMessage,
-                        variant = LightTextVariant.Detail,
-                        lighten = true,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                }
+                // No last-message preview subtext (feedback 2026-08-15): the
+                // row is just the thread name + timestamp + unread count.
             }
             Column(horizontalAlignment = Alignment.End) {
                 LightText(

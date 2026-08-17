@@ -47,9 +47,11 @@ import java.io.File
  * startActivity and the companion can't launch activities from the background,
  * so the tool calls `StartVoiceNoteSend` (which records the room) and then
  * starts this activity via `SimpleLightScreen.startServerActivity` — the same
- * pattern as [PhotoSendActivity]. Tap the mic to record (AAC in an m4a
- * container), tap again to stop; the recording is uploaded to Matrix as an
- * m.audio message and sent in the recorded room. RECORD_AUDIO is requested at
+ * pattern as [PhotoSendActivity]. Tap the mic to record (Opus in an ogg
+ * container — the MSC3245 canonical voice-message format, ~2-3× smaller than
+ * the old AAC/m4a at speech bitrates), tap again to stop; the recording is
+ * uploaded to Matrix as an m.audio message and sent in the recorded room.
+ * RECORD_AUDIO is requested at
  * runtime (the manifest declares it; the launcher activity grants it on
  * install, but the companion's own install may not carry the grant).
  */
@@ -181,14 +183,18 @@ class VoiceNoteActivity : ComponentActivity() {
     }
 
     private fun startRecording() {
-        val file = File(cacheDir, "voice_${System.currentTimeMillis()}.m4a")
+        val file = File(cacheDir, "voice_${System.currentTimeMillis()}.ogg")
         val r = runCatching {
             MediaRecorder().apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioEncodingBitRate(64_000)
-                setAudioSamplingRate(44_100)
+                // Opus in an ogg container (MSC3245 voice messages). Opus
+                // native sample rates are 8/12/16/24/48 kHz — the old 44.1 kHz
+                // is not valid; 48 kHz is the default. 32 kbps is transparent
+                // for speech and ~2× smaller than the old 64 kbps AAC.
+                setOutputFormat(MediaRecorder.OutputFormat.OGG)
+                setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
+                setAudioEncodingBitRate(32_000)
+                setAudioSamplingRate(48_000)
                 setOutputFile(file.absolutePath)
                 prepare()
                 start()

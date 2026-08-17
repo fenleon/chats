@@ -1,10 +1,14 @@
 package com.lightphone.chats.server
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.PowerManager
 import androidx.room.Room
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
 import io.ktor.client.HttpClient
@@ -30,17 +34,23 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import net.folivo.trixnity.client.MatrixClient
 import net.folivo.trixnity.client.MatrixClientConfiguration
@@ -54,6 +64,7 @@ import net.folivo.trixnity.client.media.MediaService
 import net.folivo.trixnity.client.media.MediaStore
 import net.folivo.trixnity.client.media.okio.createOkioMediaStoreModule
 import net.folivo.trixnity.client.room
+import net.folivo.trixnity.client.room.GetTimelineEventConfig
 import net.folivo.trixnity.client.room.GetTimelineEventsConfig
 import net.folivo.trixnity.client.room.message.image
 import net.folivo.trixnity.client.room.message.reply
@@ -78,9 +89,11 @@ import net.folivo.trixnity.clientserverapi.model.authentication.IdentifierType
 import net.folivo.trixnity.clientserverapi.model.authentication.LoginType
 import net.folivo.trixnity.clientserverapi.model.rooms.GetEvents.Direction
 import net.folivo.trixnity.clientserverapi.model.rooms.GetEvents.Direction.BACKWARDS
+import net.folivo.trixnity.core.AuthRequired
 import net.folivo.trixnity.core.model.EventId
 import net.folivo.trixnity.core.model.RoomId
 import net.folivo.trixnity.core.model.UserId
+import net.folivo.trixnity.core.model.events.m.Presence
 import net.folivo.trixnity.core.model.events.m.ReceiptType
 import net.folivo.trixnity.core.model.events.m.RelatesTo
 import net.folivo.trixnity.core.model.events.m.key.verification.VerificationMethod
@@ -124,8 +137,11 @@ object MatrixRepository {
     private const val KEY_LOGIN_MODE = "login_mode"
     private const val KEY_BEEPER_REQUEST_ID = "beeper_request_id"
     private const val KEY_SYNC_ENABLED = "sync_enabled"
+    /** When the one-shot megolm restore scan last ran (daily gate, 2026-08-15). */
+    private const val KEY_RESTORE_LAST_RUN_MS = "restore_last_run_ms"
     private const val DB_NAME = "matrix_client"
     private const val MEDIA_DIR = "matrix_media"
+
 
     // PRIVATE Beeper integration — Beeper's private API (undocumented, unstable).
     // These endpoints and the API token stay in the companion only (the chats/
@@ -253,6 +269,65 @@ object MatrixRepository {
 
     val isSyncEnabled: Boolean get() = syncEnabled
 
+    /** Sync cadence. ACTIVE = continuous long-poll while the screen is on;
+     *  SLOW = periodic [net.folivo.trixnity.client.MatrixClient.syncOnce] once
+     *  the screen's been off for a while — the long-poll's per-response
+     *  parse/decrypt/store processing is the main standby cost on an
+     *  always-active bridged account (battery, 2026-08-14). */
+    enum class SyncMode { ACTIVE, SLOW }
+
+    @Volatile
+    private var syncMode = SyncMode.ACTIVE
+
+    /** True while the periodic slow-sync loop owns sync. The FGS/watchdog must
+     *  not restart a long-poll then (ChatSyncService reads this). */
+    val isSlowSyncing: Boolean get() = syncMode == SyncMode.SLOW
+
+    private var slowSyncJob: Job? = null
+    private var screenOffJob: Job? = null
+
+    /** Screen must stay off this long before dropping to slow sync. */
+    private const val SLOW_SYNC_GRACE_MS = 60_000L
+
+    /** Slow-sync cadence: one sync round every 5 min.
+     *  ponytail: 5 min is a session value — tighten if message latency feels
+     *  too high, loosen if battery still burns. */
+    private const val SLOW_SYNC_INTERVAL_MS = 300_000L
+
+    /**
+     * Slow-sync cadence while the push channel is connected (2026-08-17): the
+     * SSE wake delivers messages instantly (each push = one syncOnce), so the
+     * rounds are pure redundancy — stretch them to a 30-min safety net that
+     * still catches a silent SSE/Beeper failure. Without a live channel the
+     * 5-min cadence runs.
+     *  ponytail: 30 min is a session value — if push proves rock-solid over
+     *  nights, drop the net entirely (O4 end state).
+     */
+    private const val SLOW_SYNC_PUSH_NET_MS = 1_800_000L
+
+    /** Screen on/off → sync cadence. Registered on the app context in [init],
+     *  so it lives as long as the process (which the FGS keeps alive). */
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_ON -> {
+                    scope.launch { enterActiveSync() }
+                    // A thread was open when the screen went dark — resume
+                    // keeping its page fresh now that it's visible again.
+                    startActiveRoomRefresh()
+                }
+                Intent.ACTION_SCREEN_OFF -> {
+                    scheduleSlowSync()
+                    // Battery (2026-08-15 audit): the active-room refresh was
+                    // running 24/7 with no visibility coupling — every 2s a full
+                    // page rebuild (SQL chain walk + key-backup restore + API
+                    // re-reads). Nobody is looking while the screen is off.
+                    stopActiveRoomRefresh()
+                }
+            }
+        }
+    }
+
     /** Called once from [ServerApplication]; restores a stored session if there is one. */
     fun init(context: Context) {
         val app = context.applicationContext
@@ -262,6 +337,21 @@ object MatrixRepository {
         // no sync loop and no foreground service — the battery escape hatch.
         syncEnabled = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_SYNC_ENABLED, true)
+        // Screen-driven cadence: long-poll while the screen is on, periodic
+        // syncOnce after it's been off for a while (battery, 2026-08-14).
+        app.registerReceiver(
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            },
+            Context.RECEIVER_NOT_EXPORTED,
+        )
+        // Booted with the screen already dark: no SCREEN_OFF broadcast is
+        // coming — drop to slow sync after the grace instead of long-polling
+        // with nobody watching.
+        val power = app.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (power?.isInteractive == false) scheduleSlowSync()
         scope.launch {
             // Restore the session regardless of the sync toggle. GetAccountState
             // reads the live client, so a paused companion that skips the restore
@@ -272,6 +362,10 @@ object MatrixRepository {
             if (ensureClient() != null) {
                 if (syncEnabled) {
                     startSyncLoop(app)
+                    // Push wake-up channel (2026-08-16): register the Matrix
+                    // HTTP pusher + hold the SSE subscription so idle sync has
+                    // zero latency — see PushChannel.
+                    PushChannel.start(app, client!!)
                 } else {
                     _connectionState.value = ChatConnectionState.Offline("sync paused")
                     android.util.Log.d(TAG, "sync disabled by preference — session restored, no sync loop")
@@ -294,20 +388,127 @@ object MatrixRepository {
         syncEnabled = enabled
         val c = client
         if (!enabled) {
+            slowSyncJob?.cancel()
+            slowSyncJob = null
+            screenOffJob?.cancel()
+            screenOffJob = null
+            syncMode = SyncMode.ACTIVE
             runCatching { c?.stopSync() }
             inProcessSyncRunning = false
             activeRoomRefreshJob?.cancel()
             activeRoomRefreshJob = null
+            PushChannel.stop()
             ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
             _connectionState.value = ChatConnectionState.Offline("sync paused")
             android.util.Log.d(TAG, "sync paused by user")
         } else {
+            slowSyncJob?.cancel()
+            slowSyncJob = null
+            screenOffJob?.cancel()
+            screenOffJob = null
+            syncMode = SyncMode.ACTIVE
             if (c == null) {
                 if (ensureClient() != null) startSyncLoop(ctx)
             } else {
                 startSyncLoop(ctx)
             }
+            client?.let { PushChannel.start(ctx, it) }
             android.util.Log.d(TAG, "sync resumed by user")
+        }
+    }
+
+    /**
+     * Drops to the slow cadence once the screen has been dark for the grace
+     * period: stop the long-poll and run periodic [MatrixClient.syncOnce]
+     * rounds instead. The FGS stays (it keeps the process alive for the slow
+     * loop); the manual Settings → Sync toggle is the fully-off control.
+     */
+    private fun scheduleSlowSync() {
+        screenOffJob?.cancel()
+        screenOffJob = scope.launch {
+            delay(SLOW_SYNC_GRACE_MS)
+            // Screen came back on during the grace — [enterActiveSync] already
+            // cancelled this job; this is just paranoia.
+            val power = appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (power?.isInteractive == true) return@launch
+            enterSlowSync()
+        }
+    }
+
+    private suspend fun enterSlowSync() {
+        if (!syncEnabled || syncMode == SyncMode.SLOW) return
+        val c = client ?: return
+        syncMode = SyncMode.SLOW // gate first: the watchdog must not restart the long-poll
+        runCatching { c.stopSync() }
+        inProcessSyncRunning = false
+        slowSyncJob?.cancel()
+        slowSyncJob = startSlowSyncRounds(c)
+        android.util.Log.d(
+            TAG,
+            "sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s, " +
+                "push-gated ${SLOW_SYNC_PUSH_NET_MS / 1000}s when SSE connected)",
+        )
+    }
+
+    /** The periodic syncOnce rounds (also restarted by a push-wake — see [onPushDelivered]). */
+    private fun startSlowSyncRounds(c: MatrixClient): Job {
+        val job = scope.launch {
+            while (isActive) {
+                if (client !== c) return@launch // logged out / re-logged in under us
+                runCatching { c.syncOnce(Presence.OFFLINE) }
+                    .onFailure { android.util.Log.w(TAG, "slow sync round failed: ${it.message}") }
+                // Push-health-gated cadence (2026-08-17): while the SSE channel
+                // is connected, pushes deliver messages instantly (each wakes
+                // one syncOnce), so the rounds are pure redundancy — stretch to
+                // a 30-min safety net that still catches a silent SSE/Beeper
+                // failure. Without a live channel (no config, reconnecting,
+                // stopped) fall back to the 5-min cadence.
+                val cadenceMs = if (PushChannel.isConnected) SLOW_SYNC_PUSH_NET_MS else SLOW_SYNC_INTERVAL_MS
+                delay(cadenceMs)
+            }
+        }
+        return job
+    }
+
+    /** Back to the real-time long-poll (screen on, or any reason sync restarts). */
+    private suspend fun enterActiveSync() {
+        screenOffJob?.cancel()
+        screenOffJob = null
+        slowSyncJob?.cancel()
+        slowSyncJob = null
+        if (syncMode == SyncMode.ACTIVE) return
+        syncMode = SyncMode.ACTIVE
+        if (!syncEnabled) return
+        val ctx = appContext ?: return
+        if (client != null) {
+            startSyncLoop(ctx)
+            android.util.Log.d(TAG, "sync mode: active (long-poll)")
+        }
+    }
+
+    /**
+     * Push-wake (2026-08-16, see PushChannel): an SSE push notification
+     * arrived, so a message is waiting. While idle (slow sync, screen off)
+     * run ONE syncOnce round — the notification watcher then posts the local
+     * notification and the room flows update. While active the long-poll
+     * already delivers it, so the push is redundant and skipped. The slow-sync
+     * rounds are the fallback delivery (a silent SSE drop must not mean missed
+     * messages) — push-gated to a 30-min net while the SSE is connected
+     * (2026-08-17, see startSlowSyncRounds).
+     */
+    suspend fun onPushDelivered() {
+        val c = client ?: return
+        if (syncMode != SyncMode.SLOW) return
+        slowSyncJob?.cancel()
+        slowSyncJob = null
+        runCatching { c.syncOnce(Presence.OFFLINE) }
+            .onFailure { android.util.Log.w(TAG, "push-wake sync failed: ${it.message}") }
+        // Restart the fallback rounds. If the screen came back on mid-wake,
+        // enterActiveSync owns sync (its long-poll already delivers); only
+        // restart when it is still dark.
+        val power = appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        if (syncEnabled && power?.isInteractive == false) {
+            slowSyncJob = startSlowSyncRounds(c)
         }
     }
 
@@ -373,7 +574,7 @@ object MatrixRepository {
         val c = client ?: return
         if (inProcessSyncRunning) return
         inProcessSyncRunning = true
-        runCatching { c.startSync() }
+        runCatching { c.startSync(Presence.OFFLINE) }
             .onFailure { android.util.Log.w(TAG, "in-process sync failed to start: ${it.message}") }
         android.util.Log.d(TAG, "in-process sync loop started for ${c.userId.full}")
         var delayMs = 3_000L
@@ -396,6 +597,9 @@ object MatrixRepository {
                 runCatching { old.stopSync() }
                 client = null
             }
+            // The old client's loop is stopped; a stale flag would silently
+            // kill the new session's sync (re-login after restore/expiry).
+            inProcessSyncRunning = false
             _connectionState.value = ChatConnectionState.Connecting
 
             // Accept a bare domain ("matrix.org") or a full URL; .well-known
@@ -428,7 +632,13 @@ object MatrixRepository {
                 .putString(KEY_LOGIN_MODE, "homeserver")
                 .apply()
         }
+        slowSyncJob?.cancel()
+        slowSyncJob = null
+        screenOffJob?.cancel()
+        screenOffJob = null
+        syncMode = SyncMode.ACTIVE
         startSyncLoop(ctx)
+        PushChannel.start(ctx, client!!)
         client!!
     }
 
@@ -481,6 +691,7 @@ object MatrixRepository {
                 runCatching { old.stopSync() }
                 client = null
             }
+            inProcessSyncRunning = false
             _connectionState.value = ChatConnectionState.Connecting
 
             val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -533,7 +744,13 @@ object MatrixRepository {
                 .remove(KEY_BEEPER_REQUEST_ID)
                 .apply()
         }
+        slowSyncJob?.cancel()
+        slowSyncJob = null
+        screenOffJob?.cancel()
+        screenOffJob = null
+        syncMode = SyncMode.ACTIVE
         startSyncLoop(ctx)
+        PushChannel.start(ctx, client!!)
         client!!
     }
 
@@ -788,8 +1005,25 @@ object MatrixRepository {
      * After the device is verified, load every undecrypted event's megolm session
      * from the server-side key backup so the room store can decrypt it. Called on
      * verification success; loading a session decrypts what the session covers.
+     *
+     * Battery/UX (2026-08-15): gated to at most once per day and bounded tighter
+     * per room. Before, it ran on EVERY process start (reboot/install/force-stop)
+     * and could crawl for 20+ min at several cores, starving the tool's requests
+     * ("Loading messages…" / "…" account). The on-demand page path
+     * (collectRelevantTimelineEvents → restoreRoomSessions) still restores when a
+     * room is actually read, so the daily crawl is only the preemptive pass.
      */
     private suspend fun restoreMegolmSessions() {
+        val ctx = appContext ?: return
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val lastRun = prefs.getLong(KEY_RESTORE_LAST_RUN_MS, 0L)
+        val now = System.currentTimeMillis()
+        if (now - lastRun < RESTORE_INTERVAL_MS) {
+            android.util.Log.d(TAG, "restore: skipped — last run ${(now - lastRun) / 60_000}m ago")
+            return
+        }
+        // Written on START: even a scan that dies mid-run won't re-run for a day.
+        prefs.edit().putLong(KEY_RESTORE_LAST_RUN_MS, now).apply()
         val c = client ?: return
         val keyBackup = runCatching {
             c.di.get<net.folivo.trixnity.client.key.KeyBackupService>(
@@ -815,8 +1049,8 @@ object MatrixRepository {
                 android.util.Log.d(TAG, "restore: $scanned/${rooms.size} rooms scanned, $roomsTouched with encrypted content")
             }
             val events = mutableListOf<TimelineEvent>()
-            val done = withTimeoutOrNull(MESSAGES_BUDGET_MS) {
-                c.room.getLastTimelineEvents(roomId) { maxSize = 100 }
+            val done = withTimeoutOrNull(RESTORE_ROOM_BUDGET_MS) {
+                c.room.getLastTimelineEvents(roomId) { maxSize = RESTORE_ROOM_EVENTS }
                     .filterNotNull().first()
                     .collect { eventFlow ->
                         eventFlow.filterNotNull().firstOrNull()?.let { events.add(it) }
@@ -841,6 +1075,11 @@ object MatrixRepository {
             manualLogout = true
             val old = client
             client = null
+            slowSyncJob?.cancel()
+            slowSyncJob = null
+            screenOffJob?.cancel()
+            screenOffJob = null
+            syncMode = SyncMode.ACTIVE
             inProcessSyncRunning = false
             observedClient = null
             resetVerification()
@@ -848,6 +1087,10 @@ object MatrixRepository {
             pendingNotifyRoomId = null
             stopAudioPlayback()
             resetRoomList()
+            // Drop the push subscription and remove the pusher from the account
+            // (best-effort — an unguessable ntfy topic is harmless if it fails).
+            PushChannel.stop()
+            old?.let { runCatching { PushChannel.unregister(ctx, it) } }
             ChatNotifier.clearAll(ctx)
             runCatching { old?.logout() } // API logout + clears Trixnity's store
             runCatching { old?.closeSuspending() }
@@ -863,6 +1106,7 @@ object MatrixRepository {
     }
 
     fun getClient(): MatrixClient? = client
+
 
     /**
      * Restores a session from the Room store, if one exists (idempotent).
@@ -968,6 +1212,26 @@ object MatrixRepository {
      */
     private val messagePageCache =
         java.util.concurrent.ConcurrentHashMap<String, MessagePageEntry>()
+
+    /** Rooms with a background page refresh currently in flight (battery
+     *  2026-08-15: the 2s ticker used to launch unbounded concurrent rebuilds). */
+    private val messagePageRefreshInFlight =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Room → its last event id at the previous refresh. An unchanged id means
+     *  nothing new arrived — the refresh skips the rebuild (one cheap read). */
+    private val lastRefreshedEventId = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Room → elapsed-realtime timestamp until which the futile key-backup
+     *  restore is suppressed (battery 2026-08-15: pre-verification history
+     *  never gets its sessions back, yet every page build retried it). */
+    private val decryptRestoreCooldown = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** True while the room's key-backup restore is in the futile cooldown. */
+    private fun inDecryptRestoreCooldown(matrixRoomId: RoomId): Boolean {
+        val until = decryptRestoreCooldown[matrixRoomId.full] ?: return false
+        return android.os.SystemClock.elapsedRealtime() < until
+    }
 
     /**
      * Display JPEGs served to the tool for image rows, keyed by
@@ -1113,15 +1377,32 @@ object MatrixRepository {
 
     /** Recomputes and re-stores a room's newest page in the background. */
     private fun refreshMessagePage(roomId: String, limit: Int = THREAD_PAGE_SIZE) {
+        // Battery (2026-08-15 audit): never pile up refreshes — a tick that
+        // finds one already in flight is a no-op (the 2s ticker used to launch
+        // unbounded concurrent rebuilds that saturated the CPU).
+        if (!messagePageRefreshInFlight.add(roomId)) return
         scope.launch {
-            runCatching {
-                val page = computeMessagesPage(roomId, null, limit)
-                messagePageCache[roomId] = MessagePageEntry(
-                    page,
-                    limit,
-                    android.os.SystemClock.elapsedRealtime(),
-                )
-                saveMessagePageToDisk(roomId, page)
+            try {
+                val c = client ?: return@launch
+                // Nothing new since the last refresh → keep the cached page; a
+                // quiet room costs one cheap last-event read per tick instead of
+                // a full chain walk + restore + re-reads.
+                val lastId = withTimeoutOrNull(ROOM_BUDGET_MS) {
+                    c.room.getById(RoomId(roomId)).firstOrNull()?.lastEventId?.full
+                } ?: return@launch
+                if (lastRefreshedEventId[roomId] == lastId) return@launch
+                runCatching {
+                    val page = computeMessagesPage(roomId, null, limit)
+                    messagePageCache[roomId] = MessagePageEntry(
+                        page,
+                        limit,
+                        android.os.SystemClock.elapsedRealtime(),
+                    )
+                    lastRefreshedEventId[roomId] = lastId
+                    saveMessagePageToDisk(roomId, page)
+                }
+            } finally {
+                messagePageRefreshInFlight.remove(roomId)
             }
         }
     }
@@ -1150,7 +1431,7 @@ object MatrixRepository {
                 cached.limit >= limit &&
                 android.os.SystemClock.elapsedRealtime() - cached.refreshedAtMs < MESSAGE_PAGE_TTL_MS
             ) {
-                return cached.page
+                return injectPendingEchoes(roomId, cached.page)
             }
             // Cold (TTL expired / fresh process): serve the persisted page at
             // once and recompute in the background — the next poll is fresh.
@@ -1161,7 +1442,7 @@ object MatrixRepository {
                     android.os.SystemClock.elapsedRealtime(),
                 )
                 refreshMessagePage(roomId, limit)
-                return disk
+                return injectPendingEchoes(roomId, disk)
             }
             return computeMessagesPage(roomId, null, limit, fast = true).also {
                 messagePageCache[roomId] = MessagePageEntry(
@@ -1173,6 +1454,53 @@ object MatrixRepository {
             }
         }
         return computeMessagesPage(roomId, beforeEventId, limit)
+    }
+
+    /**
+     * Appends the optimistic voice-note/text rows to a SERVED page (memory
+     * cache or disk). The send's sync echo can still be in the outbox when the
+     * page is read — and re-opening a thread served the stale cached page,
+     * so a just-sent message appeared missing until the background refresh
+     * landed (feedback 2026-08-15: "the voice note didn't appear, even after
+     * exiting and entering"). The rows dedup by their "local-…" id; the
+     * refresh's [computeMessagesPage] replaces them with the real echo.
+     */
+    private fun injectPendingEchoes(roomId: String, page: MessagesPage): MessagesPage {
+        val c = client ?: return page
+        if (pendingAudioEcho[roomId] == null && pendingTextEcho[roomId] == null) return page
+        val result = page.messages.toMutableList()
+        val existing = result.mapTo(HashSet()) { it.id }
+        fun addIfMissing(message: com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message) {
+            if (existing.add(message.id)) result += message
+        }
+        pendingAudioEcho[roomId]?.let { pending ->
+            addIfMissing(
+                com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+                    id = "local-${pending.txnId}",
+                    sender = c.userId.full,
+                    senderName = "",
+                    body = "Voice note",
+                    timestampMs = pending.timestampMs,
+                    isMine = true,
+                    contentType = "audio",
+                    durationMs = pending.durationMs,
+                ),
+            )
+        }
+        pendingTextEcho[roomId]?.let { pending ->
+            addIfMissing(
+                com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+                    id = "local-${pending.txnId}",
+                    sender = c.userId.full,
+                    senderName = "",
+                    body = pending.body,
+                    timestampMs = pending.timestampMs,
+                    isMine = true,
+                ),
+            )
+        }
+        return if (result.size == page.messages.size) page
+        else MessagesPage(result, page.hasMore, page.encrypted)
     }
 
     // --- Bridge re-import ("ghost") detection (Phase 14.5) ------------------
@@ -1267,39 +1595,155 @@ object MatrixRepository {
 
     /**
      * Raw timeline events for a message page, with bridge re-import copies
-     * dropped (content dedup + flood fallback). The newest page (null cursor)
-     * grows its raw window — doubling until it holds [limit] + 1 real events or
-     * the timeline ends — so a 7am bridge flood is walked past instead of
-     * becoming the thread's newest messages. Older pages (cursor set) are
-     * filtered in place; the ghost region sits at the top of the timeline, so
-     * pagination never reaches it.
+     * dropped (content dedup + flood fallback), plus whether older events
+     * exist beyond the page (the caller's hasMore).
+     *
+     * Reads the room's timeline chain straight from the Room store (raw SQL
+     * over the stored previous-event links) — the handler's API reads
+     * (getTimelineEvents/getTimelineEvent) serve its in-memory view, which
+     * after a cold start holds a partial, fluctuating subset of the room's
+     * history and stops at sync-chunk boundaries ("hasGapBefore", never
+     * backfilled): the newest page came back short, hasMore flipped false, and
+     * older messages never loaded. The store rows are the only consistent
+     * truth. Falls back to a single windowed API fetch if the query fails.
      */
     private suspend fun collectRelevantTimelineEvents(
         c: MatrixClient,
         matrixRoomId: RoomId,
-        beforeEventId: String?,
+        startEventId: String?,
         limit: Int,
         fast: Boolean = false,
-    ): List<TimelineEvent> {
-        if (beforeEventId != null) {
-            val events = collectTimelineEvents(c, matrixRoomId, beforeEventId, limit + 1)
-            return filterGhosts(c, events)
+    ): Pair<List<TimelineEvent>, Boolean> {
+        if (startEventId == null) return emptyList<TimelineEvent>() to false
+        val fromDb = readTimelineChainFromDb(c, matrixRoomId, startEventId, limit + 1)
+        var events: List<TimelineEvent>
+        var hasMore: Boolean
+        if (fromDb != null) {
+            events = fromDb.first
+            hasMore = fromDb.second
+        } else {
+            val fallback = collectTimelineEvents(c, matrixRoomId, startEventId, limit + 1)
+            events = fallback
+            hasMore = fallback.size >= limit + 1
         }
-        // [fast] bounds the newest-page walk for the first (user-visible) poll:
-        // show the newest real messages quickly; the background refresher walks
-        // to [GHOST_WALK_MAX] and refines the page within a few seconds.
-        val walkMax = if (fast) FIRST_POLL_GHOST_WALK_MAX else GHOST_WALK_MAX
-        var window = limit + 1
-        var raw = collectTimelineEvents(c, matrixRoomId, null, window)
-        while (
-            filterGhosts(c, raw).size < limit + 1 &&
-            raw.size >= window &&
-            window < walkMax
-        ) {
-            window = (window * 2).coerceAtMost(walkMax)
-            raw = collectTimelineEvents(c, matrixRoomId, null, window)
+        // E2EE: a stored event's content can still be undecrypted (its megolm
+        // session wasn't in the local store at sync time). Restore the
+        // sessions from the key backup, then re-read those events once through
+        // the API — the read decrypts and re-persists them.
+        val undecrypted = events.filter { it.content?.isFailure == true }
+        if (undecrypted.isNotEmpty()) {
+            // Battery (2026-08-15 audit): events that can't decrypt (e.g.
+            // pre-verification history — the bridge never re-shares those
+            // sessions) made every page build / 2s refresh repeat a doomed
+            // key-backup restore + per-event API re-read. When a restore finds
+            // nothing to load, back off for a cooldown — the normal sync path
+            // decrypts in-band the moment real sessions do arrive.
+            val roomKey = matrixRoomId.full
+            val cooldownUntil = decryptRestoreCooldown[roomKey]
+            if (cooldownUntil == null || android.os.SystemClock.elapsedRealtime() >= cooldownUntil) {
+                val loaded = restoreRoomSessions(c, matrixRoomId, undecrypted)
+                if (loaded == 0) {
+                    decryptRestoreCooldown[roomKey] =
+                        android.os.SystemClock.elapsedRealtime() + DECRYPT_RESTORE_COOLDOWN_MS
+                }
+                val config: GetTimelineEventConfig.() -> Unit = {
+                    fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                    decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                }
+                val resolved = HashMap<String, TimelineEvent>()
+                undecrypted.forEach { te ->
+                    withTimeoutOrNull(DECRYPT_WAIT_MS) {
+                        c.room.getTimelineEvent(matrixRoomId, te.event.id, config).firstOrNull()
+                            ?.takeIf { it.content?.getOrNull() != null }
+                    }?.let { resolved[te.event.id.full] = it }
+                }
+                if (resolved.isNotEmpty()) {
+                    events = events.map { resolved[it.event.id.full] ?: it }
+                }
+            }
         }
-        return filterGhosts(c, raw)
+        // Bridge re-import dedup (battery 2026-08-15 audit): the old
+        // filterGhosts heuristic (per-page signature + a 30-per-minute txn-id
+        // flood rule) was assumption-based and could drop real messages; the
+        // account's duplicates are exact re-imports, so keep the first
+        // occurrence of each content signature in the walked chain and drop
+        // the copies. Undecrypted events (no readable content) pass through.
+        // Ceiling: bounded by the walked window — a burst longer than the page
+        // still spills one copy per page (ingest-time dedup is the endgame).
+        return dedupeChain(c, events) to hasMore
+    }
+
+    /** First occurrence of each content signature in [raw] (chain order,
+     *  newest first). Events without readable content fall back to their
+     *  event id, so they pass through untouched. */
+    private fun dedupeChain(c: MatrixClient, raw: List<TimelineEvent>): List<TimelineEvent> {
+        val seen = HashSet<String>()
+        val out = ArrayList<TimelineEvent>(raw.size)
+        for (te in raw) {
+            if (seen.add(contentSignature(c, te) ?: te.event.id.full)) out += te
+        }
+        return out
+    }
+
+    /**
+     * The room's timeline chain (newest-first, [startEventId] inclusive)
+     * straight from the store via a recursive SQL walk over the stored
+     * previous-event links. Returns (events, hasMore) where hasMore says the
+     * deepest event has a further previous link; null when the store query
+     * isn't available (the caller falls back to the API). Bounded by
+     * [maxEvents].
+     */
+    private suspend fun readTimelineChainFromDb(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        startEventId: String,
+        maxEvents: Int,
+    ): Pair<List<TimelineEvent>, Boolean>? {
+        val db = runCatching {
+            c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class)
+        }.onFailure { e ->
+            android.util.Log.w(TAG, "readTimelineChainFromDb: TrixnityRoomDatabase not in DI — falling back to the API walk", e)
+        }.getOrNull() ?: return null
+        val json = runCatching { c.di.get<Json>() }.getOrNull() ?: return null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val sql = """
+                    WITH RECURSIVE chain(prev, value, n) AS (
+                        SELECT json_extract(value, '$.previousEventId'), value, 1
+                        FROM TimelineEvent WHERE roomId = ? AND eventId = ?
+                        UNION ALL
+                        SELECT json_extract(t.value, '$.previousEventId'), t.value, c.n + 1
+                        FROM TimelineEvent t JOIN chain c ON t.eventId = c.prev
+                        WHERE c.n < ?
+                    )
+                    SELECT value FROM chain ORDER BY n
+                """.trimIndent()
+                val events = ArrayList<TimelineEvent>()
+                var hasMore = false
+                db.openHelper.writableDatabase.query(
+                    sql,
+                    // maxEvents must bind as a number — a string makes SQLite's
+                    // `n < '21'` (INTEGER vs TEXT) compare true for every row.
+                    arrayOf<Any>(matrixRoomId.full, startEventId, maxEvents),
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val value = cursor.getString(0) ?: continue
+                        // The DI Json carries the store's serializers module,
+                        // which registers TimelineEvent's serializer — the
+                        // reified decode resolves it.
+                        events += json.decodeFromString<TimelineEvent>(value)
+                    }
+                }
+                if (events.isNotEmpty()) {
+                    // The deepest event's stored prev link decides hasMore.
+                    hasMore = events.last().previousEventId != null
+                }
+                android.util.Log.d(TAG, "readTimelineChainFromDb: $matrixRoomId from=$startEventId → ${events.size} events hasMore=$hasMore")
+                events to hasMore
+            }.onFailure { e ->
+                android.util.Log.w(TAG, "readTimelineChainFromDb: store query failed — falling back to the API walk", e)
+            }.getOrNull()
+        }
     }
 
     /**
@@ -1327,42 +1771,69 @@ object MatrixRepository {
             return MessagesPage(emptyList(), false, encrypted = true)
         }
 
-        // Lazy per-room decrypt, but seeded BEFORE the newest-page walk: the
-        // walk re-reads in growing windows and each read used to wait ~3 s for
-        // a decrypt that couldn't land until the megolm sessions were in the
-        // store (5-7 windows × 3 s ≈ the whole first load). One small seed read
-        // + session restore makes every walk read decrypt instantly.
-        val seed = collectTimelineEvents(c, matrixRoomId, beforeEventId, limit + 1)
-        val sessionsLoaded = restoreRoomSessions(c, matrixRoomId, seed)
-
-        // If no megolm session could be loaded (e.g. an unverified device with
-        // no key-backup access), the events stay encrypted no matter how often
-        // we re-read — return the ghost-filtered seed ("[Encrypted]" rows beat
-        // a 20 s dead walk).
-        var events = if (sessionsLoaded > 0) {
-            collectRelevantTimelineEvents(c, matrixRoomId, beforeEventId, limit, fast)
+        // The newest page (null cursor) pages BACKWARDS from the room's newest
+        // event instead of using getLastTimelineEvents' newest-page stream:
+        // that stream serves the handler's in-memory/cache view, which after a
+        // cold start holds a partial and fluctuating subset of the room's real
+        // history (observed: a 64-event room returned 9-17 events, hasMore
+        // flipped false, and pagination died — "older messages don't load").
+        // The Room store's lastEventId is the authoritative newest event, and
+        // [collectRelevantTimelineEvents] walks BACKWARDS from it, chaining
+        // across sync-chunk boundaries via the stored previous-event links.
+        // [keepCursor] keeps that event as the page's newest row; older pages
+        // drop their boundary cursor instead.
+        val keepCursor = beforeEventId == null
+        val pageCursor = if (keepCursor) {
+            withTimeoutOrNull(ROOM_BUDGET_MS) {
+                c.room.getById(matrixRoomId).firstOrNull()?.lastEventId?.full
+            }
         } else {
-            filterGhosts(c, seed)
+            beforeEventId
         }
-        repeat(DECRYPT_RETRIES) {
-            if (sessionsLoaded == 0) return@repeat
-            val stillEncrypted = events.any { it.content?.isFailure == true }
-            if (!stillEncrypted) return@repeat
-            kotlinx.coroutines.delay(DECRYPT_RETRY_DELAY_MS)
-            events = collectRelevantTimelineEvents(c, matrixRoomId, beforeEventId, limit, fast)
+        if (keepCursor && pageCursor == null) {
+            // No events in the room at all (the getById read is a cache hit —
+            // only an empty room misses).
+            return MessagesPage(emptyList(), false)
         }
 
-        // A full page (limit + 1, including the cursor event for older pages)
-        // means older messages exist beyond this one. Ghosts don't count — the
-        // newest-page walk guarantees this size when real history exists.
-        val hasMore = events.size >= limit + 1
+        // Lazy per-room decrypt, but seeded BEFORE the walk: the seed read
+        // triggers decryption of the page's events and restores the megolm
+        // sessions that are missing (a decrypt that can't land until the
+        // sessions are in the store made the first open slow). Skipped inside
+        // the futile-restore cooldown (battery 2026-08-15 audit).
+        val seed = collectTimelineEvents(c, matrixRoomId, pageCursor, limit + 1)
+        if (!inDecryptRestoreCooldown(matrixRoomId)) {
+            restoreRoomSessions(c, matrixRoomId, seed)
+        }
+
+        // The page comes from [collectRelevantTimelineEvents] — a straight
+        // store read (raw SQL over the previous-event links, per-event API
+        // re-reads for anything still undecrypted), so the page size and
+        // hasMore no longer depend on the handler's in-memory view.
+        var events: List<TimelineEvent>
+        var hasMore = false
+        val (e, h) = collectRelevantTimelineEvents(c, matrixRoomId, pageCursor, limit, fast)
+        events = e
+        hasMore = h
+        // The retries exist to catch a decrypt that lands a beat late. Inside
+        // the restore cooldown they can't succeed — skip them (battery audit).
+        if (!inDecryptRestoreCooldown(matrixRoomId)) {
+            repeat(DECRYPT_RETRIES) {
+                val stillEncrypted = events.any { it.content?.isFailure == true }
+                if (!stillEncrypted) return@repeat
+                kotlinx.coroutines.delay(DECRYPT_RETRY_DELAY_MS)
+                val (e2, h2) = collectRelevantTimelineEvents(c, matrixRoomId, pageCursor, limit, fast)
+                events = e2
+                hasMore = h2
+            }
+        }
         android.util.Log.d(
             TAG,
             "getMessages: room=$matrixRoomId before=$beforeEventId limit=$limit page=${events.size} hasMore=$hasMore",
         )
 
         val result = mutableListOf<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>()
-        val startIndex = if (beforeEventId == null) 0 else 1 // drop the cursor event
+        val startIndex = if (keepCursor) 0 else 1 // drop the boundary cursor on older pages
         // Delivery status only matters for the newest page (what the user just
         // sent): the status events sit right after the message in the timeline.
         // Older pages don't get the marker (Phase 10, minimal scope).
@@ -1711,11 +2182,11 @@ object MatrixRepository {
         // 2026-08-14). The echo row survives leaving the thread; the sync
         // echo (matched by txn id) replaces it in [computeMessagesPage].
         pendingTextEcho[matrixRoomId.full] = PendingTextSend(txnId, System.currentTimeMillis(), body)
-        // The cached newest page is stale now; the active-room refresher (or
-        // the tool's next poll) recomputes it once the echo lands. The disk
-        // page is dropped too, so a cold re-open can't serve a pre-send page.
-        messagePageCache.remove(matrixRoomId.full)
-        messagePageCacheFile(matrixRoomId.full)?.delete()
+        // Keep the cached/disk newest page — re-opening the thread serves it
+        // instantly with the optimistic row injected ([injectPendingEchoes]),
+        // and the active-room refresher (or the next poll) recomputes the page
+        // once the sync echo lands (feedback 2026-08-15: re-open showed
+        // "Loading messages…" because the send had dropped the cache).
         roomListDirty = true // the room's preview/unread change once the echo lands
         android.util.Log.d(TAG, "SendMessage: room=$roomId txn=$txnId body=$body")
         return com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response(
@@ -1805,9 +2276,19 @@ object MatrixRepository {
         val matrixRoomId = RoomId(roomId)
         val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
             var event: TimelineEvent? = null
+            var restored = false
             repeat(MEDIA_CONTENT_RETRIES) {
                 event = c.room.getTimelineEvent(matrixRoomId, EventId(eventId)).firstOrNull()
                 if (event?.content?.getOrNull() != null) return@withTimeoutOrNull event
+                // An older note's megolm session is often not in the local
+                // store (sessions load lazily per room, mostly via getMessages)
+                // — the content stays encrypted and the note silently "doesn't
+                // play" (feedback 2026-08-14). Pull the session from the key
+                // backup once, then re-read so decryption can land.
+                if (event?.content?.isFailure == true && !restored) {
+                    restored = true
+                    restoreRoomSessions(c, matrixRoomId, listOf(event))
+                }
                 delay(MEDIA_CONTENT_RETRY_DELAY_MS)
             }
             event
@@ -1916,7 +2397,8 @@ object MatrixRepository {
      * Records the room a voice-note send should land in and returns the
      * flattened component name of the companion's recording activity, which
      * the tool launches via `SimpleLightScreen.startServerActivity` (same
-     * pattern as [startPhotoSend]). The activity records an m4a and sends it.
+     * pattern as [startPhotoSend]). The activity records an ogg/Opus note and
+     * sends it.
      */
     fun startVoiceNoteSend(roomId: String): String {
         VoiceNoteActivity.register(roomId)
@@ -1924,7 +2406,7 @@ object MatrixRepository {
     }
 
     /**
-     * Uploads and sends a recorded voice note (an m4a file) to the room —
+     * Uploads and sends a recorded voice note (an ogg/Opus file) to the room —
      * encrypted media when the room is end-to-end encrypted (WhatsApp/Beeper),
      * plain otherwise. The content is hand-built as an
      * [RoomMessageEventContent.Unknown] (whose raw JSON is sent verbatim) so
@@ -1933,6 +2415,10 @@ object MatrixRepository {
      * present, otherwise WhatsApp shows a plain audio file (feedback
      * 2026-08-14). Trixnity's typed audio DSL has no extension slot, so the
      * upload is done here (same encrypted/plain split the DSL performs).
+     * `audio/ogg; codecs=opus` is the MSC3245 canonical voice-message
+     * mimetype — every Matrix client and the mautrix bridges treat it as a
+     * voice message, and it is ~2-3× smaller than the old AAC/m4a notes
+     * (2026-08-15 switch).
      * @return true when the send was enqueued.
      */
     suspend fun sendVoiceNote(roomId: String, file: java.io.File): Boolean {
@@ -1956,7 +2442,7 @@ object MatrixRepository {
             ms
         }.getOrNull()
         val mediaService = c.di.get<MediaService>(MediaService::class)
-        val mimeType = "audio/mp4"
+        val mimeType = "audio/ogg; codecs=opus"
         val isEncryptedRoom = withTimeoutOrNull(ROOM_BUDGET_MS) {
             c.room.getById(matrixRoomId).first()?.encrypted
         } == true
@@ -1966,7 +2452,7 @@ object MatrixRepository {
             buildJsonObject {
                 put("msgtype", "m.audio")
                 put("body", "")
-                put("filename", "voice.m4a")
+                put("filename", "voice.ogg")
                 putJsonObject("info") {
                     put("mimetype", mimeType)
                     put("size", bytes.size)
@@ -1983,7 +2469,7 @@ object MatrixRepository {
             buildJsonObject {
                 put("msgtype", "m.audio")
                 put("body", "")
-                put("filename", "voice.m4a")
+                put("filename", "voice.ogg")
                 putJsonObject("info") {
                     put("mimetype", mimeType)
                     put("size", bytes.size)
@@ -2007,10 +2493,12 @@ object MatrixRepository {
             }
         }.getOrNull() ?: return false
         android.util.Log.d(TAG, "SendVoiceNote: room=$roomId txn=$txnId bytes=${bytes.size} duration=${durationMs}ms voice=m.audio+msc3245")
-        // Invalidate the page caches so the thread doesn't serve the pre-send
-        // page, and show an optimistic "Voice note" row until the sync echo lands.
-        messagePageCache.remove(matrixRoomId.full)
-        messagePageCacheFile(matrixRoomId.full)?.delete()
+        // Keep the cached/disk newest page — re-opening serves it instantly
+        // with the optimistic "Voice note" row injected ([injectPendingEchoes])
+        // until the sync echo lands (the refresher then replaces it with the
+        // real event). The send previously dropped the cache, so a re-open
+        // recomputed from scratch (slow — "Loading messages…") and could show
+        // the note as missing (feedback 2026-08-15).
         pendingAudioEcho[matrixRoomId.full] = PendingAudioSend(txnId, System.currentTimeMillis(), durationMs)
         return true
     }
@@ -2133,7 +2621,21 @@ object MatrixRepository {
         )
         // Opening the thread makes the room's notification moot.
         appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
-        roomListDirty = true // the room's unread count changed
+        // Optimistically clear the room's unread in the served list — the
+        // store's unreadMessageCount only drops after the read-marker echo
+        // round-trips through sync (a full tick on a big account), which used
+        // to leave the badge up long after the thread was opened. The
+        // resolver keeps serving 0 until the echo confirms or a newer event
+        // arrives ([servedUnread]).
+        pendingReadClear[roomId] = eventId
+        roomListCache[roomId]?.let { entry ->
+            if (entry.room.unreadCount > 0) {
+                val cleared = entry.copy(room = entry.room.copy(unreadCount = 0))
+                roomListCache[roomId] = cleared
+                _roomList.value = _roomList.value.map { if (it.id == roomId) cleared.room else it }
+            }
+        }
+        roomListDirty = true
     }
 
     suspend fun setTyping(roomId: String, active: Boolean) {
@@ -2158,22 +2660,40 @@ object MatrixRepository {
         activeRoomId = roomId
         // While a thread is open, keep its cached newest page fresh in the
         // background — sync echoes and Beeper send-status events then reach the
-        // tool's next poll without it blocking on a compute.
-        activeRoomRefreshJob?.cancel()
-        activeRoomRefreshJob = if (roomId != null) {
-            scope.launch {
-                while (true) {
-                    delay(ACTIVE_ROOM_REFRESH_MS)
-                    if (activeRoomId != roomId) break
-                    refreshMessagePage(roomId)
-                }
-            }
-        } else {
-            null
-        }
+        // tool's next poll without it blocking on a compute. Stops on thread
+        // close, navigation, SCREEN_OFF and sync-pause (battery 2026-08-15).
+        stopActiveRoomRefresh()
+        if (roomId != null) startActiveRoomRefresh()
         val ctx = appContext ?: return
         if (roomId != null) ChatNotifier.cancelRoom(ctx, roomId)
     }
+
+    /** The active-room page refresh: rebuild the room's newest page cache every
+     *  [ACTIVE_ROOM_REFRESH_MS] while the screen is on and a thread is open.
+     *  [refreshMessagePage] itself skips rooms that haven't changed and never
+     *  piles up, so a quiet room costs one cheap last-event read per tick. */
+    private fun startActiveRoomRefresh() {
+        val roomId = activeRoomId ?: return
+        stopActiveRoomRefresh()
+        activeRoomRefreshJob = scope.launch {
+            while (true) {
+                delay(ACTIVE_ROOM_REFRESH_MS)
+                if (activeRoomId != roomId) break
+                refreshMessagePage(roomId)
+            }
+        }
+    }
+
+    private fun stopActiveRoomRefresh() {
+        activeRoomRefreshJob?.cancel()
+        activeRoomRefreshJob = null
+    }
+
+    /** Screen truth for the speculative-work gates (battery 2026-08-15: eager
+     *  page pre-computes and resolver passes are wasted while the screen is
+     *  dark — nobody reads them until the next wake). */
+    private fun isScreenInteractive(): Boolean =
+        (appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive == true
 
     /**
      * One-shot read of the room a posted notification belongs to (set by
@@ -2379,6 +2899,12 @@ object MatrixRepository {
     /** Last-seen room signatures, maintained by [observeNotifications] — a
      *  difference sets [roomListDirty] (the resolver's skip gate, audit 2026-08-14). */
     private val roomSigSeen = java.util.concurrent.ConcurrentHashMap<String, RoomSig>()
+    /** Room ids the user has opened (MarkRead fired) → the event id marked
+     *  read. The store's unreadMessageCount only drops after the read-marker
+     *  echo round-trips through sync (a full tick on a big account), so the
+     *  served list shows 0 until the echo confirms or a newer event arrives
+     *  (feedback 2026-08-15: the badge lingered after viewing). */
+    private val pendingReadClear = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val _roomList = MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>(emptyList())
 
     @Volatile
@@ -2400,9 +2926,24 @@ object MatrixRepository {
         val membership: String?,
     )
 
+    /** Unread count to show in the list. While a MarkRead is pending (the
+     *  store hasn't echoed it yet — see [pendingReadClear]) the count reads 0;
+     *  the suppression lifts when the echo confirms (store unread 0) or a
+     *  newer event than the one marked read arrives (real unread again). */
+    private fun servedUnread(roomId: String, markedAt: String?, newestId: String?, storeUnread: Long): Long {
+        if (markedAt == null) return storeUnread
+        return if (storeUnread == 0L || (newestId != null && newestId != markedAt)) {
+            pendingReadClear.remove(roomId)
+            storeUnread
+        } else {
+            0
+        }
+    }
+
     private fun resetRoomList() {
         roomListCache.clear()
         roomSigSeen.clear()
+        pendingReadClear.clear()
         effectiveLastCache.clear()
         ghostResolveInFlight.clear()
         _roomList.value = emptyList()
@@ -2509,31 +3050,46 @@ object MatrixRepository {
                     // newest pages are computed in the background so opening a
                     // thread is a cache hit instead of a cold walk. A few per
                     // pass; rooms with a fresh page (memory or disk) are skipped.
-                    var precomputed = 0
-                    for ((roomId, _) in loaded) {
-                        if (precomputed >= EAGER_PAGES_PER_PASS) break
-                        if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
-                        val key = roomId.full
-                        val now = android.os.SystemClock.elapsedRealtime()
-                        val cached = messagePageCache[key]
-                        if (cached != null && now - cached.refreshedAtMs < MESSAGE_PAGE_TTL_MS) continue
-                        if (loadMessagePageFromDisk(key) != null) continue
-                        val page = runCatching {
-                            computeMessagesPage(key, null, THREAD_PAGE_SIZE, fast = true)
-                        }.getOrNull()
-                        if (page != null) {
-                            messagePageCache[key] = MessagePageEntry(
-                                page, THREAD_PAGE_SIZE, android.os.SystemClock.elapsedRealtime(),
-                            )
-                            saveMessagePageToDisk(key, page)
-                            precomputed++
+                    // Battery (2026-08-15): screen-gated — the slow-sync rounds
+                    // kept the list dirty on the live account, so the resolver
+                    // was rebuilding the hottest room's page on every pass,
+                    // 24/7, screen off or not (the second speculative-work loop
+                    // after the active-room refresh). Nobody opens a thread
+                    // while the screen is dark; the refresh re-arms on wake.
+                    if (isScreenInteractive()) {
+                        var precomputed = 0
+                        for ((roomId, _) in loaded) {
+                            if (precomputed >= EAGER_PAGES_PER_PASS) break
+                            if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
+                            val key = roomId.full
+                            val now = android.os.SystemClock.elapsedRealtime()
+                            val cached = messagePageCache[key]
+                            if (cached != null && now - cached.refreshedAtMs < MESSAGE_PAGE_TTL_MS) continue
+                            if (loadMessagePageFromDisk(key) != null) continue
+                            val page = runCatching {
+                                computeMessagesPage(key, null, THREAD_PAGE_SIZE, fast = true)
+                            }.getOrNull()
+                            if (page != null) {
+                                messagePageCache[key] = MessagePageEntry(
+                                    page, THREAD_PAGE_SIZE, android.os.SystemClock.elapsedRealtime(),
+                                )
+                                saveMessagePageToDisk(key, page)
+                                precomputed++
+                            }
                         }
                     }
                     publishRoomList()
                 } catch (e: Exception) {
                     android.util.Log.w(TAG, "room list resolver pass failed: ${e.message}")
                 }
-                kotlinx.coroutines.delay(ROOM_LIST_REFRESH_DELAY_MS)
+                // Battery (2026-08-15): while the screen is off, coalesce the
+                // resolver's dirty-loop — the room list only needs to be fresh
+                // for the next wake, not sub-minute (the slow-sync rounds kept
+                // it dirty on the live account, so the old 2s breather meant
+                // near-continuous passes).
+                kotlinx.coroutines.delay(
+                    if (isScreenInteractive()) ROOM_LIST_REFRESH_DELAY_MS else SLOW_RESOLVER_DELAY_MS
+                )
             }
         }
     }
@@ -2556,7 +3112,12 @@ object MatrixRepository {
                     lastMessage = "",
                     // An unverified device can't decrypt — suppress unread for
                     // encrypted rooms only; unencrypted ones stay readable.
-                    unreadCount = if (verified || !room.encrypted) room.unreadMessageCount else 0,
+                    unreadCount = servedUnread(
+                        key,
+                        pendingReadClear[key],
+                        room.lastRelevantEventId?.full,
+                        if (verified || !room.encrypted) room.unreadMessageCount else 0,
+                    ),
                     lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
                     lastEventId = room.lastRelevantEventId?.full,
                     isDirect = room.isDirect,
@@ -2603,7 +3164,8 @@ object MatrixRepository {
         val (lastEventId, ts) = effectiveLastEvent(c, roomId, serverLastId, serverTs)
         // An unverified device can't decrypt — suppress unread for encrypted
         // rooms only; unencrypted ones stay readable.
-        val unread = if (verified || !room.encrypted) room.unreadMessageCount else 0
+        val storeUnread = if (verified || !room.encrypted) room.unreadMessageCount else 0
+        val unread = servedUnread(key, pendingReadClear[key], room.lastRelevantEventId?.full, storeUnread)
         val stateChanged = prev == null ||
             prev.room.lastEventId != lastEventId ||
             prev.room.unreadCount != unread ||
@@ -3055,6 +3617,10 @@ object MatrixRepository {
                     SyncState.STARTED, SyncState.RUNNING -> ChatConnectionState.Syncing
                     SyncState.ERROR, SyncState.TIMEOUT -> ChatConnectionState.Offline("sync $state")
                     SyncState.STOPPED -> when {
+                        // Slow sync (screen off) stops the long-poll between
+                        // periodic syncOnce rounds — that's still "syncing",
+                        // not an outage.
+                        isSlowSyncing -> ChatConnectionState.Syncing
                         // The sync toggle is the source of truth while paused —
                         // the restored client reports STOPPED until resumed, and
                         // that must read as "paused", not "stopped" (or, worse,
@@ -3091,6 +3657,7 @@ object MatrixRepository {
                 }
                 if (!sawLoggedIn || manualLogout || sessionExpired) return@collect
                 sessionExpired = true
+                PushChannel.stop()
                 android.util.Log.w(TAG, "session no longer logged in ($state) — treating as expired")
                 _connectionState.value = ChatConnectionState.Offline("session expired — sign in again")
                 scheduleSyncStop()
@@ -3217,16 +3784,32 @@ object MatrixRepository {
     private const val ROOMS_BUDGET_MS = 15_000L
     private const val ROOM_BUDGET_MS = 3_000L
     private const val MESSAGES_BUDGET_MS = 15_000L
+    /** Restore-scan cadence: at most one full crawl per day (battery/UX
+     *  2026-08-15 — it used to run on every process start and starve the app
+     *  for 20+ min on the bridged account; the on-demand page path still
+     *  restores when a room is actually read). */
+    private const val RESTORE_INTERVAL_MS = 86_400_000L
+    /** Per-room budget + window for the restore scan (the shared
+     *  [MESSAGES_BUDGET_MS] / 100-event window is fine for reads, wasteful for
+     *  the preemptive crawl). */
+    private const val RESTORE_ROOM_BUDGET_MS = 6_000L
+    private const val RESTORE_ROOM_EVENTS = 40L
     private const val FETCH_TIMEOUT_SECONDS = 5L
     /** The thread's page size (matches the tool's PAGE_SIZE). */
     private const val THREAD_PAGE_SIZE = 20
     /** Serve a cached newest page within this window (feedback pass). */
     private const val MESSAGE_PAGE_TTL_MS = 5_000L
-    /** Recompute the active room's cached newest page at this cadence. */
-    private const val ACTIVE_ROOM_REFRESH_MS = 2_000L
+    /** Recompute the active room's cached newest page at this cadence. The
+     *  tool's own poll (3s) hits the cache, so 30s is invisible — and the
+     *  refresh skips unchanged rooms entirely (battery audit 2026-08-15: was
+     *  2s, running 24/7 with no screen coupling — the drain's engine). */
+    private const val ACTIVE_ROOM_REFRESH_MS = 30_000L
     private const val TYPING_TIMEOUT_MS = 30_000L
     private const val DECRYPT_RETRIES = 3
     private const val DECRYPT_RETRY_DELAY_MS = 1_500L
+    /** How long to stop retrying a room's key-backup restore after it found
+     *  nothing to load (battery 2026-08-15 audit). */
+    private const val DECRYPT_RESTORE_COOLDOWN_MS = 600_000L
     private const val DECRYPT_WAIT_MS = 3_000L
     /** Peek budget for events after the first one failed to decrypt. */
     private const val QUICK_DECRYPT_WAIT_MS = 100L
@@ -3237,6 +3820,11 @@ object MatrixRepository {
     private const val ROOM_LIST_PASS_BUDGET_MS = 12_000L
     /** Breather between passes; a settled pass itself takes milliseconds. */
     private const val ROOM_LIST_REFRESH_DELAY_MS = 2_000L
+    /** Resolver breather while the screen is off (battery 2026-08-15): the
+     *  live bridged account keeps the list dirty, so the 2s breather meant
+     *  near-continuous passes overnight; the list only needs freshness for
+     *  the next wake. */
+    private const val SLOW_RESOLVER_DELAY_MS = 60_000L
     /** A "[Encrypted]" preview is retried no sooner than this. */
     private const val ROOM_LIST_ENCRYPTED_RETRY_MS = 60_000L
     /** Bounded decrypt-wait per room preview. */

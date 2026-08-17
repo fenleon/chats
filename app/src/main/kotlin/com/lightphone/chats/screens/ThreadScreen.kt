@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -20,6 +21,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -59,6 +61,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.time.LocalDate
+import kotlin.math.roundToInt
 
 /** Newest image messages whose bytes start downloading on page arrival. */
 private const val MEDIA_PREFETCH_COUNT = 4
@@ -320,6 +323,9 @@ class ThreadViewModel(
     /** Prepends the page of messages older than the oldest one currently shown. */
     fun loadOlder() {
         val oldest = messages.value.firstOrNull() ?: return
+        // An optimistic "local-…" row is not a real event — paging from it
+        // returns nothing and would dead-end pagination (feedback 2026-08-15).
+        if (oldest.id.startsWith(LOCAL_ROW_PREFIX)) return
         if (loadingMore.value || !hasMore.value) return
         viewModelScope.launch {
             loadingMore.value = true
@@ -351,6 +357,9 @@ class ThreadViewModel(
 
 /** Load the next older page when the topmost visible message is within this many of the end. */
 private const val OLDER_LOAD_THRESHOLD = 3
+
+/** Optimistic rows (not yet echoed by sync) carry this id prefix. */
+private const val LOCAL_ROW_PREFIX = "local-"
 
 class ThreadScreen(
     sealedActivity: SealedLightActivity,
@@ -419,22 +428,23 @@ class ThreadScreen(
         // Read status only makes sense in a 1:1 — groups get no tag at all.
         val latestMessageId = remember(messages) { messages.lastOrNull()?.id }
 
-        // Infinite scroll: the list is newest-at-the-bottom (reverseLayout), so
-        // reaching the top (the highest indices, i.e. older messages) loads the
-        // next page automatically — no "Earlier messages" tap. New items are
-        // appended above the viewport, so the reading position stays put.
+        // Infinite scroll, polled rather than snapshotFlow-driven: in this
+        // Compose version reads of LazyListState.layoutInfo don't invalidate
+        // snapshotFlow/derivedStateOf on every scroll (verified 2026-08-15), so
+        // a snapshotFlow trigger never fired — the list sat at its top with
+        // older messages one page away and "older messages don't load". The
+        // poll reads the real layout info each tick; the loadOlder condition
+        // is index-exact (the topmost visible index vs the total), so rows
+        // prepended above the viewport don't re-trigger it.
         LaunchedEffect(listState) {
-            snapshotFlow {
+            while (true) {
                 val info = listState.layoutInfo
-                // reverseLayout: the topmost visible item carries the highest
-                // index. The max visible index is the topmost regardless of
-                // how visibleItemsInfo orders its entries.
-                info.visibleItemsInfo.maxOfOrNull { it.index } ?: -1
-            }.distinctUntilChanged().collect { topIndex ->
-                val total = listState.layoutInfo.totalItemsCount
+                val topIndex = info.visibleItemsInfo.maxOfOrNull { it.index } ?: -1
+                val total = info.totalItemsCount
                 if (total > 0 && topIndex >= total - OLDER_LOAD_THRESHOLD) {
                     viewModel.loadOlder()
                 }
+                delay(if (listState.isScrollInProgress) 50L else 300L)
             }
         }
 
@@ -466,38 +476,86 @@ class ThreadScreen(
                             // (Phase 9); display order is newest-first because
                             // reverseLayout puts index 0 at the bottom.
                             val rows = remember(messages) { buildThreadRows(messages) }
-                            LazyColumn(
-                                state = listState,
-                                reverseLayout = true,
-                                modifier = Modifier.fillMaxSize(),
-                            ) {
-                                items(rows, key = { it.key }) { row ->
-                                    when (row) {
-                                        is ThreadRow.Message -> MessageRow(
-                                            row.message,
-                                            // In a 1:1 the other person's name is
-                                            // redundant — the thread is the
-                                            // conversation with them. In groups,
-                                            // the name shows at the start of each
-                                            // sender's group (same rows that carry
-                                            // the timestamp).
-                                            showSender = !room.isDirect && row.showTime,
-                                            showTime = row.showTime,
-                                            showReadStatus = showReadStatus,
-                                            showDeliveryTag = row.message.id == latestMessageId && room.isDirect,
-                                            mediaBytes = mediaBytes,
-                                            allowMobile = downloadOverMobile,
-                                            playing = row.message.id == playingEventId,
-                                            playingPositionMs = playingPositionMs,
-                                            playingPositionAtMs = playingPositionAtMs,
-                                            onEnsureMedia = viewModel::ensureMedia,
-                                            onPlayVoiceNote = viewModel::playVoiceNote,
-                                            onOpenImage = { bytes ->
-                                                navigateTo(screenFactory = { FullscreenImageScreen(it, bytes) })
-                                            },
-                                        )
-                                        is ThreadRow.DayDivider -> DayDivider(row.label)
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                LazyColumn(
+                                    state = listState,
+                                    reverseLayout = true,
+                                    modifier = Modifier.fillMaxSize(),
+                                ) {
+                                    items(rows, key = { it.key }) { row ->
+                                        when (row) {
+                                            is ThreadRow.Message -> MessageRow(
+                                                row.message,
+                                                // In a 1:1 the other person's name is
+                                                // redundant — the thread is the
+                                                // conversation with them. In groups,
+                                                // the name shows at the start of each
+                                                // sender's group (same rows that carry
+                                                // the timestamp).
+                                                showSender = !room.isDirect && row.showTime,
+                                                showTime = row.showTime,
+                                                showReadStatus = showReadStatus,
+                                                showDeliveryTag = row.message.id == latestMessageId && room.isDirect,
+                                                mediaBytes = mediaBytes,
+                                                allowMobile = downloadOverMobile,
+                                                playing = row.message.id == playingEventId,
+                                                playingPositionMs = playingPositionMs,
+                                                playingPositionAtMs = playingPositionAtMs,
+                                                onEnsureMedia = viewModel::ensureMedia,
+                                                onPlayVoiceNote = viewModel::playVoiceNote,
+                                                onOpenImage = { bytes ->
+                                                    navigateTo(screenFactory = { FullscreenImageScreen(it, bytes) })
+                                                },
+                                            )
+                                            is ThreadRow.DayDivider -> DayDivider(row.label)
+                                        }
                                     }
+                                }
+                                // Thread rows vary in height, so the SDK's
+                                // uniform-height LightLazyScrollView can't drive the
+                                // thumb — ThreadScrollBar estimates from the real
+                                // lazy layout (same rail + thumb look as the SDK
+                                // bar). Polled rather than snapshot-driven: reads of
+                                // LazyListState.layoutInfo don't invalidate on every
+                                // scroll in this Compose version (verified on-device),
+                                // so derivedStateOf/snapshotFlow go stale.
+                                var scrollMetrics by remember {
+                                    mutableStateOf(listState.threadListMetrics())
+                                }
+                                LaunchedEffect(listState) {
+                                    while (true) {
+                                        scrollMetrics = listState.threadListMetrics()
+                                        delay(
+                                            if (listState.isScrollInProgress) 50L else 300L,
+                                        )
+                                    }
+                                }
+                                if (scrollMetrics.overflows) {
+                                    val scope = rememberCoroutineScope()
+                                    ThreadScrollBar(
+                                        contentScrollOffsetPx = scrollMetrics.displayScrollPx,
+                                        maxContentScrollOffsetPx = scrollMetrics.maxScrollPx,
+                                        onScrollTo = { targetPx ->
+                                            val m = scrollMetrics
+                                            if (m.maxScrollPx > 0f && m.avgItemHeightPx > 0f) {
+                                                // targetPx is in flipped (display)
+                                                // space — convert back to list space.
+                                                val target = (m.maxScrollPx - targetPx)
+                                                    .coerceIn(0f, m.maxScrollPx)
+                                                val itemCount = listState.layoutInfo.totalItemsCount
+                                                if (itemCount > 0) {
+                                                    val index = (target / m.avgItemHeightPx)
+                                                        .toInt().coerceIn(0, itemCount - 1)
+                                                    val offset = (target - index * m.avgItemHeightPx)
+                                                        .roundToInt()
+                                                    scope.launch { listState.scrollToItem(index, offset) }
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier
+                                            .align(Alignment.CenterEnd)
+                                            .fillMaxHeight(),
+                                    )
                                 }
                             }
                         }
