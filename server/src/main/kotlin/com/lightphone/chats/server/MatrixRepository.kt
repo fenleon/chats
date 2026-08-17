@@ -1996,6 +1996,24 @@ object MatrixRepository {
                 hasMore = h2
             }
         }
+        // Older-page dead-end guard (2026-08-17): the chain can run through a
+        // block of events that build no rows — the re-import's m.replace edits
+        // are dropped by [messageFrom], so an older page landing on the edit
+        // wall returned an empty page. The tool's cursor can't advance past
+        // invisible events, so it re-polled the same cursor forever (1 req/s
+        // storm → server ANR). Walk deeper (in big steps — walls can be 100+
+        // edits, e.g. the Crocs room's 168) until the page holds renderable
+        // events or the chain ends, bounded.
+        if (beforeEventId != null && hasMore) {
+            var guard = 0
+            while (guard++ < OLDER_PAGE_SKIP_WALKS && events.drop(1).none { isRenderableRow(it) }) {
+                val deepest = events.lastOrNull()?.event?.id?.full ?: break
+                val (e2, h2) = collectRelevantTimelineEvents(c, matrixRoomId, deepest, OLDER_PAGE_SKIP_STEP, fast)
+                if (e2.size <= 1) { hasMore = h2; break }
+                events += e2.drop(1) // e2 re-includes `deepest` (start-inclusive walk)
+                hasMore = h2
+            }
+        }
         android.util.Log.d(
             TAG,
             "getMessages: room=$matrixRoomId before=$beforeEventId limit=$limit page=${events.size} hasMore=$hasMore",
@@ -2120,6 +2138,12 @@ object MatrixRepository {
      *  m.read receipts as bridge bookkeeping, not as a human read — see
      *  [readReceiptsByEvent]. */
     private val FUNCTIONAL_MEMBERS_STATE_TYPE = "io.element.functional_members"
+    private val BRIDGE_STATE_TYPE = "m.bridge"
+    private val LEGACY_BRIDGE_STATE_TYPE = "uk.half-shot.bridge"
+
+    /** Memoized bridge-bot id per room ("" = non-bridged), resolved lazily on
+     *  a room's first newest-page build — see [bridgeBotOf]. */
+    private val bridgeBotByRoom = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /**
      * Latest Beeper send status per message event id, from the room's most
@@ -2219,6 +2243,30 @@ object MatrixRepository {
      * (older than its oldest event) cover nothing here — they describe an
      * earlier read position.
      */
+    /** The room's bridge-bot user id ("" = non-bridged) — the bot whose m.read
+     *  receipts are Beeper bridge bookkeeping, not human reads. Resolved lazily
+     *  on a room's first newest-page build and memoized per room: the old
+     *  per-pass resolver was the 280-400% CPU battery disaster (WORKLOG
+     *  2026-08-17). Beeper flags its bot via m.bridge ("bridgebot"); the
+     *  fallbacks cover older bridges (uk.half-shot.bridge) and rooms without
+     *  bridge state (functional_members "service_members" — which misses the
+     *  Instagram DM, whose @instagramgobot posts receipts too). Callers must be
+     *  inside a store transaction (Room-backed repo reads need one). */
+    private suspend fun bridgeBotOf(c: MatrixClient, matrixRoomId: RoomId): String {
+        bridgeBotByRoom[matrixRoomId.full]?.let { return it }
+        val stateRepo = c.di.get<RoomStateRepository>(RoomStateRepository::class)
+        suspend fun bridgebotOfState(type: String): String? =
+            (stateRepo.get(RoomStateRepositoryKey(matrixRoomId, type), "")?.content as? UnknownEventContent)
+                ?.raw?.get("bridgebot")?.jsonPrimitive?.contentOrNull
+        val bot = bridgebotOfState(BRIDGE_STATE_TYPE)
+            ?: bridgebotOfState(LEGACY_BRIDGE_STATE_TYPE)
+            ?: (stateRepo.get(RoomStateRepositoryKey(matrixRoomId, FUNCTIONAL_MEMBERS_STATE_TYPE), "")?.content as? UnknownEventContent)
+                ?.raw?.get("service_members")?.jsonArray?.firstOrNull()?.jsonPrimitive?.contentOrNull
+        val resolved = bot ?: ""
+        bridgeBotByRoom[matrixRoomId.full] = resolved
+        return resolved
+    }
+
     private suspend fun readReceiptsByEvent(
         c: MatrixClient,
         matrixRoomId: RoomId,
@@ -2226,30 +2274,26 @@ object MatrixRepository {
     ): Set<String> {
         val rawIndex = HashMap<String, Int>() // event id -> newest-first index
         events.forEachIndexed { i, te -> rawIndex[te.event.id.full] = i }
-        val (receiptsByUser, serviceMembers) = withTimeoutOrNull(MESSAGES_BUDGET_MS) {
+        val (receiptsByUser, bridgebot) = withTimeoutOrNull(MESSAGES_BUDGET_MS) {
             // The Room-backed repositories only work inside a store transaction
             // (the flow APIs set it up themselves; direct repo reads need the
             // explicit scope, or Room answers "read transaction is missing").
             val txManager = c.di.get<RepositoryTransactionManager>(RepositoryTransactionManager::class)
             txManager.readTransaction {
-                // Bridge/service bots (Beeper's @whatsappbot, @instagramgobot, …)
-                // post m.read receipts as room bookkeeping, not as a human read —
-                // ignoring them keeps the "seen" tag honest. They're flagged by
-                // the room's io.element.functional_members state ("service_members").
-                val state = c.di.get<RoomStateRepository>(RoomStateRepository::class)
-                    .get(RoomStateRepositoryKey(matrixRoomId, FUNCTIONAL_MEMBERS_STATE_TYPE), "")
-                val serviceMembers = when (val content = state?.content) {
-                    is UnknownEventContent -> content.raw["service_members"]?.jsonArray
-                        ?.mapNotNull { it.jsonPrimitive.contentOrNull }.orEmpty()
-                    else -> emptyList()
-                }
-                c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class)
-                    .get(matrixRoomId) to serviceMembers
+                val receipts = c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class)
+                    .get(matrixRoomId)
+                // Bridge bots (Beeper's @whatsappbot, @instagramgobot, …) post
+                // m.read receipts as room bookkeeping, not human reads — ignoring
+                // them keeps the "seen" tag honest. Resolve the bot lazily
+                // (memoized, see [bridgeBotOf]) and only when there are receipts
+                // to filter.
+                val bridgebot = if (receipts.isEmpty()) "" else bridgeBotOf(c, matrixRoomId)
+                receipts to bridgebot
             }
         } ?: return emptySet()
         val readEventIds = mutableSetOf<String>()
         for ((userId, roomUserReceipts) in receiptsByUser) {
-            if (userId == c.userId || userId.full in serviceMembers) continue
+            if (userId == c.userId || userId.full == bridgebot) continue
             val receiptIndex = roomUserReceipts.receipts[ReceiptType.Read]?.eventId?.full
                 ?.let { rawIndex[it] } ?: continue
             for ((eventId, index) in rawIndex) {
@@ -3122,6 +3166,13 @@ object MatrixRepository {
                 it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
             }
         } ?: return
+        // Beeper re-imports old media as m.replace edits — each used to surface
+        // as a fresh image row + notification. Matrix semantics: an edit
+        // replaces its target, never a new message. Don't notify.
+        if (isReplaceEdit(te)) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping m.replace edit $eventId in $roomId")
+            return
+        }
         // Bridge re-import floods (the 7am wall) must not notify — a real
         // conversation almost never reaches 30 messages per minute, so the
         // density fallback skips the flood without touching real messages.
@@ -3281,6 +3332,7 @@ object MatrixRepository {
     private fun resetRoomList() {
         roomListCache.clear()
         roomSigSeen.clear()
+        bridgeBotByRoom.clear()
         pendingReadClear.clear()
         effectiveLastCache.clear()
         ghostResolveInFlight.clear()
@@ -3749,12 +3801,24 @@ object MatrixRepository {
         val fast = withTimeoutOrNull(ROOM_BUDGET_MS) {
             collectTimelineEvents(c, matrixRoomId, serverLastId, EFFECTIVE_LAST_FAST)
         }.orEmpty()
-        val fastFiltered = filterGhosts(c, fast)
+        val fastFiltered = filterGhosts(c, fast).filterNot { isReplaceEdit(it) }
         val serverLast = fast.firstOrNull { it.event.id.full == serverLastId }
         val inFlood = serverLast != null && isFloodGhost(c, serverLast, fast)
         if (fastFiltered.firstOrNull()?.event?.id?.full == serverLastId && !inFlood) {
             effectiveLastCache[key] = EffectiveLast(serverLastId, serverLastId, serverTs)
             return serverLastId to serverTs
+        }
+        // The server's newest event renders as nothing — an m.replace edit (the
+        // re-import's old media, stamped Thursday) or an in-flood ghost. When
+        // the fast window already holds a real event, resolve it immediately:
+        // edits decrypt fine, so the background walk would find the same event
+        // after a needless session-restore detour (feedback 2026-08-17: rooms
+        // topped by edits showed "last message Thursday").
+        val firstReal = fastFiltered.firstOrNull()
+        if (firstReal != null && firstReal.event.id.full != serverLastId) {
+            val realTs = firstReal.event.originTimestamp
+            effectiveLastCache[key] = EffectiveLast(serverLastId, firstReal.event.id.full, realTs)
+            return firstReal.event.id.full to realTs
         }
         // Suspicious (dropped by the dedup, or inside a flood): resolve in the
         // background with a session restore (the copies' originals are old
@@ -3807,7 +3871,7 @@ object MatrixRepository {
                     } else events
                 }
                 if (walked != null) {
-                    val real = filterGhosts(c, walked).firstOrNull()
+                    val real = filterGhosts(c, walked).filterNot { isReplaceEdit(it) }.firstOrNull()
                     effectiveLastCache[key] = EffectiveLast(
                         serverLastId,
                         real?.event?.id?.full,
@@ -4135,6 +4199,26 @@ object MatrixRepository {
         return "Chat"
     }
 
+    /** True for m.replace edit events — Beeper re-imports old media as edits
+     *  (new events referencing originals we never sync); Matrix semantics make
+     *  them replace their target, never a row, so they render as nothing here:
+     *  dropped from pages, previews, and notifications. */
+    private fun isReplaceEdit(te: TimelineEvent): Boolean {
+        val content = te.content?.getOrNull()
+        return content is RoomMessageEventContent && content.relatesTo is RelatesTo.Replace
+    }
+
+    /** Cheap renderability check for older-page pagination (no user lookups):
+     *  an event builds a row unless it's a dropped edit or an unresolvable
+     *  non-message payload. Undecrypted encrypted events render as
+     *  "[Encrypted]" placeholders, so they count as renderable. */
+    private fun isRenderableRow(te: TimelineEvent): Boolean {
+        if (isReplaceEdit(te)) return false
+        val content = te.content?.getOrNull()
+        return content is RoomMessageEventContent ||
+            (content == null && te.event.content is EncryptedMessageEventContent)
+    }
+
     private suspend fun messageFrom(
         c: MatrixClient,
         roomId: RoomId,
@@ -4149,6 +4233,11 @@ object MatrixRepository {
         // every other showable event renders as text. Text bodies are the full
         // message — the 80-char preview cap is only for the room list.
         val content = te.content?.getOrNull()
+        // ponytail: m.replace edits are dropped (not merged into their target) —
+        // the app has no edit UI and Beeper's re-import edits target originals
+        // we never sync (whatsapp.com bridge rooms); merge only if real local
+        // edits appear.
+        if (isReplaceEdit(te)) return null
         val (body, contentType) = when (content) {
             is RoomMessageEventContent.FileBased.Image ->
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "[Photo]") to "image"
@@ -4187,6 +4276,9 @@ object MatrixRepository {
         // content is still the m.room.encrypted payload, so it must not shadow
         // the resolved content.
         val content = te.content?.getOrNull()
+        // m.replace edits (Beeper's re-imported media) never become a preview —
+        // see [messageFrom].
+        if (isReplaceEdit(te)) return null
         if (content != null) {
             return when (content) {
                 is RoomMessageEventContent.TextBased -> stripReplyQuote(content.body).take(MAX_PREVIEW_LENGTH)
@@ -4241,6 +4333,14 @@ object MatrixRepository {
     private const val FETCH_TIMEOUT_SECONDS = 5L
     /** The thread's page size (matches the tool's PAGE_SIZE). */
     private const val THREAD_PAGE_SIZE = 20
+    /** Max extra chain walks an older page may take to skip a run of dropped
+     *  events (the m.replace edit wall) before giving up — bounded so a
+     *  pathological chain can't turn one page read into a long walk. The
+     *  steps are big ([OLDER_PAGE_SKIP_STEP]); re-import walls run 100+
+     *  (the Crocs room has 168 consecutive edits). */
+    private const val OLDER_PAGE_SKIP_WALKS = 10
+    /** Events per guard walk when skipping a dropped-event wall. */
+    private const val OLDER_PAGE_SKIP_STEP = 100
     /** Serve a cached newest page within this window (feedback pass). */
     private const val MESSAGE_PAGE_TTL_MS = 5_000L
     /** Recompute the active room's cached newest page at this cadence. The

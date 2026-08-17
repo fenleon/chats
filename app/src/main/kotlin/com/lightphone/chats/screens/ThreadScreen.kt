@@ -527,12 +527,13 @@ class ThreadScreen(
                                 // LazyListState.layoutInfo don't invalidate on every
                                 // scroll in this Compose version (verified on-device),
                                 // so derivedStateOf/snapshotFlow go stale.
+                                val heightSampler = remember { HeightSampler() }
                                 var scrollMetrics by remember {
-                                    mutableStateOf(listState.threadListMetrics())
+                                    mutableStateOf(listState.threadListMetrics(heightSampler))
                                 }
                                 LaunchedEffect(listState) {
                                     while (true) {
-                                        scrollMetrics = listState.threadListMetrics()
+                                        scrollMetrics = listState.threadListMetrics(heightSampler)
                                         delay(
                                             if (listState.isScrollInProgress) 50L else 300L,
                                         )

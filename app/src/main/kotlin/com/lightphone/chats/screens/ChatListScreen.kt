@@ -436,9 +436,9 @@ private fun RoomRow(
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            // Top-aligned: the right-side time sits on the name line, not
-            // centered against the row (feedback 2026-08-17).
-            verticalAlignment = Alignment.Top,
+            // Centered: the right-side time lines up with the room name's
+            // vertical center (feedback 2026-08-17: was top-aligned to the name).
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             // The unread marker is a large asterisk inline at the start of the
             // name, not a reserved column of its own (feedback 2026-08-17).

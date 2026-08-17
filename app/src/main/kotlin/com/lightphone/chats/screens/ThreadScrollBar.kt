@@ -42,6 +42,27 @@ private const val SCROLLBAR_WIDTH_UNITS = 2f
 private const val MIN_THUMB_FRACTION = 0.1f
 private const val MAX_THUMB_FRACTION = 0.85f
 
+/** Accumulates the heights of every distinct laid-out item so the row-height
+ *  average converges to the true mean. The visible-only snapshot is a biased
+ *  sample — a too-short estimate made the thumb pin at the top of long
+ *  threads and never reflect older pages loading in (feedback 2026-08-17). */
+internal class HeightSampler {
+    private val seen = HashSet<Int>()
+    private var sum = 0.0
+    private var count = 0
+
+    fun sample(items: List<androidx.compose.foundation.lazy.LazyListItemInfo>) {
+        for (item in items) {
+            if (seen.add(item.index)) {
+                sum += item.size
+                count++
+            }
+        }
+    }
+
+    val avg: Float get() = if (count == 0) 0f else (sum / count).toFloat()
+}
+
 /** Scroll metrics for a lazy list, estimated from the real layout info
  *  (viewport × itemCount / average visible height — the estimate the old
  *  foundation scrollbar used). Flipped for the thread's reverseLayout so the
@@ -53,11 +74,16 @@ internal class ThreadListMetrics(
     val avgItemHeightPx: Float,
 ) {
     val overflows: Boolean get() = maxScrollPx > 0f
-    /** Display offset for the reverse-layout track: 0 = newest (list end). */
+    /** Display offset for the reverse-layout track: 0 = the oldest end, max =
+     *  the newest end. [scrollPx] is the position from the newest end, so the
+     *  thumb sits at the bottom of the track at the newest message and at the
+     *  top at the oldest (feedback 2026-08-17: the old offset-based position
+     *  read viewport-relative values in this Compose version and froze the
+     *  thumb at the track bottom). */
     val displayScrollPx: Float get() = maxScrollPx - scrollPx
 }
 
-internal fun LazyListState.threadListMetrics(): ThreadListMetrics {
+internal fun LazyListState.threadListMetrics(sampler: HeightSampler): ThreadListMetrics {
     val layoutInfo = layoutInfo
     // viewportStartOffset/EndOffset are the visible viewport's pixel bounds —
     // in reverseLayout the coordinate space is flipped (start can sit above
@@ -67,18 +93,20 @@ internal fun LazyListState.threadListMetrics(): ThreadListMetrics {
     val visible = layoutInfo.visibleItemsInfo
     val totalItems = layoutInfo.totalItemsCount
     if (totalItems == 0 || visible.isEmpty()) return ThreadListMetrics(0f, 0f, 0f)
-    // LazyListItemInfo.size is the item's pixel height in this Compose version.
-    var totalVisibleHeightPx = 0
-    visible.forEach { totalVisibleHeightPx += it.size }
-    val avgItemHeightPx = totalVisibleHeightPx / visible.size.toFloat()
+    sampler.sample(visible)
+    val avgItemHeightPx = sampler.avg.takeIf { it > 0f }
+        ?: (visible.sumOf { it.size } / visible.size.toFloat())
     val totalContentPx = totalItems * avgItemHeightPx
     val maxScrollPx = (totalContentPx - viewportHeightPx).coerceAtLeast(0f)
-    // reverseLayout: the scroll origin is the bottom (index 0 = newest), so the
-    // scroll offset is the laid-out `offset` of the bottom-edge visible item
-    // (the lowest index). Index×avg estimates go stale with variable row
-    // heights; the real offset always tracks the scroll.
-    val scrollPx = visible.minByOrNull { it.index }?.offset?.toFloat()
-        ?.coerceAtMost(maxScrollPx) ?: 0f
+    // Position from the newest end, in items: the lowest visible index (the
+    // row at the viewport's bottom edge in reverseLayout). Item `offset` is
+    // viewport-relative in this Compose version (verified 2026-08-17: the
+    // bottom-edge item reads ~0 regardless of scroll depth), so the scroll
+    // position comes from the index, converted to px via the sampled average.
+    // Index 0 (newest) visible → 0 → thumb at the track bottom; the oldest
+    // end reads ≈ maxScrollPx → thumb at the top.
+    val minIdx = visible.minByOrNull { it.index }?.index ?: 0
+    val scrollPx = (minIdx * avgItemHeightPx).coerceAtMost(maxScrollPx)
     return ThreadListMetrics(scrollPx, maxScrollPx, avgItemHeightPx)
 }
 
