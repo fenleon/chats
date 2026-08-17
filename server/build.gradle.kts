@@ -21,10 +21,10 @@ android {
         applicationId = "com.lightphone.chats.server"
         minSdk = 34
         targetSdk = 36
-        // First public release. versionCode tracks the repo's commit count
-        // (15 commits at release); keep +1 per release like audiobooks.
-        versionCode = 15
-        versionName = "0.1.0"
+        // Public release. versionCode tracks the repo's commit count
+        // (25 commits at 0.2.0).
+        versionCode = 25
+        versionName = "0.2.0"
     }
 
     buildTypes {

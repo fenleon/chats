@@ -12,7 +12,7 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 > **Current Status:** Beta
 >
-> **Current Version:** 0.1.0 (versionCode 15)
+> **Current Version:** 0.2.0 (versionCode 25)
 
 ---
 
@@ -36,15 +36,15 @@ The chat list, a 1:1 thread, a group thread, the networks panel, and settings on
 - **End-to-end encryption** — megolm encrypted conversations, SAS device verification (emoji comparison), and recovery-key login for new devices
 - **Beeper accounts** — WhatsApp, Instagram, and other Beeper bridges, with a network selector (All / WhatsApp / Instagram) derived from room tags
 - **Or a Matrix homeserver of your own** — the companion speaks plain Matrix
-- **Notifications** — one calm notification per room as messages arrive, tap to open the thread
-- **Voice notes** — record, send, and play (AAC)
+- **Notifications** — one calm notification per room as messages arrive, tap to open the thread; a push channel (ntfy) wakes the sync the moment a message arrives, so delivery is instant without a permanent long-poll
+- **Voice notes** — record, send, and play (Opus in ogg — the Matrix voice-message format, roughly half the size of the earlier AAC)
 - **Photos** — attach via the system photo picker; tap a thumbnail for a full-screen view
 - **Message reactions** — shown as small tags under the message
-- **Delivery status** — a "not delivered" marker when a message fails to reach the room
+- **Delivery status** — a "delivered" tag on your newest message once it reaches the room, and a "not delivered" marker when it fails
 - **Read state** — opening a thread marks it read server-side
 - **Day-grouped timestamps** — time-of-day for today, "yesterday", weekday names, then dates
 - **Instant re-open** — room list and threads are cached to disk, so returning to a chat is immediate
-- **Battery-conscious sync** — a Settings toggle pauses sync entirely (and the foreground service) when you don't need it
+- **Battery-conscious sync** — with the screen off, sync stretches to a slow idle cadence (push-wake keeps delivery instant); a Settings toggle pauses sync entirely (and the foreground service) when you don't need it
 - **Optional Wi-Fi-only media downloads**
 
 ---
@@ -123,7 +123,7 @@ The tool is a thin UI over the companion's binder: every screen is a request ove
 
 - Requires the "All tools" external-tools tier on a real Light Phone III (dev-signed APKs are treated as `Unknown` by LightOS).
 - Beeper login uses Beeper's v1 account flow; generic-homeserver login exists in the codebase as dev/test tooling.
-- With a very active account (many live bridge rooms), background sync costs measurable battery — the sync-pause toggle is the escape hatch.
+- Instant delivery depends on the push channel; without a configured push endpoint, new messages arrive at the next scheduled sync round.
 - E2EE key backup restoration is scoped to the logged-in account's session.
 
 ---
