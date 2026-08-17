@@ -2,7 +2,7 @@
 
 *A calm, end-to-end-encrypted Matrix messaging tool for the Light Phone III.*
 
-Chats is a Matrix client built specifically for the Light Phone III. It brings your 1:1 and group chats to the phone in a quiet, text-first interface inspired by the philosophy of Light OS — no ads, no infinite feeds, no noise. Just your conversations.
+Chats is a Matrix client built specifically for the Light Phone III. It brings your 1:1 and group chats to the phone in a quiet, text-first interface inspired by the philosophy of Light OS.
 
 It works with **Beeper accounts**, so your WhatsApp and Instagram chats arrive through Beeper's bridges, or with a **self-hosted Matrix homeserver**. Conversations are protected with Matrix end-to-end encryption (megolm), with on-device SAS verification and recovery-key login.
 
