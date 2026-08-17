@@ -12,7 +12,7 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 > **Current Status:** Beta
 >
-> **Current Version:** 0.2.0 (versionCode 25)
+> **Current Version:** 0.3.0 (versionCode 30)
 
 ---
 
@@ -44,6 +44,7 @@ The chat list, a 1:1 thread, a group thread, the networks panel, and settings on
 - **Read state** — opening a thread marks it read server-side
 - **Day-grouped timestamps** — time-of-day for today, "yesterday", weekday names, then dates
 - **Instant re-open** — room list and threads are cached to disk
+- **Handles very large accounts** — the conversation list stays reliable even with thousands of rooms; any room that gets a new message surfaces immediately
 - **Battery-conscious sync** — with the screen off, sync stretches to a slow idle cadence (push-wake keeps delivery instant); a Settings toggle pauses sync entirely (and the foreground service) when you don't need it
 - **Optional Wi-Fi-only media downloads**
 

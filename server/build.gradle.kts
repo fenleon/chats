@@ -22,9 +22,9 @@ android {
         minSdk = 34
         targetSdk = 36
         // Public release. versionCode tracks the repo's commit count
-        // (25 commits at 0.2.0).
-        versionCode = 25
-        versionName = "0.2.0"
+        // (30 commits at 0.3.0).
+        versionCode = 30
+        versionName = "0.3.0"
     }
 
     buildTypes {

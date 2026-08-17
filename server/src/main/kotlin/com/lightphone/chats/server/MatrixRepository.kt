@@ -1263,7 +1263,12 @@ object MatrixRepository {
         if (_roomList.value.isEmpty()) {
             preloadRoomListFromDisk()
         }
-        return _roomList.value
+        // Binder cap: the whole reply crosses as one transaction (~1 MB hard
+        // limit); the list is sorted newest-first, so the cap drops the stale
+        // tail. The full census stays in _roomList (resolver keeps refreshing
+        // every room); any room that gets a new message sorts back into the
+        // window on the next publish.
+        return _roomList.value.take(MAX_ROOMS_OVER_BINDER)
     }
 
     /**
@@ -4371,6 +4376,12 @@ object MatrixRepository {
     private const val ROOM_LIST_PASS_BUDGET_MS = 12_000L
     /** Breather between passes; a settled pass itself takes milliseconds. */
     private const val ROOM_LIST_REFRESH_DELAY_MS = 2_000L
+    /** Cap on rooms shipped over the binder: the encoded reply is one binder
+     *  transaction, hard-capped at ~1 MB — beyond ~1,600 rooms every GetRooms
+     *  call failed and the list stuck on "loading…". 200 rooms ≈ 200 KB. Rooms
+     *  past the cap are still tracked/refreshed; a new message sorts them back
+     *  into the served window. (Roadmap: search / a cap-raising page flow.) */
+    private const val MAX_ROOMS_OVER_BINDER = 200
     /** Resolver breather while the screen is off (battery 2026-08-15): the
      *  live bridged account keeps the list dirty, so the 2s breather meant
      *  near-continuous passes overnight; the list only needs freshness for

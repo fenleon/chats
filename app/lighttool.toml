@@ -1,8 +1,8 @@
 [tool]
 id = "com.lightphone.chats"
 label = "Chats"
-versionCode = 25
-versionName = "0.2.0"
+versionCode = 30
+versionName = "0.3.0"
 permissions = ["android.permission.INTERNET"]
 # The tool is a thin UI; the companion (:server) hosts the SDK service, the
 # persistent Matrix connection (sync loop), storage, and notifications. Point
