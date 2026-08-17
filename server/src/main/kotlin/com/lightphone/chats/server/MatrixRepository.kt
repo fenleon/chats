@@ -3772,13 +3772,19 @@ object MatrixRepository {
     }
 
     /**
-     * The room's newest event that is not a bridge re-import ghost, for the
-     * list's sort + preview. The server's room summary points at the newest
-     * event — after a bridge re-import flood that is a ghost, which bumped
-     * every room to the top of the chat list. When the server's last event is
-     * a ghost, walk back through the store to the first real event (bounded);
-     * otherwise the server values pass through. Cached per server last event
-     * (the summary is stable between new messages, so the walk runs once).
+     * The room's newest event that renders as a message row, for the list's
+     * sort + timestamp + preview (LP3 2026-08-17: the panel showed the
+     * bridge's `com.beeper.message_send_status` delivery ack as the latest
+     * message — 22:08 — while the thread's newest message was 21:59; Beeper's
+     * status acks sit after the message in the timeline, so Trixnity's
+     * summary, which counts any timeline event, bumped the row to the ack
+     * time). The server's room summary points at the newest event — after a
+     * bridge re-import flood that is a ghost, which bumped every room to the
+     * top of the chat list. When the server's last event is a ghost (or any
+     * non-renderable event — ack, reaction, redaction, edit), walk back
+     * through the store to the first renderable event (bounded); otherwise
+     * the server values pass through. Cached per server last event (the
+     * summary is stable between new messages, so the walk runs once).
      */
     private suspend fun effectiveLastEvent(
         c: MatrixClient,
@@ -3802,23 +3808,29 @@ object MatrixRepository {
         }
         // Fast in-path walk (no session restore — old originals may not
         // decrypt yet): if the server's newest event survives the dedup AND
-        // isn't inside a flood, it's a real message (the common case).
+        // isn't inside a flood, it's a real message (the common case). The
+        // renderable filter also drops bridge status acks / reactions /
+        // redactions — events the thread never shows — so the row's time +
+        // preview match the newest actual message (2026-08-17: a
+        // message_send_status ack stamped 22:08 topped the row for a 21:59
+        // message).
         val fast = withTimeoutOrNull(ROOM_BUDGET_MS) {
             collectTimelineEvents(c, matrixRoomId, serverLastId, EFFECTIVE_LAST_FAST)
         }.orEmpty()
-        val fastFiltered = filterGhosts(c, fast).filterNot { isReplaceEdit(it) }
+        val fastFiltered = filterGhosts(c, fast).filter { isRenderableRow(it) }
         val serverLast = fast.firstOrNull { it.event.id.full == serverLastId }
         val inFlood = serverLast != null && isFloodGhost(c, serverLast, fast)
         if (fastFiltered.firstOrNull()?.event?.id?.full == serverLastId && !inFlood) {
             effectiveLastCache[key] = EffectiveLast(serverLastId, serverLastId, serverTs)
             return serverLastId to serverTs
         }
-        // The server's newest event renders as nothing — an m.replace edit (the
-        // re-import's old media, stamped Thursday) or an in-flood ghost. When
-        // the fast window already holds a real event, resolve it immediately:
-        // edits decrypt fine, so the background walk would find the same event
-        // after a needless session-restore detour (feedback 2026-08-17: rooms
-        // topped by edits showed "last message Thursday").
+        // The server's newest event renders as nothing — a dropped edit, a
+        // bridge status ack / reaction / redaction, or an in-flood ghost. When
+        // the fast window already holds a renderable event, resolve it
+        // immediately: real messages decrypt fine, so the background walk
+        // would find the same event after a needless session-restore detour
+        // (feedback 2026-08-17: rooms topped by edits showed "last message
+        // Thursday").
         val firstReal = fastFiltered.firstOrNull()
         if (firstReal != null && firstReal.event.id.full != serverLastId) {
             val realTs = firstReal.event.originTimestamp
@@ -3876,7 +3888,7 @@ object MatrixRepository {
                     } else events
                 }
                 if (walked != null) {
-                    val real = filterGhosts(c, walked).filterNot { isReplaceEdit(it) }.firstOrNull()
+                    val real = filterGhosts(c, walked).filter { isRenderableRow(it) }.firstOrNull()
                     effectiveLastCache[key] = EffectiveLast(
                         serverLastId,
                         real?.event?.id?.full,
