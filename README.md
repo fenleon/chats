@@ -1,10 +1,10 @@
 # Chats
 
-*A calm, end-to-end-encrypted Matrix messaging tool for the Light Phone III.*
+*WhatsApp, Instagram, and your other chats — on your Light Phone III.*
 
-Chats is a Matrix client built specifically for the Light Phone III. It brings your 1:1 and group chats to the phone in a quiet, text-first interface inspired by the philosophy of Light OS.
+Chats brings **WhatsApp to your Light Phone III** — along with **Instagram DMs** and other networks — through your Beeper account. Log in once and your existing conversations arrive on the phone in a quiet, text-first interface inspired by the philosophy of Light OS. No browser workarounds, no extra device, no accounts to juggle: just your chats.
 
-It works with **Beeper accounts**, so your WhatsApp and Instagram chats arrive through Beeper's bridges, or with a **self-hosted Matrix homeserver**. Conversations are protected with Matrix end-to-end encryption (megolm), with on-device SAS verification and recovery-key login.
+Under the hood it runs on **Matrix**, the open, encrypted messaging standard behind Beeper's bridges, so every conversation is end-to-end encrypted — but you don't need to know anything about Matrix to use Chats. If you'd rather not use Beeper, Chats speaks plain Matrix and works with any Matrix homeserver.
 
 Chats is a **real LightOS tool**: a thin interface built on the Light SDK design system, launched from the LightOS toolbox, with a companion app hosting the persistent encrypted connection, storage, and notifications — the same tool + companion architecture Light's own messaging tool uses, so messages keep arriving and notifying even after the tool closes.
 
@@ -32,12 +32,12 @@ The chat list, a 1:1 thread, a group thread, the networks panel, and settings on
 
 # Features
 
-- **1:1 and group chats** — Matrix rooms, with a single-line chat list (unread counts, relative timestamps) that reveals more on scroll
-- **End-to-end encryption** — megolm encrypted conversations, SAS device verification (emoji comparison), and recovery-key login for new devices
-- **Beeper accounts** — WhatsApp, Instagram, and other Beeper bridges, with a network selector (All / WhatsApp / Instagram) derived from room tags
-- **Or a Matrix homeserver of your own** — the companion speaks plain Matrix
-- **Notifications** — one calm notification per room as messages arrive, tap to open the thread; a push channel (ntfy) wakes the sync the moment a message arrives, so delivery is instant without a permanent long-poll
-- **Voice notes** — record, send, and play (Opus in ogg — the Matrix voice-message format, roughly half the size of the earlier AAC)
+- **WhatsApp, Instagram & more** — your existing chats from Beeper's bridged networks, with a network selector (All / WhatsApp / Instagram) so you can focus on one at a time
+- **1:1 and group chats** — a single-line chat list (unread counts, relative timestamps) that reveals more on scroll
+- **End-to-end encryption** — every conversation is encrypted end to end, with simple emoji-based device verification and recovery-key login for new devices
+- **Or a Matrix homeserver of your own** — Chats isn't tied to Beeper; it works with any Matrix homeserver
+- **Notifications** — one calm notification per room as messages arrive; a push channel (ntfy) wakes the sync the moment a message arrives, so delivery is instant
+- **Voice notes** — record, send, and play (Opus — the standard voice-message format, roughly half the size of the earlier AAC)
 - **Photos** — attach via the system photo picker; tap a thumbnail for a full-screen view
 - **Message reactions** — shown as small tags under the message
 - **Delivery status** — a "delivered" tag on your newest message once it reaches the room, and a "not delivered" marker when it fails
@@ -58,7 +58,7 @@ Chats is a two-APK app — the tool and its companion — signed with a developm
 1. Enable USB debugging (Settings → Developer options) and install both APKs via `adb install -r`.
 2. On the phone, set **Developer options → External tools → "All tools"** (LightOS warns about the security risk — the APKs are dev-signed, not Light-signed).
 3. Open **Chats** from the toolbox. The companion ("Chats Server") hosts the connection.
-4. Log in from Settings with your Beeper account (or a homeserver).
+4. Log in from Settings with your Beeper account — your WhatsApp and Instagram chats appear automatically.
 
 ## Build
 
@@ -111,7 +111,7 @@ The tool is a thin UI over the companion's binder: every screen is a request ove
 
 # Privacy & Security
 
-- **End-to-end encryption.** With a Beeper account, conversations are megolm-encrypted and decrypt only on your verified devices. You verify new devices by comparing emojis, or by entering your recovery key.
+- **End-to-end encryption.** Every conversation is end-to-end encrypted and decrypts only on your verified devices. You verify a new device by comparing emojis, or by entering your recovery key.
 - **No analytics, ads, or tracking.**
 - **Data lives on your homeserver** — Beeper's or your own. The companion stores the message history locally (in its private storage) so rooms re-open instantly and old messages are searchable offline.
 - **Notifications** show a message preview, like any messaging app. The companion runs a foreground service only while sync is enabled; the sync-pause toggle stops it entirely.
@@ -121,6 +121,7 @@ The tool is a thin UI over the companion's binder: every screen is a request ove
 
 # Current Limitations
 
+- WhatsApp and Instagram arrive through Beeper's bridges — an independent, unofficial path, not an official Meta client, and subject to Beeper's service.
 - Requires the "All tools" external-tools tier on a real Light Phone III (dev-signed APKs are treated as `Unknown` by LightOS).
 - Beeper login uses Beeper's v1 account flow; generic-homeserver login exists in the codebase as dev/test tooling.
 - Instant delivery depends on the push channel; without a configured push endpoint, new messages arrive at the next scheduled sync round.
@@ -144,13 +145,17 @@ If you encounter a bug, please include:
 
 # Frequently Asked Questions
 
-### Does Chats require a Beeper account?
+### How do I get WhatsApp on my Light Phone?
 
-No — it speaks Matrix. Beeper accounts are the primary supported path (they bring WhatsApp and Instagram through Beeper's bridges), but any Matrix homeserver can be used.
+Log in to Chats with a Beeper account, and your WhatsApp and Instagram conversations appear automatically — Chats is the client, Beeper supplies the bridge to those networks. No Beeper account? Chats also works with any Matrix homeserver directly.
 
-### Is my data stored anywhere besides my homeserver?
+### Is this an official WhatsApp client?
 
-The companion keeps a local copy of your message history on the phone so rooms re-open instantly and are readable offline. Nothing is uploaded anywhere else.
+No. Chats is an independent, unofficial project. WhatsApp and Instagram messages arrive through Beeper's bridge service, which is unaffiliated with Meta.
+
+### Where is my data stored?
+
+Your messages live on your messaging server — Beeper's, or your own Matrix homeserver. The companion keeps a local copy of your message history on the phone so rooms re-open instantly and are readable offline. Nothing is uploaded anywhere else.
 
 ### Does Chats collect analytics or usage data?
 
