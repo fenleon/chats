@@ -753,12 +753,17 @@ private fun MessageRow(
             // Feedback pass: only the first message of a group carries the time —
             // consecutive same-sender messages within 15 minutes are combined
             // visually, while the sender/alignment stays on every message.
-            if (showTime) {
+            // An IN-FLIGHT row shows "SENDING" even inside a group — the group
+            // would otherwise hide the slot entirely, and the just-sent
+            // message must still be visibly pending (feedback 2026-08-17).
+            // When the server confirms it, the served page swaps in the real
+            // row: grouped → it merges under the shared timestamp; otherwise
+            // it carries its own. A failed send shows its time, not SENDING.
+            val inFlight = message.id.startsWith(LOCAL_ROW_PREFIX)
+            val failed = message.sendStatus?.startsWith("FAIL_") == true
+            if (showTime || (inFlight && !failed)) {
                 LightText(
-                    // In-flight (optimistic, not yet echoed by sync): the time
-                    // slot says so instead of a send timestamp (feedback
-                    // 2026-08-17).
-                    text = if (message.id.startsWith(LOCAL_ROW_PREFIX)) {
+                    text = if (inFlight && !failed) {
                         "SENDING"
                     } else {
                         formatMessageTime(message.timestampMs)

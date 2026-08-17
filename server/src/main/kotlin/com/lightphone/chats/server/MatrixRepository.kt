@@ -212,22 +212,44 @@ object MatrixRepository {
     fun audioPositionMs(): Long? =
         audioPlayer?.takeIf { playingAudioEventId != null }?.currentPosition?.toLong()
 
-    /** Voice-note sends awaiting their sync echo (room key → send info). */
-    private val pendingAudioEcho = java.util.concurrent.ConcurrentHashMap<String, PendingAudioSend>()
+    /**
+     * Voice-note sends awaiting their sync echo (room key → txn → send info).
+     * Multi-slot: two rapid sends in one room must BOTH keep their optimistic
+     * rows — a single per-room slot let the second send overwrite the first,
+     * whose row then vanished until its echo (feedback 2026-08-17: "only one
+     * shows").
+     */
+    private val pendingAudioEcho = java.util.concurrent.ConcurrentHashMap<
+        String, java.util.concurrent.ConcurrentHashMap<String, PendingAudioSend>>()
 
     private data class PendingAudioSend(val txnId: String, val timestampMs: Long, val durationMs: Long?)
 
     /**
-     * Text sends awaiting their sync echo (room key → send info), the same
-     * optimistic-row pattern as [pendingAudioEcho]. The echo (which can take a
-     * full sync tick on a big account) replaces the row; until then every
-     * getMessages shows the sent message — including a re-opened thread, which
-     * is why the echo lives server-side and not in the tool's view model
+     * Text sends awaiting their sync echo (room key → txn → send info), the
+     * same optimistic-row pattern as [pendingAudioEcho]. The echo (which can
+     * take a full sync tick on a big account) replaces the row; until then
+     * every getMessages shows the sent message — including a re-opened thread,
+     * which is why the echo lives server-side and not in the tool's view model
      * (feedback 2026-08-14: a sent message vanished from a re-opened thread).
      */
-    private val pendingTextEcho = java.util.concurrent.ConcurrentHashMap<String, PendingTextSend>()
+    private val pendingTextEcho = java.util.concurrent.ConcurrentHashMap<
+        String, java.util.concurrent.ConcurrentHashMap<String, PendingTextSend>>()
 
     private data class PendingTextSend(val txnId: String, val timestampMs: Long, val body: String)
+
+    /** A room's in-flight text sends, oldest first (chronological row order). */
+    private fun pendingTextEchoes(roomId: String): List<PendingTextSend> =
+        pendingTextEcho[roomId]?.values?.sortedBy { it.timestampMs }.orEmpty()
+
+    /** A room's in-flight audio sends, oldest first. */
+    private fun pendingAudioEchoes(roomId: String): List<PendingAudioSend> =
+        pendingAudioEcho[roomId]?.values?.sortedBy { it.timestampMs }.orEmpty()
+
+    /** The newest in-flight send in a room (the panel bump / pending override
+     *  only ever shows the latest one). */
+    private fun newestPending(roomId: String): Any? =
+        (pendingTextEcho[roomId]?.values?.maxByOrNull { it.timestampMs })
+            ?: (pendingAudioEcho[roomId]?.values?.maxByOrNull { it.timestampMs })
 
     /** Client the sync-state + notification observers are currently attached to. */
     @Volatile
@@ -906,10 +928,13 @@ object MatrixRepository {
         val c = client ?: return com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response(
             verified = false, canVerify = false, detail = "not logged in",
         )
-        val trust = withTimeoutOrNull(ROOM_BUDGET_MS) {
-            c.key.getTrustLevel(c.userId, c.deviceId).firstOrNull()
-        }
-        val verified = trust is net.folivo.trixnity.crypto.key.DeviceTrustLevel.CrossSigned && trust.verified
+        // Same policy as [isDeviceVerified]: a timed-out trust read must NOT
+        // read as "unverified" — on the LP3 the first read after opening the
+        // screen can exceed the budget on a cold trust store, and the Account
+        // row flipped "not verified" → "verified" on the next 5s poll
+        // (2026-08-17, user report). Only a genuine non-CrossSigned trust
+        // result counts as unverified.
+        val verified = isDeviceVerified(c)
         if (verified && !restoreAttempted) {
             restoreAttempted = true
             scope.launch { restoreMegolmSessions() }
@@ -1531,7 +1556,7 @@ object MatrixRepository {
      * exiting and entering"). The rows dedup by their "local-…" id; the
      * refresh's [computeMessagesPage] replaces them with the real echo.
      */
-    private fun injectPendingEchoes(roomId: String, page: MessagesPage): MessagesPage {
+    private suspend fun injectPendingEchoes(roomId: String, page: MessagesPage): MessagesPage {
         val c = client ?: return page
         if (pendingAudioEcho[roomId] == null && pendingTextEcho[roomId] == null) return page
         val result = page.messages.toMutableList()
@@ -1539,30 +1564,22 @@ object MatrixRepository {
         fun addIfMissing(message: com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message) {
             if (existing.add(message.id)) result += message
         }
-        pendingAudioEcho[roomId]?.let { pending ->
+        // [pendingEchoRow]: an acked send renders with its real event id (sent),
+        // a failed one with the FAIL_ marker, a queued one as the optimistic
+        // "local-…" row — dedup by id keeps a page that already holds the real
+        // row from gaining a duplicate. Every in-flight send in the room is
+        // injected (rapid sends must ALL keep their rows — feedback 2026-08-17).
+        for (pending in pendingAudioEchoes(roomId)) {
             addIfMissing(
-                com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
-                    id = "local-${pending.txnId}",
-                    sender = c.userId.full,
-                    senderName = "",
-                    body = "Voice note",
-                    timestampMs = pending.timestampMs,
-                    isMine = true,
-                    contentType = "audio",
-                    durationMs = pending.durationMs,
+                pendingEchoRow(
+                    c, RoomId(roomId), pending.txnId, pending.timestampMs,
+                    body = "Voice note", contentType = "audio", durationMs = pending.durationMs,
                 ),
             )
         }
-        pendingTextEcho[roomId]?.let { pending ->
+        for (pending in pendingTextEchoes(roomId)) {
             addIfMissing(
-                com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
-                    id = "local-${pending.txnId}",
-                    sender = c.userId.full,
-                    senderName = "",
-                    body = pending.body,
-                    timestampMs = pending.timestampMs,
-                    isMine = true,
-                ),
+                pendingEchoRow(c, RoomId(roomId), pending.txnId, pending.timestampMs, pending.body),
             )
         }
         return if (result.size == page.messages.size) page
@@ -1859,6 +1876,40 @@ object MatrixRepository {
         }
     }
 
+    /** Row for a send whose sync echo hasn't rendered yet. The message is
+     *  treated as SENT the moment the server acks it: once the outbox records
+     *  the real event id (the /send 200 — ~1s after the send, long before the
+     *  sync echo), the row carries that id + the send time; a recorded outbox
+     *  error renders as "! not delivered" (FAIL_ status, shown by the tool);
+     *  only a still-queued send keeps the optimistic "local-…" row. The tool
+     *  shows the send time for all three, so the thread reflects a send
+     *  immediately, until proven sent or not delivered (feedback 2026-08-17).
+     */
+    private suspend fun pendingEchoRow(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        txnId: String,
+        timestampMs: Long,
+        body: String,
+        contentType: String = "text",
+        durationMs: Long? = null,
+    ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message {
+        val outbox = withTimeoutOrNull(OUTBOX_READ_TIMEOUT_MS) {
+            c.room.getOutbox(matrixRoomId, txnId).first()
+        }
+        return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+            id = outbox?.eventId?.full ?: "local-$txnId",
+            sender = c.userId.full,
+            senderName = "",
+            body = body,
+            timestampMs = timestampMs,
+            isMine = true,
+            sendStatus = if (outbox?.sendError != null) "FAIL_LOCAL_SEND" else null,
+            contentType = contentType,
+            durationMs = durationMs,
+        )
+    }
+
     private suspend fun computeMessagesPage(
         roomId: String,
         beforeEventId: String?,
@@ -1968,10 +2019,10 @@ object MatrixRepository {
         // the undecrypted "[Encrypted]" placeholder — a message the user just
         // sent from this device must never read "waiting for key" (feedback
         // 2026-08-17: the newest sent message appeared missing on re-entry).
-        val pendingTxnIds = setOfNotNull(
-            pendingAudioEcho[roomId]?.txnId,
-            pendingTextEcho[roomId]?.txnId,
-        )
+        val pendingTxnIds = buildSet {
+            pendingAudioEcho[roomId]?.keys?.let { addAll(it) }
+            pendingTextEcho[roomId]?.keys?.let { addAll(it) }
+        }
         for (i in startIndex until events.size) {
             if (result.size >= limit) break
             val te = events[i]
@@ -1989,7 +2040,7 @@ object MatrixRepository {
         // Optimistic voice-note row (feedback 2026-08-13): a voice note sent
         // from this device shows immediately as a "Voice note" row — the sync
         // echo (which can take a full tick on a big account) replaces it.
-        pendingAudioEcho[roomId]?.let { pending ->
+        for (pending in pendingAudioEchoes(roomId)) {
             // Only a DECRYPTED echo retires the optimistic row — the echo is
             // re-read via the API (which triggers decryption; a store decode
             // can leave E2EE content unresolved), and the just-sent note
@@ -2001,7 +2052,7 @@ object MatrixRepository {
             val echoWasSkipped = echo != null && echo.content?.getOrNull() == null
             val resolved = resolvePendingEcho(c, matrixRoomId, events, pending.txnId)
             if (resolved != null) {
-                pendingAudioEcho.remove(roomId)
+                pendingAudioEcho[roomId]?.remove(pending.txnId)
                 if (echoWasSkipped && beforeEventId == null && result.size < limit + 1) {
                     messageFrom(
                         c, matrixRoomId, resolved,
@@ -2016,18 +2067,13 @@ object MatrixRepository {
                 // at the newest end. (The old append put it at the OLDEST end:
                 // the just-sent message surfaced at the TOP of the thread and
                 // dead-ended pagination via the local-row guard; feedback
-                // 2026-08-17.)
+                // 2026-08-17.) Oldest-first iteration keeps rapid sends in
+                // chronological order.
                 result.add(
                     0,
-                    com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
-                        id = "local-${pending.txnId}",
-                        sender = c.userId.full,
-                        senderName = "",
-                        body = "Voice note",
-                        timestampMs = pending.timestampMs,
-                        isMine = true,
-                        contentType = "audio",
-                        durationMs = pending.durationMs,
+                    pendingEchoRow(
+                        c, matrixRoomId, pending.txnId, pending.timestampMs,
+                        body = "Voice note", contentType = "audio", durationMs = pending.durationMs,
                     ),
                 )
             }
@@ -2036,12 +2082,12 @@ object MatrixRepository {
         // echo above — a just-sent message shows in every newest page (even a
         // re-opened thread) until its sync echo lands. The row id matches the
         // tool's "local-<txn>" id, so the tool's own pending row dedupes.
-        pendingTextEcho[roomId]?.let { pending ->
+        for (pending in pendingTextEchoes(roomId)) {
             val echo = events.firstOrNull { txnIdOf(it) == pending.txnId }
             val echoWasSkipped = echo != null && echo.content?.getOrNull() == null
             val resolved = resolvePendingEcho(c, matrixRoomId, events, pending.txnId)
             if (resolved != null) {
-                pendingTextEcho.remove(roomId)
+                pendingTextEcho[roomId]?.remove(pending.txnId)
                 // Render the now-decrypted real row only when the loop skipped
                 // the unresolved echo (an already-rendered echo must not be
                 // added twice — LazyColumn duplicate-key crash, 2026-08-17).
@@ -2056,14 +2102,7 @@ object MatrixRepository {
             } else if (beforeEventId == null && result.size < limit + 1) {
                 result.add(
                     0,
-                    com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
-                        id = "local-${pending.txnId}",
-                        sender = c.userId.full,
-                        senderName = "",
-                        body = pending.body,
-                        timestampMs = pending.timestampMs,
-                        isMine = true,
-                    ),
+                    pendingEchoRow(c, matrixRoomId, pending.txnId, pending.timestampMs, pending.body),
                 )
             }
         }
@@ -2321,6 +2360,68 @@ object MatrixRepository {
         return loaded
     }
 
+    /** An own send leaves its echo waiting on the server; without a wake,
+     *  the outbox drain + echo are gated on the sync cycle — the long-poll
+     *  can hold up to 30s, the slow rounds 5/30 min — so the just-sent
+     *  message sat on "SENDING" and the room panel kept the pre-send preview
+     *  (LP3 2026-08-17, user report: minutes). A queued syncOnce ABORTS an
+     *  in-flight long-poll immediately (SyncApiClient selects it away), so
+     *  run ONE in both modes: the round drains the outbox (the message
+     *  reaches the server now) and the follow-up long-poll returns the echo
+     *  in ~1-2s — same ~640ms cost as a push-wake round, only on a user
+     *  send. Also wakes the room-list resolver so the panel recomputes the
+     *  row. Skipped when sync is paused by the user.
+     */
+    private fun wakeAfterSend(roomId: String) {
+        roomListDirty = true
+        wakeRoomList()
+        // Publish the sent room's pending bump NOW — [publishRoomList] alone
+        // waits for the resolver's next full pass, which on a big bridged
+        // account is gated by the resolve loop's ghost-walk work (measured
+        // 10-40s on the LP3). The bump is a direct cache update: row time +
+        // preview come from the in-flight send, so the room jumps to the top
+        // the moment the tool's next list read lands. [resolveRoomListEntry]'s
+        // own pending override keeps the row bumped until the echo lands.
+        val pending = newestPending(roomId)
+        if (pending != null) {
+            val ts = when (pending) {
+                is PendingTextSend -> pending.timestampMs
+                is PendingAudioSend -> pending.timestampMs
+                else -> 0L
+            }
+            val preview = when (pending) {
+                is PendingTextSend ->
+                    if (roomListCache[roomId]?.room?.isDirect == true) pending.body else "You: ${pending.body}"
+                else -> "Voice note"
+            }
+            roomListCache[roomId]?.let { entry ->
+                roomListCache[roomId] = entry.copy(
+                    room = entry.room.copy(
+                        lastTimestampMs = maxOf(entry.room.lastTimestampMs, ts),
+                        lastMessage = preview,
+                    ),
+                )
+            }
+            publishRoomList()
+        }
+        val c = client ?: return
+        if (!syncEnabled) return
+        slowSyncJob?.cancel()
+        slowSyncJob = null
+        scope.launch {
+            timedSyncOnce(c)
+                .onFailure { android.util.Log.w(TAG, "send-wake sync failed: ${it.message}") }
+            // Slow mode owns the rounds (active mode's long-poll restarts
+            // itself after the syncOnce). The screen may have come back on
+            // mid-wake — enterActiveSync owns sync then; restart the fallback
+            // rounds only while it is still dark.
+            val power = appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (syncMode == SyncMode.SLOW && power?.isInteractive == false) {
+                slowSyncJob = startSlowSyncRounds(c)
+            }
+        }
+    }
+
     suspend fun sendMessage(
         roomId: String,
         body: String,
@@ -2353,13 +2454,15 @@ object MatrixRepository {
         // sitting on "Sending…" while the homeserver acks (feedback
         // 2026-08-14). The echo row survives leaving the thread; the sync
         // echo (matched by txn id) replaces it in [computeMessagesPage].
-        pendingTextEcho[matrixRoomId.full] = PendingTextSend(txnId, System.currentTimeMillis(), body)
+        val roomPending = pendingTextEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
+        roomPending[txnId] = PendingTextSend(txnId, System.currentTimeMillis(), body)
         // Keep the cached/disk newest page — re-opening the thread serves it
         // instantly with the optimistic row injected ([injectPendingEchoes]),
         // and the active-room refresher (or the next poll) recomputes the page
         // once the sync echo lands (feedback 2026-08-15: re-open showed
         // "Loading messages…" because the send had dropped the cache).
-        roomListDirty = true // the room's preview/unread change once the echo lands
+        // Fetch the echo + refresh the panel even in slow-sync mode (screen off).
+        wakeAfterSend(matrixRoomId.full)
         android.util.Log.d(TAG, "SendMessage: room=$roomId txn=$txnId body=$body")
         return com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response(
             transactionId = txnId,
@@ -2424,6 +2527,7 @@ object MatrixRepository {
         }.getOrNull() ?: return false
         android.util.Log.d(TAG, "SendPhoto: room=$roomId txn=$txnId bytes=${payload.jpeg.size}")
         messagePageCache.remove(matrixRoomId.full)
+        wakeAfterSend(matrixRoomId.full)
         return true
     }
 
@@ -2685,7 +2789,9 @@ object MatrixRepository {
         // real event). The send previously dropped the cache, so a re-open
         // recomputed from scratch (slow — "Loading messages…") and could show
         // the note as missing (feedback 2026-08-15).
-        pendingAudioEcho[matrixRoomId.full] = PendingAudioSend(txnId, System.currentTimeMillis(), durationMs)
+        val roomPending = pendingAudioEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
+        roomPending[txnId] = PendingAudioSend(txnId, System.currentTimeMillis(), durationMs)
+        wakeAfterSend(matrixRoomId.full)
         return true
     }
 
@@ -3306,9 +3412,16 @@ object MatrixRepository {
                 // for the next wake, not sub-minute (the slow-sync rounds kept
                 // it dirty on the live account, so the old 2s breather meant
                 // near-continuous passes).
-                kotlinx.coroutines.delay(
+                // Wakeable (2026-08-17): a send/push/list-open wake ends the
+                // breather early, so the next pass — and its publish — runs
+                // immediately and the tool's very next list refresh shows the
+                // bump instead of waiting out the cadence. Coalescing is
+                // unchanged: the breather only shortens on a wake signal.
+                withTimeoutOrNull(
                     if (isScreenInteractive()) ROOM_LIST_REFRESH_DELAY_MS else SLOW_RESOLVER_DELAY_MS
-                )
+                ) {
+                    roomListWake.receive()
+                }
             }
         }
     }
@@ -3381,6 +3494,19 @@ object MatrixRepository {
         val serverTs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L
         val serverLastId = room.lastRelevantEventId?.full
         val (lastEventId, ts) = effectiveLastEvent(c, roomId, serverLastId, serverTs)
+        // Own send in flight (echo not yet in the store): the row must bump to
+        // the top NOW with the send's preview + time — the panel must not keep
+        // the pre-send state while the user's own message is on its way (LP3
+        // 2026-08-17: the panel kept the old timestamp for ~10-15s after a
+        // send). The pending's values (send time + body) match the echo's
+        // closely, so the swap when the echo lands is invisible; once the
+        // pending is gone (echo processed) the normal store row takes over.
+        val pending = newestPending(key)
+        val rowTs = when (val p = pending) {
+            is PendingTextSend -> maxOf(ts, p.timestampMs)
+            is PendingAudioSend -> maxOf(ts, p.timestampMs)
+            else -> ts
+        }
         // An unverified device can't decrypt — suppress unread for encrypted
         // rooms only; unencrypted ones stay readable.
         val storeUnread = if (verified || !room.encrypted) room.unreadMessageCount else 0
@@ -3388,7 +3514,7 @@ object MatrixRepository {
         val stateChanged = prev == null ||
             prev.room.lastEventId != lastEventId ||
             prev.room.unreadCount != unread ||
-            prev.room.lastTimestampMs != ts
+            prev.room.lastTimestampMs != rowTs
         // A parked preview stays stale only while the room is unchanged — a new
         // message (lastEventId move) re-attempts the preview immediately, so a
         // freshly-decryptable arrival isn't hidden for the rest of the park.
@@ -3405,6 +3531,17 @@ object MatrixRepository {
         val previewResolved: Boolean
         val previewRetryAtMs: Long
         when {
+            pending != null -> {
+                // A send in flight: the preview is the sent body ("Voice note"
+                // for audio), named like [resolveRoomPreview] would.
+                preview = when (val p = pending) {
+                    is PendingTextSend ->
+                        if (room.isDirect) p.body else "You: ${p.body}"
+                    else -> "Voice note"
+                }
+                previewResolved = true
+                previewRetryAtMs = 0L
+            }
             !resolvePreview && prev?.previewResolved != true -> {
                 // Outside the preview window and never resolved: keep the name
                 // row without a preview. Opening the thread fills it in.
@@ -3441,7 +3578,7 @@ object MatrixRepository {
                 name = name,
                 lastMessage = preview,
                 unreadCount = unread,
-                lastTimestampMs = ts,
+                lastTimestampMs = rowTs,
                 lastEventId = lastEventId,
                 isDirect = room.isDirect,
                 network = networks[key],
@@ -4097,6 +4234,8 @@ object MatrixRepository {
     private const val DECRYPT_WAIT_MS = 3_000L
     /** Peek budget for events after the first one failed to decrypt. */
     private const val QUICK_DECRYPT_WAIT_MS = 100L
+    /** Local outbox read for the pending-row state (event id / send error). */
+    private const val OUTBOX_READ_TIMEOUT_MS = 500L
 
     // Room-list resolver (Phase 5).
     private const val ROOM_NAME_PLACEHOLDER = "…"
