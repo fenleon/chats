@@ -58,17 +58,23 @@ class ComposerViewModel(
         if (body.isEmpty() || busy.value) return
         viewModelScope.launch {
             busy.value = true
-            val response = ChatClient.sendMessage(roomId, body)
-            ChatClient.setTyping(roomId, false)
-            busy.value = false
-            if (response != null) {
-                screen.goBack(
-                    ComposerResult(
-                        body = body,
-                        id = response.eventId ?: "local-${response.transactionId}",
-                        timestampMs = System.currentTimeMillis(),
-                    ),
-                )
+            try {
+                val response = ChatClient.sendMessage(roomId, body)
+                if (response != null) {
+                    screen.goBack(
+                        ComposerResult(
+                            body = body,
+                            id = response.eventId ?: "local-${response.transactionId}",
+                            timestampMs = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+            } finally {
+                // A failed/exception RPC must not leave the busy flag set —
+                // every later press would silently return and Send would look
+                // dead (feedback 2026-08-17: "send needs multiple presses").
+                ChatClient.setTyping(roomId, false)
+                busy.value = false
             }
         }
     }

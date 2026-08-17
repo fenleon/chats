@@ -755,7 +755,14 @@ private fun MessageRow(
             // visually, while the sender/alignment stays on every message.
             if (showTime) {
                 LightText(
-                    text = formatMessageTime(message.timestampMs),
+                    // In-flight (optimistic, not yet echoed by sync): the time
+                    // slot says so instead of a send timestamp (feedback
+                    // 2026-08-17).
+                    text = if (message.id.startsWith(LOCAL_ROW_PREFIX)) {
+                        "SENDING"
+                    } else {
+                        formatMessageTime(message.timestampMs)
+                    },
                     variant = LightTextVariant.Superfine,
                     lighten = true,
                     modifier = Modifier.padding(top = 1.dp),
@@ -801,18 +808,30 @@ private fun MessageRow(
                     lighten = true,
                     modifier = Modifier.padding(top = 1.dp),
                 )
-            } else if (message.isMine && showReadStatus && showDeliveryTag && message.sendStatus != "PENDING") {
+            } else if (message.isMine && showReadStatus && showDeliveryTag) {
                 // Phase 13: the seen/delivered marker (off via Settings →
                 // Show read status) — only on the newest message of a 1:1
                 // thread, so past messages and group chats stay quiet.
-                // "seen" = the other party's read receipt covers this message;
-                // "delivered" = sent but not read yet.
-                LightText(
-                    text = if (message.read) "seen" else "delivered",
-                    variant = LightTextVariant.Superfine,
-                    lighten = true,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
+                // Only claim what is actually known (feedback 2026-08-17:
+                // "seen" showed when only delivered, and fresh sends showed
+                // "delivered" before any delivery evidence existed): "seen"
+                // needs the other party's m.read receipt (or a Beeper READ
+                // status); "delivered" needs a Beeper status that means
+                // delivered. A message with no status event yet (still in
+                // flight, or no bridge report) gets no tag.
+                val tag = when {
+                    message.read || message.sendStatus == "READ" -> "seen"
+                    message.sendStatus == "DELIVERED" -> "delivered"
+                    else -> null
+                }
+                if (tag != null) {
+                    LightText(
+                        text = tag,
+                        variant = LightTextVariant.Superfine,
+                        lighten = true,
+                        modifier = Modifier.padding(top = 1.dp),
+                    )
+                }
             }
         }
     }

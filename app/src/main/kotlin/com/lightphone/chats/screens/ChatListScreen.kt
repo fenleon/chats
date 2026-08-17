@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
@@ -51,6 +52,10 @@ import kotlinx.coroutines.launch
 
 /** Grow the list slice when the last visible row is within this many of the end. */
 private const val REVEAL_THRESHOLD = 4
+
+/** Width of the room rows' reserved unread-star slot — always reserved so
+ *  names left-align across read/unread rows. */
+private const val STAR_SLOT_WIDTH_GRID_UNITS = 1.5f
 
 /**
  * Launch-intent extra carrying the room a notification tap should open
@@ -284,6 +289,18 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
             listState.requestScrollToItem(0)
         }
 
+        // Feedback pass: a new-message bump reorders the list; when the user
+        // was at (or within a row of) the top, keep the newest conversation
+        // pinned at index 0 — LazyColumn anchors by key, so the room that slid
+        // down stays in view and the bumped room hides just above the
+        // viewport without this (feedback 2026-08-17: "the room bumps to the
+        // top, but the panel requires scrolling up to see it").
+        LaunchedEffect(filteredRooms.firstOrNull()?.id) {
+            if (listState.firstVisibleItemIndex <= 1) {
+                listState.requestScrollToItem(0)
+            }
+        }
+
         // Offline: the list still shows cached rooms, with a status line on top
         // ("Can't reach server"); an expired session points at Settings instead.
         val offlineText = connection?.takeIf { it.state == "offline" }?.let { state ->
@@ -413,32 +430,50 @@ private fun RoomRow(
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
+            // Top-aligned: the unread count sits on the name line, not
+            // centered against the two-line column (feedback 2026-08-17).
+            verticalAlignment = Alignment.Top,
         ) {
+            // The unread star is its own element in a reserved left slot, as
+            // large as the name (the biggest LightTextVariant) — the built-in
+            // phone app marks unread with a separate left marker (feedback
+            // 2026-08-17). The slot is always reserved so names align across
+            // read/unread rows.
+            Box(
+                modifier = Modifier.width(STAR_SLOT_WIDTH_GRID_UNITS.gridUnitsAsDp()),
+            ) {
+                if (room.unreadCount > 0) {
+                    LightText(
+                        text = "*",
+                        variant = LightTextVariant.Heading,
+                    )
+                }
+            }
             Column(modifier = Modifier.weight(1f)) {
                 LightText(
                     text = room.name,
-                    variant = LightTextVariant.Copy,
+                    // Native Messages list names are ~80 px ink — the Heading
+                    // variant (feedback 2026-08-17).
+                    variant = LightTextVariant.Heading,
                     // One line, like the built-in titles — no wrapping.
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // No last-message preview subtext (feedback 2026-08-15): the
-                // row is just the thread name + timestamp + unread count.
-            }
-            Column(horizontalAlignment = Alignment.End) {
+                // The latest-message date under the name, smaller than the
+                // name (Detail = the settings sub-caption size; feedback
+                // 2026-08-17).
                 LightText(
                     text = formatRelativeTimestamp(room.lastTimestampMs),
-                    variant = LightTextVariant.Fine,
+                    variant = LightTextVariant.Detail,
                     lighten = true,
                 )
-                if (room.unreadCount > 0) {
-                    LightText(
-                        text = room.unreadCount.toString(),
-                        variant = LightTextVariant.Copy,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                }
+            }
+            if (room.unreadCount > 0) {
+                LightText(
+                    text = room.unreadCount.toString(),
+                    variant = LightTextVariant.Copy,
+                    modifier = Modifier.padding(start = 1f.gridUnitsAsDp()),
+                )
             }
         }
     }

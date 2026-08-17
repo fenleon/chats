@@ -6,9 +6,9 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 /**
- * Relative timestamp for room rows: time of day for today, "Yest." for the
- * previous day, the capitalized weekday within the last week (Mon, Tue, Wed,
- * Thu, Fri, Sat, Sun), "Mon XX" ("Aug 12", "Dec 01") for anything older.
+ * Relative timestamp for room rows: time of day for today, "Yesterday", the
+ * full weekday name within the last week (Monday, Tuesday, …), "Aug 12"
+ * (month abbreviation retained) for anything older.
  */
 fun formatRelativeTimestamp(timestampMs: Long): String {
     if (timestampMs <= 0) return ""
@@ -18,14 +18,14 @@ fun formatRelativeTimestamp(timestampMs: Long): String {
     val date = dateTime.toLocalDate()
     return when {
         date == today -> dateTime.toLocalTime().format(TIME_FORMAT)
-        date == today.minusDays(1) -> "Yest."
-        date.isAfter(today.minusDays(7)) -> SHORT_DAY_NAMES[date.dayOfWeek.value - 1]
+        date == today.minusDays(1) -> "Yesterday"
+        date.isAfter(today.minusDays(7)) -> DAY_NAMES[date.dayOfWeek.value - 1]
         else -> date.format(MONTH_DAY_FORMAT)
     }
 }
 
-/** Short capitalized weekday names (ISO: Monday=1 … Sunday=7). */
-private val SHORT_DAY_NAMES = arrayOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+/** Full capitalized weekday names (ISO: Monday=1 … Sunday=7). */
+private val DAY_NAMES = arrayOf("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 /** Time of day only, for message rows in the thread (Phase 9). */
 fun formatMessageTime(timestampMs: Long): String {
@@ -42,15 +42,15 @@ fun dayOf(timestampMs: Long): LocalDate =
 
 /**
  * Divider label for a thread day, matching the chat list's delineation:
- * "Today", "Yesterday", the capitalized weekday within the last week, or
- * "Mon XX" ("Aug 12", "Dec 01") for anything older.
+ * "Today", "Yesterday", the full weekday within the last week, or "Mon XX"
+ * ("Aug 12", "Dec 01") for anything older.
  */
 fun dayDividerLabel(date: LocalDate): String {
     val today = LocalDate.now()
     return when {
         date == today -> "Today"
         date == today.minusDays(1) -> "Yesterday"
-        date.isAfter(today.minusDays(7)) -> SHORT_DAY_NAMES[date.dayOfWeek.value - 1]
+        date.isAfter(today.minusDays(7)) -> DAY_NAMES[date.dayOfWeek.value - 1]
         else -> date.format(MONTH_DAY_FORMAT)
     }
 }

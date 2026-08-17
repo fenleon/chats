@@ -274,10 +274,11 @@ object PushChannel {
      * A push notification arrived over SSE. ntfy wraps the homeserver POST
      * in its own envelope (`data.message` = the JSON body as a string); the
      * dev gateway relays the notification verbatim. Either shape unwraps to
-     * the Matrix notification. The wake is unconditional once a notification
-     * payload is recognized: Beeper has been observed POSTing counts-style
-     * payloads WITHOUT room_id/event_id (2026-08-16 live test) — push means
-     * "something happened, sync once", and the sync is what decides.
+     * the Matrix notification. Payloads with room/event ids are messages —
+     * always wake one sync. Counts-only payloads (Beeper's read-receipt /
+     * unread-count updates) still wake, but [MatrixRepository.onPushDelivered]
+     * rate-limits them — a group chat's read actions must not each run a full
+     * ~30-50 s syncOnce (battery 2026-08-17 audit).
      */
     private suspend fun onNotification(json: String) {
         val outer = runCatching { Json { ignoreUnknownKeys = true }.parseToJsonElement(json).jsonObject }
@@ -315,6 +316,6 @@ object PushChannel {
             // Beeper counts-only payload (no event/room ids) — still a wake.
             Log.i(TAG, "push received (counts-style, no ids) -> waking one sync")
         }
-        MatrixRepository.onPushDelivered()
+        MatrixRepository.onPushDelivered(countsOnly = eventId == null && roomId == null)
     }
 }
