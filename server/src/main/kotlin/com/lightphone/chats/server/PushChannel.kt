@@ -30,12 +30,10 @@ import java.util.concurrent.TimeUnit
  * often as it polls. Matrix HTTP pushers fix the latency: the homeserver
  * gets a pusher whose `data.url` is an endpoint that serves the exact path
  * `/_matrix/push/v1/notify` (both Synapse and Beeper validate the path
- * exactly). Two endpoint options: the user's own gateway
- * (chats/push/gateway.py), reachable from the homeserver over a public
- * tunnel — or ntfy.sh, whose Matrix Push Gateway serves that exact path
- * and routes to the topic named in the pusher's pushkey
- * (`https://ntfy.sh/<topic>`), which the SSE side then subscribes to (no
- * tunnel; the topic is a per-install bearer token). The homeserver POSTs a
+ * exactly). The production endpoint is ntfy.sh, whose Matrix Push Gateway
+ * serves that exact path and routes to the topic named in the pusher's
+ * pushkey (`https://ntfy.sh/<topic>`), which the SSE side then subscribes to
+ * (no tunnel; the topic is a per-install bearer token). The homeserver POSTs a
  * small event-id-only payload on every new message; this object holds an
  * SSE subscription and turns each notification into one
  * [MatrixRepository.onPushDelivered] — a single syncOnce round while idle,

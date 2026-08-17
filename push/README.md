@@ -7,7 +7,7 @@ gateway; the Beeper desktop client on this Linux box is the live proof that
 Beeper → non-FCM delivery exists).
 
 ```
-matrix homeserver                    your Linux box (gateway.py)          LP3
+matrix homeserver                         the relay (ntfy.sh)              LP3
 ┌──────────────────┐   POST /_matrix/ ┌──────────────────┐   channel    ┌──────────────┐
 │ message arrives  │  push/v1/notify  │  /notify (queue) │ ◄─────────── │ companion    │
 │ push rules match │ ───────────────► │  /wait (long-poll)│  holds open │ wakes, syncs │
@@ -59,24 +59,8 @@ long-poll / 5-min rounds.
   `prio`, `count` and the event `content` — enough to render a notification
   without syncing; `format: "event_id_only"` shrinks it further if wanted.
 - Delivery is asynchronous: Synapse's pusher loop retries with backoff
-  (`Push failed: delaying for Ns`), so a gateway being briefly down is not
+  (`Push failed: delaying for Ns`), so a relay being briefly down is not
   data loss.
-
-## Run the tests
-
-Requires the local dev Synapse on `127.0.0.1:8008` (running; see root
-`AGENTS.md`). Uses **dummy users on the local dev server only** — nothing
-real, nothing sent anywhere.
-
-```bash
-python3 gateway.py 8721 &          # the gateway
-python3 test_local.py 8721 longpoll   # Theory A: homeserver -> POST -> /wait -> sync
-python3 test_local.py 8721 sse        # Theory B: same, delivered over SSE
-```
-
-`test_local.py` registers a fresh dummy user pair, registers the pusher,
-delivers a message, asserts the notification arrives with the right event id +
-body, then asserts a one-shot `/sync` sees the event, and deletes the pusher.
 
 ## LP3 companion integration — IMPLEMENTED (2026-08-16, emulator + LIVE verified)
 
@@ -161,7 +145,7 @@ an ntfy topic — the body-routing that was assumed not to exist.
 --es pushsse https://ntfy.sh/<random-topic>/json     # ntfy raw JSON stream
 --es pushnotify https://ntfy.sh/_matrix/push/v1/notify
 ```
-(`--es pushkey` added 2026-08-16; default stays a random UUID for gateway.py.)
+(`--es pushkey` added 2026-08-16.)
 
 **Current install state (2026-08-17, DEPLOYED):** the LP3 runs the final
 auto-provisioning build — push is **on with zero setup** (install → launch →
@@ -232,24 +216,10 @@ polling fallback remains for the other gap class — Beeper not POSTing at all
 be expected to run an always-on box.** That is exactly why the ntfy.sh path
 matters — and it WORKS (verified 2026-08-16, see the ntfy.sh section above):
 ntfy serves the exact `/_matrix/push/v1/notify` path as a Matrix Push
-Gateway that routes by the pushkey, so the no-box option is alive again. Two
-proven endpoint choices: the user's own box (gateway.py) or ntfy.sh's shared
-gateway.
-
-**Deployment 1 — the user's own box (works today, proven live):** the
-companion's own gateway (`gateway.py`) on an always-on box, reachable by
-Beeper over a **public tunnel**, and by the phone over LAN/tunnel/adb-reverse:
-
-- `pushnotify = https://<public-tunnel>/_matrix/push/v1/notify` (Beeper
-  POSTs here; the tunnel forwards to the local gateway).
-- `pushsse = http://<gateway-host>:8721/events` (whatever the phone can
-  reach — LAN IP at home, the same tunnel when away, `adb reverse` in dev).
-- Beeper POSTs → tunnel → gateway → SSE → one `syncOnce` → `ChatNotifier` →
-  idle. No FGS sync traffic between messages beyond the 5-min fallback rounds.
-- This is the natural deployment for users who DO have an always-on box
-  (this workspace's box is one). The tunnel is the only new infrastructure
-  (a named Cloudflare tunnel/Tailscale Funnel/VPS for stability). The pusher
-  is registered by the app at login; `--es pushclear 1` removes it.
+Gateway that routes by the pushkey, so the no-box option is alive. The
+original self-hosted-gateway design (a `gateway.py` on an always-on box
+behind a public tunnel) was **torn down the same day** — ntfy makes it
+obsolete (see "What's next").
 
 **Deployment 2 — a hosted relay for everyone (the general-public answer):**
 one public service serves `/_matrix/push/v1/notify` and routes each
