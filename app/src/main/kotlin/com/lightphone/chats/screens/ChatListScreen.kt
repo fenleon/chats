@@ -6,9 +6,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
@@ -52,10 +52,6 @@ import kotlinx.coroutines.launch
 
 /** Grow the list slice when the last visible row is within this many of the end. */
 private const val REVEAL_THRESHOLD = 4
-
-/** Width of the room rows' reserved unread-star slot — always reserved so
- *  names left-align across read/unread rows. */
-private const val STAR_SLOT_WIDTH_GRID_UNITS = 1.5f
 
 /**
  * Launch-intent extra carrying the room a notification tap should open
@@ -317,6 +313,16 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                // Feedback pass: a black bar spans the top of the panel, the
+                // same width as the content between the side buffers — the
+                // native Messages list starts its rows below a full-width top
+                // region, so neither the rooms nor the scrollbar crowd the
+                // screen's top edge.
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2f.gridUnitsAsDp()),
+                )
                 // Feedback pass: with a network filter active the list gets a
                 // context top bar naming the network ("WhatsApp"); on "All"
                 // it stays a bare list home. The null left/right slots render
@@ -424,34 +430,21 @@ private fun RoomRow(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onOpen)
-            // Left matches the built-in messaging margin; the right is trimmed
-            // so the time/unread sit right against the scrollbar.
+            // Left matches the built-in messaging margin; the right leaves the
+            // time clear of the scrollbar.
             .padding(start = 2f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 14.dp, bottom = 14.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            // Top-aligned: the unread count sits on the name line, not
-            // centered against the two-line column (feedback 2026-08-17).
+            // Top-aligned: the right-side time sits on the name line, not
+            // centered against the row (feedback 2026-08-17).
             verticalAlignment = Alignment.Top,
         ) {
-            // The unread star is its own element in a reserved left slot, as
-            // large as the name (the biggest LightTextVariant) — the built-in
-            // phone app marks unread with a separate left marker (feedback
-            // 2026-08-17). The slot is always reserved so names align across
-            // read/unread rows.
-            Box(
-                modifier = Modifier.width(STAR_SLOT_WIDTH_GRID_UNITS.gridUnitsAsDp()),
-            ) {
-                if (room.unreadCount > 0) {
-                    LightText(
-                        text = "*",
-                        variant = LightTextVariant.Heading,
-                    )
-                }
-            }
+            // The unread marker is a large asterisk inline at the start of the
+            // name, not a reserved column of its own (feedback 2026-08-17).
             Column(modifier = Modifier.weight(1f)) {
                 LightText(
-                    text = room.name,
+                    text = if (room.unreadCount > 0) "* ${room.name}" else room.name,
                     // Native Messages list names are ~80 px ink — the Heading
                     // variant (feedback 2026-08-17).
                     variant = LightTextVariant.Heading,
@@ -459,22 +452,16 @@ private fun RoomRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // The latest-message date under the name, smaller than the
-                // name (Detail = the settings sub-caption size; feedback
-                // 2026-08-17).
-                LightText(
-                    text = formatRelativeTimestamp(room.lastTimestampMs),
-                    variant = LightTextVariant.Detail,
-                    lighten = true,
-                )
             }
-            if (room.unreadCount > 0) {
-                LightText(
-                    text = room.unreadCount.toString(),
-                    variant = LightTextVariant.Copy,
-                    modifier = Modifier.padding(start = 1f.gridUnitsAsDp()),
-                )
-            }
+            // The latest-message time sits at the row's right, on the name
+            // line like the built-in list, with the short hand format
+            // (feedback 2026-08-17: back on the right after the under-name
+            // Detail date; the unread count was removed at the same time).
+            LightText(
+                text = formatRelativeTimestamp(room.lastTimestampMs),
+                variant = LightTextVariant.Fine,
+                lighten = true,
+            )
         }
     }
 }

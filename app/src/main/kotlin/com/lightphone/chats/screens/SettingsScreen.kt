@@ -220,7 +220,11 @@ private fun ToggleRow(
             .fillMaxWidth()
             .lightClickable(onClick = onToggle)
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
-        verticalAlignment = Alignment.CenterVertically,
+        // The toggle sits immediately left of its action label, the row
+        // top-aligned so it lines up with the main label — not centered
+        // between the label and the caption (same as Audiobooks Settings,
+        // feedback 2026-08-17).
+        verticalAlignment = Alignment.Top,
     ) {
         Box(
             modifier = Modifier.size(36.dp),

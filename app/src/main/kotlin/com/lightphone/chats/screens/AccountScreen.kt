@@ -407,7 +407,10 @@ private fun TokenToggleRow(
             .fillMaxWidth()
             .lightClickable(onClick = onToggle)
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
-        verticalAlignment = Alignment.CenterVertically,
+        // The toggle sits immediately left of its action label, the row
+        // top-aligned so it lines up with the main label (same as Audiobooks
+        // Settings, feedback 2026-08-17).
+        verticalAlignment = Alignment.Top,
     ) {
         Box(
             modifier = Modifier.size(36.dp),
@@ -477,7 +480,10 @@ private fun ModeRow(
             .fillMaxWidth()
             .lightClickable(onClick = onClick)
             .padding(horizontal = 1f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
-        verticalAlignment = Alignment.CenterVertically,
+        // The toggle sits immediately left of its action label, the row
+        // top-aligned so it lines up with the main label (same as Audiobooks
+        // Settings, feedback 2026-08-17).
+        verticalAlignment = Alignment.Top,
     ) {
         Box(
             modifier = Modifier.size(36.dp),
@@ -600,7 +606,10 @@ private fun EncryptionRow(
             .fillMaxWidth()
             .lightClickable(enabled = onClick != null, onClick = { onClick?.invoke() })
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
-        verticalAlignment = Alignment.CenterVertically,
+        // The toggle sits immediately left of its action label, the row
+        // top-aligned so it lines up with the main label (same as Audiobooks
+        // Settings, feedback 2026-08-17).
+        verticalAlignment = Alignment.Top,
     ) {
         Box(
             modifier = Modifier.size(36.dp),

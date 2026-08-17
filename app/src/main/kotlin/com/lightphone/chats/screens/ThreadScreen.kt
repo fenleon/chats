@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -28,7 +30,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
@@ -54,6 +60,7 @@ import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import com.thelightphone.sdk.ui.scaledForScreenHeight
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,6 +68,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import java.time.LocalDate
+import kotlin.math.ceil
 import kotlin.math.roundToInt
 
 /** Newest image messages whose bytes start downloading on page arrival. */
@@ -706,6 +714,38 @@ private fun DayDivider(label: String) {
     )
 }
 
+/**
+ * Outgoing message body: left-aligned text in a block sized to the FIRST
+ * line (measured at the message column's max width), so the top line's last
+ * word always touches the right edge while the rest wraps normally — the
+ * left buffer varies with the message (feedback 2026-08-17).
+ */
+@Composable
+private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
+    val density = LocalDensity.current
+    val textMeasurer = rememberTextMeasurer()
+    val style = LightThemeTokens.typography.paragraph.scaledForScreenHeight()
+    val widthDp = remember(body, maxWidthPx, density, style) {
+        val layout = textMeasurer.measure(
+            text = AnnotatedString(body),
+            style = style,
+            constraints = Constraints(maxWidth = maxWidthPx),
+        )
+        // Round UP: the box must be at least as wide as line 1's last word —
+        // a sub-pixel shortfall flips the wrap and drops the word to line 2,
+        // leaving the gap on the top line (verified on-device 2026-08-17).
+        val w = ceil(layout.getLineRight(0))
+        with(density) { w.toFloat().toDp() }
+    }
+    LightText(
+        text = body,
+        variant = LightTextVariant.Paragraph,
+        modifier = Modifier
+            .padding(top = 1.dp)
+            .width(widthDp),
+    )
+}
+
 @Composable
 private fun MessageRow(
     message: LightServiceMethod.GetMessages.Message,
@@ -724,19 +764,30 @@ private fun MessageRow(
 ) {
     // Phase 13: a buffer keeps message text off the far screen edge. Outgoing
     // messages sit on the right and incoming on the left — the built-in Phone
-    // app's layout — each capped at ~3/4 of the row width so long text never
+    // app's layout — each capped at ~7/8 of the row width so long text never
     // spans edge to edge.
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxWidth()
             // A little extra air between senders: the group-start rows (which
             // carry the timestamp + name) get more top padding; same-sender
             // grouped rows stay tight.
             .padding(
-                horizontal = 1.5f.gridUnitsAsDp(),
-                vertical = if (showTime) 8.dp else 3.dp,
+                // Outgoing text gets a wider right buffer so it stays clear of
+                // the thread scrollbar (feedback 2026-08-17).
+                start = 1.5f.gridUnitsAsDp(),
+                end = if (message.isMine) 2.5f.gridUnitsAsDp() else 1.5f.gridUnitsAsDp(),
+                top = if (showTime) 8.dp else 3.dp,
+                bottom = if (showTime) 8.dp else 3.dp,
             ),
     ) {
+        // The outgoing body's column cap (0.875 × the row content width):
+        // outgoing text is measured against it so the first line's natural
+        // width — the block width — keeps the top line's last word touching
+        // the right edge (feedback 2026-08-17).
+        val bodyMaxWidthPx = with(LocalDensity.current) {
+            (maxWidth * MESSAGE_WIDTH_FRACTION).toPx().roundToInt()
+        }
         Column(
             modifier = Modifier
                 .fillMaxWidth(MESSAGE_WIDTH_FRACTION)
@@ -784,11 +835,18 @@ private fun MessageRow(
                     onTogglePlay = { onPlayVoiceNote(message.id) },
                 )
             } else {
-                LightText(
-                    text = message.body,
-                    variant = LightTextVariant.Paragraph,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
+                if (message.isMine) {
+                    // Outgoing: block sized to the first line so the top line's
+                    // last word always touches the right edge (see
+                    // [OutgoingBodyText]).
+                    OutgoingBodyText(message.body, bodyMaxWidthPx)
+                } else {
+                    LightText(
+                        text = message.body,
+                        variant = LightTextVariant.Paragraph,
+                        modifier = Modifier.padding(top = 1.dp),
+                    )
+                }
             }
             // Phase 14: reactions, as a quiet tag under the message (same
             // grammar as the "! not delivered" marker). Each entry reads
@@ -949,8 +1007,12 @@ private fun formatDuration(ms: Long): String {
     return "${totalSecs / 60}:${(totalSecs % 60).toString().padStart(2, '0')}"
 }
 
-/** Cap for the message block — long text never spans the full row width. */
-private const val MESSAGE_WIDTH_FRACTION = 0.75f
+/** Cap for the message block — long text never spans the full row width.
+ *  The far-side buffer (the empty band on the message's outer side) is half
+ *  of what it was: 25 % → 12.5 % (feedback 2026-08-17). Incoming text fills
+ *  this width; outgoing text is measured against it and blocks can be
+ *  narrower — sized to the first line so the top line touches the right. */
+private const val MESSAGE_WIDTH_FRACTION = 0.875f
 
 /** Tallest an image row grows; tall photos letterbox inside. */
 private val MAX_IMAGE_HEIGHT_DP = 240.dp
