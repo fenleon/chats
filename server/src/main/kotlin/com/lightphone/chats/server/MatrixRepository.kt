@@ -75,6 +75,8 @@ import net.folivo.trixnity.client.store.GlobalAccountDataStore
 import net.folivo.trixnity.client.store.OlmCryptoStore
 import net.folivo.trixnity.client.store.TimelineEvent
 import net.folivo.trixnity.client.store.Room as MatrixRoom
+import net.folivo.trixnity.client.store.repository.RoomStateRepository
+import net.folivo.trixnity.client.store.repository.RoomStateRepositoryKey
 import net.folivo.trixnity.client.store.repository.RoomUserReceiptsRepository
 import net.folivo.trixnity.client.store.repository.RepositoryTransactionManager
 import net.folivo.trixnity.client.store.repository.room.TrixnityRoomDatabase
@@ -2113,6 +2115,12 @@ object MatrixRepository {
      *  by the bridge right after the message). */
     private val BEEPER_SEND_STATUS_EVENT_TYPE = "com.beeper.message_send_status"
 
+    /** Type of the room-state event flagging bridge/service bots ("functional
+     *  members", Element's MSC): e.g. Beeper's @whatsappbot. Those users post
+     *  m.read receipts as bridge bookkeeping, not as a human read — see
+     *  [readReceiptsByEvent]. */
+    private val FUNCTIONAL_MEMBERS_STATE_TYPE = "io.element.functional_members"
+
     /**
      * Latest Beeper send status per message event id, from the room's most
      * recent [BEEPER_SEND_STATUS_EVENT_TYPE] events (newest-first window, so the
@@ -2141,7 +2149,15 @@ object MatrixRepository {
             val content = te.event.content
             if (content !is UnknownEventContent || content.eventType != BEEPER_SEND_STATUS_EVENT_TYPE) continue
             val raw = content.raw
-            val status = raw["status"]?.jsonPrimitive?.contentOrNull ?: continue
+            // Beeper's WhatsApp/… bridges report delivery as a SUCCESS status
+            // carrying the recipient ghosts in "delivered_to_users" — that IS
+            // the delivered state Beeper's own clients show (the statuses are
+            // otherwise only SUCCESS, never "DELIVERED").
+            val status = raw["status"]?.jsonPrimitive?.contentOrNull
+                ?.let {
+                    if (raw["delivered_to_users"]?.jsonArray?.isNotEmpty() == true && it == "SUCCESS") "DELIVERED" else it
+                }
+                ?: continue
             val relatedEventId = raw["m.relates_to"]?.jsonObject?.get("event_id")?.jsonPrimitive?.contentOrNull
                 ?: content.relatesTo?.eventId?.full
                 ?: continue
@@ -2210,18 +2226,30 @@ object MatrixRepository {
     ): Set<String> {
         val rawIndex = HashMap<String, Int>() // event id -> newest-first index
         events.forEachIndexed { i, te -> rawIndex[te.event.id.full] = i }
-        val receiptsByUser = withTimeoutOrNull(MESSAGES_BUDGET_MS) {
+        val (receiptsByUser, serviceMembers) = withTimeoutOrNull(MESSAGES_BUDGET_MS) {
             // The Room-backed repositories only work inside a store transaction
             // (the flow APIs set it up themselves; direct repo reads need the
             // explicit scope, or Room answers "read transaction is missing").
             val txManager = c.di.get<RepositoryTransactionManager>(RepositoryTransactionManager::class)
             txManager.readTransaction {
-                c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class).get(matrixRoomId)
+                // Bridge/service bots (Beeper's @whatsappbot, @instagramgobot, …)
+                // post m.read receipts as room bookkeeping, not as a human read —
+                // ignoring them keeps the "seen" tag honest. They're flagged by
+                // the room's io.element.functional_members state ("service_members").
+                val state = c.di.get<RoomStateRepository>(RoomStateRepository::class)
+                    .get(RoomStateRepositoryKey(matrixRoomId, FUNCTIONAL_MEMBERS_STATE_TYPE), "")
+                val serviceMembers = when (val content = state?.content) {
+                    is UnknownEventContent -> content.raw["service_members"]?.jsonArray
+                        ?.mapNotNull { it.jsonPrimitive.contentOrNull }.orEmpty()
+                    else -> emptyList()
+                }
+                c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class)
+                    .get(matrixRoomId) to serviceMembers
             }
         } ?: return emptySet()
         val readEventIds = mutableSetOf<String>()
         for ((userId, roomUserReceipts) in receiptsByUser) {
-            if (userId == c.userId) continue
+            if (userId == c.userId || userId.full in serviceMembers) continue
             val receiptIndex = roomUserReceipts.receipts[ReceiptType.Read]?.eventId?.full
                 ?.let { rawIndex[it] } ?: continue
             for ((eventId, index) in rawIndex) {
