@@ -308,6 +308,11 @@ object MatrixRepository {
      *  not restart a long-poll then (ChatSyncService reads this). */
     val isSlowSyncing: Boolean get() = syncMode == SyncMode.SLOW
 
+    /** Screen truth for the sync-cadence decision. ChatSyncService reads this
+     *  so it never starts a long-poll while the screen is dark (battery
+     *  2026-08-19 audit: a service restart at night long-polled all night). */
+    val isScreenOn: Boolean get() = isScreenInteractive()
+
     private var slowSyncJob: Job? = null
     private var screenOffJob: Job? = null
 
@@ -348,7 +353,7 @@ object MatrixRepository {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 Intent.ACTION_SCREEN_ON -> {
-                    scope.launch { enterActiveSync() }
+                    applySyncModeForScreenState()
                     // A thread was open when the screen went dark — resume
                     // keeping its page fresh now that it's visible again.
                     startActiveRoomRefresh()
@@ -358,7 +363,7 @@ object MatrixRepository {
                     wakeRoomList()
                 }
                 Intent.ACTION_SCREEN_OFF -> {
-                    scheduleSlowSync()
+                    applySyncModeForScreenState()
                     // Battery (2026-08-15 audit): the active-room refresh was
                     // running 24/7 with no visibility coupling — every 2s a full
                     // page rebuild (SQL chain walk + key-backup restore + API
@@ -402,7 +407,13 @@ object MatrixRepository {
             // stay dormant without sync (room flows never emit).
             if (ensureClient() != null) {
                 if (syncEnabled) {
-                    startSyncLoop(app)
+                    // Screen-state-aware start (battery 2026-08-19 audit): a
+                    // session restore that lands while the screen is dark must
+                    // NOT long-poll — the boot-time sample above races the
+                    // restore, and a SCREEN_OFF broadcast that fired before the
+                    // receiver registered is gone. The shared entry point
+                    // applies the cadence the screen actually calls for.
+                    applySyncModeForScreenState()
                     // Push wake-up channel (2026-08-16): register the Matrix
                     // HTTP pusher + hold the SSE subscription so idle sync has
                     // zero latency — see PushChannel.
@@ -459,6 +470,25 @@ object MatrixRepository {
     }
 
     /**
+     * Single entry point for the screen-state → sync-cadence decision (battery
+     * 2026-08-19 audit: the slow-sync gate could silently never fire — a
+     * process restart raced the grace, `enterSlowSync` bailed on a null
+     * client, and the restore's long-poll never re-checked the screen).
+     * Called from [init] after the client is ready, the SCREEN_ON/OFF
+     * receiver, and [ChatSyncService] before it starts a long-poll, so a sync
+     * loop never runs while the screen is dark. Screen on → active long-poll;
+     * dark → slow sync after the grace.
+     */
+    fun applySyncModeForScreenState() {
+        if (!syncEnabled) return
+        if (isScreenInteractive()) {
+            scope.launch { enterActiveSync() }
+        } else {
+            scheduleSlowSync()
+        }
+    }
+
+    /**
      * Drops to the slow cadence once the screen has been dark for the grace
      * period: stop the long-poll and run periodic [MatrixClient.syncOnce]
      * rounds instead. The FGS stays (it keeps the process alive for the slow
@@ -478,7 +508,30 @@ object MatrixRepository {
 
     private suspend fun enterSlowSync() {
         if (!syncEnabled || syncMode == SyncMode.SLOW) return
-        val c = client ?: return
+        // The session restore may still be in flight when the grace fires (a
+        // process restart while dark — battery 2026-08-19 audit). Wait for it
+        // (bounded, screen re-checked) instead of bailing: a bail left syncMode
+        // ACTIVE and the restore's long-poll ran all night with no re-check.
+        var c = client
+        if (c == null) {
+            val deadline = android.os.SystemClock.elapsedRealtime() + SLOW_SYNC_GRACE_MS
+            while (c == null && !isScreenInteractive() &&
+                android.os.SystemClock.elapsedRealtime() < deadline
+            ) {
+                delay(250)
+                c = client
+            }
+            if (c == null) {
+                android.util.Log.w(
+                    TAG,
+                    "slow-sync grace: client still not ready after ${SLOW_SYNC_GRACE_MS / 1000}s — " +
+                        "applySyncModeForScreenState() re-arms on client-ready",
+                )
+                return
+            }
+            if (isScreenInteractive()) return // screen came back on — enterActiveSync owns sync
+            android.util.Log.w(TAG, "slow-sync grace: waited for client — engaging slow sync")
+        }
         syncMode = SyncMode.SLOW // gate first: the watchdog must not restart the long-poll
         runCatching { c.stopSync() }
         inProcessSyncRunning = false
@@ -527,7 +580,11 @@ object MatrixRepository {
         screenOffJob = null
         slowSyncJob?.cancel()
         slowSyncJob = null
-        if (syncMode == SyncMode.ACTIVE) return
+        // Skip only when ACTIVE mode already owns a live loop (in-process or
+        // the FGS's). syncMode starts ACTIVE in a fresh process with nothing
+        // running — bailing there (as the old `init`-independent guard did)
+        // would leave a fresh screen-on start with no sync at all.
+        if (syncMode == SyncMode.ACTIVE && (inProcessSyncRunning || ChatSyncService.isRunning)) return
         syncMode = SyncMode.ACTIVE
         if (!syncEnabled) return
         val ctx = appContext ?: return
@@ -905,6 +962,7 @@ object MatrixRepository {
         data object Waiting : VerificationUi          // request sent / SAS started, awaiting the other device
         data object Accept : VerificationUi           // their request or their SAS start
         data object Start : VerificationUi            // both ready; this side starts the SAS
+        data object Verifying : VerificationUi        // SAS exchange in progress (keys/macs)
         data class Compare(val emoji: List<String>) : VerificationUi
         data object Done : VerificationUi
         data object Cancelled : VerificationUi
@@ -957,6 +1015,7 @@ object MatrixRepository {
         val otherDevices = c.api.device.getDevices().getOrThrow()
             .map { it.deviceId }.filter { it != c.deviceId }.toSet()
         if (otherDevices.isEmpty()) error("no other devices on this account to verify with")
+        android.util.Log.i(TAG, "startDeviceVerification: requesting from ${otherDevices.size} devices")
         resetVerification()
         // The verification events go out unencrypted via
         // PlaintextVerificationOlmEncryptionService (Beeper drops encrypted
@@ -977,6 +1036,7 @@ object MatrixRepository {
                 VerificationUi.Waiting -> "waiting"
                 VerificationUi.Accept -> "accept"
                 VerificationUi.Start -> "start"
+                VerificationUi.Verifying -> "verifying"
                 is VerificationUi.Compare -> "compare"
                 VerificationUi.Done -> "done"
                 VerificationUi.Cancelled -> "cancelled"
@@ -989,19 +1049,27 @@ object MatrixRepository {
 
     /** Drives the interactive verification; [action] ∈ accept | start | match | no_match | cancel | reset. */
     suspend fun verifyAction(action: String): Result<Unit> = runCatching {
+        android.util.Log.i(TAG, "verify: action=$action")
         when (action) {
             "accept" -> {
-                // The "accept" UI covers both an incoming request and the SAS
-                // start; act on whichever is pending.
+                // The "accept" UI covers the other device's SAS start, an
+                // incoming request, and our Ready (both sides ready — start
+                // the SAS ourselves). Prefer whichever is pending; the states
+                // churn fast (their accept → their SAS start within ms), so
+                // the tap may land on a later state than the panel rendered.
                 val request = pendingTheirRequest
                 val sas = pendingTheirSasStart
+                val ready = pendingReady
                 when {
-                    request != null -> request.ready()
                     sas != null -> sas.accept()
+                    request != null -> request.ready()
+                    ready != null -> ready.start(VerificationMethod.Sas)
                     else -> error("no incoming request")
                 }
             }
             "start" -> {
+                // Legacy: the Ready-state action; the UI now routes it through
+                // "accept" (which prefers the SAS-accept path).
                 val ready = pendingReady ?: error("verification not ready")
                 ready.start(VerificationMethod.Sas)
             }
@@ -1023,6 +1091,7 @@ object MatrixRepository {
     }
 
     private suspend fun onVerificationState(state: ActiveVerificationState) {
+        android.util.Log.i(TAG, "verify: top-level state -> ${state::class.simpleName}")
         _verification.value = when (state) {
             is ActiveVerificationState.OwnRequest -> VerificationUi.Waiting
             is ActiveVerificationState.TheirRequest -> {
@@ -1038,7 +1107,11 @@ object MatrixRepository {
                 if (method is ActiveSasVerificationMethod) {
                     scope.launch { method.state.collectLatest { sas -> onSasState(sas) } }
                 }
-                VerificationUi.Waiting
+                // The SAS is engaging — stay on the accept panel instead of
+                // dipping back to "waiting" (the other device's SAS start
+                // follows their accept within ms; the dip read as the flow
+                // reverting — LP3 2026-08-19).
+                VerificationUi.Accept
             }
             is ActiveVerificationState.Done -> {
                 scope.launch { restoreMegolmSessions() }
@@ -1056,8 +1129,9 @@ object MatrixRepository {
     }
 
     private suspend fun onSasState(state: ActiveSasVerificationState) {
+        android.util.Log.i(TAG, "verify: SAS state -> ${state::class.simpleName}")
         _verification.value = when (state) {
-            is ActiveSasVerificationState.OwnSasStart -> VerificationUi.Waiting
+            is ActiveSasVerificationState.OwnSasStart -> VerificationUi.Verifying
             is ActiveSasVerificationState.TheirSasStart -> {
                 pendingTheirSasStart = state
                 VerificationUi.Accept
@@ -1066,9 +1140,9 @@ object MatrixRepository {
                 pendingCompare = state
                 VerificationUi.Compare(state.emojis.map { it.second })
             }
-            // Accept / WaitForKeys / WaitForMacs are progress states; Done and
-            // Cancelled arrive on the top-level verification state instead.
-            else -> VerificationUi.Waiting
+            // WaitForKeys / WaitForMacs are exchange progress — "Verifying…",
+            // not "waiting for the other device to accept".
+            else -> VerificationUi.Verifying
         }
     }
 

@@ -6,18 +6,19 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.style.TextAlign
+import com.thelightphone.lp3Keyboard.ui.KeyboardOptions
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.rememberKeyboardOptions
-import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightTextInputEditor
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.scaledForScreenHeight
+import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
  * Recovery-key entry matching Beeper's format: letters/digits grouped four at
@@ -35,7 +36,19 @@ class RecoveryKeyEditorScreen(
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
-        val keyboardOptionsFlow = rememberKeyboardOptions()
+        // Fixed options — no remote fetch, so the mic/emoji/return keys stay
+        // off (the passes code-entry style, feedback 2026-08-19).
+        val keyboardOptionsFlow = remember {
+            MutableStateFlow(
+                KeyboardOptions(
+                    emojis = emptyList(),
+                    displayReturn = false,
+                    displayVoice = false,
+                    enableKeyAnimation = true,
+                    swipeEnabled = false,
+                ),
+            )
+        }
         val textState = rememberTextFieldState("")
         // TextFieldCharSequence: snapshot-observed when read in composition
         // (not a State — it cannot be delegated with `by`).
@@ -64,8 +77,10 @@ class RecoveryKeyEditorScreen(
                 // small centered text, lines growing upward. The typography
                 // tokens carry no color, so copy the active content color —
                 // without it BasicText falls back to black-on-black on the dark
-                // theme and the key is unreadable.
-                inputTextStyle = LightThemeTokens.typography.paragraph
+                // theme and the key is unreadable. Copy-sized (was paragraph) —
+                // feedback 2026-08-19: slightly bigger, the 3-line key still
+                // fits above the keyboard.
+                inputTextStyle = LightThemeTokens.typography.copy
                     .copy(color = themeColors.content, textAlign = TextAlign.Center)
                     .scaledForScreenHeight(),
                 onSubmit = { result ->
@@ -74,12 +89,8 @@ class RecoveryKeyEditorScreen(
                 },
                 onBack = { goBack() },
                 modifier = Modifier.background(LightThemeTokens.colors.background),
-                submitLabel = "Done",
-                // Feedback pass: Notes-style entry — the action lives in the
-                // top bar and the keyboard sits flush at the bottom, so the
-                // 3-line grouped key gets the full vertical space.
-                submitInTopBar = true,
-                topBarSubmitIcon = LightIcons.ACCEPT,
+                // Feedback pass: the action lives in the bottom bar (SUBMIT —
+                // bar text buttons are uppercase), the key stays bottom-anchored.
                 bottomAligned = true,
             )
         }

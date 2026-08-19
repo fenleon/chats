@@ -59,4 +59,10 @@ dependencies {
         exclude(group = "androidx.camera")
     }
     implementation(libs.kotlinx.coroutines)
+
+    // The former :server companion — merged into this APK (2026-08-19): the
+    // tool hosts its own LightSdkService + Matrix sync (lighttool.toml
+    // serverPackage = com.lightphone.chats) and binds to itself. Everything
+    // the tool runtime forbids lives in this library module.
+    implementation(project(":server"))
 }

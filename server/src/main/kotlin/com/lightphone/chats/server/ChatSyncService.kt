@@ -46,13 +46,33 @@ class ChatSyncService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification(this))
         serviceScope.launch {
             val c = MatrixRepository.ensureClient() ?: return@launch
-            if (syncedClient !== c && !MatrixRepository.isInProcessSyncRunning && !MatrixRepository.isSlowSyncing) {
+            // Screen-state-aware sync start (battery 2026-08-19 audit): a
+            // service restart while the screen is dark must not long-poll —
+            // apply the screen → cadence decision first, and only start a
+            // long-poll here when the screen is actually on (slow-sync grace
+            // owns sync while dark; the shared entry point re-engages it).
+            MatrixRepository.applySyncModeForScreenState()
+            if (syncedClient !== c && !MatrixRepository.isInProcessSyncRunning &&
+                !MatrixRepository.isSlowSyncing && MatrixRepository.isScreenOn
+            ) {
                 runCatching { syncedClient?.stopSync() }
                 c.startSync(Presence.OFFLINE)
                 syncedClient = c
-                Log.d(TAG, "sync loop started for ${c.userId.full}")
+                Log.d(
+                    TAG,
+                    "sync loop started for ${c.userId.full} " +
+                        "(screen ${if (MatrixRepository.isScreenOn) "on" else "off"}, " +
+                        "mode ${if (MatrixRepository.isSlowSyncing) "slow" else "active"})",
+                )
             } else if (syncedClient !== c) {
-                Log.d(TAG, "in-process/slow sync loop already running for ${c.userId.full} — service is keep-alive only")
+                Log.d(
+                    TAG,
+                    if (MatrixRepository.isScreenOn) {
+                        "in-process/slow sync loop already running for ${c.userId.full} — service is keep-alive only"
+                    } else {
+                        "screen off — service stays keep-alive; slow-sync grace owns sync"
+                    },
+                )
             }
             if (watchdogClient !== c) {
                 watchdogClient = c
@@ -87,7 +107,10 @@ class ChatSyncService : Service() {
                 return@collect
             }
             if (stuckSinceMs == 0L) stuckSinceMs = now
-            if (syncedClient === c && now - stuckSinceMs >= SYNC_RESTART_AFTER_MS) {
+            // Never restart the long-poll while the screen is dark (battery
+            // 2026-08-19 audit): slow-sync owns sync then, and a restart would
+            // defeat the whole screen → cadence gate.
+            if (syncedClient === c && now - stuckSinceMs >= SYNC_RESTART_AFTER_MS && MatrixRepository.isScreenOn) {
                 Log.w(TAG, "sync stuck in $state for ${SYNC_RESTART_AFTER_MS / 1000}s — restarting sync loop")
                 runCatching { c.stopSync() }
                 c.startSync(Presence.OFFLINE)

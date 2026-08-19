@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LP3 reboot-confirmation X (captured 2026-08-19): two straight diagonals,
+     ~7 px stroke in a 79 px canvas, corners to corners. Replicates the native
+     confirm-dialog icon; the Verify flow's confirm panel uses it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="40dp"
+    android:height="40dp"
+    android:viewportWidth="79"
+    android:viewportHeight="79">
+    <path
+        android:pathData="M 6,6 L 73,73"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="7" />
+    <path
+        android:pathData="M 73,6 L 6,73"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="7" />
+</vector>

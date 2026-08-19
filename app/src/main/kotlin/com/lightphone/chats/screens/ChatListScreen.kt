@@ -313,24 +313,23 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                // Feedback pass: a black bar spans the top of the panel, the
-                // same width as the content between the side buffers — the
-                // native Messages list starts its rows below a full-width top
-                // region, so neither the rooms nor the scrollbar crowd the
-                // screen's top edge.
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(2f.gridUnitsAsDp()),
-                )
                 // Feedback pass: with a network filter active the list gets a
                 // context top bar naming the network ("WhatsApp"); on "All"
-                // it stays a bare list home. The null left/right slots render
-                // as spacers, so the title stays centered.
+                // it stays a bare list home (the 2-gu bar). A filtered list is
+                // a standard top-bar screen — the top bar REPLACES the 2-gu
+                // bar, so the header height matches every other titled screen
+                // (feedback 2026-08-19). The null left/right slots render as
+                // spacers, so the title stays centered.
                 val activeAccount = networkFilter
                 if (activeAccount != null) {
                     LightTopBar(
                         center = LightTopBarCenter.Text(activeAccount),
+                    )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(2f.gridUnitsAsDp()),
                     )
                 }
                 Box(modifier = Modifier.weight(1f)) {

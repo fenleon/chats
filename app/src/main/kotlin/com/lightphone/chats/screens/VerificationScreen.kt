@@ -12,12 +12,18 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.R
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -40,11 +46,19 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
+/** Cancelled/failed panels dismiss themselves back to the main panel. */
+private const val CANCELLED_AUTO_DISMISS_MS = 4_000L
+
 /**
  * Interactive (SAS/emoji) device verification: proves this device to the
  * account's other device (e.g. the Beeper app), which unlocks encrypted
  * message keys. The state machine runs in the companion (Trixnity); this
  * screen polls it over the binder and forwards the user's choices.
+ *
+ * The flow renders as full-screen panels (feedback 2026-08-19): a local
+ * confirmation panel before the request is sent, then the server's states —
+ * waiting / accept / compare / cancelled — each with the X-cancel affordance
+ * in the bottom bar.
  */
 class VerificationViewModel : LightViewModel<Unit>() {
 
@@ -52,6 +66,15 @@ class VerificationViewModel : LightViewModel<Unit>() {
     val e2ee = MutableStateFlow<LightServiceMethod.GetE2eeState.Response?>(null)
     val busy = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
+
+    /** Local pre-start confirmation panel ("send a request … Continue?"). The
+     *  server stays idle ("none") until the user confirms. */
+    val confirmOpen = MutableStateFlow(false)
+
+    /** True between Continue and the server reporting a non-idle verification
+     *  state — the waiting panel shows immediately, no main-panel flash
+     *  (feedback 2026-08-19). */
+    val starting = MutableStateFlow(false)
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
@@ -61,9 +84,25 @@ class VerificationViewModel : LightViewModel<Unit>() {
             while (true) {
                 state.value = ChatClient.verificationState()
                 e2ee.value = ChatClient.e2eeState()
+                if (starting.value && state.value?.state != "none") starting.value = false
                 delay(POLL_MS)
             }
         }
+    }
+
+    fun openConfirm() {
+        confirmOpen.value = true
+    }
+
+    fun dismissConfirm() {
+        confirmOpen.value = false
+    }
+
+    /** Continue from the confirmation panel: kick the server-side verification. */
+    fun confirmStart() {
+        confirmOpen.value = false
+        starting.value = true
+        start()
     }
 
     fun start() {
@@ -75,6 +114,7 @@ class VerificationViewModel : LightViewModel<Unit>() {
             busy.value = false
             if (response?.started != true) {
                 error.value = response?.error ?: "couldn't start verification"
+                starting.value = false
             } else {
                 state.value = ChatClient.verificationState()
             }
@@ -129,7 +169,13 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
         val e2ee by viewModel.e2ee.collectAsState()
         val error by viewModel.error.collectAsState()
         val busy by viewModel.busy.collectAsState()
+        val confirmOpen by viewModel.confirmOpen.collectAsState()
+        val starting by viewModel.starting.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
+        // The confirm panel's X + triangle replicate the LP3 reboot-confirmation
+        // icons (captured 2026-08-19); the play icon is the LP3's restart glyph.
+        val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
+        val confirmTriangle = painterResource(R.drawable.ic_lp3_confirm_triangle)
 
         LightTheme(colors = themeColors) {
             Column(
@@ -137,168 +183,292 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                // Cancelled/failed panels dismiss themselves back to the main
+                // panel after a few seconds (feedback 2026-08-19).
+                LaunchedEffect(state?.state) {
+                    if (state?.state == "cancelled" || state?.state == "error") {
+                        delay(CANCELLED_AUTO_DISMISS_MS)
+                        viewModel.act("reset")
+                    }
+                }
+
+                // Done: a bare overlay — no top bar, no back, just the centered
+                // confirmation and DONE (feedback 2026-08-19).
+                val verified = e2ee?.verified == true || state?.state == "done"
+                if (verified) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxSize(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        LightText(
+                            text = "Verified. Encrypted messages can now decrypt.",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                        )
+                    }
+                    LightBottomBar(
+                        modifier = Modifier.navigationBarsPadding(),
+                        items = listOf(
+                            null,
+                            LightBarButton.Text(
+                                text = "DONE",
+                                onClick = { goBack() },
+                            ),
+                            null,
+                        ),
+                    )
+                    return@Column
+                }
+
                 LightTopBar(
-                    leftButton = LightBarButton.LightIcon(
-                        icon = LightIcons.BACK,
-                        onClick = { goBack() },
-                        contentDescription = "Back to settings",
+                    leftButton = if (confirmOpen) {
+                        // The confirm panel's X (bottom-left) is the only exit —
+                        // no top-bar back (feedback 2026-08-19).
+                        null
+                    } else {
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.BACK,
+                            onClick = { goBack() },
+                            contentDescription = "Back to settings",
+                        )
+                    },
+                    center = LightTopBarCenter.Text(
+                        if (state?.state == "compare" && !confirmOpen) "Check your other device" else "Verify",
                     ),
-                    center = LightTopBarCenter.Text("Verify"),
                 )
-                // The scroll body sits in a weighted Box (like Settings) so the
-                // greedy scroll view can't squeeze the bottom bar to zero height.
+
                 Box(modifier = Modifier.weight(1f)) {
-                    LightScrollView {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
-                        ) {
-                            when {
-                            // The recovery key verifies without a state machine —
-                            // the e2ee flag flipping to verified is the signal.
-                            e2ee?.verified == true -> {
-                                // The bottom bar carries DONE; no duplicate row here.
-                                Body("Verified. Encrypted messages can now decrypt — open a conversation to load them.")
-                            }
+                    when {
+                        confirmOpen -> CenteredPanel(
+                            "This will send a verification request to your other Beeper device. Continue?",
+                        )
 
-                            else -> when (state?.state) {
-                                "none" -> {
-                                    Body("This device isn't verified yet — encrypted messages stay locked. Verify with another Beeper device or your recovery key.")
-                                    ActionRow(
-                                        text = if (busy) "…" else "START VERIFICATION",
-                                        enabled = !busy,
-                                        onClick = viewModel::start,
-                                    )
-                                }
+                        // Between Continue and the server's first non-idle
+                        // state, show the waiting panel directly — no flash of
+                        // the main panel (feedback 2026-08-19).
+                        starting && state?.state == "none" -> CenteredPanel(
+                            "Waiting for your other device to accept...",
+                        )
 
-                                "waiting" -> {
-                                    Body("Waiting for your other device… Open the Beeper app and accept the verification there.")
-                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                                }
-
-                                "accept" -> {
-                                    Body("Your other device wants to verify. Accept?")
-                                    ActionRow("ACCEPT", enabled = !busy) { viewModel.act("accept") }
-                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                                }
-
-                                "start" -> {
-                                    Body("Both devices are ready. Start the verification.")
-                                    ActionRow("START", enabled = !busy) { viewModel.act("start") }
-                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                                }
-
-                                "compare" -> {
-                                    Body("Compare the emojis on this device with the ones on your other device.")
-                                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                                    // All seven on one line so the SAS set reads
-                                    // as a single comparison (Heading keeps them
-                                    // small enough to fit).
-                                    state?.emoji.orEmpty().chunked(7).forEach { rowEmojis ->
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceEvenly,
-                                        ) {
-                                            rowEmojis.forEach { emoji ->
-                                                LightText(text = emoji, variant = LightTextVariant.Heading)
-                                            }
-                                        }
-                                    }
-                                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                                    ActionRow("MATCH", enabled = !busy) { viewModel.act("match") }
-                                    ActionRow("DON'T MATCH", enabled = !busy) { viewModel.act("no_match") }
-                                    ActionRow("CANCEL", enabled = !busy) { viewModel.act("cancel") }
-                                }
-
-                                "done" -> {
-                                    // The bottom bar carries DONE; no duplicate row here.
-                                    Body("Verified. Encrypted messages can now decrypt — open a conversation to load them.")
-                                }
-
-                                "cancelled" -> {
-                                    Body("Verification was cancelled or failed.")
-                                    ActionRow("START OVER", enabled = !busy) { viewModel.act("reset") }
-                                }
-
-                                "error" -> {
-                                    Body(state?.detail ?: "Verification failed.")
-                                    ActionRow("START OVER", enabled = !busy) { viewModel.act("reset") }
-                                }
-
-                                else -> Body("Checking…")
-                            }
-                        }
-                        error?.let { message ->
-                            LightText(
-                                text = message,
-                                variant = LightTextVariant.Detail,
-                                lighten = true,
-                                modifier = Modifier.padding(vertical = 0.5f.gridUnitsAsDp()),
+                        else -> when (state?.state) {
+                            "none" -> MainPanel(
+                                busy = busy,
+                                error = error,
+                                onStartVerification = viewModel::openConfirm,
+                                onUseRecoveryKey = { openRecoveryEditor() },
                             )
+
+                            "waiting" -> CenteredPanel("Waiting for your other device to accept...")
+                            "accept", "start" -> CenteredPanel("Your other device wants to verify. Accept?")
+                            "verifying" -> CenteredPanel("Verifying…")
+                            "compare" -> ComparePanel(state?.emoji.orEmpty())
+                            "cancelled" -> CenteredPanel("Verification was cancelled or failed.")
+                            "error" -> CenteredPanel(state?.detail ?: "Verification failed.")
+                            else -> CenteredPanel("Checking…")
                         }
                     }
                 }
-                }
-                // The bottom bar always stays visible with the screen's action
-                // (design rule): the recovery key is the dependable unlock while
-                // unverified; DONE once verified. Hidden during an active
-                // verification — the flow's actions live in the body.
-                val inVerification = state?.state in setOf("waiting", "accept", "start", "compare")
+
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
-                    items = listOf(
-                        null,
-                        when {
-                            e2ee?.verified == true -> LightBarButton.Text(
-                                text = "DONE",
-                                onClick = { goBack() },
-                            )
-                            inVerification -> null
-                            else -> LightBarButton.Text(
-                                text = if (busy) "…" else "USE RECOVERY KEY",
-                                onClick = if (busy) null else ({ openRecoveryEditor() }),
-                            )
-                        },
-                        null,
+                    items = bottomBarItems(
+                        confirmOpen,
+                        e2ee?.verified == true,
+                        state?.state,
+                        starting,
+                        confirmX,
+                        confirmTriangle,
                     ),
                 )
             }
         }
     }
 
+    /** The bottom-bar action set for the current panel (feedback 2026-08-19:
+     *  X dismiss/cancel; the panel's action; the compare page has no X, the
+     *  waiting and cancelled panels' X sits centered). */
+    private fun bottomBarItems(
+        confirmOpen: Boolean,
+        verified: Boolean,
+        state: String?,
+        starting: Boolean,
+        confirmX: Painter,
+        confirmTriangle: Painter,
+    ): List<LightBarButton?> = when {
+        confirmOpen -> listOf(
+            LightBarButton.Icon(
+                painter = confirmX,
+                onClick = viewModel::dismissConfirm,
+                contentDescription = "Cancel",
+            ),
+            null,
+            LightBarButton.Icon(
+                painter = confirmTriangle,
+                onClick = viewModel::confirmStart,
+                contentDescription = "Continue",
+            ),
+        )
+
+        verified -> listOf(
+            null,
+            LightBarButton.Text(
+                text = "DONE",
+                onClick = { goBack() },
+            ),
+            null,
+        )
+
+        else -> when {
+            starting && state == "none" -> listOf(null, cancelButton(), null)
+            state == "waiting" -> listOf(null, cancelButton(), null)
+            state == "accept" || state == "start" -> listOf(
+                // Both panels route through "accept" — the server prefers the
+                // pending SAS-accept over starting the SAS itself (the states
+                // churn fast, LP3 2026-08-19).
+                cancelButton(),
+                null,
+                LightBarButton.Text(
+                    text = "ACCEPT",
+                    onClick = { viewModel.act("accept") },
+                ),
+            )
+            state == "verifying" -> listOf(null, cancelButton(), null)
+            state == "compare" -> listOf(
+                // X (cancel) left + THEY MATCH center — the two text buttons
+                // crowded each other; "they don't match" is covered by the X
+                // (feedback 2026-08-19).
+                cancelButton(),
+                LightBarButton.Text(
+                    text = "THEY MATCH",
+                    onClick = { viewModel.act("match") },
+                ),
+                null,
+            )
+            state == "cancelled" || state == "error" -> listOf(
+                null,
+                LightBarButton.Icon(
+                    painter = confirmX,
+                    onClick = { viewModel.act("reset") },
+                    contentDescription = "Dismiss",
+                ),
+                null,
+            )
+            else -> listOf(null, null, null)
+        }
+    }
+
+    private fun cancelButton(): LightBarButton = LightBarButton.LightIcon(
+        icon = LightIcons.CLOSE,
+        onClick = { viewModel.act("cancel") },
+        contentDescription = "Cancel",
+    )
+
     private fun openRecoveryEditor() {
         navigateTo(screenFactory = {
             RecoveryKeyEditorScreen(it)
         }) { key ->
-            if (key != null && key.isNotBlank()) viewModel.recover(key)
+            if (key.isNotBlank()) viewModel.recover(key)
         }
     }
 }
 
+/** The main verify panel: the two options as settings-style rows (feedback
+ *  2026-08-19 — no intro text, "Use Recovery Key" is a plain row now). */
 @Composable
-private fun Body(text: String) {
-    LightText(
-        text = text,
-        variant = LightTextVariant.Copy,
-        modifier = Modifier.padding(vertical = 0.5f.gridUnitsAsDp()),
-    )
+private fun MainPanel(
+    busy: Boolean,
+    error: String?,
+    onStartVerification: () -> Unit,
+    onUseRecoveryKey: () -> Unit,
+) {
+    LightScrollView {
+        Column(
+            modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1f.gridUnitsAsDp()),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .lightClickable(enabled = !busy, onClick = onStartVerification)
+                    .padding(vertical = 0.75f.gridUnitsAsDp()),
+            ) {
+                LightText(
+                    text = if (busy) "…" else "Start Verification",
+                    variant = LightTextVariant.Heading,
+                )
+                LightText(
+                    text = "with another Beeper device",
+                    variant = LightTextVariant.Detail,
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .lightClickable(onClick = onUseRecoveryKey)
+                    .padding(vertical = 0.75f.gridUnitsAsDp()),
+            ) {
+                LightText(
+                    text = "Use Recovery Key",
+                    variant = LightTextVariant.Heading,
+                )
+            }
+            error?.let { message ->
+                LightText(
+                    text = message,
+                    variant = LightTextVariant.Detail,
+                    modifier = Modifier.padding(vertical = 0.5f.gridUnitsAsDp()),
+                )
+            }
+        }
+    }
 }
 
+/** A black centered-text panel (the confirm/waiting/accept/cancelled states). */
 @Composable
-private fun ActionRow(
-    text: String,
-    enabled: Boolean = true,
-    onClick: () -> Unit,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .lightClickable(enabled = enabled, onClick = onClick)
-            .padding(vertical = 0.75f.gridUnitsAsDp()),
+private fun CenteredPanel(text: String) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
     ) {
         LightText(
             text = text,
             variant = LightTextVariant.Copy,
-            lighten = true,
+            align = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
         )
+    }
+}
+
+/** The emoji-comparison panel: the SAS emojis, with the confirmation line
+ *  centred underneath (feedback 2026-08-19). */
+@Composable
+private fun ComparePanel(emojis: List<String>) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            // All seven on one line so the SAS set reads as a single
+            // comparison (Heading keeps them small enough to fit).
+            emojis.chunked(7).forEach { rowEmojis ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                ) {
+                    rowEmojis.forEach { emoji ->
+                        LightText(text = emoji, variant = LightTextVariant.Heading)
+                    }
+                }
+            }
+            Spacer(Modifier.height(1f.gridUnitsAsDp()))
+            LightText(
+                text = "Confirm the Emojis match the ones shown on your other device",
+                variant = LightTextVariant.Copy,
+                align = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+            )
+        }
     }
 }

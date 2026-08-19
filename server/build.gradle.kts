@@ -1,5 +1,10 @@
 plugins {
-    alias(libs.plugins.android.application)
+    // Version-less by design: the plugin is already on the build classpath
+    // (the composite's included light-sdk root declares it `apply false`, and
+    // :app loads AGP). A versioned request here is rejected with "already on
+    // the classpath with an unknown version" (Gradle composite quirk); the
+    // classpath version IS the catalog's agp (8.12.3), so nothing is lost.
+    id("com.android.library")
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
@@ -7,36 +12,11 @@ android {
     namespace = "com.lightphone.chats.server"
     compileSdk = 36
 
-    signingConfigs {
-        // Workspace dev signing (same key as the SDK tools/emulator).
-        create("lightsdkDev") {
-            storeFile = file("../../light-sdk/sdk/keys/lightsdk-dev.jks")
-            storePassword = "android"
-            keyAlias = "lightsdk-dev"
-            keyPassword = "android"
-        }
-    }
-
     defaultConfig {
-        applicationId = "com.lightphone.chats.server"
         minSdk = 34
-        targetSdk = 36
-        // Public release. versionCode tracks the repo's commit count
-        // (30 commits at 0.3.0).
-        versionCode = 30
-        versionName = "0.3.0"
-    }
-
-    buildTypes {
-        getByName("release") {
-            isMinifyEnabled = true      // R8: dead-code elimination + obfuscation
-            isShrinkResources = true    // drop unused resources
-            proguardFiles("proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("lightsdkDev")
-        }
-        getByName("debug") {
-            signingConfig = signingConfigs.getByName("lightsdkDev")
-        }
+        // R8 runs at the app level (the merged tool APK minifies); these keep
+        // rules (JNA / Trixnity olm) must reach that run via the consumer.
+        consumerProguardFiles("proguard-rules.pro")
     }
 
     compileOptions {
@@ -57,8 +37,8 @@ kotlin {
 
 dependencies {
     // SDK modules come from the included ../light-sdk build (see settings.gradle.kts).
-    // The QR scanner + CameraX come transitively via sdk:ui; the companion is a chat
-    // server and never scans codes (its manifest even strips CAMERA).
+    // The QR scanner + CameraX come transitively via sdk:ui; the chat server never
+    // scans codes (the merged manifest even strips CAMERA).
     implementation(libs.sdk.server)   // LightSdkServer + LightSdkService (the binder)
     implementation(libs.sdk.client) { // binder client + service connection
         exclude(group = "com.google.mlkit")

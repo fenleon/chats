@@ -1,9 +1,12 @@
 package com.lightphone.chats.server
 
-import android.app.Application
+import android.content.ContentProvider
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.pm.Signature
+import android.database.Cursor
+import android.net.Uri
 import com.thelightphone.sdk.server.ClientCertType
 import com.thelightphone.sdk.server.ClientFilterLevel
 import com.thelightphone.sdk.server.DefaultLightSdkServerSettings
@@ -16,29 +19,35 @@ private const val LIGHTSDK_DEV_CERT_SHA256 =
     "B9C33E29B0CCAD2BFF11ACAB55F65A3C517EF4BC92CD9C77785366FA353D5F28"
 
 /**
- * The Chats companion: hosts the SDK's [LightSdkService] so the tool can bind
- * to it, and owns the persistent Matrix connection — session restore, the sync
- * loop in [ChatSyncService], storage, and notifications.
+ * Single-APK build (2026-08-19): the former companion's `ServerApplication`
+ * wiring runs here, inside the merged tool APK. A ContentProvider is the only
+ * app-start hook with a real [Context] that is not part of the tool-plugin
+ * scanned module — it wires the SDK server (settings, cert check, chat
+ * methods) and hands the application context to [MatrixRepository.init]
+ * (session restore + sync service start). Providers run before the tool's
+ * first binder call, so the tool binds to its own APK's LightSdkService and
+ * the server is already wired when it does.
  */
-class ServerApplication : Application() {
+class ServerBootstrapProvider : ContentProvider() {
 
-    override fun onCreate() {
-        super.onCreate()
+    override fun onCreate(): Boolean {
+        val context = context?.applicationContext ?: return false
         with(LightSdkServer) {
             defaultClientFilterLevel = ClientFilterLevel.AllowLightSignedApks
             provideSdkSettings = { DefaultLightSdkServerSettings(it) }
-            checkCert = { callingPackage -> checkLightSdkCert(callingPackage) }
+            checkCert = { callingPackage -> checkLightSdkCert(context, callingPackage) }
             customServiceMethodResolver = { callingId, methodId, payload ->
                 ChatServiceMethods.dispatch(methodId, payload)
             }
         }
         // Restores a stored session (if any) and starts the sync service.
-        MatrixRepository.init(this)
+        MatrixRepository.init(context)
+        return true
     }
 
-    private fun Context.checkLightSdkCert(callingPackage: String): ClientCertType {
+    private fun checkLightSdkCert(context: Context, callingPackage: String): ClientCertType {
         val info = try {
-            packageManager.getPackageInfo(callingPackage, PackageManager.GET_SIGNING_CERTIFICATES)
+            context.packageManager.getPackageInfo(callingPackage, PackageManager.GET_SIGNING_CERTIFICATES)
         } catch (e: PackageManager.NameNotFoundException) {
             return ClientCertType.Unknown
         }
@@ -57,4 +66,21 @@ class ServerApplication : Application() {
     }
 
     private fun ByteArray.toHexString(): String = joinToString("") { "%02X".format(it) }
+
+    // The provider exists for its onCreate only; no content is served.
+    override fun query(
+        uri: Uri,
+        projection: Array<String>?,
+        selection: String?,
+        selectionArgs: Array<String>?,
+        sortOrder: String?,
+    ): Cursor? = null
+
+    override fun getType(uri: Uri): String? = null
+
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<String>?): Int = 0
+
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<String>?): Int = 0
 }

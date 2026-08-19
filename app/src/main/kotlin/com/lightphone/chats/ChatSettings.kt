@@ -8,9 +8,8 @@ import kotlinx.coroutines.flow.first
 
 /**
  * Tool-local settings, persisted in the SDK's DataStore
- * ([SealedLightContext.dataStore]). The seen/delivered marker preference lives
- * here: Settings toggles it, the thread reads the flow to decide whether
- * outgoing messages carry a "seen"/"delivered" line.
+ * ([SealedLightContext.dataStore]). The seen/delivered marker + data-saver
+ * preferences live here: Settings toggles them, the thread reads the flows.
  */
 object ChatSettings {
 
@@ -20,9 +19,10 @@ object ChatSettings {
     /** Whether the thread shows "seen"/"delivered" under outgoing messages. Default on. */
     val showReadStatus = MutableStateFlow(true)
 
-    /** Whether photo downloads are allowed on the mobile-data connection. Default off
-     *  (Wi-Fi only — the data-conscious default). */
-    val downloadOverMobile = MutableStateFlow(false)
+    /** Data Saver Mode: true = media downloads restricted to Wi-Fi. The Settings
+     *  toggle shows the inverse of this flag (checked = saver ON). Defaults to
+     *  mobile-allowed (feedback 2026-08-19: "Data Saver Mode … default OFF"). */
+    val downloadOverMobile = MutableStateFlow(true)
 
     private var loaded = false
 
@@ -33,7 +33,7 @@ object ChatSettings {
         runCatching {
             val prefs = lightContext.dataStore.data.first()
             showReadStatus.value = prefs[KEY_SHOW_READ_STATUS] ?: true
-            downloadOverMobile.value = prefs[KEY_DOWNLOAD_OVER_MOBILE] ?: false
+            downloadOverMobile.value = prefs[KEY_DOWNLOAD_OVER_MOBILE] ?: true
         }
     }
 

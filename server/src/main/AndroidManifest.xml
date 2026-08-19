@@ -2,8 +2,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- The companion holds the persistent Matrix connection (Phase 2) and posts
-         new-message notifications; everything the tool runtime forbids. -->
+    <!-- Merged into the tool APK (single-APK build, 2026-08-19): the former
+         companion is a library whose manifest contributes the persistent
+         Matrix connection (sync loop, storage, notifications) — everything the
+         tool runtime forbids — as components + permissions in the same APK. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -11,33 +13,36 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Media downloads are gated on the connection type (Settings toggle). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- Voice notes are recorded in the companion (the tool runtime forbids
-         media APIs; RECORD_AUDIO is granted at runtime by VoiceNoteActivity). -->
+    <!-- Voice notes are recorded in the server library (RECORD_AUDIO is granted
+         at runtime by VoiceNoteActivity). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
-    <!-- sdk:ui merges CAMERA for its QR scanner; the companion is a chat server. -->
+    <!-- sdk:ui merges CAMERA for its QR scanner; this is a chat server. -->
     <uses-permission
         android:name="android.permission.CAMERA"
         tools:node="remove" />
 
+    <!-- The tool's generated manifest provides the application class
+         (LightSdkApplication), label, and theme; the library contributes only
+         components + attributes that don't conflict (cleartext HTTP so a
+         self-hosted LAN homeserver, e.g. 10.0.2.2 in dev, works; large heap for
+         the Trixnity Room store). -->
     <application
-        android:name=".ServerApplication"
-        android:allowBackup="false"
-        android:icon="@android:mipmap/sym_def_app_icon"
-        android:label="Chats Server"
-        android:theme="@android:style/Theme.Black.NoTitleBar"
-        android:hardwareAccelerated="true"
         android:usesCleartextTraffic="true"
         android:largeHeap="true">
 
-        <!-- MainActivity (the dev status/control screen with scripted login/send
-             extras) is declared in src/debug/AndroidManifest.xml only — the
-             release companion is a service-only app. -->
+        <!-- Wires the SDK server (settings, cert check, chat methods) and
+             initializes MatrixRepository (session restore + sync service) at
+             process start, before the tool's first binder call. -->
+        <provider
+            android:name=".ServerBootstrapProvider"
+            android:authorities="com.lightphone.chats.server.bootstrap"
+            android:exported="false" />
 
         <!-- Shows the system photo picker and sends the chosen photo; started
              by the tool via StartPhotoSend + startServerActivity (the tool
-             runtime forbids startActivity, the companion can't launch
-             activities from the background). -->
+             runtime forbids startActivity, the server can't launch activities
+             from the background). -->
         <activity
             android:name=".PhotoSendActivity"
             android:exported="true"
@@ -64,7 +69,7 @@
             android:foregroundServiceType="dataSync" />
 
         <!-- sdk:client merges its UnifiedPush service + file-share provider;
-             the companion is a local Matrix server and uses neither. -->
+             chats is a local Matrix client and uses neither. -->
         <service
             android:name="com.thelightphone.sdk.LightPushService"
             tools:node="remove" />
@@ -74,8 +79,8 @@
 
         <!-- sdk:server merges the UnifiedPush distributor (an EXPORTED receiver —
              any app can start the process with it) and the connector's
-             receiver/activity/foreground service; the chats companion delivers
-             messages via its own sync loop, so strip them all. -->
+             receiver/activity/foreground service; chats delivers messages via
+             its own sync loop, so strip them all. -->
         <receiver
             android:name="com.thelightphone.sdk.server.LightPushDistributor"
             tools:node="remove" />

@@ -1,12 +1,13 @@
 [tool]
 id = "com.lightphone.chats"
 label = "Chats"
-versionCode = 30
-versionName = "0.3.0"
+versionCode = 40
+versionName = "0.4.0"
 permissions = ["android.permission.INTERNET"]
-# The tool is a thin UI; the companion (:server) hosts the SDK service, the
-# persistent Matrix connection (sync loop), storage, and notifications. Point
-# serverPackage at com.lightos on a real LP3 only if Light ships chat methods
-# there.
-serverPackage = "com.lightphone.chats.server"
+# Single-APK build (2026-08-19): the former :server companion is a library
+# merged into this APK, which hosts its own LightSdkService + the persistent
+# Matrix connection (sync loop, storage, notifications) and binds to itself —
+# serverPackage is the tool's own id, so no separate companion APK to install
+# and no dependency on Light shipping chat methods in com.lightos.
+serverPackage = "com.lightphone.chats"
 orientation = "portrait"

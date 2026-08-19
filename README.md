@@ -54,11 +54,11 @@ The chat list, a 1:1 thread, a group thread, the networks panel, and settings on
 
 ## Install on a Light Phone III
 
-Chats is a two-APK app — the tool and its companion — signed with a development key, so it requires the community-ADB sideload route and the most permissive external-tools tier on the device:
+Chats is a single-APK app (since 2026-08-19) — the former companion is merged into the tool as a library; the APK hosts its own service and needs no separate install. It is signed with a development key, so it requires the community-ADB sideload route and the most permissive external-tools tier on the device:
 
-1. Enable USB debugging (Settings → Developer options) and install both APKs via `adb install -r`.
-2. On the phone, set **Developer options → External tools → "All tools"** (LightOS warns about the security risk — the APKs are dev-signed, not Light-signed).
-3. Open **Chats** from the toolbox. The companion ("Chats Server") hosts the connection.
+1. Enable USB debugging (Settings → Developer options) and install the one APK via `adb install -r`.
+2. On the phone, set **Developer options → External tools → "All tools"** (LightOS warns about the security risk — the APK is dev-signed, not Light-signed).
+3. Open **Chats** from the toolbox. The connection runs in-process (a `ChatSyncService` keeps sync alive in the background).
 4. Log in from Settings with your Beeper account — your WhatsApp and Instagram chats appear automatically.
 
 ## Build
@@ -67,20 +67,20 @@ From the workspace root, through the memory-guarded wrapper:
 
 ```bash
 source tools/env.sh
-tools/build --dir chats :app:assembleDebug :server:assembleDebug
+tools/build --dir chats :app:assembleDebug
 ```
 
 or directly in this directory:
 
 ```bash
-./gradlew :app:assembleDebug :server:assembleDebug
+./gradlew :app:assembleDebug
 ```
 
 Release builds are minified with R8 and resource-shrunk:
 
 ```bash
 tools/build --dir chats -Dorg.gradle.jvmargs="-Xmx5g -XX:MaxMetaspaceSize=768m" \
-    -Dkotlin.daemon.jvmargs="-Xmx2g" :app:assembleRelease :server:assembleRelease
+    -Dkotlin.daemon.jvmargs="-Xmx2g" :app:assembleRelease
 ```
 
 The build consumes `../light-sdk` as an included (composite) build — see `settings.gradle.kts`. The SDK's chat service methods are additive patches carried in the workspace's fork of the SDK (mirrored at `https://github.com/fenleon/light-sdk`).
@@ -91,7 +91,6 @@ The build consumes `../light-sdk` as an included (composite) build — see `sett
 tools/emulator.sh                 # boots the AVD (writable-system)
 adb root && adb remount
 adb install -r chats/app/build/outputs/apk/debug/app-debug.apk
-adb install -r chats/server/build/outputs/apk/debug/server-debug.apk
 # open the Chats tool from the LightOS toolbox
 ```
 

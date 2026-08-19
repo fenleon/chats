@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LP3 reboot-confirmation continue triangle (captured 2026-08-19): a hollow
+     up-pointing triangle, ~4 px stroke, apex at top-center, base full-width.
+     The Verify flow's confirm panel uses it (the play icon was the LP3's
+     restart glyph, not the confirm one). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="40dp"
+    android:height="35dp"
+    android:viewportWidth="77"
+    android:viewportHeight="68">
+    <path
+        android:pathData="M 38.5,3 L 3,65 L 74,65 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="4.5"
+        android:fillColor="#00000000" />
+</vector>
