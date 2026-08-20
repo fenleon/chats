@@ -20,6 +20,7 @@ import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
+import com.thelightphone.sdk.ui.lightClickable
 
 /**
  * Fullscreen photo viewer: tapping an image row in the thread opens it here.
@@ -46,7 +47,12 @@ class FullscreenImageScreen(
                         bitmap = bitmap.asImageBitmap(),
                         contentDescription = null,
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            // Tapping the photo again shrinks it back to the
+                            // thread (feedback 2026-08-19) — same toggle as
+                            // native viewers; the top-bar back still works.
+                            .lightClickable(onClick = { goBack() }),
                     )
                 }
                 LightTopBar(

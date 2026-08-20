@@ -119,6 +119,21 @@ object ChatClient {
     suspend fun e2eeState(): LightServiceMethod.GetE2eeState.Response? =
         callRemoteServiceMethod(LightServiceMethod.GetE2eeState, Unit).getOrNull()
 
+    /** The media stream's current volume level + max (drives the volume panel). */
+    suspend fun volumeLevel(): LightServiceMethod.GetVolumeLevel.Response? =
+        callRemoteServiceMethod(LightServiceMethod.GetVolumeLevel, Unit).getOrNull()
+
+    /**
+     * Long-poll: blocks until the media-stream volume changes (or its ~2 s
+     * timeout) — the volume panel reacts instantly to a connected BT device's
+     * own volume buttons (AVRCP) instead of polling.
+     */
+    suspend fun waitForVolumeChange(knownLevel: Int): LightServiceMethod.WaitForVolumeChange.Response? =
+        callRemoteServiceMethod(
+            LightServiceMethod.WaitForVolumeChange,
+            LightServiceMethod.WaitForVolumeChange.Request(knownLevel),
+        ).getOrNull()
+
     suspend fun startDeviceVerification(): LightServiceMethod.StartDeviceVerification.Response? =
         callRemoteServiceMethod(LightServiceMethod.StartDeviceVerification, Unit).getOrNull()
 
@@ -173,13 +188,20 @@ object ChatClient {
 
     /**
      * Toggles voice-note playback in the companion: plays [eventId], or stops
-     * it if it is already the one playing. @return whether it is now playing.
+     * it if it is already the one playing. @return (nowPlaying, error) — the
+     * tool surfaces a fetch/playback failure on the row instead of a silent
+     * no-op (feedback 2026-08-19).
      */
-    suspend fun playVoiceNote(roomId: String, eventId: String): Boolean =
-        callRemoteServiceMethod(
+    suspend fun playVoiceNote(roomId: String, eventId: String): Pair<Boolean, String?> {
+        val result = callRemoteServiceMethod(
             LightServiceMethod.PlayVoiceNote,
             LightServiceMethod.PlayVoiceNote.Request(roomId, eventId),
-        ).getOrNull()?.playing == true
+        )
+        return when (result) {
+            is LightResult.Success -> result.data.playing to result.data.error
+            is LightResult.Error -> false to (result.extra ?: "playback failed")
+        }
+    }
 
     /**
      * Starts the record-a-voice-note flow for [roomId]. @return the flattened

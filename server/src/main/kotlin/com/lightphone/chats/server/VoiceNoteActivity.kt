@@ -67,15 +67,29 @@ class VoiceNoteActivity : ComponentActivity() {
     private var previewing by mutableStateOf(false)
     private var playing by mutableStateOf(false)
     private var sending by mutableStateOf(false)
+    /** RECORD_AUDIO was denied — show why, with a retry (2026-08-19 feedback
+     *  round: "the phone doesn't ask for the permission" — a denial must not
+     *  silently drop the screen). */
+    private var micDenied by mutableStateOf(false)
+    /** The last send failed — keep the take + SEND so the user can retry
+     *  instead of a silent drop (2026-08-19 feedback round). */
+    private var sendFailed by mutableStateOf(false)
 
     private val requestMicPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) startRecording() else finish()
+            if (granted) {
+                micDenied = false
+                startRecording()
+            } else {
+                micDenied = true
+            }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val roomId = takePendingRoomId() ?: run {
+        val roomId = takePendingRoomId()
+        android.util.Log.d(TAG, "onCreate: pendingRoom=$roomId")
+        if (roomId == null) {
             finish()
             return
         }
@@ -107,7 +121,9 @@ class VoiceNoteActivity : ComponentActivity() {
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             // Record → tap to stop → play the take back → SEND
-                            // in the bottom bar (or back to discard).
+                            // in the bottom bar (or back to discard). A mic
+                            // denial shows a message + ALLOW instead of a
+                            // silent drop.
                             Box(
                                 modifier = Modifier
                                     .size(96.dp)
@@ -115,6 +131,10 @@ class VoiceNoteActivity : ComponentActivity() {
                                         enabled = !sending,
                                         onClick = {
                                             when {
+                                                micDenied -> {
+                                                    micDenied = false
+                                                    ensureMicThenRecord()
+                                                }
                                                 recording -> stopRecording()
                                                 previewing -> togglePreviewPlayback()
                                                 else -> ensureMicThenRecord()
@@ -125,6 +145,7 @@ class VoiceNoteActivity : ComponentActivity() {
                             ) {
                                 LightIcon(
                                     icon = when {
+                                        micDenied -> LightIcons.MICROPHONE
                                         recording -> LightIcons.MICROPHONE
                                         previewing && playing -> LightIcons.PAUSE
                                         previewing -> LightIcons.PLAY
@@ -132,6 +153,7 @@ class VoiceNoteActivity : ComponentActivity() {
                                     },
                                     size = 3f,
                                     contentDescription = when {
+                                        micDenied -> "Allow microphone"
                                         recording -> "Stop recording"
                                         previewing -> if (playing) "Stop preview" else "Play preview"
                                         else -> "Record voice note"
@@ -140,6 +162,7 @@ class VoiceNoteActivity : ComponentActivity() {
                             }
                             LightText(
                                 text = when {
+                                    micDenied -> "Microphone permission is needed to record."
                                     sending -> "Sending…"
                                     recording -> "Recording… tap to stop"
                                     previewing && playing -> "Playing… tap to stop"
@@ -150,13 +173,21 @@ class VoiceNoteActivity : ComponentActivity() {
                                 lighten = !recording && !sending,
                                 modifier = Modifier.padding(top = 2f.gridUnitsAsDp()),
                             )
+                            if (sendFailed) {
+                                LightText(
+                                    text = "Couldn't send — tap SEND to retry.",
+                                    variant = LightTextVariant.Superfine,
+                                    lighten = true,
+                                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+                                )
+                            }
                         }
                     }
                     LightBottomBar(
                         modifier = Modifier.navigationBarsPadding(),
                         items = listOf(
                             null,
-                            if (previewing && !sending) {
+                            if ((previewing || sendFailed) && !sending) {
                                 LightBarButton.Text(
                                     text = "SEND",
                                     onClick = { sendCurrent(roomId) },
@@ -260,8 +291,8 @@ class VoiceNoteActivity : ComponentActivity() {
             finish()
             return
         }
-        outputFile = null
         previewing = false
+        sendFailed = false
         sending = true
         runCatching { previewPlayer?.release() }
         previewPlayer = null
@@ -278,11 +309,17 @@ class VoiceNoteActivity : ComponentActivity() {
             }
             if (sent) {
                 android.util.Log.d(TAG, "VoiceNote: sent $bytes bytes to room $roomId")
+                file.delete()
+                finish()
             } else {
+                // Keep the take + SEND so the failure is visible and retryable
+                // (feedback 2026-08-19: a failed send vanished silently).
                 android.util.Log.w(TAG, "VoiceNote: failed to send to room $roomId")
+                outputFile = file
+                sending = false
+                previewing = true
+                sendFailed = true
             }
-            file.delete()
-            finish()
         }
     }
 
@@ -297,6 +334,8 @@ class VoiceNoteActivity : ComponentActivity() {
         recording = false
         previewing = false
         playing = false
+        sending = false
+        sendFailed = false
     }
 
     override fun onStop() {

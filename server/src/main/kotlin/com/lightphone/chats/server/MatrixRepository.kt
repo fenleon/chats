@@ -214,6 +214,66 @@ object MatrixRepository {
     fun audioPositionMs(): Long? =
         audioPlayer?.takeIf { playingAudioEventId != null }?.currentPosition?.toLong()
 
+    // --- Volume (2026-08-19 feedback round: the in-app volume panel) --------
+    // Backs the SDK's GetVolumeLevel + WaitForVolumeChange long-poll. The SDK
+    // declares the methods but its own server doesn't implement them — the
+    // wrapping server app does (same as Audiobooks' VolumeChangeMonitor). The
+    // tool's volume panel needs the real media-stream level to render + move.
+
+    /** Broadcasts a media-volume change (the long-poll's wake-up signal). */
+    private val volumeChanges = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 8)
+
+    @Volatile
+    private var volumeReceiverRegistered = false
+
+    @Synchronized
+    private fun ensureVolumeReceiverRegistered(context: Context) {
+        if (volumeReceiverRegistered) return
+        volumeReceiverRegistered = true
+        runCatching {
+            context.registerReceiver(
+                object : BroadcastReceiver() {
+                    override fun onReceive(c: Context?, intent: Intent?) {
+                        volumeChanges.tryEmit(Unit)
+                    }
+                },
+                IntentFilter("android.media.VOLUME_CHANGED_ACTION"),
+            )
+        }
+    }
+
+    /** The media stream's current level + max. */
+    fun volumeLevel(): com.thelightphone.sdk.shared.LightServiceMethod.GetVolumeLevel.Response {
+        val audio = appContext?.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+        return com.thelightphone.sdk.shared.LightServiceMethod.GetVolumeLevel.Response(
+            level = audio?.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) ?: 0,
+            max = audio?.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC) ?: 0,
+        )
+    }
+
+    /**
+     * The current media-stream level/max, waiting up to [timeoutMs] for the
+     * next volume change when the level still equals [knownLevel] — the
+     * long-poll that makes the tool's volume panel react to a connected BT
+     * device's own volume buttons (AVRCP) without a polling cadence.
+     */
+    suspend fun awaitVolumeChange(timeoutMs: Long, knownLevel: Int): Pair<Int, Int> {
+        val ctx = appContext
+        if (ctx == null) {
+            val v = volumeLevel()
+            return v.level to v.max
+        }
+        ensureVolumeReceiverRegistered(ctx)
+        val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            ?: return volumeLevel().let { it.level to it.max }
+        fun current() = audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) to
+            audio.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+        val now = current()
+        if (now.first != knownLevel) return now
+        withTimeoutOrNull(timeoutMs) { volumeChanges.first() }
+        return current()
+    }
+
     /**
      * Voice-note sends awaiting their sync echo (room key → txn → send info).
      * Multi-slot: two rapid sends in one room must BOTH keep their optimistic
@@ -1616,14 +1676,21 @@ object MatrixRepository {
                 refreshMessagePage(roomId, limit)
                 return injectPendingEchoes(roomId, disk)
             }
-            return computeMessagesPage(roomId, null, limit, fast = true).also {
-                messagePageCache[roomId] = MessagePageEntry(
-                    it,
-                    limit,
-                    android.os.SystemClock.elapsedRealtime(),
-                )
-                saveMessagePageToDisk(roomId, it)
-            }
+            // Cold with no disk page (first open of the room): serve a SMALL
+            // page immediately — the decrypt restores + status walks that make
+            // a full page slow are what kept the thread on "Loading messages…"
+            // — then recompute the full page in the background; the thread's
+            // poll swaps it in seconds later (feedback 2026-08-19: "could the
+            // room load incrementally? the last 5-8 messages").
+            val first = computeMessagesPage(roomId, null, minOf(limit, INCREMENTAL_FIRST_PAGE), fast = true)
+            messagePageCache[roomId] = MessagePageEntry(
+                first,
+                limit,
+                android.os.SystemClock.elapsedRealtime(),
+            )
+            saveMessagePageToDisk(roomId, first)
+            refreshMessagePage(roomId, limit)
+            return first
         }
         return computeMessagesPage(roomId, beforeEventId, limit)
     }
@@ -1811,33 +1878,38 @@ object MatrixRepository {
         // E2EE: a stored event's content can still be undecrypted (its megolm
         // session wasn't in the local store at sync time). Restore the
         // sessions from the key backup, then re-read those events once through
-        // the API — the read decrypts and re-persists them.
-        val undecrypted = events.filter { it.content?.isFailure == true }
-        if (undecrypted.isNotEmpty()) {
-            // Battery (2026-08-15 audit): events that can't decrypt (e.g.
-            // pre-verification history — the bridge never re-shares those
-            // sessions) made every page build / 2s refresh repeat a doomed
-            // key-backup restore + per-event API re-read. When a restore finds
-            // nothing to load, back off for a cooldown — the normal sync path
-            // decrypts in-band the moment real sessions do arrive.
-            val roomKey = matrixRoomId.full
-            val cooldownUntil = decryptRestoreCooldown[roomKey]
-            if (cooldownUntil == null || android.os.SystemClock.elapsedRealtime() >= cooldownUntil) {
-                val loaded = restoreRoomSessions(c, matrixRoomId, undecrypted)
-                if (loaded == 0) parkFutileRestore(matrixRoomId)
-                val config: GetTimelineEventConfig.() -> Unit = {
-                    fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
-                    decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
-                }
-                val resolved = HashMap<String, TimelineEvent>()
-                undecrypted.forEach { te ->
-                    withTimeoutOrNull(DECRYPT_WAIT_MS) {
-                        c.room.getTimelineEvent(matrixRoomId, te.event.id, config).firstOrNull()
-                            ?.takeIf { it.content?.getOrNull() != null }
-                    }?.let { resolved[te.event.id.full] = it }
-                }
-                if (resolved.isNotEmpty()) {
-                    events = events.map { resolved[it.event.id.full] ?: it }
+        // the API — the read decrypts and re-persists them. Skipped in the
+        // fast first-page path (2026-08-19 feedback round): the background
+        // full-page refresh resolves them; the fast page may briefly show
+        // "[Encrypted message]" placeholders instead of a long loading state.
+        if (!fast) {
+            val undecrypted = events.filter { it.content?.isFailure == true }
+            if (undecrypted.isNotEmpty()) {
+                // Battery (2026-08-15 audit): events that can't decrypt (e.g.
+                // pre-verification history — the bridge never re-shares those
+                // sessions) made every page build / 2s refresh repeat a doomed
+                // key-backup restore + per-event API re-read. When a restore finds
+                // nothing to load, back off for a cooldown — the normal sync path
+                // decrypts in-band the moment real sessions do arrive.
+                val roomKey = matrixRoomId.full
+                val cooldownUntil = decryptRestoreCooldown[roomKey]
+                if (cooldownUntil == null || android.os.SystemClock.elapsedRealtime() >= cooldownUntil) {
+                    val loaded = restoreRoomSessions(c, matrixRoomId, undecrypted)
+                    if (loaded == 0) parkFutileRestore(matrixRoomId)
+                    val config: GetTimelineEventConfig.() -> Unit = {
+                        fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                        decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                    }
+                    val resolved = HashMap<String, TimelineEvent>()
+                    undecrypted.forEach { te ->
+                        withTimeoutOrNull(DECRYPT_WAIT_MS) {
+                            c.room.getTimelineEvent(matrixRoomId, te.event.id, config).firstOrNull()
+                                ?.takeIf { it.content?.getOrNull() != null }
+                        }?.let { resolved[te.event.id.full] = it }
+                    }
+                    if (resolved.isNotEmpty()) {
+                        events = events.map { resolved[it.event.id.full] ?: it }
+                    }
                 }
             }
         }
@@ -2040,17 +2112,21 @@ object MatrixRepository {
         // triggers decryption of the page's events and restores the megolm
         // sessions that are missing (a decrypt that can't land until the
         // sessions are in the store made the first open slow). Skipped inside
-        // the futile-restore cooldown (battery 2026-08-15 audit).
-        val seed = collectTimelineEvents(c, matrixRoomId, pageCursor, limit + 1)
-        // Restore only when the page still has undecryptable events — an
-        // all-decrypted room needs no priming, so skip the parse entirely
-        // (battery 2026-08-17: the seed restore ran on every page read).
-        if (seed.any { it.content?.isFailure == true } && !inDecryptRestoreCooldown(matrixRoomId)) {
-            // Park genuinely undecryptable pages too — the same futility signal
-            // as the page-build path, so opening a doomed room doesn't re-seed
-            // a restore on every read (battery 2026-08-17 audit).
-            if (restoreRoomSessions(c, matrixRoomId, seed) == 0) {
-                parkFutileRestore(matrixRoomId)
+        // the futile-restore cooldown (battery 2026-08-15 audit) and in the
+        // fast first-page path (2026-08-19 feedback round — the background
+        // full-page refresh primes decrypts).
+        if (!fast) {
+            val seed = collectTimelineEvents(c, matrixRoomId, pageCursor, limit + 1)
+            // Restore only when the page still has undecryptable events — an
+            // all-decrypted room needs no priming, so skip the parse entirely
+            // (battery 2026-08-17: the seed restore ran on every page read).
+            if (seed.any { it.content?.isFailure == true } && !inDecryptRestoreCooldown(matrixRoomId)) {
+                // Park genuinely undecryptable pages too — the same futility signal
+                // as the page-build path, so opening a doomed room doesn't re-seed
+                // a restore on every read (battery 2026-08-17 audit).
+                if (restoreRoomSessions(c, matrixRoomId, seed) == 0) {
+                    parkFutileRestore(matrixRoomId)
+                }
             }
         }
 
@@ -2064,8 +2140,10 @@ object MatrixRepository {
         events = e
         hasMore = h
         // The retries exist to catch a decrypt that lands a beat late. Inside
-        // the restore cooldown they can't succeed — skip them (battery audit).
-        if (!inDecryptRestoreCooldown(matrixRoomId)) {
+        // the restore cooldown they can't succeed — skip them (battery audit);
+        // the fast first-page path skips them too (the background refresh
+        // re-reads with full decrypt handling).
+        if (!fast && !inDecryptRestoreCooldown(matrixRoomId)) {
             repeat(DECRYPT_RETRIES) {
                 val stillEncrypted = events.any { it.content?.isFailure == true }
                 if (!stillEncrypted) return@repeat
@@ -2102,17 +2180,19 @@ object MatrixRepository {
         val startIndex = if (keepCursor) 0 else 1 // drop the boundary cursor on older pages
         // Delivery status only matters for the newest page (what the user just
         // sent): the status events sit right after the message in the timeline.
-        // Older pages don't get the marker (Phase 10, minimal scope).
-        val sendStatuses = if (beforeEventId == null) sendStatusByEventId(c, matrixRoomId) else emptyMap()
+        // Older pages don't get the marker (Phase 10, minimal scope). The fast
+        // first-page path skips the status windows (each is a 250-event
+        // network walk); the background refresh adds them.
+        val sendStatuses = if (beforeEventId == null && !fast) sendStatusByEventId(c, matrixRoomId) else emptyMap()
         // Same scoping for read receipts: only the newest page reports whether
         // the other party has read an outgoing message (receipts point at the
         // newest events; an older page's messages are always "read" in practice
         // but re-resolving each receipt per page isn't worth it).
-        val readEventIds = if (beforeEventId == null) readReceiptsByEvent(c, matrixRoomId, events) else emptySet()
+        val readEventIds = if (beforeEventId == null && !fast) readReceiptsByEvent(c, matrixRoomId, events) else emptySet()
         // Reactions, same newest-page scope: m.reaction events sit after their
         // target in the timeline, so the newest window carries the reactions
         // that matter. Older pages report none (minimal Phase 14 scope).
-        val reactionsByEvent = if (beforeEventId == null) reactionLabelsByEvent(c, matrixRoomId) else emptyMap()
+        val reactionsByEvent = if (beforeEventId == null && !fast) reactionLabelsByEvent(c, matrixRoomId) else emptyMap()
         // A just-sent message's echo can sit in the timeline before its
         // decryption lands; the optimistic rows below represent it, so skip
         // the undecrypted "[Encrypted]" placeholder — a message the user just
@@ -2703,7 +2783,6 @@ object MatrixRepository {
         val matrixRoomId = RoomId(roomId)
         val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
             var event: TimelineEvent? = null
-            var restored = false
             repeat(MEDIA_CONTENT_RETRIES) {
                 event = c.room.getTimelineEvent(matrixRoomId, EventId(eventId)).firstOrNull()
                 if (event?.content?.getOrNull() != null) return@withTimeoutOrNull event
@@ -2711,10 +2790,14 @@ object MatrixRepository {
                 // store (sessions load lazily per room, mostly via getMessages)
                 // — the content stays encrypted and the note silently "doesn't
                 // play" (feedback 2026-08-14). Pull the session from the key
-                // backup once, then re-read so decryption can land.
-                if (event?.content?.isFailure == true && !restored) {
-                    restored = true
-                    restoreRoomSessions(c, matrixRoomId, listOf(event))
+                // backup, then re-read so decryption can land. Retried on every
+                // iteration (unless parked): a session the backup index hadn't
+                // caught up with on the first try may be there a moment later
+                // (feedback 2026-08-19 — playback "does not always work").
+                if (event?.content?.isFailure == true && !inDecryptRestoreCooldown(matrixRoomId)) {
+                    if (restoreRoomSessions(c, matrixRoomId, listOf(event)) == 0) {
+                        parkFutileRestore(matrixRoomId)
+                    }
                 }
                 delay(MEDIA_CONTENT_RETRY_DELAY_MS)
             }
@@ -2828,6 +2911,7 @@ object MatrixRepository {
      * sends it.
      */
     fun startVoiceNoteSend(roomId: String): String {
+        android.util.Log.d(TAG, "startVoiceNoteSend: registering room $roomId")
         VoiceNoteActivity.register(roomId)
         return VOICE_NOTE_ACTIVITY
     }
@@ -4352,6 +4436,12 @@ object MatrixRepository {
             reactions = reactions,
             // The voice-note row shows the length + playing progress.
             durationMs = (content as? RoomMessageEventContent.FileBased.Audio)?.info?.duration,
+            // The image's caption (the m.image body — most clients put the
+            // caption there, separate from the file name). A caption that
+            // equals the file name is not a caption (feedback round 2026-08-19).
+            caption = (content as? RoomMessageEventContent.FileBased.Image)?.let { image ->
+                image.body.takeIf { it.isNotBlank() && it != image.fileName }
+            },
         )
     }
 
@@ -4374,7 +4464,11 @@ object MatrixRepository {
             return when (content) {
                 is RoomMessageEventContent.TextBased -> stripReplyQuote(content.body).take(MAX_PREVIEW_LENGTH)
                 is RoomMessageEventContent.FileBased -> when (content) {
-                    is RoomMessageEventContent.FileBased.Image -> "[Photo]"
+                    is RoomMessageEventContent.FileBased.Image ->
+                        // A caption beats the generic "[Photo]" placeholder in
+                        // the room list (feedback round 2026-08-19).
+                        content.body.takeIf { it.isNotBlank() && it != content.fileName }
+                            ?.take(MAX_PREVIEW_LENGTH) ?: "[Photo]"
                     is RoomMessageEventContent.FileBased.Video -> "[Video]"
                     is RoomMessageEventContent.FileBased.Audio -> "[Audio]"
                     else -> "[File]"
@@ -4383,8 +4477,14 @@ object MatrixRepository {
             }
         }
         return when {
-            te.content?.isFailure == true -> "[Encrypted — waiting for key…]"
-            te.event.content is EncryptedMessageEventContent -> "[Encrypted]"
+            // An undecryptable message renders as a single calm placeholder
+            // (2026-08-19 feedback round — was "[Encrypted — waiting for key…]"
+            // and "[Encrypted]" depending on the failure state; same meaning,
+            // one label). The newest-page decrypt machinery resolves what it
+            // can; genuinely unrecoverable sessions (pre-verification history)
+            // can't be read by any client.
+            te.content?.isFailure == true || te.event.content is EncryptedMessageEventContent ->
+                "[Encrypted message]"
             else -> null
         }
     }
@@ -4424,6 +4524,10 @@ object MatrixRepository {
     private const val FETCH_TIMEOUT_SECONDS = 5L
     /** The thread's page size (matches the tool's PAGE_SIZE). */
     private const val THREAD_PAGE_SIZE = 20
+    /** Cold-open first page (2026-08-19 feedback round): a room with no cached
+     *  page opens with this many messages at once — fast, no decrypt/status
+     *  work — while the background refresh fills the full page. */
+    private const val INCREMENTAL_FIRST_PAGE = 8
     /** Max extra chain walks an older page may take to skip a run of dropped
      *  events (the m.replace edit wall) before giving up — bounded so a
      *  pathological chain can't turn one page read into a long walk. The
@@ -4527,10 +4631,14 @@ object MatrixRepository {
     private const val MEDIA_CONTENT_RETRY_DELAY_MS = 1_500L
     /** How many display JPEGs the LRU keeps (each ~100-300 KB). */
     private const val MAX_MEDIA_CACHE_ENTRIES = 24
-    /** The companion's photo-picker activity, flattened for the tool to launch. */
-    private const val PHOTO_PICKER_ACTIVITY = "com.lightphone.chats.server/.PhotoSendActivity"
-    /** The companion's voice-note recording activity, flattened for the tool. */
-    private const val VOICE_NOTE_ACTIVITY = "com.lightphone.chats.server/.VoiceNoteActivity"
+    /** The tool's photo-picker activity, flattened for the tool to launch. The
+     *  package is the TOOL's own id — the single-APK merge (2026-08-19) made
+     *  the former companion a library inside com.lightphone.chats, so the old
+     *  com.lightphone.chats.server package no longer resolves (feedback
+     *  2026-08-19: "mic and photos do not work"). */
+    private const val PHOTO_PICKER_ACTIVITY = "com.lightphone.chats/.server.PhotoSendActivity"
+    /** The tool's voice-note recording activity, flattened for the tool. */
+    private const val VOICE_NOTE_ACTIVITY = "com.lightphone.chats/.server.VoiceNoteActivity"
 
     // Disk cache (Phase 14).
     // Versioned so a stale pre-ghost-filter cache (pages/lists polluted by the

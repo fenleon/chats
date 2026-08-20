@@ -16,6 +16,11 @@
     <!-- Voice notes are recorded in the server library (RECORD_AUDIO is granted
          at runtime by VoiceNoteActivity). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Photo attach fallback (2026-08-19 feedback round): devices without a
+         system photo picker (the LP3's stripped firmware) fall back to an
+         in-app gallery over DCIM/Pictures; granted at runtime by
+         PhotoSendActivity. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
     <!-- sdk:ui merges CAMERA for its QR scanner; this is a chat server. -->
     <uses-permission

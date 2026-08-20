@@ -228,6 +228,7 @@ object PushChannel {
                 call.execute().use { resp ->
                     if (!resp.isSuccessful) throw IOException("SSE HTTP ${resp.code}")
                     Log.i(TAG, "SSE connected: $url")
+                    isConnected = true
                     delayMs = RECONNECT_BASE_MS
                     val source = resp.body?.source() ?: throw IOException("SSE empty body")
                     while (isActive) {
@@ -246,6 +247,7 @@ object PushChannel {
             } catch (e: Exception) {
                 if (isActive) Log.w(TAG, "SSE stream dropped: ${e.message}")
             }
+            isConnected = false
             currentCall = null
             if (!isActive) break
             delay(delayMs)

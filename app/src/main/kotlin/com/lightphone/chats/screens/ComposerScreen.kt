@@ -1,6 +1,8 @@
 package com.lightphone.chats.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -9,8 +11,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.ChatLightViewModel
+import com.lightphone.chats.VolumePanelOverlay
 import com.thelightphone.sdk.LightScreen
-import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.ui.LightIcons
@@ -35,7 +38,7 @@ data class ComposerResult(
 
 class ComposerViewModel(
     private val roomId: String,
-) : LightViewModel<ComposerResult>() {
+) : ChatLightViewModel<ComposerResult>() {
 
     val busy = MutableStateFlow(false)
 
@@ -94,36 +97,47 @@ class ComposerScreen(
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
+        val volumePanel by viewModel.volumePanel.collectAsState()
         // The LP3 keyboard's mic key is handled inside the closed light-keyboard
         // library (it needs a speech-recognition service, which LightOS doesn't
         // ship) — it does nothing here. Voice notes have their own button on
         // the thread (Phase 14), so hide the dead key instead of showing a
-        // control that can't act.
+        // control that can't act. The return key is gone too (feedback
+        // 2026-08-19): the notes editor wraps without newlines, and return is
+        // a send — an explicit enter key next to SEND just confuses.
         val keyboardOptionsFlow = remember {
-            MutableStateFlow(defaultKeyboardOptions().copy(displayVoice = false))
+            MutableStateFlow(defaultKeyboardOptions().copy(displayVoice = false, displayReturn = false))
         }
         val textState = rememberTextFieldState("")
 
         LightTheme(colors = themeColors) {
-            LightTextInputEditor(
-                title = roomName,
-                state = textState,
-                keyboardOptionsFlow = keyboardOptionsFlow,
-                onSubmit = { viewModel.send(it, this@ComposerScreen) },
-                onBack = { goBack() },
-                modifier = Modifier.background(LightThemeTokens.colors.background),
-                submitLabel = "Send",
-                submitIcon = LightIcons.SEND,
-                // Notes-style entry (feedback pass): small wrapping text
-                // anchored at the bottom, growing upward, keyboard flush at
-                // the bottom; return still sends (multi-line display, no
-                // newlines in the message). Send lives in the top-right bar.
-                singleLine = false,
-                submitOnReturn = true,
-                bottomAligned = true,
-                submitInTopBar = true,
-                topBarSubmitIcon = LightIcons.SEND,
-            )
+            Box(modifier = Modifier.fillMaxSize()) {
+                LightTextInputEditor(
+                    title = roomName,
+                    state = textState,
+                    keyboardOptionsFlow = keyboardOptionsFlow,
+                    onSubmit = { viewModel.send(it, this@ComposerScreen) },
+                    onBack = { goBack() },
+                    modifier = Modifier.background(LightThemeTokens.colors.background),
+                    submitLabel = "Send",
+                    submitIcon = LightIcons.SEND,
+                    // Notes-style entry (feedback pass): small wrapping text
+                    // anchored at the bottom, growing upward, keyboard flush at
+                    // the bottom; return still sends (multi-line display, no
+                    // newlines in the message). Send lives in the top-right bar.
+                    singleLine = false,
+                    submitOnReturn = true,
+                    bottomAligned = true,
+                    submitInTopBar = true,
+                    topBarSubmitIcon = LightIcons.SEND,
+                )
+                // The in-app volume panel (the LP3 rocker replica) draws over
+                // the whole screen while shown.
+                VolumePanelOverlay(
+                    state = volumePanel,
+                    onDismiss = { viewModel.dismissVolumePanel() },
+                )
+            }
         }
     }
 }

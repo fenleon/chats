@@ -156,13 +156,19 @@ class AccountViewModel : LightViewModel<Unit>() {
             busy.value = true
             error.value = null
             codeStatus.value = null
-            val failure = ChatClient.beeperRequestCode(email)
-            busy.value = false
-            if (failure != null) {
-                error.value = failure
-            } else {
-                codeStatus.value = "Code sent to $email — check your email"
-                onSuccess(email)
+            try {
+                val failure = ChatClient.beeperRequestCode(email)
+                if (failure != null) {
+                    error.value = failure
+                } else {
+                    codeStatus.value = "Code sent to $email — check your email"
+                    onSuccess(email)
+                }
+            } finally {
+                // A binder exception must not leave the button dead (feedback
+                // 2026-08-19: the same stuck-flag class as the thread's
+                // loading guard) — busy always clears.
+                busy.value = false
             }
         }
     }
@@ -172,26 +178,29 @@ class AccountViewModel : LightViewModel<Unit>() {
         viewModelScope.launch(Dispatchers.IO) {
             busy.value = true
             error.value = null
-            val failure = if (beeperMode.value) {
-                ChatClient.beeperLogin(beeperEmail.value.trim(), beeperCode.value.trim())
-            } else {
-                val response = ChatClient.setAccount(
-                    homeserver = homeserver.value.trim(),
-                    user = user.value.trim(),
-                    passwordOrToken = password.value,
-                    tokenLogin = tokenLogin.value,
-                )
-                if (response != null) null
-                else "Couldn't log in. Check the homeserver and credentials."
-            }
-            busy.value = false
-            if (failure == null) {
-                password.value = ""
-                beeperCode.value = ""
-                codeStatus.value = null
-                refreshStatus()
-            } else {
-                error.value = failure
+            try {
+                val failure = if (beeperMode.value) {
+                    ChatClient.beeperLogin(beeperEmail.value.trim(), beeperCode.value.trim())
+                } else {
+                    val response = ChatClient.setAccount(
+                        homeserver = homeserver.value.trim(),
+                        user = user.value.trim(),
+                        passwordOrToken = password.value,
+                        tokenLogin = tokenLogin.value,
+                    )
+                    if (response != null) null
+                    else "Couldn't log in. Check the homeserver and credentials."
+                }
+                if (failure == null) {
+                    password.value = ""
+                    beeperCode.value = ""
+                    codeStatus.value = null
+                    refreshStatus()
+                } else {
+                    error.value = failure
+                }
+            } finally {
+                busy.value = false
             }
         }
     }
@@ -200,12 +209,15 @@ class AccountViewModel : LightViewModel<Unit>() {
         if (busy.value) return
         viewModelScope.launch(Dispatchers.IO) {
             busy.value = true
-            ChatClient.logout()
-            busy.value = false
-            password.value = ""
-            beeperCode.value = ""
-            codeStatus.value = null
-            refreshStatus()
+            try {
+                ChatClient.logout()
+                password.value = ""
+                beeperCode.value = ""
+                codeStatus.value = null
+                refreshStatus()
+            } finally {
+                busy.value = false
+            }
         }
     }
 

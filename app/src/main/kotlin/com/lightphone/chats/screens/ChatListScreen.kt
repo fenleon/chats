@@ -23,10 +23,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.VolumePanelOverlay
 import com.lightphone.chats.formatRelativeTimestamp
 import com.thelightphone.sdk.InitialScreen
 import com.thelightphone.sdk.LightScreen
-import com.thelightphone.sdk.LightViewModel
+import com.lightphone.chats.ChatLightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightServiceMethod
@@ -60,7 +61,7 @@ private const val REVEAL_THRESHOLD = 4
  */
 private const val EXTRA_NOTIFY_ROOM = "chats.notifyRoomId"
 
-class ChatListViewModel : LightViewModel<Unit>() {
+class ChatListViewModel : ChatLightViewModel<Unit>() {
 
     val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
     val loading = MutableStateFlow(true)
@@ -88,6 +89,25 @@ class ChatListViewModel : LightViewModel<Unit>() {
     /** Selected bridged-network label (Phase 7); null = all networks. */
     val networkFilter = MutableStateFlow<String?>(null)
 
+    /**
+     * Room-list scroll position, persisted across navigation so a thread exit
+     * returns the list to where it was instead of the top (feedback 2026-08-19:
+     * "select a room half way down the list, enter, exit — return half way
+     * down"). The screen saves it continuously and restores on show.
+     */
+    private var savedScrollIndex = 0
+    private var savedScrollOffset = 0
+    private var scrollToRestore: Pair<Int, Int>? = null
+
+    fun saveScroll(index: Int, offset: Int) {
+        savedScrollIndex = index
+        savedScrollOffset = offset
+    }
+
+    /** The position to restore on show (consume-once), or null when at the top. */
+    fun takeScrollToRestore(): Pair<Int, Int>? =
+        scrollToRestore.also { scrollToRestore = null }
+
     private var refreshJob: Job? = null
     private var pollJob: Job? = null
 
@@ -95,6 +115,9 @@ class ChatListViewModel : LightViewModel<Unit>() {
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
+        if (savedScrollIndex > 0 || savedScrollOffset > 0) {
+            scrollToRestore = savedScrollIndex to savedScrollOffset
+        }
         refresh()
         startPolling()
     }
@@ -134,41 +157,46 @@ class ChatListViewModel : LightViewModel<Unit>() {
         refreshJob?.cancel()
         refreshJob = viewModelScope.launch {
             if (!quiet) loading.value = true
-            var account = ChatClient.accountState()
-            var result = ChatClient.getRooms()
-            var connection = ChatClient.connectionState()
-            // A cold start can bind before the companion's service is ready (or
-            // before it has restored a stored session), so the first calls fail
-            // (null account / empty rooms / logged-out-while-restoring). Retry
-            // until the account answers, rooms arrive, or it's a genuine
-            // logged-out account (no stored session) — don't flash a wrong
-            // empty state while the session is still restoring.
-            repeat(REFRESH_RETRIES) {
-                // Settled = really logged in with rooms, or a genuine
-                // logged-out account (no stored session). Anything else (null
-                // account, logged-out-while-restoring, or logged-in but the
-                // cold room cache hasn't warmed — the first getRooms can return
-                // empty) keeps refetching.
-                val settled = account != null && (
-                    (account.loggedIn == true && result.isNotEmpty()) ||
-                        (account.userId == null && result.isEmpty()) ||
-                        // An expired session is a settled state, not a transient
-                        // restore — don't keep refetching for 10s.
-                        (account.loggedIn == false && account.userId != null && connection?.state == "offline")
-                    )
-                if (settled) return@repeat
-                delay(REFRESH_RETRY_DELAY_MS)
-                account = ChatClient.accountState()
-                connection = ChatClient.connectionState()
-                if (account?.loggedIn == true) result = ChatClient.getRooms()
+            try {
+                var account = ChatClient.accountState()
+                var result = ChatClient.getRooms()
+                var connection = ChatClient.connectionState()
+                // A cold start can bind before the companion's service is ready (or
+                // before it has restored a stored session), so the first calls fail
+                // (null account / empty rooms / logged-out-while-restoring). Retry
+                // until the account answers, rooms arrive, or it's a genuine
+                // logged-out account (no stored session) — don't flash a wrong
+                // empty state while the session is still restoring.
+                repeat(REFRESH_RETRIES) {
+                    // Settled = really logged in with rooms, or a genuine
+                    // logged-out account (no stored session). Anything else (null
+                    // account, logged-out-while-restoring, or logged-in but the
+                    // cold room cache hasn't warmed — the first getRooms can return
+                    // empty) keeps refetching.
+                    val settled = account != null && (
+                        (account.loggedIn == true && result.isNotEmpty()) ||
+                            (account.userId == null && result.isEmpty()) ||
+                            // An expired session is a settled state, not a transient
+                            // restore — don't keep refetching for 10s.
+                            (account.loggedIn == false && account.userId != null && connection?.state == "offline")
+                        )
+                    if (settled) return@repeat
+                    delay(REFRESH_RETRY_DELAY_MS)
+                    account = ChatClient.accountState()
+                    connection = ChatClient.connectionState()
+                    if (account?.loggedIn == true) result = ChatClient.getRooms()
+                }
+                this@ChatListViewModel.account.value = account
+                rooms.value = result
+                this@ChatListViewModel.connection.value = connection
+                // A notification tap asked for a thread; open it once its room is
+                // loaded (a cold start may have to wait for the first room-list pass).
+                consumeNotifyRoom(result)
+            } finally {
+                // A binder exception mid-fetch must not leave the list stuck on
+                // "Loading…" (same guard as the thread, feedback 2026-08-19).
+                if (!quiet) loading.value = false
             }
-            this@ChatListViewModel.account.value = account
-            rooms.value = result
-            this@ChatListViewModel.connection.value = connection
-            // A notification tap asked for a thread; open it once its room is
-            // loaded (a cold start may have to wait for the first room-list pass).
-            consumeNotifyRoom(result)
-            if (!quiet) loading.value = false
         }
     }
 
@@ -240,6 +268,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         val unreadOnly by viewModel.unreadOnly.collectAsState()
         val networkFilter by viewModel.networkFilter.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
+        val volumePanel by viewModel.volumePanel.collectAsState()
         val listState = rememberLazyListState()
 
         // Phase 7 filters: the unread toggle and the network selector both
@@ -285,6 +314,30 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
             listState.requestScrollToItem(0)
         }
 
+        // Feedback pass (2026-08-19): a thread exit returns the list to where
+        // the user was — the ViewModel keeps the position across navigation
+        // (the composition is disposed on navigate), restored here on show.
+        LaunchedEffect(Unit) {
+            viewModel.takeScrollToRestore()?.let { (index, offset) ->
+                listState.requestScrollToItem(index, offset)
+            }
+        }
+
+        // Save the list's scroll position continuously (the ViewModel holds it
+        // across navigation; see takeScrollToRestore). The small delay skips
+        // the fresh composition's pre-restore snapshot: after a thread exit the
+        // list first reads index 0, then the pending restore scroll applies —
+        // without the delay that (0,0) snapshot would clobber the position the
+        // user actually returned to.
+        LaunchedEffect(listState) {
+            delay(100)
+            snapshotFlow {
+                listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+            }.distinctUntilChanged().collect { (index, offset) ->
+                viewModel.saveScroll(index, offset)
+            }
+        }
+
         // Feedback pass: a new-message bump reorders the list; when the user
         // was at (or within a row of) the top, keep the newest conversation
         // pinned at index 0 — LazyColumn anchors by key, so the room that slid
@@ -308,11 +361,12 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         }
 
         LightTheme(colors = themeColors) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(LightThemeTokens.colors.background),
-            ) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(LightThemeTokens.colors.background),
+                ) {
                 // Feedback pass: with a network filter active the list gets a
                 // context top bar naming the network ("WhatsApp"); on "All"
                 // it stays a bare list home (the 2-gu bar). A filtered list is
@@ -406,6 +460,13 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                             contentDescription = "Networks",
                         ),
                     ),
+                )
+                }
+                // The in-app volume panel (the LP3 rocker replica) draws over
+                // the whole screen while shown.
+                VolumePanelOverlay(
+                    state = volumePanel,
+                    onDismiss = { viewModel.dismissVolumePanel() },
                 )
             }
         }

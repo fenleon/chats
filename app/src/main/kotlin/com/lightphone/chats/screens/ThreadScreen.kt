@@ -39,11 +39,12 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
+import com.lightphone.chats.VolumePanelOverlay
 import com.lightphone.chats.dayDividerLabel
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
 import com.thelightphone.sdk.LightScreen
-import com.thelightphone.sdk.LightViewModel
+import com.lightphone.chats.ChatLightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightServiceMethod
@@ -76,7 +77,7 @@ private const val MEDIA_PREFETCH_COUNT = 4
 
 class ThreadViewModel(
     private val room: LightServiceMethod.GetRooms.Room,
-) : LightViewModel<Unit>() {
+) : ChatLightViewModel<Unit>() {
 
     /** Oldest-first page of messages; older pages are prepended by [loadOlder]. */
     val messages = MutableStateFlow<List<LightServiceMethod.GetMessages.Message>>(emptyList())
@@ -123,6 +124,13 @@ class ThreadViewModel(
      */
     val playingPositionMs = MutableStateFlow<Long?>(null)
     val playingPositionAtMs = MutableStateFlow(0L)
+
+    /**
+     * (eventId, message) of a voice-note playback that failed to fetch/play —
+     * the row shows the error briefly instead of a silent no-op (feedback
+     * 2026-08-19). Cleared after a few seconds.
+     */
+    val voiceError = MutableStateFlow<Pair<String, String>?>(null)
 
     /**
      * Optimistic rows from a send, waiting for their sync echo (feedback
@@ -181,24 +189,31 @@ class ThreadViewModel(
     fun loadNewest(quiet: Boolean = false) {
         viewModelScope.launch {
             if (!quiet) loading.value = true
-            val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
-            val loaded = page?.messages.orEmpty()
-            roomEncrypted.value = page?.encrypted ?: false
-            playingEventId.value = page?.audioPlayingEventId
-            if (page?.audioPositionMs != null) {
-                playingPositionMs.value = page.audioPositionMs
-                playingPositionAtMs.value = android.os.SystemClock.elapsedRealtime()
-            }
-            // Merge, don't replace: the fresh newest page updates the tail while
-            // older pages the user scrolled into (via [loadOlder]) stay put. A
-            // full replace every poll shrank the list back to the newest page
-            // and yanked the scroll down (and made top rows flicker in/out).
-            if (loaded.isNotEmpty() || messages.value.isEmpty()) {
-                messages.value = mergeWithPending(mergeNewestPage(loaded, messages.value))
-                hasMore.value = page?.hasMore ?: false
+            val loaded: List<LightServiceMethod.GetMessages.Message>
+            try {
+                val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
+                loaded = page?.messages.orEmpty()
+                roomEncrypted.value = page?.encrypted ?: false
+                playingEventId.value = page?.audioPlayingEventId
+                if (page?.audioPositionMs != null) {
+                    playingPositionMs.value = page.audioPositionMs
+                    playingPositionAtMs.value = android.os.SystemClock.elapsedRealtime()
+                }
+                // Merge, don't replace: the fresh newest page updates the tail while
+                // older pages the user scrolled into (via [loadOlder]) stay put. A
+                // full replace every poll shrank the list back to the newest page
+                // and yanked the scroll down (and made top rows flicker in/out).
+                if (loaded.isNotEmpty() || messages.value.isEmpty()) {
+                    messages.value = mergeWithPending(mergeNewestPage(loaded, messages.value))
+                    hasMore.value = page?.hasMore ?: false
+                }
+            } finally {
+                // A binder exception mid-fetch must not leave the thread stuck on
+                // "Loading messages…" (feedback 2026-08-19: a send + quick exit +
+                // re-enter could wedge it) — the flag always clears.
+                if (!quiet) loading.value = false
             }
             if (!quiet) {
-                loading.value = false
                 jumpToBottom.value = true
                 // Opening the thread marks it read up to the newest event; the
                 // room list's unread count drops on its next refresh.
@@ -299,13 +314,20 @@ class ThreadViewModel(
     /**
      * Toggles playback of a voice note in the companion (Phase 14). The local
      * state flips immediately so the row reacts; the response and the poll's
-     * `audioPlayingEventId` keep it accurate as playback finishes.
+     * `audioPlayingEventId` keep it accurate as playback finishes. A fetch or
+     * playback failure surfaces on the row instead of a silent no-op
+     * (feedback 2026-08-19).
      */
     fun playVoiceNote(eventId: String) {
         playingEventId.value = if (playingEventId.value == eventId) null else eventId
         viewModelScope.launch {
-            val playing = ChatClient.playVoiceNote(room.id, eventId)
+            val (playing, error) = ChatClient.playVoiceNote(room.id, eventId)
             playingEventId.value = if (playing) eventId else null
+            if (!playing && error != null) {
+                voiceError.value = eventId to error
+                delay(VOICE_ERROR_DISMISS_MS)
+                if (voiceError.value?.first == eventId) voiceError.value = null
+            }
         }
     }
 
@@ -337,15 +359,21 @@ class ThreadViewModel(
         if (loadingMore.value || !hasMore.value) return
         viewModelScope.launch {
             loadingMore.value = true
-            val page = ChatClient.getMessages(room.id, oldest.id, PAGE_SIZE)
-            val older = page?.messages.orEmpty()
-            if (older.isNotEmpty()) {
-                // distinctBy guards the page boundary: if the timeline changed
-                // between calls, the cursor event can appear at both edges.
-                messages.value = (older + messages.value).distinctBy { it.id }
+            try {
+                val page = ChatClient.getMessages(room.id, oldest.id, PAGE_SIZE)
+                val older = page?.messages.orEmpty()
+                if (older.isNotEmpty()) {
+                    // distinctBy guards the page boundary: if the timeline changed
+                    // between calls, the cursor event can appear at both edges.
+                    messages.value = (older + messages.value).distinctBy { it.id }
+                }
+                hasMore.value = page?.hasMore ?: hasMore.value
+            } finally {
+                // A binder failure must not wedge pagination (feedback
+                // 2026-08-19: an exception here left loadingMore stuck, so
+                // older messages never loaded again).
+                loadingMore.value = false
             }
-            hasMore.value = page?.hasMore ?: hasMore.value
-            loadingMore.value = false
         }
     }
 
@@ -360,6 +388,8 @@ class ThreadViewModel(
         /** Media fetch retries when the first read comes back null. */
         const val MEDIA_RETRIES = 3
         const val MEDIA_RETRY_DELAY_MS = 2_000L
+        /** How long a failed voice-note play error stays on the row. */
+        const val VOICE_ERROR_DISMISS_MS = 3_000L
     }
 }
 
@@ -392,9 +422,11 @@ class ThreadScreen(
         val playingEventId by viewModel.playingEventId.collectAsState()
         val playingPositionMs by viewModel.playingPositionMs.collectAsState()
         val playingPositionAtMs by viewModel.playingPositionAtMs.collectAsState()
+        val voiceError by viewModel.voiceError.collectAsState()
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
+        val volumePanel by viewModel.volumePanel.collectAsState()
         val listState = rememberLazyListState()
 
         // Load the persisted read-status toggle once (idempotent).
@@ -457,6 +489,7 @@ class ThreadScreen(
         }
 
         LightTheme(colors = themeColors) {
+            Box(modifier = Modifier.fillMaxSize()) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -509,6 +542,7 @@ class ThreadScreen(
                                                 playing = row.message.id == playingEventId,
                                                 playingPositionMs = playingPositionMs,
                                                 playingPositionAtMs = playingPositionAtMs,
+                                                voiceError = voiceError,
                                                 onEnsureMedia = viewModel::ensureMedia,
                                                 onPlayVoiceNote = viewModel::playVoiceNote,
                                                 onOpenImage = { bytes ->
@@ -596,6 +630,13 @@ class ThreadScreen(
                         ),
                     ),
                 )
+            }
+            // The in-app volume panel (the LP3 rocker replica) draws over the
+            // whole screen while shown.
+            VolumePanelOverlay(
+                state = volumePanel,
+                onDismiss = { viewModel.dismissVolumePanel() },
+            )
             }
         }
 
@@ -759,6 +800,7 @@ private fun MessageRow(
     playing: Boolean,
     playingPositionMs: Long?,
     playingPositionAtMs: Long,
+    voiceError: Pair<String, String>?,
     onEnsureMedia: (String, Boolean) -> Unit,
     onPlayVoiceNote: (String) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
@@ -833,6 +875,7 @@ private fun MessageRow(
                     playing = playing,
                     playingPositionMs = playingPositionMs,
                     playingPositionAtMs = playingPositionAtMs,
+                    error = voiceError?.takeIf { it.first == message.id }?.second,
                     onTogglePlay = { onPlayVoiceNote(message.id) },
                 )
             } else {
@@ -948,17 +991,30 @@ private fun ImageMessageContent(
             .padding(top = 1.dp)
             .lightClickable(onClick = { onOpenImage(bytes) }),
     )
+    // Feedback round 2026-08-19: received photos with a caption (the m.image
+    // body) show it under the thumbnail, like native messaging apps.
+    val caption = message.caption
+    if (caption != null) {
+        LightText(
+            text = caption,
+            variant = LightTextVariant.Paragraph,
+            modifier = Modifier.padding(top = 1.dp),
+        )
+    }
 }
 
 /** A voice-note row: a play/pause icon + label, tapped to toggle playback in
  *  the companion (Phase 14). The playing row shows its state via the poll's
- *  `audioPlayingEventId`, so the highlight survives message-list refreshes. */
+ *  `audioPlayingEventId`, so the highlight survives message-list refreshes.
+ *  A fetch/playback failure ([error]) shows briefly under the label instead of
+ *  a silent no-op (feedback 2026-08-19). */
 @Composable
 private fun AudioMessageContent(
     message: LightServiceMethod.GetMessages.Message,
     playing: Boolean,
     playingPositionMs: Long?,
     playingPositionAtMs: Long,
+    error: String?,
     onTogglePlay: () -> Unit,
 ) {
     // While playing, tick every 500 ms so the interpolated position counter
@@ -998,6 +1054,16 @@ private fun AudioMessageContent(
             variant = LightTextVariant.Paragraph,
             lighten = playing,
             modifier = Modifier.padding(start = 1f.gridUnitsAsDp()),
+        )
+    }
+    // A failed fetch/play is a quiet one-line "couldn't play" under the row,
+    // not a silent no-op (feedback 2026-08-19).
+    if (error != null) {
+        LightText(
+            text = "Couldn't play — $error",
+            variant = LightTextVariant.Superfine,
+            lighten = true,
+            modifier = Modifier.padding(top = 1.dp),
         )
     }
 }
