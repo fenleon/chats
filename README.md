@@ -6,7 +6,7 @@ Chats brings **WhatsApp to your Light Phone III**, along with **Instagram DMs** 
 
 Under the hood it runs on **Matrix**, the open, encrypted messaging standard behind Beeper's bridges, so every conversation is end-to-end encrypted. If you'd rather not use Beeper, Chats speaks plain Matrix and works with any Matrix homeserver.
 
-Chats is a **real LightOS tool**: a thin interface built on the Light SDK design system, launched from the LightOS toolbox, with a companion app hosting the persistent encrypted connection, storage, and notifications — the same tool + companion architecture Light's own messaging tool uses, so messages keep arriving and notifying even after the tool closes.
+Chats is a **real LightOS tool**: a thin interface built on the Light SDK design system, launched from the LightOS toolbox, packaged as a **single APK** that hosts its own background service — the same thin-UI-over-embedded-service architecture Light's own messaging tool uses, so messages keep arriving and notifying even after the tool closes.
 
 Chats is currently in **beta**. It is suitable for daily use; features and behavior may still evolve before a stable release.
 
@@ -116,8 +116,8 @@ The tool is a thin UI over the embedded companion's binder: every screen is a re
 
 - **End-to-end encryption.** Every conversation is end-to-end encrypted and decrypts only on your verified devices. You verify a new device by comparing emojis, or by entering your recovery key.
 - **No analytics, ads, or tracking.**
-- **Data lives on your homeserver** — Beeper's or your own. The companion stores the message history locally (in its private storage) so rooms re-open instantly and old messages are searchable offline.
-- **Notifications** show a message preview, like any messaging app. The companion runs a foreground service only while sync is enabled; the sync-pause toggle stops it entirely.
+- **Data lives on your homeserver** — Beeper's or your own. The app stores the message history locally (in its private storage) so rooms re-open instantly and old messages are searchable offline.
+- **Notifications** show a message preview, like any messaging app. The app runs a foreground service only while sync is enabled; the sync-pause toggle stops it entirely.
 - **Media downloads** can be restricted to Wi-Fi from Settings.
 
 ---
@@ -158,7 +158,7 @@ No. Chats is an independent, unofficial project. WhatsApp and Instagram messages
 
 ### Where is my data stored?
 
-Your messages live on your messaging server — Beeper's, or your own Matrix homeserver. The companion keeps a local copy of your message history on the phone so rooms re-open instantly and are readable offline. Nothing is uploaded anywhere else.
+Your messages live on your messaging server — Beeper's, or your own Matrix homeserver. The app keeps a local copy of your message history on the phone so rooms re-open instantly and are readable offline. Nothing is uploaded anywhere else.
 
 ### Does Chats collect analytics or usage data?
 
@@ -166,7 +166,7 @@ No.
 
 ### Is background messaging reliable?
 
-The companion runs a foreground service with a persistent sync loop; messages arrive and notify in real time, and a disk cache makes returning to a thread instant. A Settings toggle can pause sync entirely to save battery.
+The app runs a foreground service with a persistent sync loop; messages arrive and notify in real time, and a disk cache makes returning to a thread instant. A Settings toggle can pause sync entirely to save battery.
 
 ---
 
