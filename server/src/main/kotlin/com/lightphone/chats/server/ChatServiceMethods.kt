@@ -211,33 +211,6 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.StartVoiceNoteSend.encodeResponse(response))
                 }
 
-                // Volume (2026-08-19 feedback round: the in-app volume panel) —
-                // the SDK declares these but its own server doesn't implement
-                // them; the wrapping server app does (Audiobooks pattern).
-                LightServiceMethod.GetVolumeLevel.id -> {
-                    LightResult.Success(
-                        LightServiceMethod.GetVolumeLevel.encodeResponse(MatrixRepository.volumeLevel()),
-                    )
-                }
-
-                LightServiceMethod.WaitForVolumeChange.id -> {
-                    val request = LightServiceMethod.WaitForVolumeChange.decodeRequest(payload!!)
-                    // Blocks a binder thread up to the timeout — the SDK's
-                    // service has a thread pool, and one long-poll at a time is
-                    // the point (same pattern as Audiobooks).
-                    val (level, max) = runBlocking {
-                        MatrixRepository.awaitVolumeChange(
-                            LightServiceMethod.WaitForVolumeChange.WAIT_TIMEOUT_MS,
-                            request.knownLevel,
-                        )
-                    }
-                    LightResult.Success(
-                        LightServiceMethod.WaitForVolumeChange.encodeResponse(
-                            LightServiceMethod.WaitForVolumeChange.Response(level, max),
-                        ),
-                    )
-                }
-
                 LightServiceMethod.SetSyncEnabled.id -> {
                     val request = LightServiceMethod.SetSyncEnabled.decodeRequest(payload!!)
                     runBlocking { MatrixRepository.setSyncEnabled(request.enabled) }

@@ -311,3 +311,80 @@ Real-account tests (the live delivery test, the sliding-sync probe) are
 receive-only — register a pusher / read an endpoint, never send or deliver
 anything to anyone; per user instruction they still require explicit go-ahead
 before touching the real account.
+
+## UnifiedPush feasibility (2026-08-21) — "LightOS is a UP distributor now" assessment
+
+User relayed (feedback round 11): *"LightOS is a UnifiedPush distributor app
+now (though admittedly we need to test this more), so you shouldn't need to
+use ntfy.sh. Should be able to take advantage of our existing notification
+channel and save even more battery/simpler setup."* Assessment requested
+before deciding anything. What the SDK actually does, and where the two
+protocols meet.
+
+### What the SDK's push surface is
+
+- `light-sdk/sdk/client` implements the **UnifiedPush app** role:
+  `LightPushService : PushService()` + `LightPushManager` (persists the
+  endpoint), and `LightSdkApplication` calls `UnifiedPush.saveDistributor(this,
+  serverPackage)` then registers two instances — `light-local` (tool↔server
+  IPC) always, `light-push` (remote) only when the tool's `LightEntryPoint`
+  sets `enablePushNotifications = true`. Messages arrive via
+  `onPushNotification(data: ByteArray)`.
+- **The distributor is the SDK server package.** For chats that is
+  `com.lightphone.chats` itself (single-APK self-serving build), NOT
+  `com.lightos` — so chats' SDK UP registration currently targets its own
+  embedded server. Chats' tool also doesn't implement `LightEntryPoint`, so
+  the remote instance is never registered.
+- Chats' Matrix push (this file's whole subject) is entirely independent of
+  the SDK's UP plumbing: a Matrix HTTP pusher → ntfy.sh gateway → OkHttp SSE
+  held by the companion (`PushChannel.kt`).
+
+### Where the protocols meet (and where they don't)
+
+- **Matrix push** = the homeserver POSTs the notify body to the pusher's
+  `data.url`, which must end in `/_matrix/push/v1/notify` (Synapse validates;
+  Beeper accepted ntfy's, which serves exactly that path).
+- **UnifiedPush** = the app registers with a distributor and receives an
+  endpoint; the app's OWN backend POSTs `{"message": …}` to it; the
+  distributor delivers to the device. The endpoint is not a Matrix push
+  gateway — no `/_matrix/push/v1/notify` path, different payload shape
+  (`notification.devices[].pushkey` routing).
+- **Therefore a relay between the two is unavoidable today**: Beeper's pusher
+  cannot point at a generic UP endpoint (path check + body shape). The UP
+  channel only replaces the **device side** of the current chain (the phone's
+  SSE socket → the distributor's connection, shared across apps). The
+  notify→device relay must still exist somewhere — either ntfy.sh (today) or
+  a hosted gateway whose backend speaks to LightOS's distributor (Light-hosted
+  or the community relay from "Production architecture" above).
+
+### What the switch would look like (when the relay question is answered)
+
+1. The chats companion registers a UP instance with `com.lightos` as the
+   distributor (the connector lib is already on the classpath via the SDK
+   client) and implements `onMessage` → `MatrixRepository.onPushDelivered`
+   — replacing the SSE subscription in `PushChannel`. Device side: trivial.
+2. The Matrix pusher registration stays identical (`kind = http`, pushkey),
+   but `data.url` becomes the gateway's `/_matrix/push/v1/notify` — the only
+   real question is who hosts that gateway and whether it can reach the
+   distributor/device (Light's push infra, or the hosted relay with a
+   UP-facing device side).
+3. Battery: the phone drops its per-app SSE socket; the distributor's shared
+   connection serves it — the win the user is after, IF LightOS actually
+   keeps one persistent channel.
+
+### Verdict + next step
+
+Feasible in principle; **not shippable today**. The device side is easy; the
+missing piece is a public Matrix-notify gateway that delivers through
+LightOS's UP distributor (or Light exposing a `/_matrix/push/v1/notify`-
+serving endpoint that routes to devices). ntfy.sh remains the zero-setup
+production path meanwhile — it IS the notify→device relay, just with an SSE
+device side instead of UP.
+
+Test sequence (needs a real LP3 + LightOS with the distributor): (1) enable
+the SDK remote push instance on a test build (`enablePushNotifications = true`
+in a chats `LightEntryPoint`) and confirm `com.lightos` delivers an endpoint
++ actually routes a message — proves the distributor; (2) capture the
+endpoint's URL shape and check whether it can accept the Matrix notify body;
+(3) decide with the user/Light whether the notify→UP gateway is theirs to
+host. Until then: keep ntfy; revisit when the distributor is proven.

@@ -119,21 +119,6 @@ object ChatClient {
     suspend fun e2eeState(): LightServiceMethod.GetE2eeState.Response? =
         callRemoteServiceMethod(LightServiceMethod.GetE2eeState, Unit).getOrNull()
 
-    /** The media stream's current volume level + max (drives the volume panel). */
-    suspend fun volumeLevel(): LightServiceMethod.GetVolumeLevel.Response? =
-        callRemoteServiceMethod(LightServiceMethod.GetVolumeLevel, Unit).getOrNull()
-
-    /**
-     * Long-poll: blocks until the media-stream volume changes (or its ~2 s
-     * timeout) — the volume panel reacts instantly to a connected BT device's
-     * own volume buttons (AVRCP) instead of polling.
-     */
-    suspend fun waitForVolumeChange(knownLevel: Int): LightServiceMethod.WaitForVolumeChange.Response? =
-        callRemoteServiceMethod(
-            LightServiceMethod.WaitForVolumeChange,
-            LightServiceMethod.WaitForVolumeChange.Request(knownLevel),
-        ).getOrNull()
-
     suspend fun startDeviceVerification(): LightServiceMethod.StartDeviceVerification.Response? =
         callRemoteServiceMethod(LightServiceMethod.StartDeviceVerification, Unit).getOrNull()
 

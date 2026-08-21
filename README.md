@@ -12,7 +12,7 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 > **Current Status:** Beta
 >
-> **Current Version:** 0.3.0 (versionCode 30)
+> **Current Version:** 0.5.0 (versionCode 50)
 
 ---
 
@@ -34,10 +34,13 @@ The chat list, a 1:1 thread, a group thread, the networks panel, and settings on
 
 - **WhatsApp, Instagram & more** — your existing chats from Beeper's bridged networks, with a network selector (All / WhatsApp / Instagram) so you can focus on one at a time
 - **1:1 and group chats** — a single-line chat list (unread counts, relative timestamps) that reveals more on scroll
+- **Search** — find any chat by name from the chat list, with a direct/group mode switch; results respect the selected network
+- **Contact overlay** — tap a thread's room name to see the contact's name and network
+- **Hardware buttons work** — volume, camera, and the brightness wheel are relayed to the platform, so the native controls behave inside Chats
 - **End-to-end encryption** — every conversation is encrypted end to end, with simple emoji-based device verification and recovery-key login for new devices
 - **Or a Matrix homeserver of your own** — Chats isn't tied to Beeper; it works with any Matrix homeserver
 - **Notifications** — one calm notification per room as messages arrive; a push channel (ntfy) wakes the sync the moment a message arrives, so delivery is instant
-- **Voice notes** — record, send, and play (Opus — the standard voice-message format, roughly half the size of the earlier AAC)
+- **Voice notes** — record, send, and play (Opus — the standard voice-message format, roughly half the size of the earlier AAC); playback handles the bridge's malformed Ogg streams
 - **Photos** — attach via the system photo picker; tap a thumbnail for a full-screen view
 - **Message reactions** — shown as small tags under the message
 - **Delivery status** — a "delivered" tag on your newest message once it reaches the room, and a "not delivered" marker when it fails
@@ -100,12 +103,12 @@ The emulator's dev homeserver (local Synapse, `http://10.0.2.2:8008`) is the sta
 
 # Architecture
 
-Chats is a native Android application written in Kotlin using Jetpack Compose, following the workspace's two-module tool pattern:
+Chats is a native Android application written in Kotlin using Jetpack Compose, packaged as a single APK (since 0.4.0) with two modules:
 
-- **`:app` — the tool** (`com.lightphone.chats`, label "Chats"). A thin, quiet chat UI launched from the LightOS toolbox: chat list, thread, composer, settings. All UI is Light SDK design-system primitives, and the tool runtime's restrictions (foreground services, notifications, media APIs, background work) are respected.
-- **`:server` — the companion** (`com.lightphone.chats.server`). A plain Android app hosting the SDK's `LightSdkService` and the entire privileged Matrix stack: the Trixnity `MatrixClient` (login, session restore, sync), a Room-based event store, a foreground `ChatSyncService` sync loop, new-message notifications, E2EE (megolm + SAS verification), media handling (photo picker, voice-note recording, media downloads), and a background room-list cache.
+- **`:app` — the tool** (`com.lightphone.chats`, label "Chats"). A thin, quiet chat UI launched from the LightOS toolbox: chat list, thread, composer, search, settings. All UI is Light SDK design-system primitives, and the tool runtime's restrictions (foreground services, notifications, media APIs, background work) are respected.
+- **`:server` — the companion as a library** (`com.lightphone.chats.server`, merged into the same APK). Hosts the SDK's `LightSdkService` and the entire privileged Matrix stack: the Trixnity `MatrixClient` (login, session restore, sync), a Room-based event store, a foreground `ChatSyncService` sync loop, new-message notifications, E2EE (megolm + SAS verification), media handling (photo picker, voice-note recording, media downloads), a background room-list cache, and the push channel.
 
-The tool is a thin UI over the companion's binder: every screen is a request over the SDK's service seam, and the companion does the work. That is why messages keep syncing and notifying after the tool closes.
+The tool is a thin UI over the embedded companion's binder: every screen is a request over the SDK's service seam, and the companion does the work. That is why messages keep syncing and notifying after the tool closes.
 
 ---
 

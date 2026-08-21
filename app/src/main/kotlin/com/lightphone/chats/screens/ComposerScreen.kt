@@ -3,25 +3,30 @@ package com.lightphone.chats.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
-import com.lightphone.chats.ChatLightViewModel
-import com.lightphone.chats.VolumePanelOverlay
 import com.thelightphone.sdk.LightScreen
+import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.ui.LightIcons
+import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightTextInputEditor
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.defaultKeyboardOptions
+import com.thelightphone.sdk.ui.gridUnitsAsDp
+import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -38,7 +43,7 @@ data class ComposerResult(
 
 class ComposerViewModel(
     private val roomId: String,
-) : ChatLightViewModel<ComposerResult>() {
+) : LightViewModel<ComposerResult>() {
 
     val busy = MutableStateFlow(false)
 
@@ -97,16 +102,16 @@ class ComposerScreen(
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
-        val volumePanel by viewModel.volumePanel.collectAsState()
         // The LP3 keyboard's mic key is handled inside the closed light-keyboard
         // library (it needs a speech-recognition service, which LightOS doesn't
         // ship) — it does nothing here. Voice notes have their own button on
         // the thread (Phase 14), so hide the dead key instead of showing a
-        // control that can't act. The return key is gone too (feedback
-        // 2026-08-19): the notes editor wraps without newlines, and return is
-        // a send — an explicit enter key next to SEND just confuses.
+        // control that can't act. The return key stays (feedback 2026-08-20:
+        // it was removed at the send-round, then the user wanted it back) —
+        // it inserts a newline rather than sending (submitOnReturn = false):
+        // messages may span lines, and SEND lives in the top bar.
         val keyboardOptionsFlow = remember {
-            MutableStateFlow(defaultKeyboardOptions().copy(displayVoice = false, displayReturn = false))
+            MutableStateFlow(defaultKeyboardOptions().copy(displayVoice = false, displayReturn = true))
         }
         val textState = rememberTextFieldState("")
 
@@ -123,20 +128,41 @@ class ComposerScreen(
                     submitIcon = LightIcons.SEND,
                     // Notes-style entry (feedback pass): small wrapping text
                     // anchored at the bottom, growing upward, keyboard flush at
-                    // the bottom; return still sends (multi-line display, no
-                    // newlines in the message). Send lives in the top-right bar.
+                    // the bottom; the return key makes newlines, not sends
+                    // (feedback 2026-08-20). Send lives in the top-right bar.
+                    // The keyboard opens in caps mode — a new message starts
+                    // with a capital letter like the native composer
+                    // (feedback 2026-08-20: "compose … ensure the keyboard is
+                    // capitalised mode").
                     singleLine = false,
-                    submitOnReturn = true,
+                    submitOnReturn = false,
                     bottomAligned = true,
                     submitInTopBar = true,
                     topBarSubmitIcon = LightIcons.SEND,
+                    initialCaps = true,
                 )
-                // The in-app volume panel (the LP3 rocker replica) draws over
-                // the whole screen while shown.
-                VolumePanelOverlay(
-                    state = volumePanel,
-                    onDismiss = { viewModel.dismissVolumePanel() },
-                )
+                // Clear-draft X, bottom-right corner of the screen (feedback
+                // 2026-08-21: the old 218 dp-above-keyboard position overlapped
+                // the draft's last line). The composer keyboard (submitInTopBar)
+                // leaves its ~36 dp bottom action zone empty below the keys, so
+                // the X sits in that row, at the far right.
+                if (textState.text.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp())
+                            .lightClickable {
+                                textState.edit { replace(0, length, "") }
+                            }
+                            .padding(1f.gridUnitsAsDp()),
+                    ) {
+                        LightIcon(
+                            icon = LightIcons.CLOSE,
+                            size = 1.5f,
+                            contentDescription = "Clear draft",
+                        )
+                    }
+                }
             }
         }
     }

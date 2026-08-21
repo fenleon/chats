@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.Composable
@@ -23,11 +24,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
-import com.lightphone.chats.VolumePanelOverlay
 import com.lightphone.chats.formatRelativeTimestamp
 import com.thelightphone.sdk.InitialScreen
 import com.thelightphone.sdk.LightScreen
-import com.lightphone.chats.ChatLightViewModel
+import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightServiceMethod
@@ -61,7 +61,7 @@ private const val REVEAL_THRESHOLD = 4
  */
 private const val EXTRA_NOTIFY_ROOM = "chats.notifyRoomId"
 
-class ChatListViewModel : ChatLightViewModel<Unit>() {
+class ChatListViewModel : LightViewModel<Unit>() {
 
     val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
     val loading = MutableStateFlow(true)
@@ -84,8 +84,6 @@ class ChatListViewModel : ChatLightViewModel<Unit>() {
      * plain list refresh never sets it, so the list never auto-opens a room.
      */
     var pendingNotifyRoomId: String? = null
-    /** Unread-only filter (bottom-bar toggle, Phase 7): shows only rooms with unreadCount > 0. */
-    val unreadOnly = MutableStateFlow(false)
     /** Selected bridged-network label (Phase 7); null = all networks. */
     val networkFilter = MutableStateFlow<String?>(null)
 
@@ -93,20 +91,17 @@ class ChatListViewModel : ChatLightViewModel<Unit>() {
      * Room-list scroll position, persisted across navigation so a thread exit
      * returns the list to where it was instead of the top (feedback 2026-08-19:
      * "select a room half way down the list, enter, exit — return half way
-     * down"). The screen saves it continuously and restores on show.
+     * down"). The screen saves it continuously and the list re-creates its
+     * LazyListState seeded from it on show (feedback 2026-08-20: the old
+     * scroll-after-compose restore flashed the top of the list first).
      */
-    private var savedScrollIndex = 0
-    private var savedScrollOffset = 0
-    private var scrollToRestore: Pair<Int, Int>? = null
+    var savedScrollIndex = 0
+    var savedScrollOffset = 0
 
     fun saveScroll(index: Int, offset: Int) {
         savedScrollIndex = index
         savedScrollOffset = offset
     }
-
-    /** The position to restore on show (consume-once), or null when at the top. */
-    fun takeScrollToRestore(): Pair<Int, Int>? =
-        scrollToRestore.also { scrollToRestore = null }
 
     private var refreshJob: Job? = null
     private var pollJob: Job? = null
@@ -115,8 +110,10 @@ class ChatListViewModel : ChatLightViewModel<Unit>() {
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
-        if (savedScrollIndex > 0 || savedScrollOffset > 0) {
-            scrollToRestore = savedScrollIndex to savedScrollOffset
+        // The list only renders a slice (reveal-on-scroll); a restored position
+        // past the slice must widen it first or LazyColumn clamps to the end.
+        if (savedScrollIndex >= visibleCount.value) {
+            visibleCount.value = savedScrollIndex + REVEAL_STEP
         }
         refresh()
         startPolling()
@@ -265,18 +262,24 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         val connection by viewModel.connection.collectAsState()
         val visibleCount by viewModel.visibleCount.collectAsState()
         val pendingRoom by viewModel.openRoom.collectAsState()
-        val unreadOnly by viewModel.unreadOnly.collectAsState()
         val networkFilter by viewModel.networkFilter.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
-        val volumePanel by viewModel.volumePanel.collectAsState()
-        val listState = rememberLazyListState()
+        // The saved position seeds the list state directly (feedback
+        // 2026-08-20: restoring with a post-compose scroll flashed the top of
+        // the list for a frame). The ViewModel keeps the position across
+        // navigation (the composition is disposed on navigate), so a fresh
+        // composition picks it up with no flash.
+        val listState = rememberLazyListState(
+            initialFirstVisibleItemIndex = viewModel.savedScrollIndex,
+            initialFirstVisibleItemScrollOffset = viewModel.savedScrollOffset,
+        )
 
-        // Phase 7 filters: the unread toggle and the network selector both
-        // narrow the list; the full room set stays in the ViewModel.
-        val filteredRooms = remember(rooms, unreadOnly, networkFilter) {
+        // Phase 7 filters: the network selector narrows the list; the full
+        // room set stays in the ViewModel. (The unread toggle moved to the
+        // Search screen, feedback 2026-08-21.)
+        val filteredRooms = remember(rooms, networkFilter) {
             rooms.filter { room ->
-                (networkFilter == null || room.network == networkFilter) &&
-                    (!unreadOnly || room.unreadCount > 0)
+                networkFilter == null || room.network == networkFilter
             }
         }
         // Network labels for the Networks panel, from the rooms the companion
@@ -305,30 +308,18 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
             }
         }
 
-        // Feedback pass: switching the filter (unread toggle / account
-        // selection) returns the list to the top — the user expects the
-        // newest conversations, not a stale scroll position from the previous
-        // filter. requestScrollToItem is safe before the new list is composed
-        // (e.g. an empty unread view); the scroll lands when the list appears.
-        LaunchedEffect(unreadOnly, networkFilter) {
+        // Feedback pass: switching the filter (network selection) returns the
+        // list to the top — the user expects the newest conversations, not a
+        // stale scroll position from the previous filter. requestScrollToItem
+        // is safe before the new list is composed (e.g. an empty view); the
+        // scroll lands when the list appears.
+        LaunchedEffect(networkFilter) {
             listState.requestScrollToItem(0)
         }
 
-        // Feedback pass (2026-08-19): a thread exit returns the list to where
-        // the user was — the ViewModel keeps the position across navigation
-        // (the composition is disposed on navigate), restored here on show.
-        LaunchedEffect(Unit) {
-            viewModel.takeScrollToRestore()?.let { (index, offset) ->
-                listState.requestScrollToItem(index, offset)
-            }
-        }
-
         // Save the list's scroll position continuously (the ViewModel holds it
-        // across navigation; see takeScrollToRestore). The small delay skips
-        // the fresh composition's pre-restore snapshot: after a thread exit the
-        // list first reads index 0, then the pending restore scroll applies —
-        // without the delay that (0,0) snapshot would clobber the position the
-        // user actually returned to.
+        // across navigation; the list state seeds from it on the next show).
+        // The small delay skips the fresh composition's initial snapshot.
         LaunchedEffect(listState) {
             delay(100)
             snapshotFlow {
@@ -439,11 +430,13 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                             onClick = { openSettings() },
                             contentDescription = "Settings",
                         ),
-                        // Phase 7: unread toggle — the label names the action
-                        // it triggers, so it reads as the state too.
-                        LightBarButton.Text(
-                            text = if (unreadOnly) "ALL" else "VIEW UNREAD",
-                            onClick = { viewModel.unreadOnly.value = !viewModel.unreadOnly.value },
+                        // Feedback 2026-08-21: the VIEW UNREAD toggle moved to
+                        // the Search screen — the bottom-middle slot is the
+                        // search entry point now.
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.SEARCH,
+                            onClick = { openSearch() },
+                            contentDescription = "Search chats",
                         ),
                         // Feedback pass: the network filter lives behind the
                         // bottom-right menu (3-dash) which opens the Networks
@@ -462,18 +455,18 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                     ),
                 )
                 }
-                // The in-app volume panel (the LP3 rocker replica) draws over
-                // the whole screen while shown.
-                VolumePanelOverlay(
-                    state = volumePanel,
-                    onDismiss = { viewModel.dismissVolumePanel() },
-                )
             }
         }
     }
 
     private fun openThread(room: LightServiceMethod.GetRooms.Room) {
         navigateTo(screenFactory = { ThreadScreen(it, room) })
+    }
+
+    private fun openSearch() {
+        // The active network filter (all / WhatsApp / Instagram) carries into
+        // the search results (feedback 2026-08-21).
+        navigateTo(screenFactory = { SearchScreen(it, viewModel.networkFilter.value) })
     }
 
     private fun openSettings() {
@@ -492,7 +485,7 @@ private fun RoomRow(
             .lightClickable(onClick = onOpen)
             // Left matches the built-in messaging margin; the right leaves the
             // time clear of the scrollbar.
-            .padding(start = 2f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 14.dp, bottom = 14.dp),
+            .padding(start = 1.75f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 14.dp, bottom = 14.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -500,11 +493,22 @@ private fun RoomRow(
             // vertical center (feedback 2026-08-17: was top-aligned to the name).
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // The unread marker is a large asterisk inline at the start of the
-            // name, not a reserved column of its own (feedback 2026-08-17).
+            // The unread marker is a large asterisk in the row's leading
+            // buffer zone, at the far left — the buffer holds the star so
+            // room names line up with the bottom-left bottom-bar icon with or
+            // without it (feedback 2026-08-21: star to the far-left buffer,
+            // names aligned to the gear icon).
+            Box(modifier = Modifier.width(1f.gridUnitsAsDp())) {
+                if (room.unreadCount > 0) {
+                    LightText(
+                        text = "*",
+                        variant = LightTextVariant.Heading,
+                    )
+                }
+            }
             Column(modifier = Modifier.weight(1f)) {
                 LightText(
-                    text = if (room.unreadCount > 0) "* ${room.name}" else room.name,
+                    text = room.name,
                     // Native Messages list names are ~80 px ink — the Heading
                     // variant (feedback 2026-08-17).
                     variant = LightTextVariant.Heading,
@@ -517,10 +521,10 @@ private fun RoomRow(
             // line like the built-in list, with the short hand format
             // (feedback 2026-08-17: back on the right after the under-name
             // Detail date; the unread count was removed at the same time).
+            // Solid white, same as everything else (feedback 2026-08-21).
             LightText(
                 text = formatRelativeTimestamp(room.lastTimestampMs),
                 variant = LightTextVariant.Fine,
-                lighten = true,
             )
         }
     }

@@ -75,6 +75,14 @@ class AccountViewModel : LightViewModel<Unit>() {
     val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
     val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
     val e2ee = MutableStateFlow<LightServiceMethod.GetE2eeState.Response?>(null)
+    /**
+     * Whether the e2ee verdict has settled. The first read on a cold trust
+     * store can lag a poll behind the truth, so "Not Verified" only shows
+     * after a verified read OR two consecutive unverified reads — until then
+     * the row reads "Checking…" (feedback 2026-08-20: "not verified" flashed
+     * on launch before loading to "verified").
+     */
+    val e2eeSettled = MutableStateFlow(false)
     /** The verification state machine's state string ("none" | "waiting" |
      *  "accept" | "start" | "verifying" | "compare" | …) — the Encrypted
      *  messages row reads it to show "Verifying" mid-process. */
@@ -121,7 +129,14 @@ class AccountViewModel : LightViewModel<Unit>() {
             val state = ChatClient.accountState()
             account.value = state
             connection.value = ChatClient.connectionState()
-            e2ee.value = ChatClient.e2eeState()
+            val newE2ee = ChatClient.e2eeState()
+            val prev = e2ee.value
+            e2ee.value = newE2ee
+            // A verified read settles immediately; an unverified one only after
+            // two consecutive reads agree (the first read on a cold trust
+            // store can lag — see [e2eeSettled]).
+            e2eeSettled.value = newE2ee?.verified == true ||
+                (prev != null && prev.verified == false && newE2ee?.verified == false)
             verification.value = ChatClient.verificationState()?.state
             // Keep the homeserver field in step with the account that's active.
             state?.homeserver?.takeIf { it.isNotBlank() }?.let {
@@ -263,6 +278,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
         val account by viewModel.account.collectAsState()
         val connection by viewModel.connection.collectAsState()
         val e2ee by viewModel.e2ee.collectAsState()
+        val e2eeSettled by viewModel.e2eeSettled.collectAsState()
         val verification by viewModel.verification.collectAsState()
         val error by viewModel.error.collectAsState()
         val busy by viewModel.busy.collectAsState()
@@ -298,9 +314,10 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                             // (feedback 2026-08-19).
                             EncryptionRow(
                                 e2ee = e2ee,
+                                settled = e2eeSettled,
                                 verifying = verification != null &&
                                     verification !in VERIFICATION_TERMINAL_STATES,
-                                onClick = if (e2ee?.verified == true) null else {
+                                onClick = if (e2ee?.verified == true || !e2eeSettled) null else {
                                     { navigateTo(screenFactory = { VerificationScreen(it) }) }
                                 },
                             )
@@ -618,9 +635,8 @@ private fun ServerOptionRow(
     LightText(
         text = label,
         variant = LightTextVariant.Heading,
-        // Selected = full color + underlined; the other lightened — a quiet
-        // picker with the current value marked (feedback 2026-08-19).
-        lighten = !active,
+        // Every row full color; the selected one is underlined — selection is
+        // conveyed by underline, not color (design rule, feedback 2026-08-21).
         underline = active,
         modifier = Modifier
             .fillMaxWidth()
@@ -789,12 +805,16 @@ private fun pluralThreads(count: Int): String =
 /** "Encrypted messages" row; opens the device-verification screen while
  *  unverified, and reads as a status-only row once verified. No toggle — the
  *  state reads "Verified" / "Verifying" (mid-verification, so a back-out keeps
- *  the process visible) / "Not Verified". Value-row anatomy — "Encrypted
- *  messages" is the Detail-sized top text, the state the Heading-sized main
- *  text (DESIGN.md §6, feedback 2026-08-19). */
+ *  the process visible) / "Not Verified". While the verdict hasn't settled
+ *  (a cold trust store can lag a poll — feedback 2026-08-20) it reads
+ *  "Checking…" and is not tappable, so launch never claims a false
+ *  "Not Verified". Value-row anatomy — "Encrypted messages" is the Detail-sized
+ *  top text, the state the Heading-sized main text (DESIGN.md §6, feedback
+ *  2026-08-19). */
 @Composable
 private fun EncryptionRow(
     e2ee: LightServiceMethod.GetE2eeState.Response?,
+    settled: Boolean,
     verifying: Boolean,
     onClick: (() -> Unit)?,
 ) {
@@ -815,6 +835,7 @@ private fun EncryptionRow(
                 text = when {
                     e2ee?.verified == true -> "Verified"
                     verifying -> "Verifying"
+                    !settled -> "Checking…"
                     else -> "Not Verified"
                 },
                 // Almost touching the label (feedback 2026-08-19).

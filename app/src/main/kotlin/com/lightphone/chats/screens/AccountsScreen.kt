@@ -89,8 +89,9 @@ private fun AccountRow(
         text = label,
         // Networks is an option panel — row label at Heading per DESIGN.md.
         variant = LightTextVariant.Heading,
-        // Selected = full content color, the rest lightened — a quiet picker.
-        lighten = !active,
+        // Every row full color; the selected one is underlined — selection is
+        // conveyed by underline, not color (design rule, feedback 2026-08-21).
+        underline = active,
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onClick)

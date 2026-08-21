@@ -9,7 +9,6 @@ import android.database.Cursor
 import android.net.Uri
 import com.thelightphone.sdk.server.ClientCertType
 import com.thelightphone.sdk.server.ClientFilterLevel
-import com.thelightphone.sdk.server.DefaultLightSdkServerSettings
 import com.thelightphone.sdk.server.LightSdkServer
 import java.security.MessageDigest
 
@@ -34,12 +33,18 @@ class ServerBootstrapProvider : ContentProvider() {
         val context = context?.applicationContext ?: return false
         with(LightSdkServer) {
             defaultClientFilterLevel = ClientFilterLevel.AllowLightSignedApks
-            provideSdkSettings = { DefaultLightSdkServerSettings(it) }
+            // Haptics answer from LightOS's real setting via the relay (PLATFORM-RELAY).
+            provideSdkSettings = { RelaySdkServerSettings(it) }
             checkCert = { callingPackage -> checkLightSdkCert(context, callingPackage) }
             customServiceMethodResolver = { callingId, methodId, payload ->
                 ChatServiceMethods.dispatch(methodId, payload)
             }
+            // Chats consumes no hardware keys — every event goes to LightOS
+            // (volume panel, brightness wheel, camera).
+            onDeviceKeyEvent = { _, event -> PlatformRelay.sendDeviceKeyEvent(event) }
         }
+        // Relay hardware keys + user preferences to LightOS (PLATFORM-RELAY).
+        PlatformRelay.bind(context)
         // Restores a stored session (if any) and starts the sync service.
         MatrixRepository.init(context)
         return true

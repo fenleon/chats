@@ -22,9 +22,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
-import com.lightphone.chats.VolumePanelOverlay
 import com.thelightphone.sdk.LightScreen
-import com.lightphone.chats.ChatLightViewModel
+import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SealedLightContext
 import com.thelightphone.sdk.SimpleLightScreen
@@ -54,7 +53,7 @@ import kotlinx.coroutines.launch
  * status-heavy content — account state, sync progress, encryption — moved to
  * [AccountScreen].
  */
-class SettingsViewModel : ChatLightViewModel<Unit>() {
+class SettingsViewModel : LightViewModel<Unit>() {
 
     val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
     val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
@@ -128,7 +127,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
-        val volumePanel by viewModel.volumePanel.collectAsState()
 
         // Load the persisted toggle once (idempotent) before rendering it.
         LaunchedEffect(Unit) { ChatSettings.load(lightContext) }
@@ -198,12 +196,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                     items = listOf(null, null, null),
                 )
                 }
-                // The in-app volume panel (the LP3 rocker replica) draws over
-                // the whole screen while shown.
-                VolumePanelOverlay(
-                    state = volumePanel,
-                    onDismiss = { viewModel.dismissVolumePanel() },
-                )
             }
         }
     }

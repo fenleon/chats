@@ -1,0 +1,111 @@
+package com.lightphone.chats.server
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
+import android.os.Parcel
+import android.util.Log
+import com.thelightphone.sdk.shared.LightConstants
+import com.thelightphone.sdk.shared.LightResult
+import com.thelightphone.sdk.shared.LightServiceMethod
+
+/**
+ * Minimal passthrough client to the platform SDK server. Self-serving apps host
+ * their own LightSdkService, so hardware keys and user preferences never reach
+ * LightOS (v572 forwards keys only to the tool's serverPackage). Relay the
+ * standard RPCs to com.lightos: DeviceKeyEvent → LightOS's volume panel /
+ * brightness wheel / camera, GetUserPreferences → the real haptics setting.
+ *
+ * Emulator: point [PLATFORM] at "com.thelightphone.sdk.emulator".
+ */
+object PlatformRelay {
+
+    private const val TAG = "PlatformRelay"
+    private const val PLATFORM = "com.lightos" // emulator: com.thelightphone.sdk.emulator
+
+    @Volatile private var binder: IBinder? = null
+    @Volatile private var token: String? = null
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            binder = service
+            token = null // tokens are per-connection server-side; re-auth
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            binder = null
+            token = null
+        }
+    }
+
+    /** Call once at server bootstrap; LightOS's SDK service is already running. */
+    fun bind(context: Context) {
+        context.applicationContext.bindService(
+            Intent(LightConstants.ACTION_BIND_SDK_SERVICE).setPackage(PLATFORM),
+            connection,
+            Context.BIND_AUTO_CREATE,
+        )
+    }
+
+    fun sendDeviceKeyEvent(request: LightServiceMethod.DeviceKeyEvent.Request) {
+        request(LightServiceMethod.DeviceKeyEvent.id, LightServiceMethod.DeviceKeyEvent.encodeRequest(request))
+    }
+
+    /** Real device haptics; null when the platform server is unreachable (fall back to local default). */
+    fun getUserPreferences(): LightServiceMethod.GetUserPreferences.Response? {
+        val result = request(
+            LightServiceMethod.GetUserPreferences.id,
+            LightServiceMethod.GetUserPreferences.encodeRequest(Unit),
+        ) as? LightResult.Success ?: return null
+        return LightServiceMethod.GetUserPreferences.decodeResponse(result.data)
+    }
+
+    private fun request(methodId: String, payload: String): LightResult<String>? {
+        val serviceBinder = binder ?: return null
+        if (token == null) {
+            val tokenResult = transact(
+                serviceBinder,
+                LightServiceMethod.GetToken.id,
+                LightServiceMethod.GetToken.encodeRequest(Unit),
+                "no_auth", // GetToken is not token-gated; only verified-caller-gated
+            ) ?: return null
+            val ok = tokenResult as? LightResult.Success ?: return tokenResult
+            token = LightServiceMethod.GetToken.decodeResponse(ok.data).token
+        }
+        return transact(serviceBinder, methodId, payload, token)
+    }
+
+    private fun transact(
+        serviceBinder: IBinder,
+        methodId: String,
+        payload: String,
+        token: String?,
+    ): LightResult<String>? {
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        return try {
+            data.writeInterfaceToken(LightConstants.ACTION_BIND_SDK_SERVICE)
+            data.writeString(methodId)
+            data.writeString(payload)
+            data.writeString(token)
+            serviceBinder.transact(LightConstants.TRANSACTION_REQUEST, data, reply, 0)
+            reply.readException()
+            val errorOrdinal = reply.readInt()
+            if (errorOrdinal == -1) {
+                LightResult.Success(reply.readString() ?: "")
+            } else {
+                val extra = reply.readString()
+                val code = LightResult.ErrorCode.entries.getOrElse(errorOrdinal) { LightResult.ErrorCode.Unknown }
+                LightResult.Error(code, extra)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "transact failed: $methodId", e)
+            null
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
+    }
+}

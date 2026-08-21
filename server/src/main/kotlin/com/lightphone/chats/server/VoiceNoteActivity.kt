@@ -60,6 +60,14 @@ class VoiceNoteActivity : ComponentActivity() {
     private var recorder: MediaRecorder? = null
     private var outputFile: File? = null
     private var previewPlayer: android.media.MediaPlayer? = null
+    /** Audio focus held while recording — pauses background playback (music,
+     *  podcasts) for the take (feedback 2026-08-20). */
+    private var recordFocusRequest: android.media.AudioFocusRequest? = null
+    /** Audio focus held while the pre-send preview plays — the preview must
+     *  pause background audio the same way the recording does (feedback
+     *  2026-08-21: the recorder got transient focus but the preview player
+     *  didn't). */
+    private var previewFocusRequest: android.media.AudioFocusRequest? = null
 
     // Activity-level state so the recording functions can flip the UI (a
     // composable-local remember can't be reached from startRecording/stopAndSend).
@@ -237,7 +245,72 @@ class VoiceNoteActivity : ComponentActivity() {
         }
         recorder = r
         outputFile = file
+        // Pause whatever is playing in the background (music, a podcast, a
+        // voice note) for the take — transient focus, released on stop
+        // (feedback 2026-08-20: "background audio should pause").
+        recordFocus()
         recording = true
+    }
+
+    /** Transient media focus while recording — background audio pauses. */
+    private fun recordFocus() {
+        if (recordFocusRequest != null) return
+        val request = android.media.AudioFocusRequest.Builder(
+            android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+        )
+            .setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .build()
+        runCatching {
+            (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
+                .requestAudioFocus(request)
+        }
+        recordFocusRequest = request
+    }
+
+    private fun abandonRecordFocus() {
+        recordFocusRequest?.let { request ->
+            runCatching {
+                (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
+                    .abandonAudioFocusRequest(request)
+            }
+            recordFocusRequest = null
+        }
+    }
+
+    /** Transient media focus while the pre-send preview plays (same pattern
+     *  as [recordFocus] — feedback 2026-08-21). */
+    private fun previewFocus() {
+        if (previewFocusRequest != null) return
+        val request = android.media.AudioFocusRequest.Builder(
+            android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+        )
+            .setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .build()
+        runCatching {
+            (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
+                .requestAudioFocus(request)
+        }
+        previewFocusRequest = request
+    }
+
+    private fun abandonPreviewFocus() {
+        previewFocusRequest?.let { request ->
+            runCatching {
+                (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
+                    .abandonAudioFocusRequest(request)
+            }
+            previewFocusRequest = null
+        }
     }
 
     private fun stopRecording() {
@@ -245,6 +318,7 @@ class VoiceNoteActivity : ComponentActivity() {
         runCatching { recorder?.release() }
         recorder = null
         recording = false
+        abandonRecordFocus()
         // Only enter the preview state if there's a take to preview.
         previewing = outputFile != null
     }
@@ -256,11 +330,13 @@ class VoiceNoteActivity : ComponentActivity() {
             player != null && player.isPlaying -> {
                 player.pause()
                 playing = false
+                abandonPreviewFocus()
             }
             player != null -> {
                 player.seekTo(0)
                 player.start()
                 playing = true
+                previewFocus()
             }
             else -> {
                 val file = outputFile ?: return
@@ -274,13 +350,14 @@ class VoiceNoteActivity : ComponentActivity() {
                                 .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
                                 .build(),
                         )
-                        setOnCompletionListener { playing = false }
-                        setOnErrorListener { _, _, _ -> playing = false; true }
+                        setOnCompletionListener { playing = false; abandonPreviewFocus() }
+                        setOnErrorListener { _, _, _ -> playing = false; abandonPreviewFocus(); true }
                         setDataSource(file.absolutePath)
                         prepare()
                         start()
                     }.also { previewPlayer = it }
                     playing = true
+                    previewFocus()
                 }
             }
         }
@@ -296,6 +373,7 @@ class VoiceNoteActivity : ComponentActivity() {
         sending = true
         runCatching { previewPlayer?.release() }
         previewPlayer = null
+        abandonPreviewFocus()
         val bytes = file.length()
         if (bytes <= 0) {
             file.delete()
@@ -329,6 +407,8 @@ class VoiceNoteActivity : ComponentActivity() {
         recorder = null
         runCatching { previewPlayer?.release() }
         previewPlayer = null
+        abandonRecordFocus()
+        abandonPreviewFocus()
         outputFile?.delete()
         outputFile = null
         recording = false

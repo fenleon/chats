@@ -6,10 +6,12 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 /**
- * Relative timestamp for room rows: time of day for today, "Yest." for the
- * previous day, the short weekday name within the last week (Mon, Tue, Wed,
- * Thu, Fri, Sat, Sun), "Aug 12" (month abbreviation retained) for anything
- * older. (Feedback 2026-08-17: the row time went back to the short hand.)
+ * Relative timestamp for room rows: 24-hour time of day for today ("14:02" —
+ * feedback 2026-08-21: the AM/PM label was too big for the rows), "Yest." for
+ * the previous day, the short weekday name within the last week (Mon, Tue,
+ * Wed, Thu, Fri, Sat, Sun), "Aug 12" (month abbreviation retained) for
+ * anything older. (Feedback 2026-08-17: the row time went back to the short
+ * hand.)
  */
 fun formatRelativeTimestamp(timestampMs: Long): String {
     if (timestampMs <= 0) return ""
@@ -18,7 +20,7 @@ fun formatRelativeTimestamp(timestampMs: Long): String {
     val today = LocalDate.now(zone)
     val date = dateTime.toLocalDate()
     return when {
-        date == today -> dateTime.toLocalTime().format(TIME_FORMAT)
+        date == today -> dateTime.toLocalTime().format(ROW_TIME_FORMAT)
         date == today.minusDays(1) -> "Yest."
         date.isAfter(today.minusDays(7)) -> SHORT_DAY_NAMES[date.dayOfWeek.value - 1]
         else -> date.format(MONTH_DAY_FORMAT)
@@ -31,13 +33,14 @@ private val DAY_NAMES = arrayOf("Monday", "Tuesday", "Wednesday", "Thursday", "F
 /** Short capitalized weekday names (ISO: Monday=1 … Sunday=7), for room rows. */
 private val SHORT_DAY_NAMES = arrayOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
-/** Time of day only, for message rows in the thread (Phase 9). */
+/** Time of day only, for message rows in the thread (Phase 9). 12-hour with
+ *  AM/PM — the thread keeps the long hand (feedback 2026-08-21). */
 fun formatMessageTime(timestampMs: Long): String {
     if (timestampMs <= 0) return ""
     return Instant.ofEpochMilli(timestampMs)
         .atZone(ZoneId.systemDefault())
         .toLocalTime()
-        .format(TIME_FORMAT)
+        .format(MESSAGE_TIME_FORMAT)
 }
 
 /** The local date of a timestamp, for the thread's per-day dividers. */
@@ -59,6 +62,14 @@ fun dayDividerLabel(date: LocalDate): String {
     }
 }
 
-private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+/** 24-hour time for the room list rows — "14:02" (feedback 2026-08-21: the
+ *  AM/PM label was "too big" in the rows). */
+private val ROW_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+
+/** 12-hour time with AM/PM — "3:24 PM" — for the THREAD message times
+ *  (feedback 2026-08-20: was 24-hour; the user kept 12h in threads when the
+ *  rows went back to 24h, 2026-08-21). */
+private val MESSAGE_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("h:mm a")
+
 /** "Aug 12" / "Dec 01" — month abbreviation + zero-padded day. */
 private val MONTH_DAY_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM dd")

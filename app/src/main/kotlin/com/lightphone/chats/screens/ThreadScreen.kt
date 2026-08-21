@@ -39,12 +39,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
-import com.lightphone.chats.VolumePanelOverlay
 import com.lightphone.chats.dayDividerLabel
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
 import com.thelightphone.sdk.LightScreen
-import com.lightphone.chats.ChatLightViewModel
+import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightServiceMethod
@@ -77,7 +76,7 @@ private const val MEDIA_PREFETCH_COUNT = 4
 
 class ThreadViewModel(
     private val room: LightServiceMethod.GetRooms.Room,
-) : ChatLightViewModel<Unit>() {
+) : LightViewModel<Unit>() {
 
     /** Oldest-first page of messages; older pages are prepended by [loadOlder]. */
     val messages = MutableStateFlow<List<LightServiceMethod.GetMessages.Message>>(emptyList())
@@ -138,14 +137,42 @@ class ThreadViewModel(
      */
     private val pendingMessages = mutableListOf<LightServiceMethod.GetMessages.Message>()
 
+    /**
+     * Thread scroll position, saved continuously by the screen and restored on
+     * show — returning from the fullscreen photo viewer must land where the
+     * photo was, not the newest messages (feedback 2026-08-20).
+     */
+    private var savedScrollIndex = 0
+    private var savedScrollOffset = 0
+    private var scrollToRestore: Pair<Int, Int>? = null
+
+    fun saveScroll(index: Int, offset: Int) {
+        savedScrollIndex = index
+        savedScrollOffset = offset
+    }
+
+    /** The position to restore on show (consume-once), or null when at the newest. */
+    fun takeScrollToRestore(): Pair<Int, Int>? =
+        scrollToRestore.also { scrollToRestore = null }
+
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
         // While this room is on screen the companion suppresses its
         // new-message notifications.
         viewModelScope.launch { ChatClient.setActiveRoom(room.id) }
+        // Returning from the fullscreen photo viewer restores the scroll
+        // position instead of bouncing to the newest; a fresh open jumps to
+        // the newest as before (feedback 2026-08-20).
+        val restore = if (savedScrollIndex > 0 || savedScrollOffset > 0) {
+            savedScrollIndex to savedScrollOffset
+        } else null
+        if (restore != null) {
+            scrollToRestore = restore
+            jumpToBottom.value = false
+        }
         // Messages load first — don't gate them behind the e2ee check (that
         // only drives the decryption notice).
-        loadNewest()
+        loadNewest(restoreScroll = restore != null)
         viewModelScope.launch {
             e2eeVerified.value = ChatClient.e2eeState()?.verified
         }
@@ -186,8 +213,13 @@ class ThreadViewModel(
         pollJob = null
     }
 
-    fun loadNewest(quiet: Boolean = false) {
-        viewModelScope.launch {
+    fun loadNewest(quiet: Boolean = false, restoreScroll: Boolean = false) {
+        // Serialize: rapid sends + the 3 s poll can otherwise interleave
+        // read-modify-write merges on [messages] — a cluster showed rows
+        // duplicating and jumping until every send had echoed (feedback
+        // 2026-08-20). A newer call supersedes an in-flight one.
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
             if (!quiet) loading.value = true
             val loaded: List<LightServiceMethod.GetMessages.Message>
             try {
@@ -213,7 +245,7 @@ class ThreadViewModel(
                 // re-enter could wedge it) — the flag always clears.
                 if (!quiet) loading.value = false
             }
-            if (!quiet) {
+            if (!quiet && !restoreScroll) {
                 jumpToBottom.value = true
                 // Opening the thread marks it read up to the newest event; the
                 // room list's unread count drops on its next refresh.
@@ -245,6 +277,12 @@ class ThreadViewModel(
      * haven't echoed yet. A real event replaces its optimistic row by id; a
      * "local-…" row (no event id known at send time) is dropped when a real
      * message with the same body and a close timestamp appears.
+     *
+     * The result is deduped by id and time-sorted, so a cluster of sends
+     * stays in order while the echoes land one poll at a time — without it,
+     * an echo arriving out of order (or a fast-page → full-page transition
+     * leaving a stale optimistic copy at the oldest end) visibly shuffled and
+     * duplicated the rows until every send had echoed (feedback 2026-08-20).
      */
     private fun mergeWithPending(loaded: List<LightServiceMethod.GetMessages.Message>):
         List<LightServiceMethod.GetMessages.Message> {
@@ -255,7 +293,7 @@ class ThreadViewModel(
         while (iterator.hasNext()) {
             val pending = iterator.next()
             if (pending.id in realIds) {
-                iterator.remove() // echoed — the real event replaces it
+                iterator.remove() // the server's injected row already represents it
                 continue
             }
             val echoed = loaded.any {
@@ -265,10 +303,13 @@ class ThreadViewModel(
             if (echoed) {
                 iterator.remove()
             } else {
-                result += pending // still newest; stays at the end
+                // Still newest; stays at the end. Drop any duplicate copies the
+                // page merge left behind first (fast-page → full-page swap).
+                result.removeAll { it.id == pending.id }
+                result += pending
             }
         }
-        return result
+        return result.distinctBy { it.id }.sortedBy { it.timestampMs }
     }
 
     /** Inserts the just-sent message immediately (optimistic echo). */
@@ -378,6 +419,8 @@ class ThreadViewModel(
     }
 
     private var pollJob: Job? = null
+    /** Coalescing guard for [loadNewest] — one in-flight fetch/merge at a time. */
+    private var loadJob: Job? = null
 
     private companion object {
         const val PAGE_SIZE = 20
@@ -426,7 +469,6 @@ class ThreadScreen(
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
-        val volumePanel by viewModel.volumePanel.collectAsState()
         val listState = rememberLazyListState()
 
         // Load the persisted read-status toggle once (idempotent).
@@ -501,7 +543,14 @@ class ThreadScreen(
                         onClick = { goBack() },
                         contentDescription = "Back to chats",
                     ),
-                    center = LightTopBarCenter.Text(room.name),
+                    // Tapping the room name opens the contact overlay
+                    // (feedback 2026-08-21) — in a 1:1 it's the other party's
+                    // identifier (their Matrix ID localpart = the bridge UID:
+                    // a phone number on WhatsApp, a username on Instagram).
+                    center = LightTopBarCenter.Text(
+                        room.name,
+                        onClick = { openContact() },
+                    ),
                     rightButton = null,
                 )
                 Box(modifier = Modifier.weight(1f)) {
@@ -631,21 +680,36 @@ class ThreadScreen(
                     ),
                 )
             }
-            // The in-app volume panel (the LP3 rocker replica) draws over the
-            // whole screen while shown.
-            VolumePanelOverlay(
-                state = volumePanel,
-                onDismiss = { viewModel.dismissVolumePanel() },
-            )
             }
         }
 
         // Show the newest messages on open (and after sending); not on older
-        // pages, which arrive while the user is reading further up.
+        // pages, which arrive while the user is reading further up. Returning
+        // from the fullscreen photo viewer restores the position the photo was
+        // at instead (consume-once — feedback 2026-08-20); the jumpToBottom
+        // key keeps the effect re-firing when the flag flips after the load.
         LaunchedEffect(jumpToBottom, messages.size) {
-            if (jumpToBottom && messages.isNotEmpty()) {
+            if (messages.isEmpty()) return@LaunchedEffect
+            viewModel.takeScrollToRestore()?.let { (index, offset) ->
+                listState.scrollToItem(index, offset)
+                return@LaunchedEffect
+            }
+            if (jumpToBottom) {
                 listState.scrollToItem(0) // index 0 = the bottom in reverseLayout
                 viewModel.jumpToBottom.value = false
+            }
+        }
+
+        // Save the thread's scroll position continuously (the ViewModel holds
+        // it across the photo-viewer navigation; see takeScrollToRestore).
+        // The small delay skips the fresh composition's pre-scroll snapshot —
+        // index 0 before the jump/restore scroll lands.
+        LaunchedEffect(listState) {
+            delay(100)
+            snapshotFlow {
+                listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+            }.distinctUntilChanged().collect { (index, offset) ->
+                viewModel.saveScroll(index, offset)
             }
         }
     }
@@ -668,6 +732,49 @@ class ThreadScreen(
                 viewModel.loadNewest(quiet = true)
             }
         }
+    }
+
+    /**
+     * The contact overlay (feedback 2026-08-21): the identifier line is the
+     * bridge UID when it IS the number/username — see [contactIdentifier].
+     */
+    private fun openContact() {
+        navigateTo(screenFactory = {
+            ContactScreen(it, room.name, room.network, contactIdentifier(room.contactId, room.name))
+        })
+    }
+
+    /**
+     * The contact overlay's identifier line. WhatsApp bridged IDs come in two
+     * shapes: `whatsapp_<number>` (the contact's real number — shown) and
+     * `whatsapp_lid-<lid>` (a privacy-scoped ID, NOT the number — dropped;
+     * Beeper's backend holds the number, the room data does not). When the
+     * ID yields nothing, the display name carries the number for unsaved
+     * contacts (Beeper names those DMs by the number) — shown then, else no
+     * line. Other networks keep the localpart (e.g. Instagram's
+     * `instagramgo-…` username).
+     */
+    private fun contactIdentifier(contactId: String?, displayName: String): String? {
+        val localpart = contactId?.substringAfter("@")?.substringBefore(":")
+        if (localpart != null) {
+            val rest = localpart.removePrefix("whatsapp_")
+            if (rest != localpart) { // a WhatsApp bridged ID
+                if (rest.startsWith("lid-")) {
+                    return displayName.takeIf { it.isPhoneNumberLike() }
+                }
+                return rest
+            }
+            return localpart
+        }
+        return displayName.takeIf { it.isPhoneNumberLike() }
+    }
+
+    private fun String.isPhoneNumberLike(): Boolean {
+        val digits = trim().replace(Regex("[\\s\\-().]"), "")
+        return digits.length in 7..15 &&
+            digits.all { it.isDigit() || it == '+' } &&
+            digits.count { it == '+' } <= 1 &&
+            digits.any { it.isDigit() }
     }
 }
 
@@ -863,7 +970,8 @@ private fun MessageRow(
                         formatMessageTime(message.timestampMs)
                     },
                     variant = LightTextVariant.Superfine,
-                    lighten = true,
+                    // Solid white — timestamps read like the rest of the
+                    // message, not dimmed (feedback 2026-08-21).
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }

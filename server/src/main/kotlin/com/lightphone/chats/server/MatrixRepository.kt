@@ -214,66 +214,6 @@ object MatrixRepository {
     fun audioPositionMs(): Long? =
         audioPlayer?.takeIf { playingAudioEventId != null }?.currentPosition?.toLong()
 
-    // --- Volume (2026-08-19 feedback round: the in-app volume panel) --------
-    // Backs the SDK's GetVolumeLevel + WaitForVolumeChange long-poll. The SDK
-    // declares the methods but its own server doesn't implement them — the
-    // wrapping server app does (same as Audiobooks' VolumeChangeMonitor). The
-    // tool's volume panel needs the real media-stream level to render + move.
-
-    /** Broadcasts a media-volume change (the long-poll's wake-up signal). */
-    private val volumeChanges = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 8)
-
-    @Volatile
-    private var volumeReceiverRegistered = false
-
-    @Synchronized
-    private fun ensureVolumeReceiverRegistered(context: Context) {
-        if (volumeReceiverRegistered) return
-        volumeReceiverRegistered = true
-        runCatching {
-            context.registerReceiver(
-                object : BroadcastReceiver() {
-                    override fun onReceive(c: Context?, intent: Intent?) {
-                        volumeChanges.tryEmit(Unit)
-                    }
-                },
-                IntentFilter("android.media.VOLUME_CHANGED_ACTION"),
-            )
-        }
-    }
-
-    /** The media stream's current level + max. */
-    fun volumeLevel(): com.thelightphone.sdk.shared.LightServiceMethod.GetVolumeLevel.Response {
-        val audio = appContext?.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetVolumeLevel.Response(
-            level = audio?.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) ?: 0,
-            max = audio?.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC) ?: 0,
-        )
-    }
-
-    /**
-     * The current media-stream level/max, waiting up to [timeoutMs] for the
-     * next volume change when the level still equals [knownLevel] — the
-     * long-poll that makes the tool's volume panel react to a connected BT
-     * device's own volume buttons (AVRCP) without a polling cadence.
-     */
-    suspend fun awaitVolumeChange(timeoutMs: Long, knownLevel: Int): Pair<Int, Int> {
-        val ctx = appContext
-        if (ctx == null) {
-            val v = volumeLevel()
-            return v.level to v.max
-        }
-        ensureVolumeReceiverRegistered(ctx)
-        val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
-            ?: return volumeLevel().let { it.level to it.max }
-        fun current() = audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) to
-            audio.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
-        val now = current()
-        if (now.first != knownLevel) return now
-        withTimeoutOrNull(timeoutMs) { volumeChanges.first() }
-        return current()
-    }
-
     /**
      * Voice-note sends awaiting their sync echo (room key → txn → send info).
      * Multi-slot: two rapid sends in one room must BOTH keep their optimistic
@@ -1496,8 +1436,9 @@ object MatrixRepository {
 
     /** Room ids contain `!` and `:` — both legal on ext4, but underscore them
      *  anyway so the cache dir stays portable. */
+    private val SANITIZE_NAME_REGEX = Regex("[^A-Za-z0-9_-]")
     private fun sanitizeFileName(roomId: String): String =
-        roomId.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        roomId.replace(SANITIZE_NAME_REGEX, "_")
 
     @Synchronized
     private fun saveRoomListToDisk(rooms: List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>) {
@@ -1659,14 +1600,21 @@ object MatrixRepository {
     ): MessagesPage {
         if (beforeEventId == null) {
             val cached = messagePageCache[roomId]
-            if (cached != null &&
-                cached.limit >= limit &&
-                android.os.SystemClock.elapsedRealtime() - cached.refreshedAtMs < MESSAGE_PAGE_TTL_MS
-            ) {
+            if (cached != null && cached.limit >= limit) {
+                // The memory page is never older than disk (disk writes are
+                // throttled/skipped AFTER memory is updated), so a stale page
+                // is served from memory — recompute in the background and the
+                // next poll is fresh. The old path re-read + JSON-decoded the
+                // same page from disk on every TTL expiry (the thread polls
+                // every 3 s vs the 5 s TTL — constant disk churn; profile
+                // 2026-08-20: loadMessagePageFromDisk + sanitizeFileName).
+                if (android.os.SystemClock.elapsedRealtime() - cached.refreshedAtMs >= MESSAGE_PAGE_TTL_MS) {
+                    refreshMessagePage(roomId, limit)
+                }
                 return injectPendingEchoes(roomId, cached.page)
             }
-            // Cold (TTL expired / fresh process): serve the persisted page at
-            // once and recompute in the background — the next poll is fresh.
+            // Cold process / first open: serve the persisted page at once and
+            // recompute in the background — the next poll is fresh.
             loadMessagePageFromDisk(roomId)?.let { disk ->
                 messagePageCache[roomId] = MessagePageEntry(
                     disk,
@@ -2805,6 +2753,13 @@ object MatrixRepository {
         }
         val content = te?.content?.getOrNull()
         if (content !is RoomMessageEventContent.FileBased.Audio) {
+            // Diagnosis hook for the LP3 (feedback 2026-08-21): which content
+            // type is actually on the timeline when the row reads as a voice
+            // note — a bridge sending a different type would land here.
+            android.util.Log.w(
+                TAG,
+                "playVoiceNote: content is ${content?.javaClass?.simpleName ?: "null"}, not FileBased.Audio",
+            )
             return false to "not an audio message"
         }
         val file = content.file?.takeIf { !it.url.isNullOrBlank() }
@@ -2824,19 +2779,36 @@ object MatrixRepository {
         // path uses the extension as an extractor hint, and Beeper/WhatsApp
         // audio files (ogg/opus, mp3, aac…) mislabeled ".m4a" fail to prepare
         // (2026-08-13: an audio-file voice note played everywhere but the LP3).
+        // Incoming notes often lack a usable mimetype (our own sends always set
+        // "audio/ogg; codecs=opus", so only THEY played — feedback 2026-08-20),
+        // so sniff the container from the magic bytes and fall back to the
+        // mimetype label.
         val mime = content.info?.mimeType?.lowercase().orEmpty()
-        val ext = when {
-            "ogg" in mime || "opus" in mime -> "ogg"
-            "mpeg" in mime -> "mp3"
-            "mp4" in mime || "m4a" in mime -> "m4a"
-            "aac" in mime -> "aac"
-            "amr" in mime -> "amr"
-            "wav" in mime -> "wav"
-            "flac" in mime -> "flac"
-            else -> "m4a"
+        val ext = sniffAudioExtension(bytes, mime)
+        // WhatsApp/bridge quirk: the identification page is written with
+        // header-type 0x02 (continuation) instead of 0x01 (BOS) — WhatsApp's
+        // own decoder ignores the flag, but Android's OggExtractor requires
+        // BOS to identify the codec, so prepare() fails on the LP3's stricter
+        // media stack (verified 2026-08-21: the emulator's lenient extractor
+        // plays the raw file, the LP3 rejects it; the BOS-repaired file plays
+        // on both). Repair before writing so MediaPlayer never sees the
+        // broken stream.
+        val repaired = repairOgg(bytes)
+        if (repaired !== bytes) {
+            android.util.Log.w(
+                TAG,
+                "repairOgg: first page missing BOS — fixed (head=${repaired.take(8).joinToString("") { "%02x".format(it) }})",
+            )
         }
-        val tmp = java.io.File(ctx.cacheDir, "voice_$eventId.$ext")
-        runCatching { tmp.writeBytes(bytes) }.getOrElse { return false to "audio write failed" }
+        val playBytes = repaired
+        // An unknown container/mime yields "" — write the file WITHOUT an
+        // extension so MediaExtractor sniffs the content instead of chasing a
+        // wrong hint (see [sniffAudioExtension]).
+        val tmp = java.io.File(
+            ctx.cacheDir,
+            if (ext.isEmpty()) "voice_$eventId" else "voice_$eventId.$ext",
+        )
+        runCatching { tmp.writeBytes(playBytes) }.getOrElse { return false to "audio write failed" }
         // MediaPlayer hands the file to the media server (a different uid) —
         // an app-private 600 file gets "Permission denied" on the real LP3
         // (the emulator's in-process media stack hid this).
@@ -2874,7 +2846,16 @@ object MatrixRepository {
             player.prepare()
             player.start()
         }.onFailure { e ->
-            android.util.Log.w(TAG, "playVoiceNote: play failed for $eventId", e)
+            // Diagnosis hook for the LP3 (feedback 2026-08-21): the failing
+            // stage is MediaPlayer prepare/start — log what was actually
+            // handed to it (container, mime label, size, first bytes) so the
+            // next device test identifies the container MediaPlayer rejects.
+            android.util.Log.w(
+                TAG,
+                "playVoiceNote: play failed for $eventId (ext=$ext, mime=$mime, size=${bytes.size}, " +
+                    "head=${bytes.take(8).joinToString("") { "%02x".format(it) }})",
+                e,
+            )
             runCatching { player.release() }
             tmp.delete()
             return false to "playback failed"
@@ -2882,8 +2863,103 @@ object MatrixRepository {
         audioPlayer = player
         audioPlayerFile = tmp
         playingAudioEventId = eventId
-        android.util.Log.d(TAG, "playVoiceNote: playing $eventId (${bytes.size} bytes)")
+        android.util.Log.d(
+            TAG,
+            "playVoiceNote: playing $eventId (${playBytes.size} bytes, ext=$ext, mime=$mime, " +
+                "head=${playBytes.take(8).joinToString("") { "%02x".format(it) }})",
+        )
         return true to null
+    }
+
+    /**
+     * Container extension for a downloaded voice note: sniffed from the magic
+     * bytes first (bridged audio is often mislabeled or carries no mimetype),
+     * the mimetype label as the fallback. MediaPlayer's file-source path uses
+     * the extension as its extractor hint, so the right one matters — a real
+     * ogg named ".m4a" fails prepare (2026-08-13; feedback 2026-08-20: only
+     * the LP3's own notes played, because only they carried the ogg mimetype).
+     */
+    private fun sniffAudioExtension(bytes: ByteArray, mime: String): String {
+        fun has(s: String, at: Int) = bytes.size >= at + s.length &&
+            s.indices.all { i -> bytes[at + i] == s[i].code.toByte() }
+        return when {
+            has("OggS", 0) -> "ogg"
+            has("fLaC", 0) -> "flac"
+            has("ID3", 0) -> "mp3"
+            // Matroska/WebM (EBML 1A 45 DF A3) — some bridges serve voice
+            // notes as webm/opus (2026-08-21: previously fell to the ".m4a"
+            // default and failed prepare).
+            bytes.size >= 4 && bytes[0].toInt() == 0x1A && bytes[1].toInt() == 0x45 &&
+                bytes[2].toInt() == 0xDF && bytes[3].toInt() == 0xA3 -> "webm"
+            // ADTS AAC (sync 0xFFF, layer bits 00) — must be checked BEFORE
+            // the MPEG sync test below, which would mislabel it ".mp3" and
+            // fail prepare (2026-08-21).
+            bytes.size >= 2 && (bytes[0].toInt() and 0xFF) == 0xFF &&
+                (bytes[1].toInt() and 0xF6) == 0xF0 -> "aac"
+            // MPEG audio frame sync (0xFFE/0xFFF): byte 1's top three bits
+            // 111 with the layer bits NOT 000 (000 = reserved, i.e. ADTS).
+            bytes.size >= 2 && (bytes[0].toInt() and 0xFF) == 0xFF &&
+                (bytes[1].toInt() and 0xE0) == 0xE0 && (bytes[1].toInt() and 0x06) != 0 -> "mp3"
+            has("ftyp", 4) -> "m4a" // MP4/M4A ("....ftyp")
+            has("RIFF", 0) -> "wav"
+            has("#!AMR", 0) -> "amr"
+            "ogg" in mime || "opus" in mime -> "ogg"
+            "mpeg" in mime -> "mp3"
+            "mp4" in mime || "m4a" in mime -> "m4a"
+            "aac" in mime -> "aac"
+            "amr" in mime -> "amr"
+            "wav" in mime -> "wav"
+            "flac" in mime -> "flac"
+            "webm" in mime -> "webm"
+            // Unknown container AND unknown mime: leave the extension off —
+            // MediaExtractor then sniffs the actual content instead of being
+            // misled by a guessed hint (the old ".m4a" default was exactly
+            // the mislabel that broke playback on the LP3, 2026-08-13/21).
+            else -> ""
+        }
+    }
+
+    /**
+     * Repairs a downloaded Ogg stream whose identification page is misflagged:
+     * WhatsApp/bridge voice notes carry the OpusHead packet on a page written
+     * with header-type 0x02 ("continuation") instead of 0x01 (BOS) — the
+     * stream has NO BOS page at all (verified on the LP3's real account,
+     * 2026-08-21: 25 pages, single serial, `OpusHead` at page 0, htype 0x02).
+     * WhatsApp's own decoder ignores the flags, but Android's OggExtractor
+     * requires BOS to identify the codec, so MediaPlayer prepare() fails on
+     * the LP3's stricter media stack (the emulator's lenient extractor plays
+     * the raw file; the BOS-repaired file plays on both). Sets the BOS bit on
+     * the first page and recomputes that page's CRC. Returns the original
+     * bytes unchanged when there is nothing to fix (or the data isn't Ogg).
+     */
+    private fun repairOgg(bytes: ByteArray): ByteArray {
+        if (bytes.size < 27 || bytes[0] != 'O'.code.toByte() || bytes[1] != 'g'.code.toByte() ||
+            bytes[2] != 'g'.code.toByte() || bytes[3] != 'S'.code.toByte()
+        ) {
+            return bytes
+        }
+        if (bytes[5].toInt() and 0x01 != 0) return bytes // BOS already set
+        val out = bytes.copyOf()
+        out[5] = 0x01 // BOS only — the first page carries the stream's first packet
+        // First page length: 27-byte header + segment table + laced bodies.
+        var pageLen = 27
+        val nseg = out[26].toInt() and 0xFF
+        if (27 + nseg > out.size) return bytes
+        for (i in 0 until nseg) pageLen += out[27 + i].toInt() and 0xFF
+        if (pageLen > out.size) return bytes
+        // Ogg CRC (poly 0x04c11db7, MSB-first, no reflection) over the page
+        // with the CRC field (bytes 22..25) zeroed; stored little-endian.
+        out[22] = 0; out[23] = 0; out[24] = 0; out[25] = 0
+        var crc = 0
+        for (i in 0 until pageLen) {
+            crc = crc xor ((out[i].toInt() and 0xFF) shl 24)
+            for (j in 0 until 8) {
+                crc = if (crc and 0x80000000.toInt() != 0) (crc shl 1) xor 0x04c11db7 else crc shl 1
+            }
+        }
+        out[22] = crc.toByte(); out[23] = (crc ushr 8).toByte()
+        out[24] = (crc ushr 16).toByte(); out[25] = (crc ushr 24).toByte()
+        return out
     }
 
     /** Stops any in-flight voice-note playback and clears its state. */
@@ -3572,12 +3648,19 @@ object MatrixRepository {
                         val room = withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
                             roomFlow.filterNotNull().first()
                         }
+                        if (room == null) continue
                         // Membership filter: only rooms the user is in appear in
-                        // the list — old left rooms (bridge re-link artifacts)
-                        // stay out of the cache entirely.
-                        if (room != null && room.membership == Membership.JOIN) {
-                            loaded += roomId to room
+                        // the list. Left rooms (bridge re-link / network
+                        // disconnect artifacts) are pruned here — before this
+                        // they were dropped from `loaded` but never removed from
+                        // roomListCache, so a disconnected-then-reconnected
+                        // network left the old rooms listed next to the fresh
+                        // ones Beeper creates (the duplicate-room bug).
+                        if (room.membership != Membership.JOIN) {
+                            roomListCache.remove(roomId.full)
+                            continue
                         }
+                        loaded += roomId to room
                     }
                     loaded.sortByDescending { it.second.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L }
                     // An unverified device can't decrypt incoming messages, so the
@@ -3631,10 +3714,15 @@ object MatrixRepository {
                             if (precomputed >= EAGER_PAGES_PER_PASS) break
                             if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
                             val key = roomId.full
-                            val now = android.os.SystemClock.elapsedRealtime()
-                            val cached = messagePageCache[key]
-                            if (cached != null && now - cached.refreshedAtMs < MESSAGE_PAGE_TTL_MS) continue
-                            if (loadMessagePageFromDisk(key) != null) continue
+                            // Any in-memory page (fresh OR stale) already covers
+                            // this room — getMessages serves stale memory and
+                            // refreshes in the background, so pre-computing again
+                            // is redundant. The disk check is a file stat, not a
+                            // JSON decode: the old loadMessagePageFromDisk ran a
+                            // full decode per room per pass just to learn the
+                            // page exists (profile 2026-08-20).
+                            if (messagePageCache.containsKey(key)) continue
+                            if (messagePageCacheFile(key)?.exists() == true) continue
                             val page = runCatching {
                                 computeMessagesPage(key, null, THREAD_PAGE_SIZE, fast = true)
                             }.getOrNull()
@@ -3696,6 +3784,7 @@ object MatrixRepository {
                     lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
                     lastEventId = room.lastRelevantEventId?.full,
                     isDirect = room.isDirect,
+                    contactId = contactIdOf(room),
                     network = networks[key],
                 ),
                 nameResolved = false,
@@ -3824,6 +3913,7 @@ object MatrixRepository {
                 lastTimestampMs = rowTs,
                 lastEventId = lastEventId,
                 isDirect = room.isDirect,
+                contactId = contactIdOf(room),
                 network = networks[key],
             ),
             nameResolved = true,
@@ -3928,6 +4018,21 @@ object MatrixRepository {
         }
         return "Chat"
     }
+
+    /**
+     * The room's other participant for 1:1s — its single non-bot hero.
+     * Beeper bridged DMs list the contact as the (single) hero (e.g.
+     * @whatsapp_lid-273581128826955 / @instagramgo-xxxx); bridge bots like
+     * @whatsappbot are members but never the hero. Groups have several heroes
+     * → null, so the contact overlay shows name + network only there. The
+     * full Matrix ID; the app derives the localpart (the phone number /
+     * username) for display (feedback 2026-08-21).
+     */
+    private fun contactIdOf(room: MatrixRoom): String? =
+        room.name?.heroes
+            ?.filterNot { it.localpart.endsWith("bot", ignoreCase = true) }
+            ?.singleOrNull()
+            ?.full
 
     /**
      * The room's newest event that renders as a message row, for the list's
@@ -4477,14 +4582,17 @@ object MatrixRepository {
             }
         }
         return when {
-            // An undecryptable message renders as a single calm placeholder
-            // (2026-08-19 feedback round — was "[Encrypted — waiting for key…]"
-            // and "[Encrypted]" depending on the failure state; same meaning,
-            // one label). The newest-page decrypt machinery resolves what it
-            // can; genuinely unrecoverable sessions (pre-verification history)
-            // can't be read by any client.
-            te.content?.isFailure == true || te.event.content is EncryptedMessageEventContent ->
-                "[Encrypted message]"
+            // A genuinely undecryptable message renders as a single calm
+            // placeholder (2026-08-19 feedback round — was "[Encrypted —
+            // waiting for key…]" and "[Encrypted]" depending on the failure
+            // state; same meaning, one label). Only a real decrypt FAILURE
+            // shows it: an event whose decrypt is still pending (content
+            // unresolved, raw content still m.room.encrypted) returns null,
+            // so the thread skips the row and it appears once decrypted —
+            // new messages no longer flash "[Encrypted message]" for a poll
+            // (feedback 2026-08-20: "new messages come through as [encrypted
+            // message] and are decrypted shortly after").
+            te.content?.isFailure == true -> "[Encrypted message]"
             else -> null
         }
     }
