@@ -61,6 +61,21 @@ private const val REVEAL_THRESHOLD = 4
  */
 private const val EXTRA_NOTIFY_ROOM = "chats.notifyRoomId"
 
+/**
+ * Flattened component of the companion's POST_NOTIFICATIONS trampoline
+ * activity (matches its manifest entry; the app cannot reference the server's
+ * classes — same constraint as [EXTRA_NOTIFY_ROOM]).
+ */
+private const val NOTIFICATION_PERMISSION_ACTIVITY =
+    "com.lightphone.chats/.server.NotificationPermissionActivity"
+
+/**
+ * Process-wide "prompt already issued" latch: the ViewModel is recreated on
+ * navigation (each show is a fresh screen), so a per-screen flag would
+ * re-prompt on every return to the list.
+ */
+private var notificationPermissionPrompted = false
+
 class ChatListViewModel : LightViewModel<Unit>() {
 
     val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
@@ -86,6 +101,18 @@ class ChatListViewModel : LightViewModel<Unit>() {
     var pendingNotifyRoomId: String? = null
     /** Selected bridged-network label (Phase 7); null = all networks. */
     val networkFilter = MutableStateFlow<String?>(null)
+
+    /**
+     * One-shot launch request for the companion's POST_NOTIFICATIONS
+     * trampoline (the attach-photo/voice-note startServerActivity pattern):
+     * set by [refresh] on the first settled logged-in account, consumed by
+     * the screen once the activity is started.
+     */
+    val notificationPermissionComponent = MutableStateFlow<String?>(null)
+
+    fun consumeNotificationPermissionComponent() {
+        notificationPermissionComponent.value = null
+    }
 
     /**
      * Room-list scroll position, persisted across navigation so a thread exit
@@ -186,6 +213,16 @@ class ChatListViewModel : LightViewModel<Unit>() {
                 this@ChatListViewModel.account.value = account
                 rooms.value = result
                 this@ChatListViewModel.connection.value = connection
+                // POST_NOTIFICATIONS stays denied until requested at runtime
+                // (targetSdk 33+ — a fresh install never prompts on its own),
+                // and the tool runtime forbids permission requests, so the
+                // first settled logged-in account launches the companion's
+                // trampoline, once per process. Prompting while logged out
+                // would ask a user who has no account yet.
+                if (!notificationPermissionPrompted && account?.loggedIn == true) {
+                    notificationPermissionPrompted = true
+                    notificationPermissionComponent.value = NOTIFICATION_PERMISSION_ACTIVITY
+                }
                 // A notification tap asked for a thread; open it once its room is
                 // loaded (a cold start may have to wait for the first room-list pass).
                 consumeNotifyRoom(result)
@@ -262,6 +299,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         val connection by viewModel.connection.collectAsState()
         val visibleCount by viewModel.visibleCount.collectAsState()
         val pendingRoom by viewModel.openRoom.collectAsState()
+        val permissionComponent by viewModel.notificationPermissionComponent.collectAsState()
         val networkFilter by viewModel.networkFilter.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
         // The saved position seeds the list state directly (feedback
@@ -294,6 +332,16 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
             val room = pendingRoom ?: return@LaunchedEffect
             viewModel.openRoom.value = null
             openThread(room)
+        }
+
+        // Notification-permission handoff (same startServerActivity pattern
+        // as the attach-photo/voice-note components on the thread screen):
+        // the first settled logged-in load asks the companion's trampoline to
+        // request POST_NOTIFICATIONS.
+        LaunchedEffect(permissionComponent) {
+            val component = permissionComponent ?: return@LaunchedEffect
+            startServerActivity(component)
+            viewModel.consumeNotificationPermissionComponent()
         }
 
         // Reveal more rooms when the user scrolls near the end of the current
