@@ -540,7 +540,12 @@ class ThreadScreen(
                 LightTopBar(
                     leftButton = LightBarButton.LightIcon(
                         icon = LightIcons.BACK,
-                        onClick = { goBack() },
+                        // Pop with a Unit result so the caller's navigateTo
+                        // callback fires — a thread opened via search then
+                        // closes the search on back, landing on the main list
+                        // (feedback 2026-08-22). Callers without a callback
+                        // are no-ops.
+                        onClick = { goBack(Unit) },
                         contentDescription = "Back to chats",
                     ),
                     // Tapping the room name opens the contact overlay

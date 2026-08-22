@@ -67,6 +67,7 @@ import net.folivo.trixnity.client.media.okio.createOkioMediaStoreModule
 import net.folivo.trixnity.client.room
 import net.folivo.trixnity.client.room.GetTimelineEventConfig
 import net.folivo.trixnity.client.room.GetTimelineEventsConfig
+import net.folivo.trixnity.client.room.TimelineEventHandler
 import net.folivo.trixnity.client.room.message.image
 import net.folivo.trixnity.client.room.message.reply
 import net.folivo.trixnity.client.room.message.text
@@ -532,6 +533,14 @@ object MatrixRepository {
             if (isScreenInteractive()) return // screen came back on — enterActiveSync owns sync
             android.util.Log.w(TAG, "slow-sync grace: waited for client — engaging slow sync")
         }
+        // Screen truth re-check (2026-08-22): the grace's check above can race
+        // a SCREEN_ON broadcast (they fire in the same ms on a button press).
+        // With a live client (the c == null branch above is skipped) engaging
+        // slow mode then STOPS the long-poll while the screen is on — the
+        // "sync mode: active" + "sync mode: slow" back-to-back log + a dead
+        // loop until the next SCREEN_ON (LP3 2026-08-22: stuck offline banner
+        // + no message delivery while slow-sync rounds ran underneath).
+        if (isScreenInteractive()) return // screen came back on — enterActiveSync owns sync
         syncMode = SyncMode.SLOW // gate first: the watchdog must not restart the long-poll
         runCatching { c.stopSync() }
         inProcessSyncRunning = false
@@ -546,10 +555,18 @@ object MatrixRepository {
 
     /** One syncOnce round with a wall-clock duration log — the per-sync cost is
      *  the battery metric that decides whether sync can be leaner (Beeper's
-     *  client wakes in ~1s; ours measured here — battery 2026-08-17 audit). */
+     *  client wakes in ~1s; ours measured here — battery 2026-08-17 audit). The
+     *  round's outcome re-asserts the connection state (2026-08-22): a
+     *  successful round proves connectivity, so it clears a stale "offline"
+     *  left by the syncState observer (which can freeze on a long-poll TIMEOUT
+     *  while the rounds keep succeeding — the LP3's stuck "Can't reach server"
+     *  banner). The observer still reports long-poll TIMEOUT/ERROR instantly;
+     *  this just makes recovery not depend on it. */
     private suspend fun timedSyncOnce(c: MatrixClient): Result<Unit> {
         val t0 = android.os.SystemClock.elapsedRealtime()
         val result = runCatching { c.syncOnce(Presence.OFFLINE).getOrThrow() }
+            .onSuccess { _connectionState.value = ChatConnectionState.Syncing }
+            .onFailure { _connectionState.value = ChatConnectionState.Offline("sync failed") }
         android.util.Log.d(TAG, "syncOnce took ${android.os.SystemClock.elapsedRealtime() - t0}ms")
         return result
     }
@@ -1405,6 +1422,59 @@ object MatrixRepository {
             android.os.SystemClock.elapsedRealtime() + DECRYPT_RESTORE_COOLDOWN_MS
     }
 
+    /** Room → elapsed-realtime until which a failed gap backfill is suppressed
+     *  (battery: a fill that errored (network, token) is retried at most once
+     *  per [GAP_BACKFILL_COOLDOWN_MS], and only while the room is active). */
+    private val gapBackfillCooldown = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** True when a gap backfill is allowed for this room: the user must be
+     *  looking at it (throttle — the fill is a network + store + decrypt cost)
+     *  and a previous failed fill's cooldown must have elapsed. */
+    private fun isGapBackfillAllowed(matrixRoomId: RoomId): Boolean {
+        if (activeRoomId != matrixRoomId.full) return false
+        val until = gapBackfillCooldown[matrixRoomId.full] ?: return true
+        return android.os.SystemClock.elapsedRealtime() >= until
+    }
+
+    private fun parkGapBackfill(matrixRoomId: RoomId) {
+        gapBackfillCooldown[matrixRoomId.full] =
+            android.os.SystemClock.elapsedRealtime() + GAP_BACKFILL_COOLDOWN_MS
+    }
+
+    /** Fills a room's timeline gap from the server (Trixnity's
+     *  [net.folivo.trixnity.client.room.TimelineEventHandler.unsafeFillTimelineGaps]
+     *  — a windowed GET /rooms/{id}/messages + store + chain re-link, single
+     *  attempt) and re-reads the chain. The public [RoomService.fillTimelineGaps]
+     *  wrapper is NOT used: it retries indefinitely on the client scope (a
+     *  persistent failure would tick forever — battery), while this path hands
+     *  the retry policy to our own [GAP_BACKFILL_COOLDOWN_MS]. Returns the
+     *  re-walked chain, or null when there was nothing to fill / it failed (the
+     *  caller keeps its current page). Bounded: one window of
+     *  [GAP_BACKFILL_LIMIT] events, [GAP_BACKFILL_BUDGET_MS] budget. */
+    private suspend fun backfillTimelineGap(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        startEventId: String,
+        limit: Int,
+        gapEventId: String,
+    ): Pair<List<TimelineEvent>, Boolean>? {
+        val ok = withTimeoutOrNull(GAP_BACKFILL_BUDGET_MS) {
+            runCatching {
+                c.di.get<TimelineEventHandler>()
+                    .unsafeFillTimelineGaps(EventId(gapEventId), matrixRoomId, GAP_BACKFILL_LIMIT)
+                    .getOrThrow()
+                true
+            }.getOrDefault(false)
+        } ?: false
+        if (!ok) {
+            parkGapBackfill(matrixRoomId)
+            android.util.Log.d(TAG, "gap backfill failed for $matrixRoomId — retrying in ${GAP_BACKFILL_COOLDOWN_MS / 1000}s")
+            return null
+        }
+        // The store now holds the missing window — re-walk the chain.
+        return readTimelineChainFromDb(c, matrixRoomId, startEventId, limit + 1)
+    }
+
     /**
      * Display JPEGs served to the tool for image rows, keyed by
      * "roomId/eventId". LRU-capped — each entry is a compressed ~100-300 KB
@@ -1831,6 +1901,27 @@ object MatrixRepository {
             val fallback = collectTimelineEvents(c, matrixRoomId, startEventId, limit + 1)
             events = fallback
             hasMore = fallback.size >= limit + 1
+        }
+        // Gap-marker backfill (PLAN §8, 2026-08-21): a `limited=true` sync
+        // stores a gap marker whose missing window the store never fills —
+        // events created during the missed window are silently absent (seen
+        // live on the LP3: a WhatsApp message existed in Beeper's clients but
+        // never in Chats). When the walked chain carries a gap marker, fill it
+        // from the server (bounded window, active room only, cooldown on
+        // failure) and re-walk. Skipped on the fast first-page path — the
+        // background refresh fills it seconds later, keeping the first render
+        // instant. A gap on the room's newest event (the walk's head) is
+        // skipped: the next sync naturally picks up those events, and
+        // Trixnity's fill no-ops it anyway.
+        if (!fast && isGapBackfillAllowed(matrixRoomId)) {
+            val head = events.firstOrNull()
+            val gapEvent = events.firstOrNull { it.gap != null && it !== head }
+            if (gapEvent != null) {
+                backfillTimelineGap(c, matrixRoomId, startEventId, limit, gapEvent.event.id.full)?.let {
+                    events = it.first
+                    hasMore = it.second
+                }
+            }
         }
         // E2EE: a stored event's content can still be undecrypted (its megolm
         // session wasn't in the local store at sync time). Restore the
@@ -4766,6 +4857,17 @@ object MatrixRepository {
     private const val PREVIEW_BUDGET_MS = 1_500L
     /** Per-room state collect in the resolver (the store cache emits instantly). */
     private const val ROOM_LIST_ROOM_BUDGET_MS = 500L
+
+    // Gap-marker backfill (PLAN §8, 2026-08-21): a `limited=true` sync stores a
+    // gap marker whose missing window Trixnity never fills — events created
+    // during the missed window are silently absent from the store. The fill is
+    // triggered by the page walk and bounded below so it can't burn battery.
+    /** Events fetched per gap fill (one windowed GET /rooms/{id}/messages). */
+    private const val GAP_BACKFILL_LIMIT = 30L
+    /** A fill must complete within this (the sync-aware retry can back off long). */
+    private const val GAP_BACKFILL_BUDGET_MS = 8_000L
+    /** After a failed/blocked fill, back off this long before retrying. */
+    private const val GAP_BACKFILL_COOLDOWN_MS = 300_000L
     /** Delay before stopping the sync service after an expiry detection. */
     private const val SYNC_STOP_DELAY_MS = 3_000L
     /** Bound for the device-verification check before key-backup work. */

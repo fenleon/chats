@@ -149,7 +149,11 @@ class SearchScreen(
     }
 
     private fun openThread(room: LightServiceMethod.GetRooms.Room) {
-        navigateTo(screenFactory = { ThreadScreen(it, room) })
+        // Returning from a thread opened via search closes the search: the
+        // thread's back pops with a Unit result, so this callback pops the
+        // search screen too — back from the thread lands on the MAIN list, not
+        // the search results (feedback 2026-08-22).
+        navigateTo(screenFactory = { ThreadScreen(it, room) }) { goBack() }
     }
 }
 
