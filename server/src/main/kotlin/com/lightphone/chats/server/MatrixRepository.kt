@@ -4164,7 +4164,7 @@ object MatrixRepository {
         nameMemo: MutableMap<String, String>,
     ): String {
         room.name?.explicitName?.takeIf { it.isNotBlank() }?.let { return it }
-        val heroes = room.name?.heroes.orEmpty()
+        val heroes = titleHeroesOf(c, roomId, room)
         if (heroes.isNotEmpty()) {
             val names = heroes.mapNotNull { hero ->
                 nameMemo.getOrPut(hero.full) {
@@ -4176,6 +4176,33 @@ object MatrixRepository {
             if (names.isNotEmpty()) return names.joinToString(", ")
         }
         return "Chat"
+    }
+
+    /**
+     * Heroes that deserve a spot in a generated title. Self-hosted bridges
+     * (BlueBubbles/OpenBubbles, mautrix, …) add their bridge bot as a hero,
+     * which would glue e.g. "imessagebot" onto the contact names. Exact match
+     * first: the bridge's declared bot ([bridgeBotOf], m.bridge state) is a
+     * user id — remove just it, so a human whose name ends in "bot" keeps
+     * their spot. Bridges that declare nothing (and bots not in the heroes)
+     * fall back to contactIdOf's suffix heuristic. Bots stay only when every
+     * hero is one, so an all-bot room doesn't fall through to "Chat".
+     */
+    private suspend fun titleHeroesOf(c: MatrixClient, roomId: RoomId, room: MatrixRoom): List<UserId> {
+        val heroes = room.name?.heroes.orEmpty()
+        if (heroes.isEmpty()) return heroes
+        // Cache-hit avoids a store transaction on steady-state room passes;
+        // the cold read owns its own scope like readReceiptsByEvent does.
+        val declared = bridgeBotByRoom[roomId.full] ?: withTimeoutOrNull(ROOM_BUDGET_MS) {
+            val txManager = c.di.get<RepositoryTransactionManager>(RepositoryTransactionManager::class)
+            txManager.readTransaction { bridgeBotOf(c, roomId) }
+        }.orEmpty()
+        val humans = if (declared.isNotEmpty()) {
+            heroes.filterNot { it.full == declared }
+        } else {
+            heroes.filterNot { it.localpart.endsWith("bot", ignoreCase = true) }
+        }
+        return humans.ifEmpty { heroes }
     }
 
     /**
@@ -4626,7 +4653,7 @@ object MatrixRepository {
 
     private suspend fun roomDisplayName(c: MatrixClient, roomId: RoomId, room: MatrixRoom): String {
         room.name?.explicitName?.takeIf { it.isNotBlank() }?.let { return it }
-        val heroes = room.name?.heroes.orEmpty()
+        val heroes = titleHeroesOf(c, roomId, room)
         if (heroes.isNotEmpty()) {
             val names = heroes.mapNotNull { hero ->
                 withTimeoutOrNull(ROOM_BUDGET_MS) {
