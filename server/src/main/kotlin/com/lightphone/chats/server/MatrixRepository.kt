@@ -73,7 +73,6 @@ import net.folivo.trixnity.client.room.message.reply
 import net.folivo.trixnity.client.room.message.text
 import net.folivo.trixnity.client.serverDiscovery
 import net.folivo.trixnity.client.store.GlobalAccountDataStore
-import net.folivo.trixnity.client.store.OlmCryptoStore
 import net.folivo.trixnity.client.store.TimelineEvent
 import net.folivo.trixnity.client.store.Room as MatrixRoom
 import net.folivo.trixnity.client.store.repository.RoomStateRepository
@@ -2725,18 +2724,14 @@ object MatrixRepository {
     ): com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response {
         val c = client ?: error("not logged in")
         val matrixRoomId = RoomId(roomId)
-        // Rotate the outbound megolm session so the room key is re-shared with
-        // every device on each message. The session previously created for this
-        // room predates the bridge's olm session (its /keys/claim failed at
-        // creation — Beeper omits `failures`, which broke Trixnity's claim until
-        // the engine fix), so the bridge never got the key and reported every
-        // message undecryptable. A fresh session re-runs the share flow:
-        // keys/claim → olm session → sendToDevice, so WhatsApp/Instagram bridges
-        // always receive the key.
-        runCatching {
-            c.di.get<OlmCryptoStore>(OlmCryptoStore::class)
-                .updateOutboundMegolmSession(matrixRoomId) { null }
-        }
+        // No per-send megolm rotation: a fresh session per message made a burst
+        // of sends race — a retried/late event encrypted with an older session
+        // arrived after the newer session's room key, and Beeper flagged it
+        // "sent using an outdated encryption session" (2026-08-22). The
+        // rotation was a stopgap for the 2026-08-12 bridge-key bug; that root
+        // cause (broken /keys/claim deserialization) is fixed, and Trixnity
+        // re-shares the room key to new devices on every send with the existing
+        // session, so the bridge keeps getting keys without per-message churn.
         val txnId = c.room.sendMessage(matrixRoomId) {
             if (replyToEventId != null) {
                 val replyEvent = c.room.getTimelineEvent(matrixRoomId, EventId(replyToEventId)).firstOrNull()
@@ -2764,6 +2759,22 @@ object MatrixRepository {
             transactionId = txnId,
             eventId = null, // not awaited — the sync echo supplies the real id
         )
+    }
+
+    /**
+     * Clears the outbox send error on [transactionId] so Trixnity's retry loop
+     * re-sends the same transaction (the outbox store emission restarts the
+     * loop; the PUT is idempotent by txn id, so a message the homeserver
+     * already stored returns its existing event id instead of duplicating).
+     * No-op when no outbox entry exists (e.g. the message already echoed).
+     * @return true when the outbox error was cleared.
+     */
+    suspend fun retrySend(roomId: String, transactionId: String): Boolean {
+        val c = client ?: return false
+        return runCatching {
+            c.room.retrySendMessage(RoomId(roomId), transactionId)
+            true
+        }.getOrDefault(false)
     }
 
     // --- Photos (Phase 13) --------------------------------------------------
@@ -2802,12 +2813,6 @@ object MatrixRepository {
     ): Boolean {
         val c = client ?: return false
         val matrixRoomId = RoomId(roomId)
-        // Same megolm-session rotation as text sends — the bridge must get the
-        // fresh room key for the media event to decrypt on the other side.
-        runCatching {
-            c.di.get<OlmCryptoStore>(OlmCryptoStore::class)
-                .updateOutboundMegolmSession(matrixRoomId) { null }
-        }
         val txnId = runCatching {
             c.room.sendMessage(matrixRoomId) {
                 image(
@@ -3168,13 +3173,6 @@ object MatrixRepository {
     suspend fun sendVoiceNote(roomId: String, file: java.io.File): Boolean {
         val c = client ?: return false
         val matrixRoomId = RoomId(roomId)
-        // Same megolm-session rotation as text/photo sends — the bridge must
-        // get the fresh room key for the audio event to decrypt on the other
-        // side.
-        runCatching {
-            c.di.get<OlmCryptoStore>(OlmCryptoStore::class)
-                .updateOutboundMegolmSession(matrixRoomId) { null }
-        }
         val bytes = file.readBytes()
         val durationMs = runCatching {
             val retriever = android.media.MediaMetadataRetriever()

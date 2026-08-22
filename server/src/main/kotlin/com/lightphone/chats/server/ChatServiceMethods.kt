@@ -80,6 +80,14 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.SendMessage.encodeResponse(response))
                 }
 
+                LightServiceMethod.RetrySend.id -> {
+                    val request = LightServiceMethod.RetrySend.decodeRequest(payload!!)
+                    runBlocking {
+                        MatrixRepository.retrySend(request.roomId, request.transactionId)
+                    }
+                    LightResult.Success(LightServiceMethod.RetrySend.encodeResponse(Unit))
+                }
+
                 LightServiceMethod.MarkRead.id -> {
                     val request = LightServiceMethod.MarkRead.decodeRequest(payload!!)
                     runBlocking { MatrixRepository.markRead(request.roomId, request.eventId) }

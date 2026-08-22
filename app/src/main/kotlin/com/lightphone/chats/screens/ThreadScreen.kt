@@ -372,9 +372,21 @@ class ThreadViewModel(
         }
     }
 
+    /**
+     * Re-sends a locally-failed message (tap on the "failed to send" row): the
+     * companion clears the outbox error for the row's "local-…" txn id and
+     * Trixnity re-sends it; the poll replaces the row with the echo when it
+     * lands, or the label stays if the retry can't succeed.
+     */
+    fun retrySend(message: LightServiceMethod.GetMessages.Message) {
+        if (!message.id.startsWith(LOCAL_ROW_PREFIX)) return
+        viewModelScope.launch {
+            ChatClient.retrySend(room.id, message.id.removePrefix(LOCAL_ROW_PREFIX))
+        }
+    }
+
     /** Fetches an image message's display bytes if they aren't cached yet. */
-    fun ensureMedia(eventId: String, allowMobileData: Boolean) {
-        if (mediaBytes.value.containsKey(eventId)) return
+    fun ensureMedia(eventId: String, allowMobileData: Boolean) {        if (mediaBytes.value.containsKey(eventId)) return
         viewModelScope.launch {
             // Retry a few times: the first read can hit a still-decrypting
             // event or a transient download failure, and a null result is not
@@ -601,6 +613,7 @@ class ThreadScreen(
                                                 voiceError = voiceError,
                                                 onEnsureMedia = viewModel::ensureMedia,
                                                 onPlayVoiceNote = viewModel::playVoiceNote,
+                                                onRetrySend = viewModel::retrySend,
                                                 onOpenImage = { bytes ->
                                                     navigateTo(screenFactory = { FullscreenImageScreen(it, bytes) })
                                                 },
@@ -914,6 +927,7 @@ private fun MessageRow(
     voiceError: Pair<String, String>?,
     onEnsureMedia: (String, Boolean) -> Unit,
     onPlayVoiceNote: (String) -> Unit,
+    onRetrySend: (LightServiceMethod.GetMessages.Message) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
 ) {
     // Phase 13: a buffer keeps message text off the far screen edge. Outgoing
@@ -956,10 +970,24 @@ private fun MessageRow(
         val bodyMaxWidthPx = with(LocalDensity.current) {
             (maxWidth * MESSAGE_WIDTH_FRACTION).toPx().roundToInt()
         }
+        val inFlight = message.id.startsWith(LOCAL_ROW_PREFIX)
+        val failed = message.sendStatus?.startsWith("FAIL_") == true
+        // Locally-failed rows (the outbox recorded a send error, txn still
+        // pending) are tappable — tap re-sends the same transaction
+        // (2026-08-22). Bridge-reported FAIL_* rows already left the device;
+        // they stay a plain marker.
+        val retryable = failed && message.sendStatus == "FAIL_LOCAL_SEND" && inFlight
         Column(
             modifier = Modifier
                 .fillMaxWidth(MESSAGE_WIDTH_FRACTION)
-                .align(if (message.isMine) Alignment.CenterEnd else Alignment.CenterStart),
+                .align(if (message.isMine) Alignment.CenterEnd else Alignment.CenterStart)
+                // A locally-failed send re-sends when tapped (2026-08-22); the
+                // tap target is the row's bubble area, like the image/audio
+                // rows' own clickables.
+                .then(
+                    if (retryable) Modifier.lightClickable(onClick = { onRetrySend(message) })
+                    else Modifier,
+                ),
             horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start,
         ) {
             if (showSender && !message.isMine && message.senderName.isNotBlank()) {
@@ -978,8 +1006,6 @@ private fun MessageRow(
             // When the server confirms it, the served page swaps in the real
             // row: grouped → it merges under the shared timestamp; otherwise
             // it carries its own. A failed send shows its time, not SENDING.
-            val inFlight = message.id.startsWith(LOCAL_ROW_PREFIX)
-            val failed = message.sendStatus?.startsWith("FAIL_") == true
             if (showTime || (inFlight && !failed)) {
                 LightText(
                     text = if (inFlight && !failed) {
@@ -1035,9 +1061,12 @@ private fun MessageRow(
             // event (Phase 10) — a quiet "!" marker beats a silent stall. The
             // thread poll surfaces it within seconds, no new send needed. It
             // shows on any message, old or new.
-            if (message.isMine && message.sendStatus?.startsWith("FAIL_") == true) {
+            if (message.isMine && failed) {
                 LightText(
-                    text = "! not delivered",
+                    // A locally-failed row can be re-sent by tapping it; a
+                    // bridge-reported failure ("! not delivered") has no resend
+                    // path on this device (2026-08-22).
+                    text = if (retryable) "failed to send. tap to resend" else "! not delivered",
                     variant = LightTextVariant.Superfine,
                     // Solid white like the timestamps — the delivery labels
                     // read like the rest of the message, not dimmed (feedback

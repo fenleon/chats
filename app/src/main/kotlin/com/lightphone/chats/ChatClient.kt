@@ -84,6 +84,18 @@ object ChatClient {
         LightServiceMethod.SendMessage.Request(roomId, body, replyToEventId),
     ).getOrNull()
 
+    /**
+     * Re-sends a locally-failed message: the companion clears the outbox error
+     * on [transactionId] (the txn of the "local-…" row) and Trixnity re-sends
+     * the same transaction — idempotent, no duplicate if it already landed.
+     */
+    suspend fun retrySend(roomId: String, transactionId: String) {
+        callRemoteServiceMethod(
+            LightServiceMethod.RetrySend,
+            LightServiceMethod.RetrySend.Request(roomId, transactionId),
+        )
+    }
+
     suspend fun markRead(roomId: String, eventId: String) {
         callRemoteServiceMethod(
             LightServiceMethod.MarkRead,
