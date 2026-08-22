@@ -62,6 +62,15 @@ object PlatformRelay {
         return LightServiceMethod.GetUserPreferences.decodeResponse(result.data)
     }
 
+    /** LightOS's mollysocket push endpoint for this device; null when the platform server can't answer. */
+    fun getMollySocketUri(): String? {
+        val result = request(
+            LightServiceMethod.GetMollySocketUri.id,
+            LightServiceMethod.GetMollySocketUri.encodeRequest(Unit),
+        ) as? LightResult.Success ?: return null
+        return LightServiceMethod.GetMollySocketUri.decodeResponse(result.data).mollySocketUri
+    }
+
     private fun request(methodId: String, payload: String): LightResult<String>? {
         val serviceBinder = binder ?: return null
         if (token == null) {

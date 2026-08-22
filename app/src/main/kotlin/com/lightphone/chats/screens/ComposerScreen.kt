@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -29,6 +30,13 @@ import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+
+/**
+ * Unsent composer drafts, keyed by room id (feedback 2026-08-22): leaving the
+ * composer mid-draft restores the text on return — thread → list → thread —
+ * until it's sent or cleared. Process-scoped; a restart starts empty.
+ */
+internal val composerDrafts = mutableMapOf<String, String>()
 
 /**
  * What the thread needs to show the sent message immediately (optimistic
@@ -113,7 +121,14 @@ class ComposerScreen(
         val keyboardOptionsFlow = remember {
             MutableStateFlow(defaultKeyboardOptions().copy(displayVoice = false, displayReturn = true))
         }
-        val textState = rememberTextFieldState("")
+        // Restore the room's unsent draft (feedback 2026-08-22); the composer
+        // saves every change back to [composerDrafts] so leaving mid-draft
+        // keeps the text until it's sent or cleared.
+        val textState = rememberTextFieldState(composerDrafts[roomId] ?: "")
+        LaunchedEffect(textState.text) {
+            val text = textState.text.toString()
+            if (text.isEmpty()) composerDrafts.remove(roomId) else composerDrafts[roomId] = text
+        }
 
         LightTheme(colors = themeColors) {
             Box(modifier = Modifier.fillMaxSize()) {
@@ -143,25 +158,34 @@ class ComposerScreen(
                 )
                 // Clear-draft X, bottom-right corner of the screen (feedback
                 // 2026-08-21: the old 218 dp-above-keyboard position overlapped
-                // the draft's last line). The composer keyboard (submitInTopBar)
-                // leaves its ~36 dp bottom action zone empty below the keys, so
-                // the X sits in that row, at the far right.
-                if (textState.text.isNotEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(end = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp())
-                            .lightClickable {
-                                textState.edit { replace(0, length, "") }
-                            }
-                            .padding(1f.gridUnitsAsDp()),
-                    ) {
-                        LightIcon(
-                            icon = LightIcons.CLOSE,
-                            size = 1.5f,
-                            contentDescription = "Clear draft",
-                        )
-                    }
+                // the draft's last line; the first bottom-right attempt
+                // overlapped the keyboard's bottom row). The composer keyboard
+                // (submitInTopBar) reserves the 5-gu bottom-bar row below the
+                // keys, so the X sits in that row at the far right, vertically
+                // centered like a native bottom-bar icon (LP3-verified
+                // 2026-08-22: the doubled 1-gu outer + 1-gu inner padding put
+                // the icon 2 gu off the bottom, leaving a big buffer under it;
+                // the inner padding is horizontal-only now, so the icon lands
+                // at y 1120-1200 — the native bar-icon band). Always visible
+                // while the composer is open (feedback 2026-08-21: the X was
+                // gated on text, so it appeared only after typing); with an
+                // empty draft it's a harmless no-op.
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp())
+                        .lightClickable {
+                            textState.edit { replace(0, length, "") }
+                        }
+                        .padding(horizontal = 1f.gridUnitsAsDp()),
+                ) {
+                    LightIcon(
+                        icon = LightIcons.CLOSE,
+                        // Same size as the bottom-row icons (2 gu — the SDK's
+                        // bar-button icon size; feedback 2026-08-21: was 1.5f).
+                        size = 2f,
+                        contentDescription = "Clear draft",
+                    )
                 }
             }
         }

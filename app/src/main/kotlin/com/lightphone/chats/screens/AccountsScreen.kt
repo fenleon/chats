@@ -95,6 +95,10 @@ private fun AccountRow(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onClick)
-            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+            // Generous vertical padding — the choices need air between them
+            // (feedback 2026-08-22: 1.5 gu was too roomy; the LP3's Ringer
+            // Mode rows sit at a 200 px pitch, which is ~1.2 gu around the
+            // Heading box).
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 1.2f.gridUnitsAsDp()),
     )
 }

@@ -66,12 +66,34 @@
             android:theme="@android:style/Theme.Black.NoTitleBar"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- Dev control surface (2026-08-21, re-added): drives the push channel
+             from adb via launch extras (pushsse/pushnotify/pushkey overrides,
+             pushclear cleanup, debugLog, scripted login/send — see
+             chats/push/README.md). Exported so adb shell can start it; the
+             tool is the launcher. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- Keeps the Matrix sync loop alive in the background. Uses cleartext
              HTTP so a self-hosted LAN homeserver (e.g. 10.0.2.2 in dev) works. -->
         <service
             android:name=".ChatSyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Dev probe (2026-08-21): receives the endpoint LightOS's UP
+             distributor issues for the "light-push" instance (see
+             ServerBootstrapProvider). Removed with the probe. -->
+        <service
+            android:name=".UpProbeService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT"/>
+            </intent-filter>
+        </service>
 
         <!-- sdk:client merges its UnifiedPush service + file-share provider;
              chats is a local Matrix client and uses neither. -->
@@ -85,12 +107,12 @@
         <!-- sdk:server merges the UnifiedPush distributor (an EXPORTED receiver —
              any app can start the process with it) and the connector's
              receiver/activity/foreground service; chats delivers messages via
-             its own sync loop, so strip them all. -->
+             its own sync loop, so strip them all. (MessagingReceiverImpl is
+             un-stripped while the UP probe is active — the distributor's
+             NEW_ENDPOINT reply needs it; the connector's own receiver is not
+             exported, so no exposure.) -->
         <receiver
             android:name="com.thelightphone.sdk.server.LightPushDistributor"
-            tools:node="remove" />
-        <receiver
-            android:name="org.unifiedpush.android.connector.internal.MessagingReceiverImpl"
             tools:node="remove" />
         <activity
             android:name="org.unifiedpush.android.connector.internal.LinkActivity"

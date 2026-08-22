@@ -483,9 +483,13 @@ private fun RoomRow(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(onClick = onOpen)
-            // Left matches the built-in messaging margin; the right leaves the
-            // time clear of the scrollbar.
-            .padding(start = 1.75f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 14.dp, bottom = 14.dp),
+            // Left matches the Phone tool's recents rows (LP3-verified
+            // 2026-08-21): 0.5-gu margin, then the unread star's 1-gu slot.
+            // The room name lands at 2.75 gu — flush with the bottom-left
+            // bottom-bar icon's left edge (the SDK centers the 2-gu icon in
+            // a 3.5-gu touch box, so the icon sits at 2 + 0.75 gu). The
+            // right leaves the time clear of the scrollbar.
+            .padding(start = 0.5f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 14.dp, bottom = 14.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -494,10 +498,11 @@ private fun RoomRow(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // The unread marker is a large asterisk in the row's leading
-            // buffer zone, at the far left — the buffer holds the star so
-            // room names line up with the bottom-left bottom-bar icon with or
-            // without it (feedback 2026-08-21: star to the far-left buffer,
-            // names aligned to the gear icon).
+            // buffer: 0.5-gu margin, the star's 1-gu slot, then the gap to
+            // the room name at 2.75 gu — the name stays flush with the
+            // bottom-left bottom-bar icon (the Phone tool puts its star at
+            // x 20-60, names at x 80; feedback 2026-08-21). The slot stays
+            // even without a star so names never shift.
             Box(modifier = Modifier.width(1f.gridUnitsAsDp())) {
                 if (room.unreadCount > 0) {
                     LightText(
@@ -506,6 +511,7 @@ private fun RoomRow(
                     )
                 }
             }
+            Box(modifier = Modifier.width(1.25f.gridUnitsAsDp()))
             Column(modifier = Modifier.weight(1f)) {
                 LightText(
                     text = room.name,

@@ -1557,13 +1557,22 @@ object MatrixRepository {
         scope.launch {
             try {
                 val c = client ?: return@launch
-                // Nothing new since the last refresh → keep the cached page; a
-                // quiet room costs one cheap last-event read per tick instead of
-                // a full chain walk + restore + re-reads.
                 val lastId = withTimeoutOrNull(ROOM_BUDGET_MS) {
                     c.room.getById(RoomId(roomId)).firstOrNull()?.lastEventId?.full
                 } ?: return@launch
-                if (lastRefreshedEventId[roomId] == lastId) return@launch
+                // Nothing new since the last refresh AND the memory cache
+                // still covers the requested limit → keep the cached page; a
+                // quiet room costs one cheap last-event read per tick instead
+                // of a full chain walk + restore + re-reads. The cache check
+                // matters: the incremental cold-open path caches a limit=8
+                // page, and after that every limit=20 poll bounced to the
+                // DISK cache (serving the stale page it held) while this guard
+                // skipped the rebuild — the anni-room misorder stayed on the
+                // LP3 screen long after the page build was fixed (2026-08-21).
+                val cached = messagePageCache[roomId]
+                if (cached != null && cached.limit >= limit && lastRefreshedEventId[roomId] == lastId) {
+                    return@launch
+                }
                 runCatching {
                     val page = computeMessagesPage(roomId, null, limit)
                     messagePageCache[roomId] = MessagePageEntry(
@@ -2233,7 +2242,16 @@ object MatrixRepository {
                 )
             }
         }
-        return MessagesPage(messages = result.reversed(), hasMore = hasMore) // oldest first
+        // Order the page by each message's real time (origin_server_ts), not the
+        // timeline's topological chain order. Beeper bridges ingest messages
+        // when they arrive but stamp them with the ORIGINAL send time, so the
+        // chain can place a 1:43 PM message above a 1:41 PM one (the 1:41 was
+        // ingested late) — the visible "wrong order" in bridged rooms
+        // (2026-08-21, the anni room on the LP3). The sort is stable, so equal
+        // timestamps keep the chain order — a no-op for native (non-bridged)
+        // rooms, whose homeserver stamps events at ingest.
+        val oldestFirst = result.reversed().sortedWith(compareBy { it.timestampMs })
+        return MessagesPage(messages = oldestFirst, hasMore = hasMore)
     }
 
     /** Type of Beeper's per-message delivery-state events (unencrypted, posted
@@ -2359,6 +2377,14 @@ object MatrixRepository {
      *  bridge state (functional_members "service_members" — which misses the
      *  Instagram DM, whose @instagramgobot posts receipts too). Callers must be
      *  inside a store transaction (Room-backed repo reads need one). */
+    /**
+     * NOTE (2026-08-22): the m.bridge channel's `fi.mau.receiver` looks like
+     * the contact's number but is the USER'S OWN WhatsApp number — it repeats
+     * across every LID DM. A contact-phone source was explored here and
+     * reverted; see the comment at contactIdentifierOf/contactIdentifier in
+     * the app. LID contacts carry no number in the room data (Beeper
+     * resolves LIDs server-side).
+     */
     private suspend fun bridgeBotOf(c: MatrixClient, matrixRoomId: RoomId): String {
         bridgeBotByRoom[matrixRoomId.full]?.let { return it }
         val stateRepo = c.di.get<RoomStateRepository>(RoomStateRepository::class)
@@ -3736,7 +3762,11 @@ object MatrixRepository {
                         }
                     }
                 } catch (e: Exception) {
-                    android.util.Log.w(TAG, "room list resolver pass failed: ${e.message}")
+                    android.util.Log.w(
+                        TAG,
+                        "room list resolver pass failed: ${e.javaClass.simpleName}: ${e.message}" +
+                            "\n${e.stackTraceToString().lineSequence().take(6).joinToString("\n")}",
+                    )
                 }
                 // Battery (2026-08-15): while the screen is off, coalesce the
                 // resolver's dirty-loop — the room list only needs to be fresh

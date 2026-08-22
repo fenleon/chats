@@ -33,14 +33,13 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.rememberTextMeasurer
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
-import com.lightphone.chats.dayDividerLabel
 import com.lightphone.chats.dayOf
+import com.lightphone.chats.formatBridgePhone
 import com.lightphone.chats.formatMessageTime
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -562,9 +561,11 @@ class ThreadScreen(
                         messages.isEmpty() -> StatusText("No messages yet.")
                         else -> Column(modifier = Modifier.fillMaxSize()) {
                             if (needsDecryptionNotice) DecryptionNotice()
-                            // Messages with a centered date divider between days
-                            // (Phase 9); display order is newest-first because
-                            // reverseLayout puts index 0 at the bottom.
+                            // Messages grouped by time gap / sender / day (the
+                            // day tag lives on the group-start timestamp —
+                            // feedback 2026-08-21: the centered day dividers
+                            // were removed); display order is newest-first
+                            // because reverseLayout puts index 0 at the bottom.
                             val rows = remember(messages) { buildThreadRows(messages) }
                             Box(modifier = Modifier.fillMaxSize()) {
                                 LazyColumn(
@@ -598,7 +599,6 @@ class ThreadScreen(
                                                     navigateTo(screenFactory = { FullscreenImageScreen(it, bytes) })
                                                 },
                                             )
-                                            is ThreadRow.DayDivider -> DayDivider(row.label)
                                         }
                                     }
                                 }
@@ -717,6 +717,9 @@ class ThreadScreen(
     private fun openComposer() {
         navigateTo(screenFactory = { ComposerScreen(it, room.id, room.name) }) { result ->
             if (result != null) {
+                // The message went out — drop the restored draft so the next
+                // open starts clean (feedback 2026-08-22).
+                composerDrafts.remove(room.id)
                 // Show the sent message immediately (optimistic echo); the
                 // poll replaces the row with the real event once sync lands.
                 viewModel.addOptimistic(
@@ -745,14 +748,15 @@ class ThreadScreen(
     }
 
     /**
-     * The contact overlay's identifier line. WhatsApp bridged IDs come in two
-     * shapes: `whatsapp_<number>` (the contact's real number — shown) and
-     * `whatsapp_lid-<lid>` (a privacy-scoped ID, NOT the number — dropped;
-     * Beeper's backend holds the number, the room data does not). When the
-     * ID yields nothing, the display name carries the number for unsaved
-     * contacts (Beeper names those DMs by the number) — shown then, else no
-     * line. Other networks keep the localpart (e.g. Instagram's
-     * `instagramgo-…` username).
+     * The room's other participant for 1:1s — the single non-bot hero
+     * (Beeper bridged DMs list the contact; bridge bots like
+     * @whatsappbot are excluded). Null for groups. Drives the contact
+     * overlay's phone/username line (chats, feedback 2026-08-21). NOTE: the
+     * m.bridge channel's `fi.mau.receiver` is the USER'S OWN number, not the
+     * contact's (verified 2026-08-22 across many LID DMs) — the contact's
+     * number is only present for `whatsapp_<number>` heroes; LID heroes
+     * (`whatsapp_lid-…`, the WhatsApp privacy migration) carry no number in
+     * the room data at all (Beeper resolves LIDs server-side).
      */
     private fun contactIdentifier(contactId: String?, displayName: String): String? {
         val localpart = contactId?.substringAfter("@")?.substringBefore(":")
@@ -762,7 +766,7 @@ class ThreadScreen(
                 if (rest.startsWith("lid-")) {
                     return displayName.takeIf { it.isPhoneNumberLike() }
                 }
-                return rest
+                return formatBridgePhone(rest)
             }
             return localpart
         }
@@ -793,14 +797,17 @@ private fun DecryptionNotice() {
     )
 }
 
-/** One row of the thread: a message, or a centered per-day divider (Phase 9). */
+/** One row of the thread: a message (Phase 9). */
 private sealed interface ThreadRow {
     val key: String
 
     /**
      * [showTime]: whether this message starts a group (a new day, a different
      * sender, or a gap of [GROUP_WINDOW_MS] from the previous message) — the
-     * only messages that carry a timestamp (feedback pass).
+     * only messages that carry a timestamp (feedback pass). The timestamp
+     * itself carries the day tag ("Yesterday", weekday, "Aug 12") when the
+     * message isn't from today (feedback 2026-08-21: day tags on the message
+     * timestamps replaced the centered day dividers).
      */
     data class Message(
         val message: LightServiceMethod.GetMessages.Message,
@@ -808,20 +815,15 @@ private sealed interface ThreadRow {
     ) : ThreadRow {
         override val key get() = message.id
     }
-
-    data class DayDivider(val label: String, val date: LocalDate) : ThreadRow {
-        override val key get() = "day-$date"
-    }
 }
 
 /**
- * Messages with a centered date divider inserted between days, in display order
- * (newest first — the LazyColumn is reverseLayout, so index 0 sits at the
- * bottom). A single-day thread has no divider; each day boundary shows the
- * newer day's label above the older day's messages. Consecutive same-sender
- * messages within [GROUP_WINDOW_MS] form a group that shows its timestamp only
- * on the first message (the day-divider labels follow the chat list's
- * delineation: today / yesterday / weekday / "Month XX").
+ * Messages in display order (newest first — the LazyColumn is reverseLayout,
+ * so index 0 sits at the bottom). Consecutive same-sender messages within
+ * [GROUP_WINDOW_MS] form a group that shows its timestamp only on the first
+ * message; each new day also starts a group, and that first message's
+ * timestamp carries the day tag ("Yesterday", the weekday, or "Aug 12" —
+ * never "Today").
  */
 private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Message>): List<ThreadRow> {
     val rows = mutableListOf<ThreadRow>()
@@ -834,9 +836,6 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
         }
         val day = dayOf(message.timestampMs)
         val newDay = prevDay != null && day != prevDay
-        if (newDay) {
-            rows += ThreadRow.DayDivider(dayDividerLabel(day), day)
-        }
         val showTime = newDay || prevMessage == null ||
             prevMessage.sender != message.sender ||
             message.timestampMs - prevMessage.timestampMs >= GROUP_WINDOW_MS
@@ -849,19 +848,6 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
 
 /** Consecutive same-sender messages closer than this share one timestamp. */
 private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
-
-@Composable
-private fun DayDivider(label: String) {
-    LightText(
-        text = label,
-        variant = LightTextVariant.Detail,
-        lighten = true,
-        align = TextAlign.Center,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 10.dp),
-    )
-}
 
 /**
  * Outgoing message body: left-aligned text in a block sized to the FIRST
@@ -1008,7 +994,8 @@ private fun MessageRow(
                 LightText(
                     text = message.reactions.joinToString(" · "),
                     variant = LightTextVariant.Superfine,
-                    lighten = true,
+                    // Solid white like the timestamps/delivery labels
+                    // (feedback 2026-08-21).
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }
@@ -1020,7 +1007,9 @@ private fun MessageRow(
                 LightText(
                     text = "! not delivered",
                     variant = LightTextVariant.Superfine,
-                    lighten = true,
+                    // Solid white like the timestamps — the delivery labels
+                    // read like the rest of the message, not dimmed (feedback
+                    // 2026-08-21).
                     modifier = Modifier.padding(top = 1.dp),
                 )
             } else if (message.isMine && showReadStatus && showDeliveryTag) {
@@ -1043,7 +1032,7 @@ private fun MessageRow(
                     LightText(
                         text = tag,
                         variant = LightTextVariant.Superfine,
-                        lighten = true,
+                        // Solid white like the timestamps (feedback 2026-08-21).
                         modifier = Modifier.padding(top = 1.dp),
                     )
                 }

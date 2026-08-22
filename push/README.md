@@ -47,8 +47,13 @@ long-poll / 5-min rounds.
   `device_display_name`, `lang`, `data.url`. The legacy `PUT /pushers` is gone
   (this Synapse; Trixnity's `api.push.setPushers` targets the new endpoint).
   Delete = same endpoint with `kind: null`.
-- **The gateway URL must end in `/_matrix/push/v1/notify`** (Synapse
-  validates this; Beeper's fork may not — the gateway serves both paths).
+- **The gateway URL must end in `/_matrix/push/v1/notify`** — enforced by
+  **both** Synapse and **Beeper (live-verified 2026-08-21)**. Beeper's
+  `setPushers` rejects any other path with `400 Config Error: 'url' must have
+  a path of '/_matrix/push/v1/notify'` — tested with LightOS's UP endpoint as
+  `data.url` on the real account. **The notify→UP relay is therefore
+  mandatory**; the only open question is who hosts it (Light or a community
+  Worker).
 - **Synapse blocks pusher URLs to loopback/private IPs** by default (SSRF
   guard, `403 IP address blocked` in the log). The dev homeserver config at
   `/tmp/synapse/homeserver.yaml` got an `ip_range_whitelist` for
@@ -93,12 +98,14 @@ no content or keys — push is a wake-up signal only.
 
 Config (URLs required — **no default**, polling-only when unset):
 ```bash
-adb shell am start -n com.lightphone.chats.server/.MainActivity \
+adb shell am start -n com.lightphone.chats/com.lightphone.chats.server.MainActivity \
   --es pushsse <url>      # SSE subscription URL (from the phone's side)
   --es pushnotify <url>   # pusher data.url (from the homeserver's side)
   --es pushkey <url>      # pusher pushkey — ntfy routing needs https://ntfy.sh/<topic>
-adb shell am start -n com.lightphone.chats.server/.MainActivity --es pushclear 1  # remove pusher + config (cleanup)
+adb shell am start -n com.lightphone.chats/com.lightphone.chats.server.MainActivity --es pushclear 1  # remove pusher + config (cleanup)
 ```
+(Single-APK package `com.lightphone.chats`; the dev activity lives in the merged
+server library.)
 Two URLs are needed because one side sees the gateway from the phone and the
 other from the homeserver: `pushnotify` must be **public** (Beeper POSTs from
 their servers — a tunnel to the gateway, or ntfy.sh), while `pushsse` is
@@ -312,7 +319,90 @@ receive-only — register a pusher / read an endpoint, never send or deliver
 anything to anyone; per user instruction they still require explicit go-ahead
 before touching the real account.
 
-## UnifiedPush feasibility (2026-08-21) — "LightOS is a UP distributor now" assessment
+## UnifiedPush — LightOS IS a working UP distributor — PROVEN END-TO-END (2026-08-21)
+
+The assessment below this header concluded "not shippable today". **Same day,
+proven on the real LP3.** LightOS serves the mollysocket URI *and* acts as a
+real UnifiedPush distributor; a push was delivered end-to-end over Light's own
+cloud (dev Synapse → relay → Light → phone), and the app is wired to wake a
+sync on it.
+
+### What LightOS actually exposes (LP3-verified)
+
+- **`GetMollySocketUri`** (additive SDK method, `LightServiceMethod.kt`)
+  returns a mollysocket link:
+  `mollysocket://link?vapid=…&url=https://mollysocket.thelightphone.com/&type=webserver`
+  — a shared Light-hosted mollysocket server + VAPID key. Molly-shaped; not an
+  HTTP POST target.
+- **Standard UP distributor** — registering a UP instance against `com.lightos`
+  issues a **per-device HTTPS endpoint**:
+  `https://production.lightphonecloud.com/api/webhooks/unified_push/deliver/<uuid>`.
+  Any backend POSTs to it; Light's cloud delivers to the device; the app's
+  `PushService.onMessage` fires. **Live-verified:** host POST → HTTP 204 →
+  phone logs the message; a raw Matrix-notify body delivered the same way.
+
+### The connector wiring (what it took to get the endpoint)
+
+- A `PushService` (`UpProbeService`, server module) declared in the manifest +
+  the connector's `MessagingReceiverImpl` **un-stripped** (chats strips all UP
+  machinery otherwise).
+- Registration must run **~5 s after process start**: the connector only
+  persists the app-side token row once the distributor is settled — doing it
+  in the ContentProvider (before the SDK's Application startup) made LightOS
+  reply but the receiver silently drop the endpoint (token lookup failed).
+- The connector's `register(context, instance, messageForDistributor, vapid)`
+  — **parameter order is message-then-vapid**. Positional misuse puts the
+  message in the vapid slot → `VapidNotValidException` at provider init
+  (crashed the app). Named args only.
+- LightOS's distributor logs `Registered with token …` and sends NEW_ENDPOINT
+  (token + endpoint extras; `pushEndpointFetcher` = Light's real infra).
+
+### The Matrix leg — one tiny relay remains
+
+Beeper/Synapse require `data.url` to end in `/_matrix/push/v1/notify`; Light's
+endpoint path is `/api/webhooks/unified_push/deliver/<uuid>`. A stateless
+passthrough (`chats/push/relay.py`, ~40 lines) serves the Matrix path and
+forwards the notify body as the UP message (`{"message": "<notify json>"}`).
+
+**Full chain verified (dev Synapse → relay → Light → LP3):** message sent →
+Synapse POSTs → relay forwards → phone logs `up push received … waking one
+sync` (the app calls `MatrixRepository.onPushDelivered`, the same wake as
+`PushChannel`). Dev-Synapse note: `ip_range_whitelist` (loopback/private) must
+be in `/tmp/synapse/homeserver.yaml` or Synapse blocks the relay URL (403).
+
+### What the production path looks like (when built)
+
+- **Phone:** UP instance against `com.lightos` at start; `onMessage` → parse
+  room/event ids → `MatrixRepository.onPushDelivered`. No Google, no ntfy, no
+  phone-held socket — LightOS's channel wakes the app.
+- **Server:** the relay is the only piece to host — a Cloudflare Worker serving
+  `/_matrix/push/v1/notify`, forwarding to the device's UP endpoint. No
+  sockets, no state except the device→endpoint map.
+- **Caveats found:** the endpoint is **per-registration** (changed on
+  re-register — the relay must track current endpoints); Synapse flagged the
+  dev relay's 200 as `PartialDownloadError` and retried with backoff
+  (delivery still landed; a real Worker should return a proper body/headers);
+  screen-off/killed-app delivery and battery are **not yet measured** —
+  overnight `batterystats` next.
+
+### Next steps
+
+1. **Overnight battery + killed-app delivery test** on the LP3 (the real win
+   claim: no SSE socket, Light's channel wakes the app).
+2. **Production-ize the relay** (Cloudflare Worker; device→endpoint map —
+   the app reports its endpoint at registration, or the relay keys by
+   pushkey). **Confirmed required (2026-08-21):** Beeper rejects any
+   `data.url` without the `/_matrix/push/v1/notify` path (live 400), so the
+   relay cannot be eliminated — the only open question is who hosts it.
+3. **Replace `PushChannel`'s SSE subscription with the UP path**; drop ntfy
+   auto-provisioning; re-evaluate the 5-min fallback rounds (O4).
+4. **Cleanup:** remove or gate the mollysocket/UP probes; decide whether
+   `GetMollySocketUri` stays as a documented SDK patch (it's additive and
+   upstream-shaped — the emulator already had the server stub).
+
+---
+
+*The 2026-08-21 feasibility assessment (superseded by the proof above):*
 
 User relayed (feedback round 11): *"LightOS is a UnifiedPush distributor app
 now (though admittedly we need to test this more), so you shouldn't need to

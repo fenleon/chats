@@ -48,6 +48,7 @@ dependencies {
         exclude(group = "com.google.mlkit")
         exclude(group = "androidx.camera")
     }
+    implementation(libs.unifiedpush.connector) // dev probe: capture LightOS's UP endpoint
     implementation(libs.compose.activity)
     implementation(libs.kotlinx.coroutines)
 

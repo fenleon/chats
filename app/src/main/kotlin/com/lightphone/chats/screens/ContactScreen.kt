@@ -67,20 +67,26 @@ class ContactScreen(
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        // The phone number sits directly under the name at the
+                        // same size (feedback 2026-08-22: only the contact
+                        // overlay shows it, under the name, Heading like the
+                        // name — not the small Fine line below the network).
+                        identifier?.let {
+                            LightText(
+                                text = it,
+                                variant = LightTextVariant.Heading,
+                                align = TextAlign.Center,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
+                            )
+                        }
                         network?.let {
                             LightText(
                                 text = it,
                                 variant = LightTextVariant.Detail,
                                 lighten = true,
                                 modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
-                            )
-                        }
-                        identifier?.let {
-                            LightText(
-                                text = it,
-                                variant = LightTextVariant.Fine,
-                                lighten = true,
-                                modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
                             )
                         }
                     }

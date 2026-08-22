@@ -7,6 +7,7 @@ ktor = "3.4.2"
 room = "2.7.0"
 trixnity = "4.22.7"
 sdk = "0.1.0"
+connector = "3.3.2"
 
 [libraries]
 compose-activity = { module = "androidx.activity:activity-compose", version.ref = "compose-activity" }
@@ -27,6 +28,9 @@ sdk-ui = { module = "com.thelightphone:sdk-ui", version.ref = "sdk" }
 sdk-client = { module = "com.thelightphone:sdk-client", version.ref = "sdk" }
 sdk-server = { module = "com.thelightphone:sdk-server", version.ref = "sdk" }
 sdk-shared = { module = "com.thelightphone:sdk-shared", version.ref = "sdk" }
+# UnifiedPush app-side connector (the SDK client depends on it too; needed here
+# directly for the probe service that captures LightOS's distributor endpoint).
+unifiedpush-connector = { module = "org.unifiedpush.android:connector", version.ref = "connector" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

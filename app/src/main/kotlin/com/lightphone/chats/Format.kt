@@ -10,8 +10,9 @@ import java.time.format.DateTimeFormatter
  * feedback 2026-08-21: the AM/PM label was too big for the rows), "Yest." for
  * the previous day, the short weekday name within the last week (Mon, Tue,
  * Wed, Thu, Fri, Sat, Sun), "Aug 12" (month abbreviation retained) for
- * anything older. (Feedback 2026-08-17: the row time went back to the short
- * hand.)
+ * anything older — with the year appended ("Aug 12, 2025") when the message
+ * predates the current year (feedback 2026-08-21). (Feedback 2026-08-17: the
+ * row time went back to the short hand.)
  */
 fun formatRelativeTimestamp(timestampMs: Long): String {
     if (timestampMs <= 0) return ""
@@ -23,43 +24,72 @@ fun formatRelativeTimestamp(timestampMs: Long): String {
         date == today -> dateTime.toLocalTime().format(ROW_TIME_FORMAT)
         date == today.minusDays(1) -> "Yest."
         date.isAfter(today.minusDays(7)) -> SHORT_DAY_NAMES[date.dayOfWeek.value - 1]
-        else -> date.format(MONTH_DAY_FORMAT)
+        date.year == today.year -> date.format(MONTH_DAY_FORMAT)
+        else -> date.format(MONTH_DAY_YEAR_FORMAT)
     }
 }
 
-/** Full capitalized weekday names (ISO: Monday=1 … Sunday=7), for thread day dividers. */
+/** Full capitalized weekday names (ISO: Monday=1 … Sunday=7), for thread day tags. */
 private val DAY_NAMES = arrayOf("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 /** Short capitalized weekday names (ISO: Monday=1 … Sunday=7), for room rows. */
 private val SHORT_DAY_NAMES = arrayOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
-/** Time of day only, for message rows in the thread (Phase 9). 12-hour with
- *  AM/PM — the thread keeps the long hand (feedback 2026-08-21). */
+/**
+ * Timestamp for a message row in the thread: the time plus a day tag when the
+ * message isn't from today — "3:24 PM", "Yesterday 3:24 PM", "Monday 3:24 PM",
+ * "Aug 12 3:24 PM" (feedback 2026-08-21: the day tags replace the centered
+ * day dividers; "Today" is never tagged). A previous-year message appends the
+ * year to the date tag — "Dec 10, 2025 3:24 PM" (feedback 2026-08-21: the
+ * year disambiguates an old message; same-year messages stay "Aug 12 3:24 PM").
+ * 12-hour with AM/PM — the thread keeps the long hand (feedback 2026-08-21).
+ */
 fun formatMessageTime(timestampMs: Long): String {
     if (timestampMs <= 0) return ""
-    return Instant.ofEpochMilli(timestampMs)
-        .atZone(ZoneId.systemDefault())
-        .toLocalTime()
-        .format(MESSAGE_TIME_FORMAT)
+    val zone = ZoneId.systemDefault()
+    val dateTime = Instant.ofEpochMilli(timestampMs).atZone(zone)
+    val today = LocalDate.now(zone)
+    val date = dateTime.toLocalDate()
+    val time = dateTime.toLocalTime().format(MESSAGE_TIME_FORMAT)
+    val tag = when {
+        date == today -> null
+        date == today.minusDays(1) -> "Yesterday"
+        date.isAfter(today.minusDays(7)) -> DAY_NAMES[date.dayOfWeek.value - 1]
+        date.year == today.year -> date.format(MONTH_DAY_FORMAT)
+        else -> date.format(MONTH_DAY_YEAR_FORMAT)
+    }
+    return if (tag == null) time else "$tag $time"
 }
 
-/** The local date of a timestamp, for the thread's per-day dividers. */
+/** The local date of a timestamp, for the thread's per-day grouping. */
 fun dayOf(timestampMs: Long): LocalDate =
     Instant.ofEpochMilli(timestampMs).atZone(ZoneId.systemDefault()).toLocalDate()
 
 /**
- * Divider label for a thread day, matching the chat list's delineation:
- * "Today", "Yesterday", the full weekday within the last week, or "Mon XX"
- * ("Aug 12", "Dec 01") for anything older.
+ * Formats a bridge phone number the way Beeper's WhatsApp contact view does:
+ * "4915129093984" → "+49 151 29093984" — a plus, the country code, then the
+ * national number with a space after the mobile prefix (feedback 2026-08-22).
+ * The country code is inferred by what leaves a plausible national number:
+ * 1 (US/Canada, 1 + 10), 2 (Germany/France/…, 2 + 9..11), else 3. Non-phone
+ * strings pass through unchanged.
  */
-fun dayDividerLabel(date: LocalDate): String {
-    val today = LocalDate.now()
-    return when {
-        date == today -> "Today"
-        date == today.minusDays(1) -> "Yesterday"
-        date.isAfter(today.minusDays(7)) -> DAY_NAMES[date.dayOfWeek.value - 1]
-        else -> date.format(MONTH_DAY_FORMAT)
+fun formatBridgePhone(raw: String): String {
+    val digits = raw.trim().removePrefix("+").filter { it.isDigit() }
+    if (digits.length < 10) return raw
+    val ccLen = when {
+        digits.startsWith("1") && digits.length - 1 in 9..11 -> 1
+        digits.length - 2 in 9..11 -> 2
+        digits.length - 3 in 8..10 -> 3
+        else -> 2
     }
+    val cc = digits.take(ccLen)
+    val national = digits.drop(ccLen)
+    val body = if (national.length > 8) {
+        "${national.take(3)} ${national.drop(3)}"
+    } else {
+        national
+    }
+    return "+$cc $body"
 }
 
 /** 24-hour time for the room list rows — "14:02" (feedback 2026-08-21: the
@@ -73,3 +103,7 @@ private val MESSAGE_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern
 
 /** "Aug 12" / "Dec 01" — month abbreviation + zero-padded day. */
 private val MONTH_DAY_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM dd")
+
+/** "Dec 10, 2025" — month abbreviation + day + year, for previous-year
+ *  timestamps (feedback 2026-08-21). */
+private val MONTH_DAY_YEAR_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM dd, yyyy")

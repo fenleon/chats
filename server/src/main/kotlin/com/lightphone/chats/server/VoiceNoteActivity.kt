@@ -178,7 +178,8 @@ class VoiceNoteActivity : ComponentActivity() {
                                     else -> "Tap to record"
                                 },
                                 variant = LightTextVariant.Copy,
-                                lighten = !recording && !sending,
+                                // Solid white like the thread's labels, not
+                                // dimmed (feedback 2026-08-22).
                                 modifier = Modifier.padding(top = 2f.gridUnitsAsDp()),
                             )
                             if (sendFailed) {

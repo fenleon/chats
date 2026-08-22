@@ -98,6 +98,7 @@ private fun DevScreen() {
     // Scripted login/send via launch extras (dev verification):
     //   --es homeserver http://10.0.2.2:8008 --es user @alice:localhost
     //   --es password alicepass [--es sendTo <roomId> --es sendBody <text>]
+    // Push cleanup: --es pushclear 1 removes the pusher + config (chats/push/README.md).
     // Runs even when a session is restored, so the send can use the existing client.
     val launchExtras = (LocalContext.current as? MainActivity)?.intent?.extras
     val devContext = LocalContext.current
@@ -119,6 +120,16 @@ private fun DevScreen() {
             runCatching { MatrixRepository.sendMessage(sendTo, sendBody, null) }
                 .onSuccess { android.util.Log.d(TAG, "scripted send ok (txn ${it.transactionId})") }
                 .onFailure { android.util.Log.e(TAG, "scripted send failed", it) }
+        }
+        val clearPush = launchExtras?.getString("pushclear")
+        if (clearPush != null) {
+            val client = MatrixRepository.ensureClient()
+            if (client != null) {
+                PushChannel.clear(devContext.applicationContext, client)
+                android.util.Log.i(TAG, "push cleared (pusher removed + config wiped)")
+            } else {
+                android.util.Log.w(TAG, "pushclear: no client available")
+            }
         }
     }
 
