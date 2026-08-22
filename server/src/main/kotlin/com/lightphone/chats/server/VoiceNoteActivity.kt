@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -24,6 +25,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.thelightphone.sdk.rememberHapticsEnabled
+import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcon
@@ -35,6 +38,7 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
+import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Dispatchers
@@ -103,8 +107,15 @@ class VoiceNoteActivity : ComponentActivity() {
         }
         setContent {
             val themeColors by LightThemeController.colors.collectAsState()
+            // Haptics on the recording screen follow the real LightOS setting,
+            // like the main tool: LightActivity provides LocalHapticsEnabled
+            // from GetUserPreferences, but this plain activity never did —
+            // lightClickable silently skipped the vibration (feedback
+            // 2026-08-22: "the recording panel does not have haptics").
+            val hapticsEnabled by rememberHapticsEnabled().collectAsState()
 
-            LightTheme(colors = themeColors) {
+            CompositionLocalProvider(LocalHapticsEnabled provides hapticsEnabled) {
+                LightTheme(colors = themeColors) {
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -208,8 +219,31 @@ class VoiceNoteActivity : ComponentActivity() {
                         ),
                     )
                 }
+                }
             }
         }
+    }
+
+    /**
+     * Relay hardware keys to LightOS so the recording panel behaves like the
+     * main tool: volume rocker → LightOS's volume panel, scroll wheel →
+     * brightness, camera button etc. The tool's screens get this via the SDK
+     * server's onDeviceKeyEvent (LightOS forwards to the tool), but this plain
+     * activity sits outside that path (feedback 2026-08-22: "the recording
+     * panel does not have volume / brightness").
+     */
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        PlatformRelay.sendDeviceKeyEvent(
+            LightServiceMethod.DeviceKeyEvent.Request(
+                keyCode = event.keyCode,
+                repeatCount = event.repeatCount,
+                action = event.action,
+                characters = event.characters?.toString(),
+                unicodeChar = event.unicodeChar,
+                componentToRelaunch = null,
+            ),
+        )
+        return super.dispatchKeyEvent(event)
     }
 
     private fun ensureMicThenRecord() {

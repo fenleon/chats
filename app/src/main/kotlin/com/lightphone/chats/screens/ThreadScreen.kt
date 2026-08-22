@@ -33,6 +33,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
@@ -850,10 +851,14 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
 private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
 
 /**
- * Outgoing message body: left-aligned text in a block sized to the FIRST
- * line (measured at the message column's max width), so the top line's last
- * word always touches the right edge while the rest wraps normally — the
- * left buffer varies with the message (feedback 2026-08-17).
+ * Outgoing message body: left-aligned text in a block sized to the WIDEST
+ * line (measured without a width cap, then clipped to the message column's
+ * max width), so the block hugs the text instead of the full column — a long
+ * unbreakable word (a URL, an email address) no longer collapses the block to
+ * the width of the short line before it (feedback 2026-08-22: "But CC in
+ * hello@berlinscenelab.com" rendered as a narrow column because line 1 broke
+ * at the long word). The block never exceeds the column cap, so no line spans
+ * edge to edge (feedback 2026-08-17).
  */
 @Composable
 private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
@@ -864,12 +869,20 @@ private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
         val layout = textMeasurer.measure(
             text = AnnotatedString(body),
             style = style,
-            constraints = Constraints(maxWidth = maxWidthPx),
+            // No width cap: the widest natural line sizes the block (capped
+            // below at the column max). Measuring with the cap would break the
+            // first line before an overlong word and size the block to that
+            // shortened line.
+            constraints = Constraints(),
         )
-        // Round UP: the box must be at least as wide as line 1's last word —
+        var widestPx = 0f
+        for (i in 0 until layout.lineCount) {
+            widestPx = maxOf(widestPx, layout.getLineRight(i))
+        }
+        // Round UP: the box must be at least as wide as a line's last word —
         // a sub-pixel shortfall flips the wrap and drops the word to line 2,
         // leaving the gap on the top line (verified on-device 2026-08-17).
-        val w = ceil(layout.getLineRight(0))
+        val w = minOf(ceil(widestPx), maxWidthPx.toFloat())
         with(density) { w.toFloat().toDp() }
     }
     LightText(
@@ -917,10 +930,24 @@ private fun MessageRow(
                 bottom = if (showTime) 8.dp else 3.dp,
             ),
     ) {
+        // Bridge system messages (m.notice: "Turned off disappearing
+        // messages", timer-set notices, …) are a quiet centered small line —
+        // not a normal message from the contact (2026-08-22). Solid white,
+        // like the timestamps/labels: hierarchy from size, not dimming
+        // (feedback 2026-08-22: "no grey in the chats tool").
+        if (message.contentType == "notice") {
+            LightText(
+                text = message.body,
+                variant = LightTextVariant.Superfine,
+                align = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            return@BoxWithConstraints
+        }
         // The outgoing body's column cap (0.875 × the row content width):
-        // outgoing text is measured against it so the first line's natural
-        // width — the block width — keeps the top line's last word touching
-        // the right edge (feedback 2026-08-17).
+        // outgoing text is measured against it so the block never spans the
+        // full row (feedback 2026-08-17); the block width itself comes from
+        // [OutgoingBodyText] (the widest line, capped here).
         val bodyMaxWidthPx = with(LocalDensity.current) {
             (maxWidth * MESSAGE_WIDTH_FRACTION).toPx().roundToInt()
         }
@@ -1114,20 +1141,23 @@ private fun AudioMessageContent(
     error: String?,
     onTogglePlay: () -> Unit,
 ) {
-    // While playing, tick every 500 ms so the interpolated position counter
-    // (sampled position + time since the last poll) keeps counting up.
-    var tick by remember { mutableStateOf(0) }
+    // While playing, refresh the interpolated position counter every second:
+    // the position polls arrive every few seconds, and the label interpolates
+    // between them. (2026-08-22: the old `tick++` was never READ in
+    // composition, so the write never triggered recomposition — the label
+    // only advanced on each poll, i.e. in multi-second jumps.)
+    var nowMs by remember { mutableStateOf(android.os.SystemClock.elapsedRealtime()) }
     LaunchedEffect(playing) {
         while (playing) {
-            delay(500)
-            tick++
+            delay(1000)
+            nowMs = android.os.SystemClock.elapsedRealtime()
         }
     }
     val durationMs = message.durationMs
     val label = when {
         playing -> {
             val base = playingPositionMs ?: 0L
-            val pos = base + (android.os.SystemClock.elapsedRealtime() - playingPositionAtMs)
+            val pos = base + (nowMs - playingPositionAtMs)
             // Just the running position while playing (the row already showed
             // its length when idle).
             formatDuration(durationMs?.let { pos.coerceAtMost(it) } ?: pos)

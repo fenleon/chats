@@ -2792,14 +2792,39 @@ object MatrixRepository {
         val url = content.url?.takeIf { it.isNotBlank() }
         if (file == null && url == null) return false to "no audio file"
         val mediaService = c.di.get<MediaService>(MediaService::class)
-        val bytes = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+        val download = withTimeoutOrNull(MEDIA_BUDGET_MS) {
             when {
                 file != null -> mediaService.getEncryptedMedia(file, saveToCache = false)
                 url != null -> mediaService.getMedia(url, saveToCache = false)
                 else -> return@withTimeoutOrNull null
             }
-        }?.getOrNull()?.toByteArray()?.takeIf { it.isNotEmpty() }
-            ?: return false to "audio download failed"
+        }
+        val bytes = (if (download == null) {
+            // withTimeoutOrNull fired — the fetch itself exceeded the
+            // budget (MEDIA_BUDGET_MS). Kept separate from the failure log
+            // so a silent tap maps to exactly one cause.
+            android.util.Log.w(
+                TAG,
+                "playVoiceNote: download timed out for $eventId after ${MEDIA_BUDGET_MS}ms " +
+                    "(encrypted=${file != null}, url=${url ?: "null"})",
+            )
+            null
+        } else if (download.isFailure) {
+            // Diagnosis hook for the LP3 (feedback 2026-08-22 "download
+            // failed"): this stage was silent — the common failure (the
+            // media fetch) must log what actually went wrong (network
+            // error, missing sha256 on the EncryptedFile →
+            // MediaValidationException, …).
+            android.util.Log.w(
+                TAG,
+                "playVoiceNote: download failed for $eventId (encrypted=${file != null}, " +
+                    "url=${url ?: "null"}, size=${content.info?.size})",
+                download.exceptionOrNull(),
+            )
+            null
+        } else {
+            download.getOrNull()?.toByteArray()?.takeIf { it.isNotEmpty() }
+        }) ?: return false to "audio download failed"
         val ctx = appContext ?: return false to "no context"
         // The temp file must carry the ACTUAL format: MediaPlayer's file-source
         // path uses the extension as an extractor hint, and Beeper/WhatsApp
@@ -2868,7 +2893,18 @@ object MatrixRepository {
         audioManager.requestAudioFocus(focusRequest)
         audioFocusRequest = focusRequest
         runCatching {
-            player.setDataSource(tmp.absolutePath)
+            // Pass the FILE DESCRIPTOR, not the path: the media server is a
+            // different uid and can't traverse the app's private cache dir —
+            // a path source hits "Permission denied" on the LP3 (verified
+            // 2026-08-22: FileSource 'Failed to open file … (Permission
+            // denied)' — the app-private /data/user/0/<pkg> dir is
+            // drwx------, so setReadable on the file never helped; the
+            // recording preview plays fine because it hands over an fd).
+            // setDataSource(FileDescriptor) is the AOSP-blessed route for
+            // app-private files; the fd stays valid for the player's lifetime.
+            java.io.FileInputStream(tmp).use { input ->
+                player.setDataSource(input.fd)
+            }
             player.prepare()
             player.start()
         }.onFailure { e ->
@@ -2948,15 +2984,19 @@ object MatrixRepository {
     /**
      * Repairs a downloaded Ogg stream whose identification page is misflagged:
      * WhatsApp/bridge voice notes carry the OpusHead packet on a page written
-     * with header-type 0x02 ("continuation") instead of 0x01 (BOS) — the
-     * stream has NO BOS page at all (verified on the LP3's real account,
-     * 2026-08-21: 25 pages, single serial, `OpusHead` at page 0, htype 0x02).
-     * WhatsApp's own decoder ignores the flags, but Android's OggExtractor
-     * requires BOS to identify the codec, so MediaPlayer prepare() fails on
-     * the LP3's stricter media stack (the emulator's lenient extractor plays
-     * the raw file; the BOS-repaired file plays on both). Sets the BOS bit on
-     * the first page and recomputes that page's CRC. Returns the original
-     * bytes unchanged when there is nothing to fix (or the data isn't Ogg).
+     * with header-type 0x01 ("continuation") instead of 0x02 (BOS) — the
+     * stream has NO BOS page at all. WhatsApp's own decoder ignores the flags,
+     * but Android's OggExtractor requires BOS to identify the codec, so
+     * MediaPlayer prepare() fails on the LP3's stricter media stack (the
+     * emulator's lenient extractor plays the raw file; the BOS-repaired file
+     * plays on both). Sets the BOS bit on the first page and recomputes that
+     * page's CRC. Returns the original bytes unchanged when there is nothing
+     * to fix (or the data isn't Ogg).
+     *
+     * header_type bits (RFC 3533): 0x01 = continuation, 0x02 = BOS,
+     * 0x04 = EOS. (2026-08-22: an earlier version had these INVERTED — it
+     * "repaired" valid files (BOS=0x02) into continuation pages (0x01), which
+     * is exactly why the user's own notes stopped playing on the LP3.)
      */
     private fun repairOgg(bytes: ByteArray): ByteArray {
         if (bytes.size < 27 || bytes[0] != 'O'.code.toByte() || bytes[1] != 'g'.code.toByte() ||
@@ -2964,9 +3004,9 @@ object MatrixRepository {
         ) {
             return bytes
         }
-        if (bytes[5].toInt() and 0x01 != 0) return bytes // BOS already set
+        if (bytes[5].toInt() and 0x02 != 0) return bytes // BOS already set
         val out = bytes.copyOf()
-        out[5] = 0x01 // BOS only — the first page carries the stream's first packet
+        out[5] = 0x02 // BOS only — the first page carries the stream's first packet
         // First page length: 27-byte header + segment table + laced bodies.
         var pageLen = 27
         val nseg = out[26].toInt() and 0xFF
@@ -4553,7 +4593,14 @@ object MatrixRepository {
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "[Photo]") to "image"
             is RoomMessageEventContent.FileBased.Audio ->
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note") to "audio"
-            is RoomMessageEventContent.TextBased -> stripReplyQuote(content.body) to "text"
+            is RoomMessageEventContent.TextBased ->
+                // m.notice = bridge system messages ("Turned off disappearing
+                // messages", timer-set notices… — the mautrix bridge sends them
+                // as notices from the contact's own ghost, so sender can't
+                // distinguish them). The tool renders them as a small centered
+                // system line instead of a normal message (2026-08-22).
+                stripReplyQuote(content.body) to
+                    if (content is RoomMessageEventContent.TextBased.Notice) "notice" else "text"
             else -> (previewText(te) ?: return null) to "text"
         }
         val sender = te.event.sender
