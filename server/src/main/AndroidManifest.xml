@@ -56,6 +56,19 @@
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- Requests POST_NOTIFICATIONS at runtime — declaring it in the
+             manifest is not enough on targetSdk 33+ (it stays denied until
+             requested, so message notifications were silently blocked on
+             fresh installs). Started by the tool from the chat list via
+             startServerActivity; finishes immediately once granted. -->
+        <activity
+            android:name=".NotificationPermissionActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- Records a voice note (AAC/m4a) and sends it as an m.audio message;
              started by the tool via StartVoiceNoteSend + startServerActivity. -->
         <activity
