@@ -1,8 +1,8 @@
 # Chats
 
-*WhatsApp, Instagram, and your other chats on your Light Phone III.*
+*WhatsApp, Signal, Telegram, Instagram, and your other chats on your Light Phone III.*
 
-Chats brings **WhatsApp to your Light Phone III**, along with **Instagram DMs** and other networks, through your Beeper account. Log in once and your existing conversations arrive on the phone in a quiet, text-first interface inspired by the philosophy of Light OS.
+Chats brings **WhatsApp, Signal, and Telegram to your Light Phone III**, along with **Instagram DMs** and other networks, through your Beeper account. Log in once and your existing conversations arrive on the phone in a quiet, text-first interface inspired by the philosophy of Light OS.
 
 Under the hood it runs on **Matrix**, the open, encrypted messaging standard behind Beeper's bridges, so every conversation is end-to-end encrypted. If you'd rather not use Beeper, Chats speaks plain Matrix and works with any Matrix homeserver.
 
