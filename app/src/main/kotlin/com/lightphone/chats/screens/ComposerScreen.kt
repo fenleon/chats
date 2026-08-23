@@ -3,6 +3,7 @@ package com.lightphone.chats.screens
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.Composable
@@ -173,6 +174,10 @@ class ComposerScreen(
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
+                        // Keeps the X above the keyboard when the system IME
+                        // is in use (no-op with the embedded keyboard — the
+                        // IME never shows, so imePadding is 0).
+                        .imePadding()
                         .padding(end = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp())
                         .lightClickable {
                             textState.edit { replace(0, length, "") }
