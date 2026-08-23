@@ -110,6 +110,14 @@ object ChatClient {
         )
     }
 
+    /** Mutes/unmutes [roomId]'s notifications (contact panel, 2026-08-23). */
+    suspend fun setRoomMuted(roomId: String, muted: Boolean) {
+        callRemoteServiceMethod(
+            LightServiceMethod.SetRoomMuted,
+            LightServiceMethod.SetRoomMuted.Request(roomId, muted),
+        )
+    }
+
     /** Tells the companion which room is on screen (null = list/settings/background). */
     suspend fun setActiveRoom(roomId: String?) {
         callRemoteServiceMethod(

@@ -9,6 +9,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -24,6 +27,7 @@ import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.gridUnitsAsDp
+import com.thelightphone.sdk.ui.lightClickable
 /**
  * The contact overlay (feedback 2026-08-21): tapping the thread's top-bar
  * room name opens a minimal contact page — Name, network (WhatsApp /
@@ -38,6 +42,7 @@ import com.thelightphone.sdk.ui.gridUnitsAsDp
  */
 class ContactScreen(
     sealedActivity: SealedLightActivity,
+    private val roomId: String,
     private val name: String,
     private val network: String?,
     private val identifier: String?,
@@ -48,11 +53,20 @@ class ContactScreen(
      * line has nothing better (feedback 2026-08-23).
      */
     private val phone: String? = null,
+    /**
+     * Whether the room is muted (2026-08-23): the MUTE button under the
+     * network line reads MUTE / UNMUTE; muting stops notifications for the
+     * room while the unread badge stays.
+     */
+    private val muted: Boolean = false,
+    /** Flips the room's mute server-side; the panel mirrors the new state locally. */
+    private val onToggleMute: () -> Unit = {},
 ) : SimpleLightScreen<Unit>(sealedActivity) {
 
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
+        var isMuted by remember { mutableStateOf(muted) }
 
         LightTheme(colors = themeColors) {
             Column(
@@ -98,6 +112,25 @@ class ContactScreen(
                                 modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                             )
                         }
+                        // Mute toggle (2026-08-23): under the network line at
+                        // Settings-panel spacing; UNMUTE replaces MUTE once on.
+                        // Notifications stop, the unread badge stays. Button
+                        // variant = the bottom-bar text size (feedback
+                        // 2026-08-23: "as big as the text in the bottom bar").
+                        LightText(
+                            text = if (isMuted) "UNMUTE" else "MUTE",
+                            variant = LightTextVariant.Button,
+                            modifier = Modifier
+                                .padding(top = 0.75f.gridUnitsAsDp())
+                                .lightClickable(onClick = {
+                                    isMuted = !isMuted
+                                    onToggleMute()
+                                })
+                                .padding(
+                                    horizontal = 2f.gridUnitsAsDp(),
+                                    vertical = 0.75f.gridUnitsAsDp(),
+                                ),
+                        )
                     }
                 }
                 LightBottomBar(
