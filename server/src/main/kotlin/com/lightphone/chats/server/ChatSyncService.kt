@@ -92,7 +92,19 @@ class ChatSyncService : Service() {
      */
     private suspend fun startSyncWatchdog(c: net.folivo.trixnity.client.MatrixClient) {
         var stuckSinceMs = 0L
+        var lastState: SyncState? = null
         c.syncState.collect { state ->
+            // One line per state CHANGE (rare — a handful per night), so a
+            // silently dead loop leaves a visible last-state trail (audit
+            // 2026-08-23: long-polls stopped for hours with no logged cause).
+            if (state != lastState) {
+                lastState = state
+                Log.d(
+                    TAG,
+                    "syncState: $state (screen ${if (MatrixRepository.isScreenOn) "on" else "off"}, " +
+                        "mode ${if (MatrixRepository.isSlowSyncing) "slow" else "active"})",
+                )
+            }
             // Slow sync owns sync while it runs (STOPPED between rounds) —
             // never restart a long-poll then; MatrixRepository does on wake.
             if (MatrixRepository.isSlowSyncing) {

@@ -49,6 +49,9 @@ import kotlinx.coroutines.launch
 /** Cancelled/failed panels dismiss themselves back to the main panel. */
 private const val CANCELLED_AUTO_DISMISS_MS = 4_000L
 
+/** Shown between Continue and the other device accepting (or while waiting). */
+private const val WAITING_TEXT = "Waiting for your other device to accept..."
+
 /**
  * Interactive (SAS/emoji) device verification: proves this device to the
  * account's other device (e.g. the Beeper app), which unlocks encrypted
@@ -81,10 +84,18 @@ class VerificationViewModel : LightViewModel<Unit>() {
         // Poll while the screen is up; the companion's state machine updates as
         // the other device answers (and the recovery key updates e2ee state).
         viewModelScope.launch {
+            // verificationState stays at 1 s; e2eeState is throttled to every
+            // ~10 s — it includes a server round-trip (network), and the
+            // recovery-key/accept actions refresh it directly anyway
+            // (feedback 2026-08-23).
+            var tick = 0
             while (true) {
                 state.value = ChatClient.verificationState()
-                e2ee.value = ChatClient.e2eeState()
+                if (tick % E2EE_POLL_TICKS == 0) {
+                    e2ee.value = ChatClient.e2eeState()
+                }
                 if (starting.value && state.value?.state != "none") starting.value = false
+                tick++
                 delay(POLL_MS)
             }
         }
@@ -152,6 +163,8 @@ class VerificationViewModel : LightViewModel<Unit>() {
 
     private companion object {
         const val POLL_MS = 1_000L
+        /** e2eeState is fetched once per this many 1 s polls (~10 s). */
+        const val E2EE_POLL_TICKS = 10
     }
 }
 
@@ -249,9 +262,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                         // Between Continue and the server's first non-idle
                         // state, show the waiting panel directly — no flash of
                         // the main panel (feedback 2026-08-19).
-                        starting && state?.state == "none" -> CenteredPanel(
-                            "Waiting for your other device to accept...",
-                        )
+                        starting && state?.state == "none" -> CenteredPanel(WAITING_TEXT)
 
                         else -> when (state?.state) {
                             "none" -> MainPanel(
@@ -261,7 +272,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                                 onUseRecoveryKey = { openRecoveryEditor() },
                             )
 
-                            "waiting" -> CenteredPanel("Waiting for your other device to accept...")
+                            "waiting" -> CenteredPanel(WAITING_TEXT)
                             "accept", "start" -> CenteredPanel("Your other device wants to verify. Accept?")
                             "verifying" -> CenteredPanel("Verifying…")
                             "compare" -> ComparePanel(state?.emoji.orEmpty())
@@ -276,7 +287,6 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                     modifier = Modifier.navigationBarsPadding(),
                     items = bottomBarItems(
                         confirmOpen,
-                        e2ee?.verified == true,
                         state?.state,
                         starting,
                         confirmX,
@@ -292,7 +302,6 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
      *  waiting and cancelled panels' X sits centered). */
     private fun bottomBarItems(
         confirmOpen: Boolean,
-        verified: Boolean,
         state: String?,
         starting: Boolean,
         confirmX: Painter,
@@ -310,15 +319,6 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                 onClick = viewModel::confirmStart,
                 contentDescription = "Continue",
             ),
-        )
-
-        verified -> listOf(
-            null,
-            LightBarButton.Text(
-                text = "DONE",
-                onClick = { goBack() },
-            ),
-            null,
         )
 
         else -> when {
@@ -452,14 +452,12 @@ private fun ComparePanel(emojis: List<String>) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             // All seven on one line so the SAS set reads as a single
             // comparison (Heading keeps them small enough to fit).
-            emojis.chunked(7).forEach { rowEmojis ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                ) {
-                    rowEmojis.forEach { emoji ->
-                        LightText(text = emoji, variant = LightTextVariant.Heading)
-                    }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                emojis.forEach { emoji ->
+                    LightText(text = emoji, variant = LightTextVariant.Heading)
                 }
             }
             Spacer(Modifier.height(1f.gridUnitsAsDp()))

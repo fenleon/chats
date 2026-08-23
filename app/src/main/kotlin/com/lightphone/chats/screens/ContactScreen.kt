@@ -41,6 +41,13 @@ class ContactScreen(
     private val name: String,
     private val network: String?,
     private val identifier: String?,
+    /**
+     * The contact's phone number, resolved by the companion from the room
+     * data (a @whatsapp_<number> ghost, or the number the bridge used as the
+     * displayname before syncing the profile name). Shown when the identifier
+     * line has nothing better (feedback 2026-08-23).
+     */
+    private val phone: String? = null,
 ) : SimpleLightScreen<Unit>(sealedActivity) {
 
     @Composable
@@ -71,7 +78,9 @@ class ContactScreen(
                         // same size (feedback 2026-08-22: only the contact
                         // overlay shows it, under the name, Heading like the
                         // name — not the small Fine line below the network).
-                        identifier?.let {
+                        // The identifier wins when it IS the number (phone-ghost
+                        // contacts); otherwise the companion-resolved phone.
+                        (identifier ?: phone)?.let {
                             LightText(
                                 text = it,
                                 variant = LightTextVariant.Heading,

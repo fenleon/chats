@@ -90,6 +90,16 @@
             android:excludeFromRecents="true"
             android:configChanges="orientation|screenSize|keyboardHidden" />
 
+        <!-- AOSP runtime-permission host for the SDK permission flow (the tool
+             requests POST_NOTIFICATIONS through it; see ChatsPermissionActivity).
+             Translucent so the system dialog is the only thing visible. -->
+        <activity
+            android:name=".ChatsPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <!-- Keeps the Matrix sync loop alive in the background. Uses cleartext
              HTTP so a self-hosted LAN homeserver (e.g. 10.0.2.2 in dev) works. -->
         <service

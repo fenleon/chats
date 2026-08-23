@@ -12,7 +12,7 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 > **Current Status:** Beta
 >
-> **Current Version:** 0.5.0 (versionCode 50)
+> **Current Version:** 0.6.4 (versionCode 55)
 
 ---
 
@@ -37,15 +37,15 @@ The chat list, a 1:1 thread, a group thread, search, the networks panel, setting
 - **WhatsApp, Instagram & more** — your existing chats from Beeper's bridged networks, with a network selector (All / WhatsApp / Instagram) so you can focus on one at a time
 - **1:1 and group chats** — a single-line chat list (unread counts, relative timestamps) that reveals more on scroll
 - **Search** — find any chat by name from the chat list, with a direct/group mode switch; results respect the selected network
-- **Contact overlay** — tap a thread's room name to see the contact's name and network
+- **Contact overlay** — tap a thread's room name to see the contact's name, phone number (when the bridge data carries one), and network
 - **Hardware buttons work** — volume, camera, and the brightness wheel are relayed to the platform, so the native controls behave inside Chats
 - **End-to-end encryption** — every conversation is encrypted end to end, with simple emoji-based device verification and recovery-key login for new devices
 - **Or a Matrix homeserver of your own** — Chats isn't tied to Beeper; it works with any Matrix homeserver
 - **Notifications** — one calm notification per room as messages arrive; a push channel (ntfy) wakes the sync the moment a message arrives, so delivery is instant
-- **Voice notes** — record, send, and play (Opus — the standard voice-message format, roughly half the size of the earlier AAC); playback handles the bridge's malformed Ogg streams
-- **Photos** — attach via the system photo picker; tap a thumbnail for a full-screen view
+- **Voice notes** — record (with a live length read-out), send, and play (Opus — the standard voice-message format, roughly half the size of the earlier AAC); playback handles the bridge's malformed Ogg streams, and a note you just sent plays straight from the thread
+- **Photos** — attach via the system photo picker; tap a thumbnail for a full-screen view with pinch-to-zoom
 - **Message reactions** — shown as small tags under the message
-- **Delivery status** — a "delivered" tag on your newest message once it reaches the room, and a "not delivered" marker when it fails
+- **Delivery status** — a "delivered" tag on your newest message once it reaches the room, and a "not delivered" marker when it fails; failed messages re-send on tap
 - **Read state** — opening a thread marks it read server-side
 - **Day-grouped timestamps** — time-of-day for today, "yesterday", weekday names, then dates
 - **Instant re-open** — room list and threads are cached to disk

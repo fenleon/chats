@@ -350,21 +350,17 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 },
                             )
                             if (beeperMode) {
-                                LightTextField(
+                                FormField(
                                     label = "Beeper email:",
                                     value = beeperEmail,
                                     placeholder = "you@example.com",
                                     onClick = { editField("Beeper email", viewModel.beeperEmail) },
-                                    modifier = Modifier.padding(
-                                        horizontal = 2f.gridUnitsAsDp(),
-                                        vertical = 0.75f.gridUnitsAsDp(),
-                                    ),
                                 )
                                 // The Enter code entry appears once a code has
                                 // been requested (feedback 2026-08-19: the
                                 // request-code overlay dismisses back here).
                                 if (codeStatus != null || beeperCode.isNotEmpty()) {
-                                    LightTextField(
+                                    FormField(
                                         label = "Enter code:",
                                         value = beeperCode,
                                         placeholder = "6-digit code",
@@ -379,64 +375,36 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                                 if (code.isNotBlank()) viewModel.login()
                                             }
                                         },
-                                        modifier = Modifier.padding(
-                                            horizontal = 2f.gridUnitsAsDp(),
-                                            vertical = 0.75f.gridUnitsAsDp(),
-                                        ),
                                     )
                                 }
                             } else {
-                                LightTextField(
+                                FormField(
                                     label = "Homeserver:",
                                     value = homeserver,
                                     placeholder = "matrix.example.org",
                                     onClick = { editField("Homeserver", viewModel.homeserver) },
-                                    modifier = Modifier.padding(
-                                        horizontal = 2f.gridUnitsAsDp(),
-                                        vertical = 0.75f.gridUnitsAsDp(),
-                                    ),
                                 )
-                                LightTextField(
+                                FormField(
                                     label = "Username:",
                                     value = user,
                                     placeholder = "@user:server",
                                     onClick = { editField("Username", viewModel.user) },
-                                    modifier = Modifier.padding(
-                                        horizontal = 2f.gridUnitsAsDp(),
-                                        vertical = 0.75f.gridUnitsAsDp(),
-                                    ),
                                 )
-                                LightTextField(
+                                FormField(
                                     label = if (tokenLogin) "Access token:" else "Password:",
                                     // Masked once submitted — the plaintext only
                                     // lives in the editor (feedback 2026-08-19).
                                     value = if (password.isBlank()) password else MASKED_SECRET,
                                     placeholder = if (tokenLogin) "syt_…" else "password",
                                     onClick = { editField("Password", viewModel.password) },
-                                    modifier = Modifier.padding(
-                                        horizontal = 2f.gridUnitsAsDp(),
-                                        vertical = 0.75f.gridUnitsAsDp(),
-                                    ),
                                 )
                                 TokenToggleRow(
                                     tokenLogin = tokenLogin,
                                     onToggle = viewModel::toggleTokenLogin,
                                 )
                             }
-                            error?.let { message ->
-                                LightText(
-                                    text = message,
-                                    variant = LightTextVariant.Detail,
-                                    modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
-                                )
-                            }
-                            codeStatus?.let { status ->
-                                LightText(
-                                    text = status,
-                                    variant = LightTextVariant.Detail,
-                                    modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
-                                )
-                            }
+                            error?.let { message -> StatusLine(message) }
+                            codeStatus?.let { status -> StatusLine(status) }
                         }
                     }
                 }
@@ -501,6 +469,36 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
             onResult(value)
         }
     }
+}
+
+/** A login-form field row: the LightTextField with the standard row padding. */
+@Composable
+private fun FormField(
+    label: String,
+    value: String,
+    placeholder: String,
+    onClick: () -> Unit,
+) {
+    LightTextField(
+        label = label,
+        value = value,
+        placeholder = placeholder,
+        onClick = onClick,
+        modifier = Modifier.padding(
+            horizontal = 2f.gridUnitsAsDp(),
+            vertical = 0.75f.gridUnitsAsDp(),
+        ),
+    )
+}
+
+/** A Detail-sized status line under the form (login error / code status). */
+@Composable
+private fun StatusLine(text: String) {
+    LightText(
+        text = text,
+        variant = LightTextVariant.Detail,
+        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
+    )
 }
 
 @Composable

@@ -70,20 +70,17 @@ class MainActivity : ComponentActivity() {
         //                       be https://ntfy.sh/<topic>; default = random UUID.
         // Unset: a private ntfy.sh channel is auto-provisioned on first start
         // (PushChannel) — push works with zero setup after login.
-        intent?.getStringExtra("pushsse")?.let {
-            getSharedPreferences("chats_account", MODE_PRIVATE).edit()
-                .putString("push_sse_url", it).apply()
-        }
-        intent?.getStringExtra("pushnotify")?.let {
-            getSharedPreferences("chats_account", MODE_PRIVATE).edit()
-                .putString("push_notify_url", it).apply()
-        }
-        intent?.getStringExtra("pushkey")?.let {
-            getSharedPreferences("chats_account", MODE_PRIVATE).edit()
-                .putString("push_key", it).apply()
-        }
+        intent?.getStringExtra("pushsse")?.let { putPref("push_sse_url", it) }
+        intent?.getStringExtra("pushnotify")?.let { putPref("push_notify_url", it) }
+        intent?.getStringExtra("pushkey")?.let { putPref("push_key", it) }
         MatrixRepository.init(this)
         setContent { DevScreen() }
+    }
+
+    /** Persists a dev-extra pref in the account prefs file. */
+    private fun putPref(key: String, value: String) {
+        getSharedPreferences("chats_account", MODE_PRIVATE).edit()
+            .putString(key, value).apply()
     }
 }
 

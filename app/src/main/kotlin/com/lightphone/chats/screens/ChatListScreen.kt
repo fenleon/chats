@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import android.Manifest
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,7 +17,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,6 +33,9 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
+import com.thelightphone.sdk.checkPermission
+import com.thelightphone.sdk.rememberPermissionRequestLauncher
+import com.thelightphone.sdk.shared.LightResult
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
@@ -53,6 +59,9 @@ import kotlinx.coroutines.launch
 
 /** Grow the list slice when the last visible row is within this many of the end. */
 private const val REVEAL_THRESHOLD = 4
+
+/** Shown while the initial sync pulls the whole account (can take minutes). */
+private const val DOWNLOADING_TEXT = "Downloading your chat history…"
 
 /**
  * Launch-intent extra carrying the room a notification tap should open
@@ -124,6 +133,14 @@ class ChatListViewModel : LightViewModel<Unit>() {
      */
     var savedScrollIndex = 0
     var savedScrollOffset = 0
+
+    /**
+     * One POST_NOTIFICATIONS runtime request per process run (audit
+     * 2026-08-23: the server's message notifications never showed — the
+     * permission was never requested, importance=NONE). The request itself
+     * goes through the SDK flow (ChatsPermissionActivity in the server).
+     */
+    var notificationPermissionRequested = false
 
     fun saveScroll(index: Int, offset: Int) {
         savedScrollIndex = index
@@ -197,13 +214,7 @@ class ChatListViewModel : LightViewModel<Unit>() {
                     // account, logged-out-while-restoring, or logged-in but the
                     // cold room cache hasn't warmed — the first getRooms can return
                     // empty) keeps refetching.
-                    val settled = account != null && (
-                        (account.loggedIn == true && result.isNotEmpty()) ||
-                            (account.userId == null && result.isEmpty()) ||
-                            // An expired session is a settled state, not a transient
-                            // restore — don't keep refetching for 10s.
-                            (account.loggedIn == false && account.userId != null && connection?.state == "offline")
-                        )
+                    val settled = isSettled(account, result, connection)
                     if (settled) return@repeat
                     delay(REFRESH_RETRY_DELAY_MS)
                     account = ChatClient.accountState()
@@ -241,15 +252,27 @@ class ChatListViewModel : LightViewModel<Unit>() {
      */
     fun consumeNotifyRoom(rooms: List<LightServiceMethod.GetRooms.Room>) {
         val pending = pendingNotifyRoomId ?: return
-        val settled = account.value?.let {
-            (it.loggedIn == true && rooms.isNotEmpty()) ||
-                (it.userId == null) ||
-                (it.loggedIn == false && it.userId != null && connection.value?.state == "offline")
-        } ?: false
+        val settled = isSettled(account.value, rooms, connection.value)
         if (!settled) return
         pendingNotifyRoomId = null
         openRoom.value = rooms.firstOrNull { it.id == pending }
     }
+
+    /** Settled = really logged in with rooms, or a genuine logged-out account
+     *  (no stored session). Anything else (null account,
+     *  logged-out-while-restoring, or logged-in but the cold room cache hasn't
+     *  warmed — the first getRooms can return empty) keeps refetching. */
+    private fun isSettled(
+        account: LightServiceMethod.GetAccountState.Response?,
+        rooms: List<LightServiceMethod.GetRooms.Room>,
+        connection: LightServiceMethod.GetConnectionState.Response?,
+    ): Boolean = account != null && (
+        (account.loggedIn == true && rooms.isNotEmpty()) ||
+            (account.userId == null && rooms.isEmpty()) ||
+            // An expired session is a settled state, not a transient
+            // restore — don't keep refetching for 10s.
+            (account.loggedIn == false && account.userId != null && connection?.state == "offline")
+        )
 
     /** Grows the visible slice as the user scrolls toward the list's end. */
     fun showMore() {
@@ -293,6 +316,21 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
 
     @Composable
     override fun Content() {
+        // Runtime permission for the server's message notifications (audit
+        // 2026-08-23: POST_NOTIFICATIONS was never requested → importance=NONE
+        // → ChatNotifier silently no-oped every message). The SDK flow routes
+        // the request through the server's ChatsPermissionActivity (AOSP
+        // dialog). One request per process run.
+        val permissionLauncher = rememberPermissionRequestLauncher(Manifest.permission.POST_NOTIFICATIONS)
+        LaunchedEffect(Unit) {
+            if (!viewModel.notificationPermissionRequested) {
+                viewModel.notificationPermissionRequested = true
+                val res = checkPermission(Manifest.permission.POST_NOTIFICATIONS)
+                val granted = res is LightResult.Success &&
+                    res.data.permissionResult == LightServiceMethod.GetPermission.Result.Granted
+                if (!granted) permissionLauncher?.launch()
+            }
+        }
         val rooms by viewModel.rooms.collectAsState()
         val loading by viewModel.loading.collectAsState()
         val account by viewModel.account.collectAsState()
@@ -358,11 +396,19 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
 
         // Feedback pass: switching the filter (network selection) returns the
         // list to the top — the user expects the newest conversations, not a
-        // stale scroll position from the previous filter. requestScrollToItem
-        // is safe before the new list is composed (e.g. an empty view); the
-        // scroll lands when the list appears.
+        // stale scroll position from the previous filter. Guarded so it fires
+        // only on an actual filter CHANGE: the screen fully re-composes on
+        // every thread return, and an ungated effect would yank the list to
+        // the top each time (feedback 2026-08-23: "exit a thread — bounce
+        // back to the top of the room list"). The guard remembers the filter
+        // that last triggered the reset; a fresh composition re-initializes
+        // it to the current filter, so a plain return is a no-op.
+        var filterAtLastReset by remember { mutableStateOf(networkFilter) }
         LaunchedEffect(networkFilter) {
-            listState.requestScrollToItem(0)
+            if (networkFilter != filterAtLastReset) {
+                filterAtLastReset = networkFilter
+                listState.requestScrollToItem(0)
+            }
         }
 
         // Save the list's scroll position continuously (the ViewModel holds it
@@ -429,6 +475,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                     Column(modifier = Modifier.fillMaxSize()) {
                         offlineText?.let { OfflineBanner(it) }
                         Box(modifier = Modifier.weight(1f)) {
+                            val connecting = connection?.state == "connecting"
                             when {
                                 // First login / restored session: the initial sync
                                 // pulls the whole account (all rooms + history) and
@@ -437,11 +484,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                 // flash "No conversations" while it's still running
                                 // (the retry budget can exhaust before rooms land).
                                 loading && rooms.isEmpty() -> StatusText(
-                                    if (connection?.state == "connecting") {
-                                        "Downloading your chat history…"
-                                    } else {
-                                        "Loading…"
-                                    },
+                                    if (connecting) DOWNLOADING_TEXT else "Loading…",
                                 )
                                 filteredRooms.isNotEmpty() -> LightLazyScrollView(
                                     // Rows are ~70dp; a uniform estimate keeps the lazy
@@ -456,7 +499,11 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                         )
                                     }
                                 }
-                                rooms.isNotEmpty() -> StatusText("No conversations.")
+                                // No account / logged out (rooms empty): sign-in hint,
+                                // or the initial "connecting" state on a logged-in
+                                // account whose rooms haven't landed yet. Otherwise
+                                // (logged in, rooms empty or all filtered out) the
+                                // calm "No conversations.".
                                 account?.loggedIn != true -> StatusText(
                                     if (connection?.state == "offline") {
                                         "Sign in again — open Settings."
@@ -464,7 +511,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                         "No account. Open Settings to sign in with Beeper or a Matrix homeserver."
                                     },
                                 )
-                                connection?.state == "connecting" -> StatusText("Downloading your chat history…")
+                                connecting -> StatusText(DOWNLOADING_TEXT)
                                 else -> StatusText("No conversations.")
                             }
                         }
@@ -546,11 +593,13 @@ private fun RoomRow(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // The unread marker is a large asterisk in the row's leading
-            // buffer: 0.5-gu margin, the star's 1-gu slot, then the gap to
-            // the room name at 2.75 gu — the name stays flush with the
-            // bottom-left bottom-bar icon (the Phone tool puts its star at
-            // x 20-60, names at x 80; feedback 2026-08-21). The slot stays
-            // even without a star so names never shift.
+            // buffer: 0.5-gu margin, the star's 1-gu slot, then a 0.25-gu gap
+            // to the room name at 1.75 gu — the asterisk lands visually
+            // centered between the left edge and the name (feedback
+            // 2026-08-23: the original 1.25-gu gap left the space after the
+            // asterisk dwarfing the space before it; the name moved left to
+            // balance it). The slot stays even without a star so names never
+            // shift.
             Box(modifier = Modifier.width(1f.gridUnitsAsDp())) {
                 if (room.unreadCount > 0) {
                     LightText(
@@ -559,7 +608,7 @@ private fun RoomRow(
                     )
                 }
             }
-            Box(modifier = Modifier.width(1.25f.gridUnitsAsDp()))
+            Box(modifier = Modifier.width(0.25f.gridUnitsAsDp()))
             Column(modifier = Modifier.weight(1f)) {
                 LightText(
                     text = room.name,

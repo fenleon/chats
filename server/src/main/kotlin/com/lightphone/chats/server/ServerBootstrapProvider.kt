@@ -1,5 +1,6 @@
 package com.lightphone.chats.server
 
+import android.Manifest
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Context
@@ -8,6 +9,7 @@ import android.content.pm.Signature
 import android.database.Cursor
 import android.net.Uri
 import android.util.Log
+import android.view.KeyEvent
 import com.thelightphone.sdk.server.ClientCertType
 import com.thelightphone.sdk.server.ClientFilterLevel
 import com.thelightphone.sdk.server.LightSdkServer
@@ -52,22 +54,37 @@ class ServerBootstrapProvider : ContentProvider() {
             }
             // Chats consumes no hardware keys — every event goes to LightOS
             // (volume panel, brightness wheel, camera).
-            onDeviceKeyEvent = { _, event -> PlatformRelay.sendDeviceKeyEvent(event) }
+            onDeviceKeyEvent = { _, event ->
+                // Camera/focus keys: relay DOWN only (LP3 feedback 2026-08-23 —
+                // pressing the camera button did nothing until the tool exited,
+                // then the camera popped open and the flashlight stayed dead).
+                // LightOS handles the camera like the volume panel (take over,
+                // then relaunch the tool via componentToRelaunch); if the
+                // relaunch fires on KEY_UP, the singleTask tool instantly
+                // re-covers the just-opened camera and holds the HAL, which
+                // matches both symptoms. Volume/other keys keep both events.
+                val isCameraKey =
+                    event.keyCode == KeyEvent.KEYCODE_CAMERA || event.keyCode == KeyEvent.KEYCODE_FOCUS
+                if (event.action != KeyEvent.ACTION_UP || !isCameraKey) {
+                    PlatformRelay.sendDeviceKeyEvent(event)
+                }
+            }
+            // Runtime permission flow (audit 2026-08-23): the tool requests
+            // POST_NOTIFICATIONS through the SDK flow; this APK hosts the AOSP
+            // dialog activity (ChatsPermissionActivity) and adds the
+            // notification permission to the grantable set.
+            permissionActivity = ChatsPermissionActivity::class.java
+            androidPermissionAllowed = { _, permissionName ->
+                permissionName in setOf(
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.READ_MEDIA_AUDIO,
+                    Manifest.permission.RECORD_AUDIO,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                )
+            }
         }
         // Relay hardware keys + user preferences to LightOS (PLATFORM-RELAY).
         PlatformRelay.bind(context)
-        // Probe LightOS's mollysocket push endpoint (UP-distributor feasibility test).
-        // Bind is async, so retry briefly until the platform server answers.
-        Thread {
-            repeat(20) {
-                PlatformRelay.getMollySocketUri()?.let { uri ->
-                    Log.i(TAG, "mollySocketUri=$uri")
-                    return@Thread
-                }
-                Thread.sleep(250)
-            }
-            Log.w(TAG, "mollySocketUri unavailable (LightOS didn't answer)")
-        }.start()
         // Dev probe: register a UP app instance against LightOS's distributor
         // to capture the standard push endpoint (the "other socket" vs the
         // mollysocket URI). Delayed so it runs after the SDK's Application

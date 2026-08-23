@@ -1,9 +1,9 @@
 [tool]
 id = "com.lightphone.chats"
 label = "Chats"
-versionCode = 54
-versionName = "0.6.3"
-permissions = ["android.permission.INTERNET"]
+versionCode = 55
+versionName = "0.6.4"
+permissions = ["android.permission.INTERNET", "android.permission.POST_NOTIFICATIONS"]
 # Single-APK build (2026-08-19): the former :server companion is a library
 # merged into this APK, which hosts its own LightSdkService + the persistent
 # Matrix connection (sync loop, storage, notifications) and binds to itself —

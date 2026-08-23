@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.os.IBinder
 import android.os.Parcel
+import android.os.SystemClock
 import android.util.Log
 import com.thelightphone.sdk.shared.LightConstants
 import com.thelightphone.sdk.shared.LightResult
@@ -28,6 +29,11 @@ object PlatformRelay {
     @Volatile private var binder: IBinder? = null
     @Volatile private var token: String? = null
 
+    /** Key-event relay lane; single thread so DOWN/UP ordering is preserved. */
+    private val relayExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "platform-relay").apply { isDaemon = true }
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             binder = service
@@ -49,8 +55,25 @@ object PlatformRelay {
         )
     }
 
+    /**
+     * Key events are relayed off the SDK server's Binder thread: a slow
+     * com.lightos handler must not stall every tool RPC. Events stay ordered
+     * (single thread). Fire-and-forget — the caller never inspects the result.
+     */
     fun sendDeviceKeyEvent(request: LightServiceMethod.DeviceKeyEvent.Request) {
-        request(LightServiceMethod.DeviceKeyEvent.id, LightServiceMethod.DeviceKeyEvent.encodeRequest(request))
+        relayExecutor.execute {
+            val start = SystemClock.elapsedRealtime()
+            val result = request(
+                LightServiceMethod.DeviceKeyEvent.id,
+                LightServiceMethod.DeviceKeyEvent.encodeRequest(request),
+            )
+            val ms = SystemClock.elapsedRealtime() - start
+            if (result == null) {
+                Log.e(TAG, "DeviceKeyEvent not relayed (code=${request.keyCode} action=${request.action}) in ${ms}ms")
+            } else {
+                Log.d(TAG, "DeviceKeyEvent relayed (code=${request.keyCode} action=${request.action}) in ${ms}ms")
+            }
+        }
     }
 
     /** Real device haptics; null when the platform server is unreachable (fall back to local default). */
@@ -60,15 +83,6 @@ object PlatformRelay {
             LightServiceMethod.GetUserPreferences.encodeRequest(Unit),
         ) as? LightResult.Success ?: return null
         return LightServiceMethod.GetUserPreferences.decodeResponse(result.data)
-    }
-
-    /** LightOS's mollysocket push endpoint for this device; null when the platform server can't answer. */
-    fun getMollySocketUri(): String? {
-        val result = request(
-            LightServiceMethod.GetMollySocketUri.id,
-            LightServiceMethod.GetMollySocketUri.encodeRequest(Unit),
-        ) as? LightResult.Success ?: return null
-        return LightServiceMethod.GetMollySocketUri.decodeResponse(result.data).mollySocketUri
     }
 
     private fun request(methodId: String, payload: String): LightResult<String>? {

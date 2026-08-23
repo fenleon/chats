@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.media.MediaRecorder
 import android.os.Bundle
+import android.os.SystemClock
+import android.text.format.DateUtils
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -42,6 +45,7 @@ import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -79,6 +83,11 @@ class VoiceNoteActivity : ComponentActivity() {
     private var previewing by mutableStateOf(false)
     private var playing by mutableStateOf(false)
     private var sending by mutableStateOf(false)
+    /** Wall-clock start of the current take (elapsedRealtime) — MediaRecorder
+     *  has no position query, so the m:ss ticker derives it from this. */
+    private var recordingStartedAt: Long? = null
+    /** Elapsed seconds of the current take, ticked once per second. */
+    private var elapsedSeconds by mutableStateOf(0)
     /** RECORD_AUDIO was denied — show why, with a retry (2026-08-19 feedback
      *  round: "the phone doesn't ask for the permission" — a denial must not
      *  silently drop the screen). */
@@ -116,6 +125,16 @@ class VoiceNoteActivity : ComponentActivity() {
 
             CompositionLocalProvider(LocalHapticsEnabled provides hapticsEnabled) {
                 LightTheme(colors = themeColors) {
+                // m:ss ticker while recording (MediaRecorder has no position
+                // query — the elapsed time comes from the wall clock).
+                LaunchedEffect(recording) {
+                    while (recording) {
+                        elapsedSeconds = recordingStartedAt?.let {
+                            ((SystemClock.elapsedRealtime() - it) / 1000).toInt()
+                        } ?: 0
+                        delay(1000)
+                    }
+                }
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -164,10 +183,11 @@ class VoiceNoteActivity : ComponentActivity() {
                             ) {
                                 LightIcon(
                                     icon = when {
-                                        micDenied -> LightIcons.MICROPHONE
                                         recording -> LightIcons.MICROPHONE
                                         previewing && playing -> LightIcons.PAUSE
                                         previewing -> LightIcons.PLAY
+                                        // micDenied and idle both show the mic
+                                        // (the label differs below).
                                         else -> LightIcons.MICROPHONE
                                     },
                                     size = 3f,
@@ -193,6 +213,16 @@ class VoiceNoteActivity : ComponentActivity() {
                                 // dimmed (feedback 2026-08-22).
                                 modifier = Modifier.padding(top = 2f.gridUnitsAsDp()),
                             )
+                            if (recording) {
+                                // Recording length — same m:ss format as the
+                                // thread's audio-duration labels.
+                                LightText(
+                                    text = DateUtils.formatElapsedTime(elapsedSeconds.toLong()),
+                                    variant = LightTextVariant.Superfine,
+                                    lighten = true,
+                                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+                                )
+                            }
                             if (sendFailed) {
                                 LightText(
                                     text = "Couldn't send — tap SEND to retry.",
@@ -280,6 +310,8 @@ class VoiceNoteActivity : ComponentActivity() {
         }
         recorder = r
         outputFile = file
+        recordingStartedAt = SystemClock.elapsedRealtime()
+        elapsedSeconds = 0
         // Pause whatever is playing in the background (music, a podcast, a
         // voice note) for the take — transient focus, released on stop
         // (feedback 2026-08-20: "background audio should pause").
@@ -348,10 +380,17 @@ class VoiceNoteActivity : ComponentActivity() {
         }
     }
 
-    private fun stopRecording() {
+    /** Stops + releases the recorder (idempotent). */
+    private fun releaseRecorder() {
         runCatching { recorder?.stop() }
         runCatching { recorder?.release() }
         recorder = null
+    }
+
+    private fun stopRecording() {
+        releaseRecorder()
+        recordingStartedAt = null
+        elapsedSeconds = 0
         recording = false
         abandonRecordFocus()
         // Only enter the preview state if there's a take to preview.
@@ -437,15 +476,15 @@ class VoiceNoteActivity : ComponentActivity() {
     }
 
     private fun discardRecording() {
-        runCatching { recorder?.stop() }
-        runCatching { recorder?.release() }
-        recorder = null
+        releaseRecorder()
         runCatching { previewPlayer?.release() }
         previewPlayer = null
         abandonRecordFocus()
         abandonPreviewFocus()
         outputFile?.delete()
         outputFile = null
+        recordingStartedAt = null
+        elapsedSeconds = 0
         recording = false
         previewing = false
         playing = false

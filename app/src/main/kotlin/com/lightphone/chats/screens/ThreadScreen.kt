@@ -1,6 +1,8 @@
 package com.lightphone.chats.screens
 
 import android.graphics.BitmapFactory
+import android.telephony.PhoneNumberUtils
+import android.text.format.DateUtils
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -22,12 +24,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
@@ -61,18 +65,28 @@ import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import com.thelightphone.sdk.ui.scaledForScreenHeight
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 
 /** Newest image messages whose bytes start downloading on page arrival. */
 private const val MEDIA_PREFETCH_COUNT = 4
+
+/**
+ * Process-wide display-JPEG cache, shared by every ThreadViewModel: a photo
+ * fetched once renders instantly in later opens (same or other room) with no
+ * re-fetch RPC (feedback 2026-08-23). Keyed by event id, which is globally
+ * unique.
+ */
+private val chatsMediaCache = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
 
 class ThreadViewModel(
     private val room: LightServiceMethod.GetRooms.Room,
@@ -91,11 +105,12 @@ class ThreadViewModel(
     val roomEncrypted = MutableStateFlow(false)
 
     /**
-     * Display JPEG bytes per image-message event id (Phase 13). Fetched once
-     * via [ensureMedia] and reused across polls — the thread poll replaces the
-     * list but the event ids stay stable.
+     * Display JPEG bytes per image-message event id (Phase 13). This is a view
+     * of the process-wide [chatsMediaCache] (event ids are globally unique), so
+     * a photo already fetched in any thread renders instantly on re-open — no
+     * re-fetch RPC — and each thread's poll just adds the new arrivals.
      */
-    val mediaBytes = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
+    val mediaBytes = chatsMediaCache
 
     /**
      * Component name of the companion's photo-picker activity to launch, set
@@ -145,6 +160,8 @@ class ThreadViewModel(
     private var savedScrollIndex = 0
     private var savedScrollOffset = 0
     private var scrollToRestore: Pair<Int, Int>? = null
+    /** Newest event id already marked read — dedup for the poll's re-mark. */
+    private var lastMarkedId: String? = null
 
     fun saveScroll(index: Int, offset: Int) {
         savedScrollIndex = index
@@ -251,6 +268,20 @@ class ThreadViewModel(
                 // room list's unread count drops on its next refresh.
                 val markEventId = loaded.lastOrNull()?.id ?: room.lastEventId ?: return@launch
                 ChatClient.markRead(room.id, markEventId)
+                lastMarkedId = markEventId
+            }
+            // The quiet poll re-marks when the newest message changes: the
+            // open-time mark covers the page served at open, and a message
+            // arriving later (or the page catching up to the store's real
+            // newest) would otherwise leave the room list's unread asterisk
+            // up. Deduped via [lastMarkedId] — no RPC on ticks where nothing
+            // changed (feedback 2026-08-23).
+            if (quiet) {
+                val newestId = loaded.lastOrNull()?.id
+                if (newestId != null && newestId != lastMarkedId) {
+                    lastMarkedId = newestId
+                    ChatClient.markRead(room.id, newestId)
+                }
             }
         }
     }
@@ -278,7 +309,8 @@ class ThreadViewModel(
      * "local-…" row (no event id known at send time) is dropped when a real
      * message with the same body and a close timestamp appears.
      *
-     * The result is deduped by id and time-sorted, so a cluster of sends
+     * The result is deduped by id, then confirmed rows are time-sorted while
+     * still-pending rows stay newest in send order, so a cluster of sends
      * stays in order while the echoes land one poll at a time — without it,
      * an echo arriving out of order (or a fast-page → full-page transition
      * leaving a stale optimistic copy at the oldest end) visibly shuffled and
@@ -309,7 +341,16 @@ class ThreadViewModel(
                 result += pending
             }
         }
-        return result.distinctBy { it.id }.sortedBy { it.timestampMs }
+        // Pending rows (still in [pendingMessages]) keep their send order and
+        // stay newest: their timestamps are device-clock, while the confirmed
+        // echoes carry server-clock stamps — mixing them sorted the first
+        // message of a burst below its own echoes (feedback 2026-08-23).
+        // "local-…" rows are always pending; a fast-acked optimistic row with
+        // a real event id is too, until the served page replaces it. The
+        // confirmed sort is stable, so equal timestamps keep their order.
+        val distinct = result.distinctBy { it.id }
+        val (pending, confirmed) = distinct.partition { it in pendingMessages }
+        return confirmed.sortedBy { it.timestampMs } + pending
     }
 
     /** Inserts the just-sent message immediately (optimistic echo). */
@@ -360,7 +401,16 @@ class ThreadViewModel(
      * (feedback 2026-08-19).
      */
     fun playVoiceNote(eventId: String) {
-        playingEventId.value = if (playingEventId.value == eventId) null else eventId
+        val toggling = playingEventId.value == eventId
+        if (!toggling) {
+            // A NEW note starts at 0:00 — the position state still holds the
+            // previous note's last polled value, which otherwise showed a
+            // stale "random" position for a beat until the first poll landed
+            // and snapped it to 0 (feedback 2026-08-23).
+            playingPositionMs.value = 0L
+            playingPositionAtMs.value = android.os.SystemClock.elapsedRealtime()
+        }
+        playingEventId.value = if (toggling) null else eventId
         viewModelScope.launch {
             val (playing, error) = ChatClient.playVoiceNote(room.id, eventId)
             playingEventId.value = if (playing) eventId else null
@@ -382,6 +432,30 @@ class ThreadViewModel(
         if (!message.id.startsWith(LOCAL_ROW_PREFIX)) return
         viewModelScope.launch {
             ChatClient.retrySend(room.id, message.id.removePrefix(LOCAL_ROW_PREFIX))
+        }
+    }
+
+    /**
+     * Re-sends a bridge-reported delivery failure as a NEW message (tap on a
+     * "not delivered. tap to resend" row, 2026-08-23): the event already left
+     * the device, so there's no txn to retry — the same body goes out through
+     * the normal send path (like the composer) and the poll swaps in the echo.
+     */
+    fun resendAsNew(message: LightServiceMethod.GetMessages.Message) {
+        if (message.body.isBlank()) return
+        viewModelScope.launch {
+            val response = ChatClient.sendMessage(room.id, message.body) ?: return@launch
+            addOptimistic(
+                LightServiceMethod.GetMessages.Message(
+                    id = response.eventId ?: "local-${response.transactionId}",
+                    sender = "",
+                    senderName = "",
+                    body = message.body,
+                    timestampMs = System.currentTimeMillis(),
+                    isMine = true,
+                ),
+            )
+            loadNewest(quiet = true)
         }
     }
 
@@ -418,6 +492,11 @@ class ThreadViewModel(
                 if (older.isNotEmpty()) {
                     // distinctBy guards the page boundary: if the timeline changed
                     // between calls, the cursor event can appear at both edges.
+                    // No sort here — pagination cursors and merge boundaries are
+                    // position-based, and in rooms with non-monotonic timestamps
+                    // (re-import batches) a ts-sort moved the oldest row off the
+                    // chain edge, dead-ending older-page fetches (feedback
+                    // 2026-08-23: "scroll up doesn't refresh, nothing older").
                     messages.value = (older + messages.value).distinctBy { it.id }
                 }
                 hasMore.value = page?.hasMore ?: hasMore.value
@@ -481,7 +560,18 @@ class ThreadScreen(
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
-        val listState = rememberLazyListState()
+        // Restore the saved position at FIRST composition (the initial-params
+        // overload): returning from the fullscreen photo viewer otherwise
+        // created the list at the bottom and the post-composition scroll
+        // landed a frame late, flashing the newest messages first (feedback
+        // 2026-08-23). takeScrollToRestore is consume-once, so the restore
+        // effect below no-ops on this path; a fresh open (0,0) keeps the
+        // jump-to-bottom behavior.
+        val initialRestore = viewModel.takeScrollToRestore()
+        val listState = rememberLazyListState(
+            initialFirstVisibleItemIndex = initialRestore?.first ?: 0,
+            initialFirstVisibleItemScrollOffset = initialRestore?.second ?: 0,
+        )
 
         // Load the persisted read-status toggle once (idempotent).
         LaunchedEffect(Unit) { ChatSettings.load(lightContext) }
@@ -490,7 +580,7 @@ class ThreadScreen(
         // the moment the page lands, so visible rows render as soon as their
         // bytes arrive (instead of only when each row composes and fetches).
         LaunchedEffect(messages) {
-            messages.orEmpty().asReversed()
+            messages.asReversed()
                 .filter { it.contentType == "image" }
                 .take(MEDIA_PREFETCH_COUNT)
                 .forEach { viewModel.ensureMedia(it.id, downloadOverMobile) }
@@ -522,14 +612,17 @@ class ThreadScreen(
         // Read status only makes sense in a 1:1 — groups get no tag at all.
         val latestMessageId = remember(messages) { messages.lastOrNull()?.id }
 
-        // Infinite scroll, polled rather than snapshotFlow-driven: in this
-        // Compose version reads of LazyListState.layoutInfo don't invalidate
-        // snapshotFlow/derivedStateOf on every scroll (verified 2026-08-15), so
-        // a snapshotFlow trigger never fired — the list sat at its top with
-        // older messages one page away and "older messages don't load". The
-        // poll reads the real layout info each tick; the loadOlder condition
-        // is index-exact (the topmost visible index vs the total), so rows
-        // prepended above the viewport don't re-trigger it.
+        // Infinite scroll + scroll-bar metrics, polled rather than
+        // snapshotFlow-driven: in this Compose version reads of
+        // LazyListState.layoutInfo don't invalidate snapshotFlow/derivedStateOf
+        // on every scroll (verified 2026-08-15), so a snapshotFlow trigger
+        // never fired — the list sat at its top with older messages one page
+        // away and "older messages don't load". The poll reads the real layout
+        // info each tick; the loadOlder condition is index-exact (the topmost
+        // visible index vs the total), so rows prepended above the viewport
+        // don't re-trigger it.
+        val heightSampler = remember { HeightSampler() }
+        var scrollMetrics by remember { mutableStateOf(listState.threadListMetrics(heightSampler)) }
         LaunchedEffect(listState) {
             while (true) {
                 val info = listState.layoutInfo
@@ -538,6 +631,7 @@ class ThreadScreen(
                 if (total > 0 && topIndex >= total - OLDER_LOAD_THRESHOLD) {
                     viewModel.loadOlder()
                 }
+                scrollMetrics = listState.threadListMetrics(heightSampler)
                 delay(if (listState.isScrollInProgress) 50L else 300L)
             }
         }
@@ -592,55 +686,39 @@ class ThreadScreen(
                                     modifier = Modifier.fillMaxSize(),
                                 ) {
                                     items(rows, key = { it.key }) { row ->
-                                        when (row) {
-                                            is ThreadRow.Message -> MessageRow(
-                                                row.message,
-                                                // In a 1:1 the other person's name is
-                                                // redundant — the thread is the
-                                                // conversation with them. In groups,
-                                                // the name shows at the start of each
-                                                // sender's group (same rows that carry
-                                                // the timestamp).
-                                                showSender = !room.isDirect && row.showTime,
-                                                showTime = row.showTime,
-                                                showReadStatus = showReadStatus,
-                                                showDeliveryTag = row.message.id == latestMessageId && room.isDirect,
-                                                mediaBytes = mediaBytes,
-                                                allowMobile = downloadOverMobile,
-                                                playing = row.message.id == playingEventId,
-                                                playingPositionMs = playingPositionMs,
-                                                playingPositionAtMs = playingPositionAtMs,
-                                                voiceError = voiceError,
-                                                onEnsureMedia = viewModel::ensureMedia,
-                                                onPlayVoiceNote = viewModel::playVoiceNote,
-                                                onRetrySend = viewModel::retrySend,
-                                                onOpenImage = { bytes ->
-                                                    navigateTo(screenFactory = { FullscreenImageScreen(it, bytes) })
-                                                },
-                                            )
-                                        }
+                                        MessageRow(
+                                            row.message,
+                                            // In a 1:1 the other person's name is
+                                            // redundant — the thread is the
+                                            // conversation with them. In groups,
+                                            // the name shows at the start of each
+                                            // sender's group (same rows that carry
+                                            // the timestamp).
+                                            showSender = !room.isDirect && row.showTime,
+                                            showTime = row.showTime,
+                                            showReadStatus = showReadStatus,
+                                            showDeliveryTag = row.message.id == latestMessageId && room.isDirect,
+                                            mediaBytes = mediaBytes,
+                                            allowMobile = downloadOverMobile,
+                                            playing = row.message.id == playingEventId,
+                                            playingPositionMs = playingPositionMs,
+                                            playingPositionAtMs = playingPositionAtMs,
+                                            voiceError = voiceError,
+                                            onEnsureMedia = viewModel::ensureMedia,
+                                            onPlayVoiceNote = viewModel::playVoiceNote,
+                                            onRetrySend = viewModel::retrySend,
+                                            onResendAsNew = viewModel::resendAsNew,
+                                            onOpenImage = { bytes ->
+                                                navigateTo(screenFactory = { FullscreenImageScreen(it, bytes) })
+                                            },
+                                        )
                                     }
                                 }
                                 // Thread rows vary in height, so the SDK's
                                 // uniform-height LightLazyScrollView can't drive the
                                 // thumb — ThreadScrollBar estimates from the real
                                 // lazy layout (same rail + thumb look as the SDK
-                                // bar). Polled rather than snapshot-driven: reads of
-                                // LazyListState.layoutInfo don't invalidate on every
-                                // scroll in this Compose version (verified on-device),
-                                // so derivedStateOf/snapshotFlow go stale.
-                                val heightSampler = remember { HeightSampler() }
-                                var scrollMetrics by remember {
-                                    mutableStateOf(listState.threadListMetrics(heightSampler))
-                                }
-                                LaunchedEffect(listState) {
-                                    while (true) {
-                                        scrollMetrics = listState.threadListMetrics(heightSampler)
-                                        delay(
-                                            if (listState.isScrollInProgress) 50L else 300L,
-                                        )
-                                    }
-                                }
+                                // bar). The metrics loop above feeds it.
                                 if (scrollMetrics.overflows) {
                                     val scope = rememberCoroutineScope()
                                     ThreadScrollBar(
@@ -704,9 +782,12 @@ class ThreadScreen(
 
         // Show the newest messages on open (and after sending); not on older
         // pages, which arrive while the user is reading further up. Returning
-        // from the fullscreen photo viewer restores the position the photo was
-        // at instead (consume-once — feedback 2026-08-20); the jumpToBottom
-        // key keeps the effect re-firing when the flag flips after the load.
+        // from the fullscreen photo viewer restores the position at first
+        // composition (the list state's initial params above) — the
+        // takeScrollToRestore here is the consume-once guard, so that path
+        // never re-scrolls or jumps to the bottom (feedback 2026-08-20/
+        // 2026-08-23); the jumpToBottom key keeps the effect re-firing when
+        // the flag flips after the load.
         LaunchedEffect(jumpToBottom, messages.size) {
             if (messages.isEmpty()) return@LaunchedEffect
             viewModel.takeScrollToRestore()?.let { (index, offset) ->
@@ -762,7 +843,7 @@ class ThreadScreen(
      */
     private fun openContact() {
         navigateTo(screenFactory = {
-            ContactScreen(it, room.name, room.network, contactIdentifier(room.contactId, room.name))
+            ContactScreen(it, room.name, room.network, contactIdentifier(room.contactId, room.name), room.contactPhone)
         })
     }
 
@@ -783,21 +864,13 @@ class ThreadScreen(
             val rest = localpart.removePrefix("whatsapp_")
             if (rest != localpart) { // a WhatsApp bridged ID
                 if (rest.startsWith("lid-")) {
-                    return displayName.takeIf { it.isPhoneNumberLike() }
+                    return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
                 }
                 return formatBridgePhone(rest)
             }
             return localpart
         }
-        return displayName.takeIf { it.isPhoneNumberLike() }
-    }
-
-    private fun String.isPhoneNumberLike(): Boolean {
-        val digits = trim().replace(Regex("[\\s\\-().]"), "")
-        return digits.length in 7..15 &&
-            digits.all { it.isDigit() || it == '+' } &&
-            digits.count { it == '+' } <= 1 &&
-            digits.any { it.isDigit() }
+        return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
     }
 }
 
@@ -816,24 +889,18 @@ private fun DecryptionNotice() {
     )
 }
 
-/** One row of the thread: a message (Phase 9). */
-private sealed interface ThreadRow {
-    val key: String
-
-    /**
-     * [showTime]: whether this message starts a group (a new day, a different
-     * sender, or a gap of [GROUP_WINDOW_MS] from the previous message) — the
-     * only messages that carry a timestamp (feedback pass). The timestamp
-     * itself carries the day tag ("Yesterday", weekday, "Aug 12") when the
-     * message isn't from today (feedback 2026-08-21: day tags on the message
-     * timestamps replaced the centered day dividers).
-     */
-    data class Message(
-        val message: LightServiceMethod.GetMessages.Message,
-        val showTime: Boolean,
-    ) : ThreadRow {
-        override val key get() = message.id
-    }
+/** One row of the thread: a message (Phase 9). [showTime]: whether this
+ *  message starts a group (a new day, a different sender, or a gap of
+ *  [GROUP_WINDOW_MS] from the previous message) — the only messages that
+ *  carry a timestamp (feedback pass). The timestamp itself carries the day tag
+ *  ("Yesterday", weekday, "Aug 12") when the message isn't from today
+ *  (feedback 2026-08-21: day tags on the message timestamps replaced the
+ *  centered day dividers). */
+private data class ThreadRow(
+    val message: LightServiceMethod.GetMessages.Message,
+    val showTime: Boolean,
+) {
+    val key: String get() = message.id
 }
 
 /**
@@ -850,7 +917,7 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
     var prevMessage: LightServiceMethod.GetMessages.Message? = null
     for (message in messages) { // oldest-first, as the view model stores them
         if (message.timestampMs <= 0) {
-            rows += ThreadRow.Message(message, showTime = true)
+        rows += ThreadRow(message, showTime = true)
             continue
         }
         val day = dayOf(message.timestampMs)
@@ -858,7 +925,7 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
         val showTime = newDay || prevMessage == null ||
             prevMessage.sender != message.sender ||
             message.timestampMs - prevMessage.timestampMs >= GROUP_WINDOW_MS
-        rows += ThreadRow.Message(message, showTime)
+        rows += ThreadRow(message, showTime)
         prevMessage = message
         prevDay = day
     }
@@ -928,6 +995,7 @@ private fun MessageRow(
     onEnsureMedia: (String, Boolean) -> Unit,
     onPlayVoiceNote: (String) -> Unit,
     onRetrySend: (LightServiceMethod.GetMessages.Message) -> Unit,
+    onResendAsNew: (LightServiceMethod.GetMessages.Message) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
 ) {
     // Phase 13: a buffer keeps message text off the far screen edge. Outgoing
@@ -974,9 +1042,11 @@ private fun MessageRow(
         val failed = message.sendStatus?.startsWith("FAIL_") == true
         // Locally-failed rows (the outbox recorded a send error, txn still
         // pending) are tappable — tap re-sends the same transaction
-        // (2026-08-22). Bridge-reported FAIL_* rows already left the device;
-        // they stay a plain marker.
+        // (2026-08-22). Bridge-reported FAIL_* text rows (real event id, no
+        // txn to retry) re-send the same body as a NEW message instead
+        // (2026-08-23); non-text bridge failures stay a plain marker.
         val retryable = failed && message.sendStatus == "FAIL_LOCAL_SEND" && inFlight
+        val retryableNew = failed && !inFlight && message.contentType == "text" && message.body.isNotBlank()
         Column(
             modifier = Modifier
                 .fillMaxWidth(MESSAGE_WIDTH_FRACTION)
@@ -985,8 +1055,11 @@ private fun MessageRow(
                 // tap target is the row's bubble area, like the image/audio
                 // rows' own clickables.
                 .then(
-                    if (retryable) Modifier.lightClickable(onClick = { onRetrySend(message) })
-                    else Modifier,
+                    when {
+                        retryable -> Modifier.lightClickable(onClick = { onRetrySend(message) })
+                        retryableNew -> Modifier.lightClickable(onClick = { onResendAsNew(message) })
+                        else -> Modifier
+                    },
                 ),
             horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start,
         ) {
@@ -1063,10 +1136,15 @@ private fun MessageRow(
             // shows on any message, old or new.
             if (message.isMine && failed) {
                 LightText(
-                    // A locally-failed row can be re-sent by tapping it; a
-                    // bridge-reported failure ("! not delivered") has no resend
-                    // path on this device (2026-08-22).
-                    text = if (retryable) "failed to send. tap to resend" else "! not delivered",
+                    // A locally-failed row re-sends the same transaction when
+                    // tapped; a bridge-reported text failure re-sends the body
+                    // as a new message; non-text bridge failures have no resend
+                    // path (2026-08-23).
+                    text = when {
+                        retryable -> "failed to send. tap to resend"
+                        retryableNew -> "not delivered. tap to resend"
+                        else -> "! not delivered"
+                    },
                     variant = LightTextVariant.Superfine,
                     // Solid white like the timestamps — the delivery labels
                     // read like the rest of the message, not dimmed (feedback
@@ -1116,21 +1194,19 @@ private fun ImageMessageContent(
     // moving off cellular) re-attempts rows that were skipped as Wi-Fi-only.
     LaunchedEffect(message.id, allowMobile) { onEnsureMedia(message.id, allowMobile) }
     val bytes = mediaBytes[message.id]
-    if (bytes == null) {
-        // Still loading, or the media can't be fetched (e.g. still-encrypted):
-        // fall back to the row text ("[Photo]" or the file name).
-        LightText(
-            text = message.body,
-            variant = LightTextVariant.Paragraph,
-            lighten = true,
-            modifier = Modifier.padding(top = 1.dp),
-        )
-        return
+    // Decode off the main thread: the in-composition decode blocked the UI
+    // thread's first paint for every visible photo (feedback 2026-08-23).
+    // The text fallback below renders until the bitmap lands.
+    val bitmap by produceState<ImageBitmap?>(null, bytes) {
+        value = withContext(Dispatchers.Default) {
+            bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size).asImageBitmap() }
+        }
     }
-    val bitmap = remember(bytes, message.id) {
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-    }
-    if (bitmap == null) {
+    val image = bitmap
+    if (bytes == null || image == null) {
+        // Still loading, or the media can't be fetched/decoded (e.g.
+        // still-encrypted): fall back to the row text ("[Photo]" or the file
+        // name).
         LightText(
             text = message.body,
             variant = LightTextVariant.Paragraph,
@@ -1140,7 +1216,7 @@ private fun ImageMessageContent(
         return
     }
     Image(
-        bitmap = bitmap.asImageBitmap(),
+        bitmap = image,
         contentDescription = message.body,
         contentScale = ContentScale.Fit,
         modifier = Modifier
@@ -1230,10 +1306,8 @@ private fun AudioMessageContent(
 }
 
 /** m:ss for a voice-note length/position. */
-private fun formatDuration(ms: Long): String {
-    val totalSecs = (ms / 1000).coerceAtLeast(0)
-    return "${totalSecs / 60}:${(totalSecs % 60).toString().padStart(2, '0')}"
-}
+private fun formatDuration(ms: Long): String =
+    DateUtils.formatElapsedTime((ms / 1000).coerceAtLeast(0))
 
 /** Cap for the message block — long text never spans the full row width.
  *  The far-side buffer (the empty band on the message's outer side) is half
