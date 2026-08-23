@@ -43,6 +43,8 @@ import kotlinx.coroutines.withContext
  */
 class FullscreenImageScreen(
     sealedActivity: SealedLightActivity,
+    /** Image event id — keys the shared decoded-bitmap cache ([chatsBitmapCache]). */
+    private val eventId: String,
     private val bytes: ByteArray,
 ) : SimpleLightScreen<Unit>(sealedActivity) {
 
@@ -50,10 +52,14 @@ class FullscreenImageScreen(
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         // Decode off the main thread; the viewer shows the background until
-        // the bitmap lands (feedback 2026-08-23).
-        val bitmap by produceState<ImageBitmap?>(null, bytes) {
-            value = withContext(Dispatchers.Default) {
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+        // the bitmap lands (feedback 2026-08-23). Seeded from the shared
+        // decode cache so the thread row finds the bitmap already decoded
+        // when this viewer closes (LP3 2026-08-23 — re-decode flash).
+        val bitmap by produceState<ImageBitmap?>(chatsBitmapCache.get(eventId), bytes) {
+            if (value == null) {
+                value = withContext(Dispatchers.Default) {
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                }?.also { chatsBitmapCache.put(eventId, it) }
             }
         }
         val image = bitmap

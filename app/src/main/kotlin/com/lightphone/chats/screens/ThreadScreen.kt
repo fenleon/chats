@@ -88,12 +88,87 @@ private const val MEDIA_PREFETCH_COUNT = 4
  */
 private val chatsMediaCache = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
 
+/**
+ * Decoded display bitmaps per image event id. The BYTES live in
+ * [chatsMediaCache] and survive navigation; the decode does not — returning
+ * from the fullscreen viewer re-enters the row's composition, and the
+ * re-decode started from a null frame, flashing the "[Photo]" fallback before
+ * the image popped back in (LP3 2026-08-23). Bounded: full-res photos decode
+ * to tens of MB, so only the most recent few are kept (eviction is
+ * insertion-order, fine for a handful of photos; ponytail: LRU if the count
+ * ever matters).
+ */
+internal object chatsBitmapCache {
+    private val map = java.util.concurrent.ConcurrentHashMap<String, ImageBitmap>()
+    private const val MAX_ENTRIES = 4
+
+    fun get(eventId: String): ImageBitmap? = map[eventId]
+
+    fun put(eventId: String, bitmap: ImageBitmap) {
+        if (map.size >= MAX_ENTRIES && !map.containsKey(eventId)) {
+            map.remove(map.keys.first())
+        }
+        map[eventId] = bitmap
+    }
+}
+
+/**
+ * Loaded message pages + last scroll position per room id. The thread's
+ * [ThreadViewModel] is recreated on every open, so paged-in history and the
+ * scroll position were lost on exit — re-opening re-fetched the newest page
+ * and re-paged from the server ("exit and come back, it has to load again",
+ * LP3 2026-08-23). Kept process-wide (like [chatsMediaCache]) so a re-open
+ * renders the already-loaded history instantly and restores the position.
+ * Room ids are server-scoped, so a different account can't collide.
+ */
+internal object threadStateCache {
+    private val messageFlows = mutableMapOf<String, MutableStateFlow<List<LightServiceMethod.GetMessages.Message>>>()
+    private val scroll = mutableMapOf<String, Pair<Int, Int>>()
+
+    /** The room's message list — the SAME flow across re-opens of the room. */
+    fun messagesFlow(roomId: String): MutableStateFlow<List<LightServiceMethod.GetMessages.Message>> =
+        messageFlows.getOrPut(roomId) { MutableStateFlow(emptyList()) }
+
+    fun saveScroll(roomId: String, index: Int, offset: Int) {
+        scroll[roomId] = index to offset
+    }
+
+    fun takeScroll(roomId: String): Pair<Int, Int>? = scroll[roomId]
+}
+
+/**
+ * Resend-attempt counter per message id (2026-08-23): "not delivered. tap to
+ * resend" caps at [MAX_RESEND_ATTEMPTS] — each tap sends the body as a NEW
+ * message, so an endless loop would spam duplicates. The count propagates to
+ * the resend's new row (the chain shares one number), so tapping the original
+ * OR its resends consumes the same budget. In-memory per process run: a fresh
+ * app start resets the counter (the rows offer resend again — acceptable; the
+ * cap is about duplicate spam within a session).
+ */
+internal object resendChainState {
+    private val attempts = MutableStateFlow<Map<String, Int>>(emptyMap())
+
+    fun observe() = attempts
+
+    fun attemptsFor(messageId: String): Int = attempts.value[messageId] ?: 0
+
+    /** Records one resend: [messageId]'s chain increments and [newRowId] joins it. */
+    fun recordResend(messageId: String, newRowId: String) {
+        val n = attemptsFor(messageId) + 1
+        attempts.value = attempts.value + (messageId to n) + (newRowId to n)
+    }
+}
+
 class ThreadViewModel(
     private val room: LightServiceMethod.GetRooms.Room,
 ) : LightViewModel<Unit>() {
 
-    /** Oldest-first page of messages; older pages are prepended by [loadOlder]. */
-    val messages = MutableStateFlow<List<LightServiceMethod.GetMessages.Message>>(emptyList())
+    /**
+     * Oldest-first page of messages; older pages are prepended by [loadOlder].
+     * Process-wide per room ([threadStateCache]) — re-opening the thread keeps
+     * the already-loaded history instead of re-fetching it (2026-08-23).
+     */
+    val messages = threadStateCache.messagesFlow(room.id)
     val loading = MutableStateFlow(true)
     val loadingMore = MutableStateFlow(false)
     val hasMore = MutableStateFlow(false)
@@ -103,6 +178,20 @@ class ThreadViewModel(
     val e2eeVerified = MutableStateFlow<Boolean?>(null)
     /** Whether the room needs decryption (set from the first getMessages response). */
     val roomEncrypted = MutableStateFlow(false)
+
+    /**
+     * Mute state for the contact panel (2026-08-23): starts from the room
+     * list's value and updates locally on toggle — the list re-fetch keeps the
+     * server copy in sync, this keeps the panel honest within the session.
+     */
+    val muted = MutableStateFlow(room.muted)
+
+    /** Toggles [muted] locally and persists it server-side (notifications only). */
+    fun toggleMuted() {
+        val next = !muted.value
+        muted.value = next
+        viewModelScope.launch { ChatClient.setRoomMuted(room.id, next) }
+    }
 
     /**
      * Display JPEG bytes per image-message event id (Phase 13). This is a view
@@ -155,10 +244,12 @@ class ThreadViewModel(
     /**
      * Thread scroll position, saved continuously by the screen and restored on
      * show — returning from the fullscreen photo viewer must land where the
-     * photo was, not the newest messages (feedback 2026-08-20).
+     * photo was, not the newest messages (feedback 2026-08-20). Persisted
+     * process-wide ([threadStateCache]) so a full re-open of the thread also
+     * lands where the user left off (2026-08-23).
      */
-    private var savedScrollIndex = 0
-    private var savedScrollOffset = 0
+    private var savedScrollIndex = threadStateCache.takeScroll(room.id)?.first ?: 0
+    private var savedScrollOffset = threadStateCache.takeScroll(room.id)?.second ?: 0
     private var scrollToRestore: Pair<Int, Int>? = null
     /** Newest event id already marked read — dedup for the poll's re-mark. */
     private var lastMarkedId: String? = null
@@ -166,6 +257,7 @@ class ThreadViewModel(
     fun saveScroll(index: Int, offset: Int) {
         savedScrollIndex = index
         savedScrollOffset = offset
+        threadStateCache.saveScroll(room.id, index, offset)
     }
 
     /** The position to restore on show (consume-once), or null when at the newest. */
@@ -440,11 +532,16 @@ class ThreadViewModel(
      * "not delivered. tap to resend" row, 2026-08-23): the event already left
      * the device, so there's no txn to retry — the same body goes out through
      * the normal send path (like the composer) and the poll swaps in the echo.
+     * Capped at [MAX_RESEND_ATTEMPTS] per chain — each resend is a new
+     * message, so an endless loop would spam duplicates (feedback 2026-08-23:
+     * "only try twice, then just show 'failed to deliver'").
      */
     fun resendAsNew(message: LightServiceMethod.GetMessages.Message) {
         if (message.body.isBlank()) return
+        if (resendChainState.attemptsFor(message.id) >= MAX_RESEND_ATTEMPTS) return
         viewModelScope.launch {
             val response = ChatClient.sendMessage(room.id, message.body) ?: return@launch
+            resendChainState.recordResend(message.id, response.eventId ?: "local-${response.transactionId}")
             addOptimistic(
                 LightServiceMethod.GetMessages.Message(
                     id = response.eventId ?: "local-${response.transactionId}",
@@ -487,7 +584,7 @@ class ThreadViewModel(
         viewModelScope.launch {
             loadingMore.value = true
             try {
-                val page = ChatClient.getMessages(room.id, oldest.id, PAGE_SIZE)
+                val page = ChatClient.getMessages(room.id, oldest.id, OLDER_PAGE_SIZE)
                 val older = page?.messages.orEmpty()
                 if (older.isNotEmpty()) {
                     // distinctBy guards the page boundary: if the timeline changed
@@ -514,7 +611,10 @@ class ThreadViewModel(
     private var loadJob: Job? = null
 
     private companion object {
+        /** Newest-page size (matches the server's THREAD_PAGE_SIZE). */
         const val PAGE_SIZE = 20
+        /** Older-page size: 6 ≈ one screenful per scroll-up load (2026-08-23). */
+        const val OLDER_PAGE_SIZE = 6
         /** Poll cadence while the thread is on screen (feedback pass). */
         const val THREAD_POLL_MS = 3_000L
         /** How close (ms) a real echo's timestamp must be to a "local-…" row. */
@@ -532,6 +632,19 @@ private const val OLDER_LOAD_THRESHOLD = 3
 
 /** Optimistic rows (not yet echoed by sync) carry this id prefix. */
 private const val LOCAL_ROW_PREFIX = "local-"
+
+/**
+ * Max tap-to-resend attempts per message chain (2026-08-23): each resend is a
+ * NEW message, so past this the row shows a static "failed to deliver" instead
+ * of offering another duplicate.
+ */
+private const val MAX_RESEND_ATTEMPTS = 2
+
+/**
+ * Failed messages older than this show a static "failed to deliver" — a stale
+ * bridge FAIL isn't worth another duplicate send (feedback 2026-08-23: 4 h).
+ */
+private const val RESEND_MAX_AGE_MS = 4L * 60 * 60 * 1000
 
 class ThreadScreen(
     sealedActivity: SealedLightActivity,
@@ -557,6 +670,7 @@ class ThreadScreen(
         val playingPositionMs by viewModel.playingPositionMs.collectAsState()
         val playingPositionAtMs by viewModel.playingPositionAtMs.collectAsState()
         val voiceError by viewModel.voiceError.collectAsState()
+        val muted by viewModel.muted.collectAsState()
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
@@ -709,7 +823,7 @@ class ThreadScreen(
                                             onRetrySend = viewModel::retrySend,
                                             onResendAsNew = viewModel::resendAsNew,
                                             onOpenImage = { bytes ->
-                                                navigateTo(screenFactory = { FullscreenImageScreen(it, bytes) })
+                                                navigateTo(screenFactory = { FullscreenImageScreen(it, row.message.id, bytes) })
                                             },
                                         )
                                     }
@@ -843,7 +957,16 @@ class ThreadScreen(
      */
     private fun openContact() {
         navigateTo(screenFactory = {
-            ContactScreen(it, room.name, room.network, contactIdentifier(room.contactId, room.name), room.contactPhone)
+            ContactScreen(
+                it,
+                room.id,
+                room.name,
+                room.network,
+                contactIdentifier(room.contactId, room.name),
+                room.contactPhone,
+                muted = viewModel.muted.value,
+                onToggleMute = viewModel::toggleMuted,
+            )
         })
     }
 
@@ -1047,6 +1170,15 @@ private fun MessageRow(
         // (2026-08-23); non-text bridge failures stay a plain marker.
         val retryable = failed && message.sendStatus == "FAIL_LOCAL_SEND" && inFlight
         val retryableNew = failed && !inFlight && message.contentType == "text" && message.body.isNotBlank()
+        // Resend budget per message chain (2026-08-23): after
+        // [MAX_RESEND_ATTEMPTS] — or once the message is older than
+        // [RESEND_MAX_AGE_MS] — the row turns static "failed to deliver":
+        // no more duplicate sends.
+        val resendAttempts by resendChainState.observe().collectAsState()
+        val resendExhausted = retryableNew && (
+            (resendAttempts[message.id] ?: 0) >= MAX_RESEND_ATTEMPTS ||
+                System.currentTimeMillis() - message.timestampMs >= RESEND_MAX_AGE_MS
+            )
         Column(
             modifier = Modifier
                 .fillMaxWidth(MESSAGE_WIDTH_FRACTION)
@@ -1057,7 +1189,7 @@ private fun MessageRow(
                 .then(
                     when {
                         retryable -> Modifier.lightClickable(onClick = { onRetrySend(message) })
-                        retryableNew -> Modifier.lightClickable(onClick = { onResendAsNew(message) })
+                        retryableNew && !resendExhausted -> Modifier.lightClickable(onClick = { onResendAsNew(message) })
                         else -> Modifier
                     },
                 ),
@@ -1118,7 +1250,7 @@ private fun MessageRow(
                 }
             }
             // Phase 14: reactions, as a quiet tag under the message (same
-            // grammar as the "! not delivered" marker). Each entry reads
+            // grammar as the "not delivered" marker). Each entry reads
             // "Name reacted with ❤️" (or "You reacted with …" for own) —
             // feedback 2026-08-14.
             if (message.reactions.isNotEmpty()) {
@@ -1131,7 +1263,7 @@ private fun MessageRow(
                 )
             }
             // Beeper reports failed deliveries with a com.beeper.message_send_status
-            // event (Phase 10) — a quiet "!" marker beats a silent stall. The
+            // event (Phase 10) — a quiet label beats a silent stall. The
             // thread poll surfaces it within seconds, no new send needed. It
             // shows on any message, old or new.
             if (message.isMine && failed) {
@@ -1139,11 +1271,13 @@ private fun MessageRow(
                     // A locally-failed row re-sends the same transaction when
                     // tapped; a bridge-reported text failure re-sends the body
                     // as a new message; non-text bridge failures have no resend
-                    // path (2026-08-23).
+                    // path (2026-08-23). A chain past [MAX_RESEND_ATTEMPTS]
+                    // turns static "failed to deliver" (feedback 2026-08-23).
                     text = when {
                         retryable -> "failed to send. tap to resend"
-                        retryableNew -> "not delivered. tap to resend"
-                        else -> "! not delivered"
+                        retryableNew && !resendExhausted -> "not delivered. tap to resend"
+                        retryableNew -> "failed to deliver"
+                        else -> "not delivered"
                     },
                     variant = LightTextVariant.Superfine,
                     // Solid white like the timestamps — the delivery labels
@@ -1196,10 +1330,15 @@ private fun ImageMessageContent(
     val bytes = mediaBytes[message.id]
     // Decode off the main thread: the in-composition decode blocked the UI
     // thread's first paint for every visible photo (feedback 2026-08-23).
-    // The text fallback below renders until the bitmap lands.
-    val bitmap by produceState<ImageBitmap?>(null, bytes) {
-        value = withContext(Dispatchers.Default) {
-            bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size).asImageBitmap() }
+    // The text fallback below renders until the bitmap lands. Seeded from the
+    // process-wide [chatsBitmapCache]: returning from the fullscreen viewer
+    // re-enters this composition, and re-decoding started from a null frame
+    // (a "[Photo]" flash before the image popped back in, LP3 2026-08-23).
+    val bitmap by produceState<ImageBitmap?>(chatsBitmapCache.get(message.id), bytes) {
+        if (bytes != null && value == null) {
+            value = withContext(Dispatchers.Default) {
+                bytes.let { BitmapFactory.decodeByteArray(it, 0, it.size).asImageBitmap() }
+            }?.also { chatsBitmapCache.put(message.id, it) }
         }
     }
     val image = bitmap

@@ -398,6 +398,7 @@ object MatrixRepository {
     fun init(context: Context) {
         val app = context.applicationContext
         if (appContext == null) appContext = app
+        MuteStore.init(app)
         enableTrixnityLogging()
         // Settings → Sync pause (audit 2026-08-14): a paused companion starts
         // no sync loop and no foreground service — the battery escape hatch.
@@ -2122,7 +2123,7 @@ object MatrixRepository {
      *  treated as SENT the moment the server acks it: once the outbox records
      *  the real event id (the /send 200 — ~1s after the send, long before the
      *  sync echo), the row carries that id + the send time; a recorded outbox
-     *  error renders as "! not delivered" (FAIL_ status, shown by the tool);
+     *  error renders as "not delivered" (FAIL_ status, shown by the tool);
      *  only a still-queued send keeps the optimistic "local-…" row. The tool
      *  shows the send time for all three, so the thread reflects a send
      *  immediately, until proven sent or not delivered (feedback 2026-08-17).
@@ -2279,10 +2280,12 @@ object MatrixRepository {
         val startIndex = if (keepCursor) 0 else 1 // drop the boundary cursor on older pages
         // Delivery status only matters for the newest page (what the user just
         // sent): the status events sit right after the message in the timeline.
-        // Older pages don't get the marker (Phase 10, minimal scope). The fast
-        // first-page path skips the status windows (each is a 250-event
-        // network walk); the background refresh adds them.
-        val sendStatuses = if (beforeEventId == null && !fast) sendStatusByEventId(c, matrixRoomId) else emptyMap()
+        // Send statuses ride on EVERY page (2026-08-23): a bridge FAIL on a
+        // message that scrolled past the newest page showed as plain "sent"
+        // — the honest "not delivered" marker must survive pagination. The
+        // walk itself is cached per room (see [sendStatusesByEventIdCached]),
+        // so older/fast pages cost one map read.
+        val sendStatuses = sendStatusesByEventIdCached(c, matrixRoomId)
         // Same scoping for read receipts: only the newest page reports whether
         // the other party has read an outgoing message (receipts point at the
         // newest events; an older page's messages are always "read" in practice
@@ -2420,6 +2423,29 @@ object MatrixRepository {
     /** Memoized bridge-bot id per room ("" = non-bridged), resolved lazily on
      *  a room's first newest-page build — see [bridgeBotOf]. */
     private val bridgeBotByRoom = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Room → (fetched-at elapsedRealtime, status map), TTL-cached so every
+     *  page build (fast warm, pagination, refresh) reads one map instead of
+     *  re-walking the room's status window per call (2026-08-23). */
+    private val sendStatusCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Map<String, String>>>()
+
+    /** [sendStatusByEventId] with a per-room TTL cache — statuses must reach
+     *  messages on ANY page (the FAIL marker disappearing once a message
+     *  scrolled past the newest page read as "sent but not delivered", LP3
+     *  2026-08-23), and the 250-event walk must not run per page build. */
+    private suspend fun sendStatusesByEventIdCached(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+    ): Map<String, String> {
+        val key = matrixRoomId.full
+        val now = android.os.SystemClock.elapsedRealtime()
+        sendStatusCache[key]?.let { (fetchedAt, map) ->
+            if (now - fetchedAt < SEND_STATUS_CACHE_TTL_MS) return map
+        }
+        val map = sendStatusByEventId(c, matrixRoomId)
+        sendStatusCache[key] = now to map
+        return map
+    }
 
     /**
      * Latest Beeper send status per message event id, from the room's most
@@ -2781,8 +2807,14 @@ object MatrixRepository {
     // one of our own messages cites encryption/session problems, rotate the
     // outbound session once and never check the room again.
 
-    /** Rooms whose outbound megolm session was already rotated (one-shot). */
-    private val megolmRotatedRooms = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    /**
+     * Room → last-rotation elapsedRealtime for the outbound megolm session.
+     * Re-armed (2026-08-23): once-per-run gave a broken room exactly one
+     * rotation — the Hannah room redacted the new key after one message, so
+     * the next FAIL burst had no second attempt. Now rotation is allowed again
+     * after [MEGOLM_RE_ROTATE_MIN_MS], letting repeated FAIL bursts recover.
+     */
+    private val megolmRotatedRooms = java.util.concurrent.ConcurrentHashMap<String, Long>()
     /** Room → (checked-at elapsedRealtime, stale verdict) — the check walks
      *  the room's newest events, so it's cached for [MEGOLM_STALE_CHECK_TTL_MS]
      *  instead of running before every send. */
@@ -2794,11 +2826,21 @@ object MatrixRepository {
      *  (delivery failures etc.) must not churn the session. */
     private val MEGOLM_STALE_KEYWORDS = listOf("undecryptable")
 
-    /** Rotates a stale outbound megolm session once per room. Called before
-     *  every send; the scan is TTL-cached, and a parse failure only logs —
-     *  the send must never fail because of the check. */
+    /** Minimum gap between outbound-megolm rotations (heal re-arm, 2026-08-23). */
+    private val MEGOLM_RE_ROTATE_MIN_MS = 60_000L
+
+    private fun canRotateMegolm(roomKey: String): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val last = megolmRotatedRooms[roomKey] ?: 0L
+        return now - last >= MEGOLM_RE_ROTATE_MIN_MS
+    }
+
+    /** Rotates a stale outbound megolm session (re-armed: at most every
+     *  [MEGOLM_RE_ROTATE_MIN_MS] per room). Called before every send; the scan
+     *  is TTL-cached, and a parse failure only logs — the send must never fail
+     *  because of the check. */
     private suspend fun rotateStaleMegolmIfNeeded(c: MatrixClient, matrixRoomId: RoomId) {
-        if (megolmRotatedRooms.contains(matrixRoomId.full)) return
+        if (!canRotateMegolm(matrixRoomId.full)) return
         val now = android.os.SystemClock.elapsedRealtime()
         encryptionFailCheck[matrixRoomId.full]?.let { (fetchedAt, stale) ->
             if (now - fetchedAt < MEGOLM_STALE_CHECK_TTL_MS) {
@@ -2832,7 +2874,7 @@ object MatrixRepository {
      * bridge's current identity.
      */
     private fun rotateOnBridgeUndecryptable(c: MatrixClient, matrixRoomId: RoomId, reason: String) {
-        if (megolmRotatedRooms.contains(matrixRoomId.full)) return
+        if (!canRotateMegolm(matrixRoomId.full)) return
         scope.launch { rotateStaleMegolmOnce(c, matrixRoomId, reason) }
     }
 
@@ -2883,7 +2925,7 @@ object MatrixRepository {
         runCatching {
             c.di.get<OlmCryptoStore>(OlmCryptoStore::class).updateOutboundMegolmSession(matrixRoomId) { null }
         }.onSuccess {
-            megolmRotatedRooms.add(matrixRoomId.full)
+            megolmRotatedRooms[matrixRoomId.full] = android.os.SystemClock.elapsedRealtime()
             android.util.Log.d(TAG, "rotated stale megolm session for $matrixRoomId (bridge FAIL: $reason)")
         }
     }
@@ -2893,6 +2935,7 @@ object MatrixRepository {
         body: String,
         replyToEventId: String?,
     ): com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response {
+        try {
         val c = client ?: error("not logged in")
         val matrixRoomId = RoomId(roomId)
         // One-shot self-heal for the 2026-08-12 bridge-key bug window (see the
@@ -2936,6 +2979,15 @@ object MatrixRepository {
             transactionId = txnId,
             eventId = null, // not awaited — the sync echo supplies the real id
         )
+        } catch (e: Exception) {
+            // A send that dies before enqueueing used to be invisible: the RPC
+            // failure maps to null on the tool side and the resend looked like
+            // a no-op (LP3 2026-08-23 — "tap to resend" pressed, nothing sent,
+            // zero events/outbox rows/log lines). Log the full stack so the
+            // next resend attempt is diagnosable.
+            android.util.Log.e(TAG, "SendMessage FAILED room=$roomId body=$body", e)
+            throw e
+        }
     }
 
     /**
@@ -3677,6 +3729,16 @@ object MatrixRepository {
         )
     }
 
+    /**
+     * Mutes or unmutes a room's notifications (tool contact panel,
+     * 2026-08-23). The mute is a local device preference — the room list and
+     * unread badge keep updating, only [notifyForEvent] is gated.
+     */
+    fun setRoomMuted(roomId: String, muted: Boolean) {
+        MuteStore.setMuted(roomId, muted)
+        android.util.Log.d(TAG, "setRoomMuted: room=$roomId muted=$muted")
+    }
+
     // --- Notifications (Phase 4) --------------------------------------------
 
     /**
@@ -3828,6 +3890,13 @@ object MatrixRepository {
         if (!ctx.getSystemService(NotificationManager::class.java).areNotificationsEnabled()) return
         if (activeRoomId == roomId.full) return
         if (room.membership != Membership.JOIN) return
+        // Muted room (tool contact panel, 2026-08-23): stop notifying; the
+        // unread badge and the room list stay. Checked before the decrypt
+        // wait so a muted room costs nothing per message.
+        if (MuteStore.isMuted(roomId.full)) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping muted room $roomId")
+            return
+        }
         // Wait briefly for decryption so the preview shows the real text (the
         // raw m.room.encrypted payload resolves within milliseconds for live
         // events once the megolm session is in the store).
@@ -4238,6 +4307,7 @@ object MatrixRepository {
                     isDirect = room.isDirect || (room.joinedMemberCount ?: 0L) <= 1L,
                     contactId = contactIdOf(room),
                     network = networks[key],
+                    muted = MuteStore.isMuted(key),
                 ),
                 nameResolved = false,
                 previewResolved = false,
@@ -4383,6 +4453,7 @@ object MatrixRepository {
                 // for the member-state read). Null for groups/seed rows.
                 contactPhone = contactIdOf(room)?.let { contactPhoneOf(c, roomId, it) },
                 network = networks[key],
+                muted = MuteStore.isMuted(key),
             ),
             nameResolved = true,
             previewResolved = previewResolved,
@@ -5170,6 +5241,10 @@ object MatrixRepository {
     private const val MAX_PREVIEW_LENGTH = 80
     /** How many recent timeline events to scan for Beeper send-status events. */
     private const val SEND_STATUS_WINDOW = 250
+    /** Per-room [sendStatusesByEventIdCached] TTL: the statuses only change
+     *  when the bridge posts a new one, so a short stale window is invisible
+     *  (aligned with the thread's 3 s poll). */
+    private const val SEND_STATUS_CACHE_TTL_MS = 15_000L
     /** Flood-context read TTL (see [ghostContext]): the density verdict can't
      *  change within seconds, so a message burst reuses the walk instead of
      *  re-reading 250 events per event (battery 2026-08-17 audit). */
@@ -5196,8 +5271,10 @@ object MatrixRepository {
     private const val THREAD_PAGE_SIZE = 20
     /** Cold-open first page (2026-08-19 feedback round): a room with no cached
      *  page opens with this many messages at once — fast, no decrypt/status
-     *  work — while the background refresh fills the full page. */
-    private const val INCREMENTAL_FIRST_PAGE = 8
+     *  work — while the background refresh fills the full page. 6 ≈ one
+     *  screenful on the LP3 thread (feedback 2026-08-23: "fast load on
+     *  initial show …"; tuned 8 → 6). */
+    private const val INCREMENTAL_FIRST_PAGE = 6
     /** Max extra chain walks an older page may take to skip a run of dropped
      *  events (the m.replace edit wall) before giving up — bounded so a
      *  pathological chain can't turn one page read into a long walk. The

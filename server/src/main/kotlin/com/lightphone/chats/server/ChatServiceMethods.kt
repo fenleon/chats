@@ -100,6 +100,12 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.SetTyping.encodeResponse(Unit))
                 }
 
+                LightServiceMethod.SetRoomMuted.id -> {
+                    val request = LightServiceMethod.SetRoomMuted.decodeRequest(payload!!)
+                    MatrixRepository.setRoomMuted(request.roomId, request.muted)
+                    LightResult.Success(LightServiceMethod.SetRoomMuted.encodeResponse(Unit))
+                }
+
                 LightServiceMethod.GetConnectionState.id -> {
                     val response = MatrixRepository.connectionState()
                     LightResult.Success(LightServiceMethod.GetConnectionState.encodeResponse(response))
