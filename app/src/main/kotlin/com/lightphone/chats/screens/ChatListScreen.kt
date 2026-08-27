@@ -609,13 +609,14 @@ private fun RoomRow(
                 }
             }
             Box(modifier = Modifier.width(0.25f.gridUnitsAsDp()))
-            Column(modifier = Modifier.weight(1f)) {
+            // The room name fills the row's leading width (one line, like the
+            // built-in titles — no wrapping).
+            Box(modifier = Modifier.weight(1f)) {
                 LightText(
                     text = room.name,
                     // Native Messages list names are ~80 px ink — the Heading
                     // variant (feedback 2026-08-17).
                     variant = LightTextVariant.Heading,
-                    // One line, like the built-in titles — no wrapping.
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )

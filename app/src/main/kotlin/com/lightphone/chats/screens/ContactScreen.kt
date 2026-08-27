@@ -108,7 +108,9 @@ class ContactScreen(
                             LightText(
                                 text = it,
                                 variant = LightTextVariant.Detail,
-                                lighten = true,
+                                // Solid white — the network line reads like the
+                                // name above it, not dimmed (feedback
+                                // 2026-08-27).
                                 modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                             )
                         }
@@ -117,11 +119,12 @@ class ContactScreen(
                         // Notifications stop, the unread badge stays. Button
                         // variant = the bottom-bar text size (feedback
                         // 2026-08-23: "as big as the text in the bottom bar").
+                        // Sits lower on the panel (feedback 2026-08-27).
                         LightText(
                             text = if (isMuted) "UNMUTE" else "MUTE",
                             variant = LightTextVariant.Button,
                             modifier = Modifier
-                                .padding(top = 0.75f.gridUnitsAsDp())
+                                .padding(top = 4f.gridUnitsAsDp())
                                 .lightClickable(onClick = {
                                     isMuted = !isMuted
                                     onToggleMute()

@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -39,8 +40,6 @@ import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
-import com.thelightphone.sdk.ui.LightTopBar
-import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
@@ -88,6 +87,13 @@ class VoiceNoteActivity : ComponentActivity() {
     private var recordingStartedAt: Long? = null
     /** Elapsed seconds of the current take, ticked once per second. */
     private var elapsedSeconds by mutableStateOf(0)
+    /**
+     * Recorded length (seconds) — the timer slot keeps showing it after the
+     * take stops, and the preview ticks through it while playing (feedback
+     * 2026-08-27: "show the final length where it was counting, count through
+     * it on playback").
+     */
+    private var finalDurationSeconds by mutableStateOf(0)
     /** RECORD_AUDIO was denied — show why, with a retry (2026-08-19 feedback
      *  round: "the phone doesn't ask for the permission" — a denial must not
      *  silently drop the screen). */
@@ -135,22 +141,22 @@ class VoiceNoteActivity : ComponentActivity() {
                         delay(1000)
                     }
                 }
+                // While the pre-send preview plays, the same slot counts
+                // through the take (feedback 2026-08-27).
+                LaunchedEffect(playing) {
+                    while (playing) {
+                        elapsedSeconds = (previewPlayer?.currentPosition?.let { (it / 1000).toInt() }
+                            ?: finalDurationSeconds).coerceAtMost(finalDurationSeconds)
+                        delay(1000)
+                    }
+                }
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(LightThemeTokens.colors.background),
                 ) {
-                    LightTopBar(
-                        leftButton = LightBarButton.LightIcon(
-                            icon = LightIcons.BACK,
-                            onClick = {
-                                discardRecording()
-                                finish()
-                            },
-                            contentDescription = "Discard voice note",
-                        ),
-                        center = LightTopBarCenter.Text("Voice note"),
-                    )
+                    // No top bar / back button — the bottom bar's X dismisses
+                    // (feedback 2026-08-27).
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -159,25 +165,15 @@ class VoiceNoteActivity : ComponentActivity() {
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             // Record → tap to stop → play the take back → SEND
-                            // in the bottom bar (or back to discard). A mic
-                            // denial shows a message + ALLOW instead of a
-                            // silent drop.
+                            // in the bottom bar (RETRY, X, SEND — feedback
+                            // 2026-08-27). A mic denial shows a message + ALLOW
+                            // instead of a silent drop.
                             Box(
                                 modifier = Modifier
                                     .size(96.dp)
                                     .lightClickable(
                                         enabled = !sending,
-                                        onClick = {
-                                            when {
-                                                micDenied -> {
-                                                    micDenied = false
-                                                    ensureMicThenRecord()
-                                                }
-                                                recording -> stopRecording()
-                                                previewing -> togglePreviewPlayback()
-                                                else -> ensureMicThenRecord()
-                                            }
-                                        },
+                                        onClick = { onCenterTap() },
                                     ),
                                 contentAlignment = Alignment.Center,
                             ) {
@@ -199,6 +195,8 @@ class VoiceNoteActivity : ComponentActivity() {
                                     },
                                 )
                             }
+                            // The whole label is a tap target too, not just the
+                            // icon (feedback 2026-08-27).
                             LightText(
                                 text = when {
                                     micDenied -> "Microphone permission is needed to record."
@@ -211,17 +209,35 @@ class VoiceNoteActivity : ComponentActivity() {
                                 variant = LightTextVariant.Copy,
                                 // Solid white like the thread's labels, not
                                 // dimmed (feedback 2026-08-22).
-                                modifier = Modifier.padding(top = 2f.gridUnitsAsDp()),
+                                modifier = Modifier
+                                    .padding(top = 2f.gridUnitsAsDp())
+                                    .lightClickable(enabled = !sending, onClick = { onCenterTap() }),
                             )
-                            if (recording) {
-                                // Recording length — same m:ss format as the
-                                // thread's audio-duration labels.
-                                LightText(
-                                    text = DateUtils.formatElapsedTime(elapsedSeconds.toLong()),
-                                    variant = LightTextVariant.Superfine,
-                                    lighten = true,
-                                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
-                                )
+                            // Fixed-height slot: the timer appears/disappears
+                            // without shifting the icon + label above it
+                            // (feedback 2026-08-27: "the icon and text move
+                            // up when you press record"). 2 grid units —
+                            // gridUnitsAsDp is composable, so it's inlined
+                            // here (not a companion constant).
+                            Box(
+                                modifier = Modifier.height(2f.gridUnitsAsDp()),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                val timerText = when {
+                                    recording -> DateUtils.formatElapsedTime(elapsedSeconds.toLong())
+                                    previewing && playing -> DateUtils.formatElapsedTime(elapsedSeconds.toLong())
+                                    previewing -> DateUtils.formatElapsedTime(finalDurationSeconds.toLong())
+                                    else -> null
+                                }
+                                if (timerText != null) {
+                                    LightText(
+                                        text = timerText,
+                                        variant = LightTextVariant.Superfine,
+                                        // Solid white like the thread's
+                                        // timestamps (feedback 2026-08-27).
+                                        modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+                                    )
+                                }
                             }
                             if (sendFailed) {
                                 LightText(
@@ -236,7 +252,25 @@ class VoiceNoteActivity : ComponentActivity() {
                     LightBottomBar(
                         modifier = Modifier.navigationBarsPadding(),
                         items = listOf(
-                            null,
+                            // RETRY: delete the take, back to "tap to record"
+                            // (feedback 2026-08-27).
+                            if ((previewing || sendFailed) && !sending) {
+                                LightBarButton.Text(
+                                    text = "RETRY",
+                                    onClick = { retryRecording() },
+                                )
+                            } else {
+                                null
+                            },
+                            // X in the middle dismisses the panel — no top-bar
+                            // back (feedback 2026-08-27). finish() only, so a
+                            // recorded take never flashes the idle panel on the
+                            // way out (feedback 2026-08-27); onStop cleans up.
+                            LightBarButton.LightIcon(
+                                icon = LightIcons.CLOSE,
+                                onClick = { finish() },
+                                contentDescription = "Discard voice note",
+                            ),
                             if ((previewing || sendFailed) && !sending) {
                                 LightBarButton.Text(
                                     text = "SEND",
@@ -245,7 +279,6 @@ class VoiceNoteActivity : ComponentActivity() {
                             } else {
                                 null
                             },
-                            null,
                         ),
                     )
                 }
@@ -284,6 +317,35 @@ class VoiceNoteActivity : ComponentActivity() {
         } else {
             startRecording()
         }
+    }
+
+    /** Shared center-tap handler (the icon AND the label — feedback 2026-08-27). */
+    private fun onCenterTap() {
+        when {
+            micDenied -> {
+                micDenied = false
+                ensureMicThenRecord()
+            }
+            recording -> stopRecording()
+            previewing -> togglePreviewPlayback()
+            else -> ensureMicThenRecord()
+        }
+    }
+
+    /**
+     * RETRY (feedback 2026-08-27): deletes the take and returns to "tap to
+     * record" — a fresh recording replaces the discarded one.
+     */
+    private fun retryRecording() {
+        runCatching { previewPlayer?.release() }
+        previewPlayer = null
+        abandonPreviewFocus()
+        outputFile?.delete()
+        outputFile = null
+        previewing = false
+        playing = false
+        sendFailed = false
+        finalDurationSeconds = 0
     }
 
     private fun startRecording() {
@@ -390,7 +452,9 @@ class VoiceNoteActivity : ComponentActivity() {
     private fun stopRecording() {
         releaseRecorder()
         recordingStartedAt = null
-        elapsedSeconds = 0
+        // Keep the recorded length in the timer slot (feedback 2026-08-27:
+        // "show you the final length where it was counting").
+        finalDurationSeconds = elapsedSeconds
         recording = false
         abandonRecordFocus()
         // Only enter the preview state if there's a take to preview.
@@ -485,6 +549,7 @@ class VoiceNoteActivity : ComponentActivity() {
         outputFile = null
         recordingStartedAt = null
         elapsedSeconds = 0
+        finalDurationSeconds = 0
         recording = false
         previewing = false
         playing = false

@@ -191,6 +191,21 @@ object MatrixRepository {
     @Volatile
     private var playingAudioEventId: String? = null
 
+    /**
+     * Event id of a PAUSED voice note (null when nothing is paused). Pausing
+     * keeps the player + file + position alive (audioPositionMs() reports
+     * null — the row shows the note's length), so re-tapping the same note
+     * RESUMES from the pause point instead of restarting (feedback 2026-08-27).
+     */
+    @Volatile
+    private var pausedAudioEventId: String? = null
+
+    /** Room id of the note currently playing/paused — needed by the
+     *  completion handler to auto-advance to the next note in the same room
+     *  (feedback 2026-08-27). */
+    @Volatile
+    private var playingAudioRoomId: String? = null
+
     /** Player owned by the companion; released when playback ends or changes. */
     @Volatile
     private var audioPlayer: android.media.MediaPlayer? = null
@@ -2162,6 +2177,16 @@ object MatrixRepository {
         val c = client ?: return MessagesPage(emptyList(), false)
         val matrixRoomId = RoomId(roomId)
 
+        // Broadcast channels (you + the channel ghost) echo your own posts
+        // back with your display name baked into the body ("FENN: post" —
+        // feedback 2026-08-28). Resolve the name once so [messageFrom] can
+        // strip it; null outside broadcast rooms = no stripping.
+        val ownName = if (withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()?.joinedMemberCount
+        }?.let { it <= 2L } == true) {
+            senderNameOf(c, matrixRoomId, c.userId)
+        } else null
+
         // Fast path: an encrypted room on an unverified device can't decrypt —
         // say so immediately instead of fetching events and waiting on
         // decryption that can never land.
@@ -2276,6 +2301,26 @@ object MatrixRepository {
             "getMessages: room=$matrixRoomId before=$beforeEventId limit=$limit page=${events.size} hasMore=$hasMore",
         )
 
+        // Edits (m.replace, feedback 2026-08-27): an edit never becomes a row,
+        // but it REPLACES its target's body and marks it edited. [events] is
+        // newest-first and an edit is newer than its target, so the first
+        // occurrence of a target is the NEWEST edit — putIfAbsent keeps it.
+        // Edits targeting events outside the page can't be applied here (their
+        // target isn't in this page build) and stay invisible, as before.
+        val editByTarget = HashMap<String, Pair<String, Long>>()
+        for (te in events) {
+            val content = te.content?.getOrNull() as? RoomMessageEventContent ?: continue
+            val replace = content.relatesTo as? RelatesTo.Replace ?: continue
+            val newBody = (replace.newContent as? RoomMessageEventContent)?.body
+                ?.takeIf { it.isNotBlank() } ?: continue
+            editByTarget.putIfAbsent(replace.eventId.full, newBody to te.event.originTimestamp)
+        }
+        // Auto-download: the newest audio notes of the opened thread start
+        // downloading in the background so the first play tap usually hits the
+        // on-disk cache (feedback 2026-08-27). No-ops for already-cached or
+        // in-flight notes, so every 3 s poll costs nothing here.
+        prefetchVoiceNotes(c, matrixRoomId, events)
+
         val result = mutableListOf<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>()
         val startIndex = if (keepCursor) 0 else 1 // drop the boundary cursor on older pages
         // Delivery status only matters for the newest page (what the user just
@@ -2309,6 +2354,7 @@ object MatrixRepository {
             val te = events[i]
             val txnId = txnIdOf(te)
             if (txnId != null && txnId in pendingTxnIds && te.content?.getOrNull() == null) continue
+            val edit = editByTarget[te.event.id.full]
             messageFrom(
                 c,
                 matrixRoomId,
@@ -2316,6 +2362,9 @@ object MatrixRepository {
                 sendStatuses[te.event.id.full],
                 read = te.event.id.full in readEventIds,
                 reactions = reactionsByEvent[te.event.id.full].orEmpty(),
+                editedBody = edit?.first,
+                edited = edit != null,
+                ownName = ownName,
             )?.let { result.add(it) }
         }
         // Optimistic rows for sends whose sync echo hasn't landed (voice notes
@@ -2346,6 +2395,7 @@ object MatrixRepository {
                             sendStatuses[resolved.event.id.full],
                             read = resolved.event.id.full in readEventIds,
                             reactions = reactionsByEvent[resolved.event.id.full].orEmpty(),
+                            ownName = ownName,
                         )?.let { result.add(0, it) }
                     }
                 } else if (beforeEventId == null && result.size < limit + 1) {
@@ -3077,10 +3127,23 @@ object MatrixRepository {
      */
     suspend fun playVoiceNote(roomId: String, eventId: String): Pair<Boolean, String?> {
         val c = client ?: return false to "not logged in"
-        // Tap the playing row again → stop (toggle semantics).
+        // Tap the playing row again → PAUSE (keeps the position; the next tap
+        // on the same row resumes from there — feedback 2026-08-27).
         if (playingAudioEventId == eventId) {
-            stopAudioPlayback()
+            runCatching { audioPlayer?.pause() }
+            playingAudioEventId = null
+            pausedAudioEventId = eventId
+            android.util.Log.d(TAG, "playVoiceNote: paused $eventId")
             return false to null
+        }
+        // Tap the PAUSED row again → RESUME from the pause point (no re-download,
+        // no position reset).
+        if (pausedAudioEventId == eventId && audioPlayer != null) {
+            runCatching { audioPlayer?.start() }
+            pausedAudioEventId = null
+            playingAudioEventId = eventId
+            android.util.Log.d(TAG, "playVoiceNote: resumed $eventId")
+            return true to null
         }
         stopAudioPlayback()
         // A still-pending send: the echoed event isn't in the store yet, but
@@ -3098,13 +3161,30 @@ object MatrixRepository {
                 if (runCatching { local.copyTo(tmp, overwrite = true) }.isSuccess) {
                     android.util.Log.d(TAG, "playVoiceNote: playing local pending audio (id=$eventId)")
                     return playLocalAudioFile(
-                        ctx, eventId, tmp,
+                        ctx, roomId, eventId, tmp,
                         successDetail = "playing local pending audio (id=$eventId, ${tmp.length()} bytes)",
                         failureDetail = "for local pending audio (id=$eventId, ${tmp.length()} bytes)",
                     )
                 }
             }
             // Missing copy → fall through to the store path's error handling.
+        }
+        // A previously-downloaded note plays from the cache — no network, no
+        // "failed to download" on a note that played before (feedback
+        // 2026-08-27: notes playable in the morning failed at night).
+        val ctx = appContext ?: return false to "no context"
+        voiceCacheFile(eventId)?.let { cached ->
+            if (cached.exists()) {
+                val tmp = java.io.File(ctx.cacheDir, "voice_play_$eventId")
+                if (runCatching { cached.copyTo(tmp, overwrite = true) }.isSuccess) {
+                    android.util.Log.d(TAG, "playVoiceNote: playing cached audio (id=$eventId)")
+                    return playLocalAudioFile(
+                        ctx, roomId, eventId, tmp,
+                        successDetail = "playing cached audio (id=$eventId, ${tmp.length()} bytes)",
+                        failureDetail = "for cached audio (id=$eventId)",
+                    )
+                }
+            }
         }
         val matrixRoomId = RoomId(roomId)
         val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
@@ -3198,7 +3278,6 @@ object MatrixRepository {
         }
         val bytes = (download?.getOrNull()?.toByteArray()?.takeIf { it.isNotEmpty() })
             ?: return false to "audio download failed"
-        val ctx = appContext ?: return false to "no context"
         // The temp file must carry the ACTUAL format: MediaPlayer's file-source
         // path uses the extension as an extractor hint, and Beeper/WhatsApp
         // audio files (ogg/opus, mp3, aac…) mislabeled ".m4a" fail to prepare
@@ -3225,6 +3304,14 @@ object MatrixRepository {
             )
         }
         val playBytes = repaired
+        // Cache the downloaded note on disk so re-plays are instant and survive
+        // a bad network (feedback 2026-08-27: auto-download + "played this
+        // morning, failed to download now").
+        voiceCacheDir()?.let { dir ->
+            val cacheFile = java.io.File(dir, "voice_$eventId.$ext")
+            runCatching { cacheFile.writeBytes(playBytes) }
+            trimVoiceCache(dir)
+        }
         // An unknown container/mime yields "" — write the file WITHOUT an
         // extension so MediaExtractor sniffs the content instead of chasing a
         // wrong hint (see [sniffAudioExtension]).
@@ -3236,7 +3323,7 @@ object MatrixRepository {
         // Shared fd-based playback tail (media attributes, audio focus, the
         // file-descriptor data source — see [playLocalAudioFile]).
         return playLocalAudioFile(
-            ctx, eventId, tmp,
+            ctx, roomId, eventId, tmp,
             successDetail = "playing $eventId (${playBytes.size} bytes, ext=$ext, mime=$mime, " +
                 "head=${playBytes.take(8).joinToString("") { "%02x".format(it) }})",
             failureDetail = "for $eventId (ext=$ext, mime=$mime, size=${bytes.size}, " +
@@ -3256,6 +3343,7 @@ object MatrixRepository {
      */
     private fun playLocalAudioFile(
         ctx: Context,
+        roomId: String,
         eventId: String,
         tmp: java.io.File,
         successDetail: String,
@@ -3276,7 +3364,19 @@ object MatrixRepository {
             .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
         player.setAudioAttributes(mediaAttributes)
-        player.setOnCompletionListener { stopAudioPlayback() }
+        player.setOnCompletionListener {
+            // Natural end: release the player but KEEP the audio focus, so the
+            // app we transiently paused (a podcast, music) stays paused — a
+            // finishing note must not resume it (feedback 2026-08-27). Then
+            // auto-play the next voice note in the room when there is one
+            // immediately after (same feedback round).
+            val finishedId = playingAudioEventId
+            val finishedRoom = playingAudioRoomId
+            releaseFinishedPlayback()
+            if (finishedId != null && finishedRoom != null) {
+                scope.launch { autoPlayNextAudio(finishedRoom, finishedId) }
+            }
+        }
         player.setOnErrorListener { _, _, _ -> stopAudioPlayback(); true }
         val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
         val focusRequest = android.media.AudioFocusRequest.Builder(
@@ -3320,9 +3420,32 @@ object MatrixRepository {
         }
         audioPlayer = player
         audioPlayerFile = tmp
+        playingAudioRoomId = roomId
         playingAudioEventId = eventId
+        // Record the measured length — the idle row shows it for bridged notes
+        // whose m.audio event lacks info.duration (Signal — feedback 2026-08-27).
+        player.duration.takeIf { it > 0 }?.let { voiceDurationMsByEvent[eventId] = it.toLong() }
         android.util.Log.d(TAG, "playVoiceNote: $successDetail")
         return true to null
+    }
+
+    /**
+     * Natural-completion cleanup: release the player + file + state, but KEEP
+     * the audio focus held — the transient-focus pause must not bounce the
+     * other app (podcast/music) back on when a note ends (feedback 2026-08-27).
+     * The focus is released by the next [stopAudioPlayback] (a new note, an
+     * explicit stop, or another app taking focus — the focus-loss listener
+     * calls [stopAudioPlayback]).
+     */
+    private fun releaseFinishedPlayback() {
+        playingAudioEventId = null
+        pausedAudioEventId = null
+        playingAudioRoomId = null
+        runCatching { audioPlayer?.stop() }
+        runCatching { audioPlayer?.release() }
+        audioPlayer = null
+        audioPlayerFile?.delete()
+        audioPlayerFile = null
     }
 
     /**
@@ -3423,6 +3546,8 @@ object MatrixRepository {
     /** Stops any in-flight voice-note playback and clears its state. */
     private fun stopAudioPlayback() {
         playingAudioEventId = null
+        pausedAudioEventId = null
+        playingAudioRoomId = null
         runCatching { audioPlayer?.stop() }
         runCatching { audioPlayer?.release() }
         audioPlayer = null
@@ -3434,6 +3559,188 @@ object MatrixRepository {
                     .abandonAudioFocusRequest(focus)
             }
             audioFocusRequest = null
+        }
+    }
+
+    // --- Voice-note download cache + auto-advance (feedback 2026-08-27) -----
+    // Notes are kept on disk after their first download so re-plays are
+    // instant and survive a bad network ("played this morning, failed to
+    // download now"); the newest notes of an opened thread prefetch while its
+    // page builds, so the first tap usually plays without a fetch. A note
+    // that ENDS auto-plays the next note in the same room when one follows
+    // immediately (the "multiple voice notes one after another" flow).
+
+    /** Bounded voice-note cache dir (eventId-keyed files, LRU by mtime). */
+    private fun voiceCacheDir(): java.io.File? =
+        appContext?.let { java.io.File(it.cacheDir, "voice_cache").apply { mkdirs() } }
+
+    /** The cached file for [eventId], or null when the cache dir can't exist.
+     *  The extension is unknown until the first download, so a file that
+     *  exists is matched by prefix. */
+    private fun voiceCacheFile(eventId: String): java.io.File? =
+        voiceCacheDir()?.let { dir ->
+            dir.listFiles()?.firstOrNull { it.name == "voice_$eventId" || it.name.startsWith("voice_${eventId}.") }
+        }
+
+    /** Drops the oldest cached notes past [VOICE_CACHE_MAX_FILES]. */
+    private fun trimVoiceCache(dir: java.io.File) {
+        val files = dir.listFiles()?.toMutableList() ?: return
+        files.sortBy { it.lastModified() }
+        while (files.size > VOICE_CACHE_MAX_FILES) {
+            runCatching { files.removeAt(0).delete() }
+        }
+    }
+
+    /**
+     * Downloads [eventId]'s audio into the on-disk cache and returns the
+     * cached file. Mirrors [playVoiceNote]'s fetch/repair tail so both the
+     * prefetch and the first-tap path share it.
+     */
+    private suspend fun downloadVoiceNoteToCache(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        eventId: String,
+        content: RoomMessageEventContent.FileBased.Audio,
+    ): java.io.File? {
+        val ctx = appContext ?: return null
+        val file = content.file?.takeIf { !it.url.isNullOrBlank() }
+        val url = content.url?.takeIf { it.isNotBlank() }
+        if (file == null && url == null) return null
+        val mediaService = c.di.get<MediaService>(MediaService::class)
+        var download: Result<net.folivo.trixnity.client.media.PlatformMedia>? = null
+        for (attempt in 1..2) {
+            val result = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+                when {
+                    file != null -> mediaService.getEncryptedMedia(file, saveToCache = false)
+                    url != null -> mediaService.getMedia(url, saveToCache = false)
+                    else -> return@withTimeoutOrNull null
+                }
+            }
+            if (result == null || result.isFailure) {
+                if (result?.isFailure == true) {
+                    android.util.Log.w(
+                        TAG,
+                        "voice download failed for $eventId (attempt $attempt/2)",
+                        result.exceptionOrNull(),
+                    )
+                }
+                continue
+            }
+            download = result
+            break
+        }
+        val bytes = (download?.getOrNull()?.toByteArray()?.takeIf { it.isNotEmpty() })
+            ?: return null
+        val repaired = repairOgg(bytes)
+        val dir = voiceCacheDir() ?: return null
+        val ext = sniffAudioExtension(repaired, content.info?.mimeType?.lowercase().orEmpty())
+        val cacheFile = java.io.File(
+            dir,
+            if (ext.isEmpty()) "voice_$eventId" else "voice_$eventId.$ext",
+        )
+        runCatching { cacheFile.writeBytes(repaired) }.getOrElse { return null }
+        trimVoiceCache(dir)
+        return cacheFile
+    }
+
+    /** Prefetch set — one download per event id per process run. */
+    private val voicePrefetchInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Measured lengths (ms) of voice notes whose m.audio event carries no
+     *  info.duration (bridged notes — Signal sends none; feedback 2026-08-27).
+     *  Filled by the prefetch/play paths; [messageFrom] falls back to it so the
+     *  idle row shows the length instead of the "Voice note" body text. */
+    private val voiceDurationMsByEvent = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Starts background downloads of the newest uncached audio notes in
+     * [events] (newest-first), so tapping play on a fresh note usually hits
+     * the cache (feedback 2026-08-27: auto-download; play "looked like it was
+     * playing" then silently failed on the fetch). Called from the page
+     * builds; the exists()/in-flight guards make repeated calls no-ops.
+     */
+    private fun prefetchVoiceNotes(c: MatrixClient, matrixRoomId: RoomId, events: List<TimelineEvent>) {
+        val ctx = appContext ?: return
+        for (te in events.asSequence()
+            .filter { it.content?.getOrNull() is RoomMessageEventContent.FileBased.Audio }
+            .take(VOICE_PREFETCH_COUNT)
+        ) {
+            val eventId = te.event.id.full
+            val content = te.content?.getOrNull() as? RoomMessageEventContent.FileBased.Audio ?: continue
+            if (!voicePrefetchInFlight.add(eventId)) continue
+            scope.launch {
+                try {
+                    val cached = voiceCacheFile(eventId)
+                    val file = cached?.takeIf { it.exists() }
+                        ?: downloadVoiceNoteToCache(c, matrixRoomId, eventId, content)
+                    // Length probe for bridged notes without info.duration
+                    // (Signal — feedback 2026-08-27): one prepare per note per
+                    // process; the map hit skips it on later page builds.
+                    if (file != null && !voiceDurationMsByEvent.containsKey(eventId)) {
+                        probeVoiceDurationMs(file)?.let { voiceDurationMsByEvent[eventId] = it }
+                    }
+                } finally {
+                    voicePrefetchInFlight.remove(eventId)
+                }
+            }
+        }
+    }
+
+    /** Measures a cached voice note's length with a throwaway MediaPlayer (fd
+     *  data source — the media server can't traverse the app-private cache dir
+     *  by path, same constraint as playback). Null on a probe failure; the
+     *  caller falls back to the body text. */
+    private fun probeVoiceDurationMs(file: java.io.File): Long? {
+        if (file.length() == 0L) return null
+        file.setReadable(true, false)
+        val player = android.media.MediaPlayer()
+        return try {
+            java.io.FileInputStream(file).use { input -> player.setDataSource(input.fd) }
+            player.prepare()
+            player.duration.takeIf { it > 0 }?.toLong()
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "voice duration probe failed for ${file.name}", e)
+            null
+        } finally {
+            runCatching { player.release() }
+        }
+    }
+
+    /**
+     * Auto-advance: after a note ends, play the NEXT audio note in the room
+     * when one follows immediately (feedback 2026-08-27: "play one, the next
+     * should play if there's a voice note immediately after"). "Immediately"
+     * = the first audio event newer than the finished one, within
+     * [VOICE_AUTO_ADVANCE_WINDOW_MS] of it — a note hours later stays
+     * unplayed.
+     */
+    private suspend fun autoPlayNextAudio(roomId: String, finishedEventId: String) {
+        val c = client ?: return
+        val matrixRoomId = RoomId(roomId)
+        // The room's authoritative newest event, then the same store-backed
+        // chain walk the message pages use. The previous getLastTimelineEvents
+        // read serves the handler's partial in-memory view (see the
+        // computeMessagesPage note), which silently dropped the following note
+        // — no auto-play for two notes sent one after the other (feedback
+        // 2026-08-27).
+        val lastEventId = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()?.lastEventId?.full
+        } ?: return
+        val events = collectRelevantTimelineEvents(
+            c, matrixRoomId, lastEventId, VOICE_AUTO_ADVANCE_WINDOW,
+        ).first
+        // [events] is newest-first; the finished note's position splits it —
+        // everything before it (indices < idx) is NEWER. Reversed, that is
+        // chronological order: the first audio event there is the next note.
+        val idx = events.indexOfFirst { it.event.id.full == finishedEventId }
+        if (idx <= 0) return
+        val finishedTs = events[idx].event.originTimestamp
+        for (te in events.subList(0, idx).asReversed()) {
+            if (te.content?.getOrNull() !is RoomMessageEventContent.FileBased.Audio) continue
+            if (te.event.originTimestamp - finishedTs > VOICE_AUTO_ADVANCE_WINDOW_MS) return
+            android.util.Log.d(TAG, "autoPlayNextAudio: $finishedEventId -> ${te.event.id.full}")
+            playVoiceNote(roomId, te.event.id.full)
+            return
         }
     }
 
@@ -3946,8 +4253,13 @@ object MatrixRepository {
             roomId = roomId.full,
             roomName = name,
             // No sender prefix in DMs, and never for our own account (a
-            // note-to-self message needs no "FENN:" prefix).
-            senderName = if (room.isDirect || te.event.sender == c.userId) null else senderNameOf(c, roomId, te.event.sender),
+            // note-to-self message needs no "FENN:" prefix). Channel/broadcast
+            // rooms (≤2 members, e.g. a Telegram channel + its account) are
+            // treated the same way — every message comes from the channel
+            // (feedback 2026-08-28).
+            senderName = if (room.isDirect || (room.joinedMemberCount ?: 0L) <= 2L ||
+                te.event.sender == c.userId
+            ) null else senderNameOf(c, roomId, te.event.sender),
             preview = preview,
             direct = room.isDirect,
             unreadCount = room.unreadMessageCount,
@@ -4301,10 +4613,13 @@ object MatrixRepository {
                     ),
                     lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
                     lastEventId = room.lastRelevantEventId?.full,
-                    // Beeper never writes m.direct for self-rooms — a
-                    // Note-to-Self room (only yourself in it) reads as a group
-                    // chat otherwise.
-                    isDirect = room.isDirect || (room.joinedMemberCount ?: 0L) <= 1L,
+                    // Beeper never writes m.direct for self-rooms (Note-to-Self
+                    // would read as a group), and Telegram CHANNEL rooms (you +
+                    // the channel account) aren't marked direct either — but
+                    // every message there comes from the channel, so a per-row
+                    // sender name is redundant noise. Treating both as direct
+                    // hides it (feedback 2026-08-28).
+                    isDirect = room.isDirect || (room.joinedMemberCount ?: 0L) <= 2L,
                     contactId = contactIdOf(room),
                     network = networks[key],
                     muted = MuteStore.isMuted(key),
@@ -4444,10 +4759,13 @@ object MatrixRepository {
                 unreadCount = unread,
                 lastTimestampMs = rowTs,
                 lastEventId = lastEventId,
-                // Beeper never writes m.direct for self-rooms — a
-                // Note-to-Self room (only yourself in it) reads as a group
-                // chat otherwise.
-                isDirect = room.isDirect || (room.joinedMemberCount ?: 0L) <= 1L,
+                // Beeper never writes m.direct for self-rooms (Note-to-Self
+                // would read as a group), and Telegram CHANNEL rooms (you +
+                // the channel account) aren't marked direct either — but
+                // every message there comes from the channel, so a per-row
+                // sender name is redundant noise. Treating both as direct
+                // hides it (feedback 2026-08-28).
+                isDirect = room.isDirect || (room.joinedMemberCount ?: 0L) <= 2L,
                 contactId = contactIdOf(room),
                 // Resolved here (not in the seed pass — this one has a client
                 // for the member-state read). Null for groups/seed rows.
@@ -4491,7 +4809,20 @@ object MatrixRepository {
             return networkByRoomCache
         }
         val result = mutableMapOf<String, String>()
+        // Community/group sub-spaces of account spaces inherit the account's
+        // label (see below) — their ids are collected on the first pass.
+        val groupSpaceChildren = mutableMapOf<String, String>()
         withTimeoutOrNull(NETWORK_MAP_BUDGET_MS) {
+            // Every space id (account spaces AND community/group spaces): an
+            // account space's child that is itself a space is a sub-space
+            // whose own children still belong to the same network.
+            val spaceIds = HashSet<String>()
+            for ((spaceId, spaceFlow) in rooms) {
+                val space = spaceFlow.filterNotNull().firstOrNull() ?: continue
+                if (space.createEventContent?.type is CreateEventContent.RoomType.Space) {
+                    spaceIds += spaceId.full
+                }
+            }
             for ((spaceId, spaceFlow) in rooms) {
                 val space = spaceFlow.filterNotNull().firstOrNull() ?: continue
                 if (space.createEventContent?.type !is CreateEventContent.RoomType.Space) continue
@@ -4500,7 +4831,22 @@ object MatrixRepository {
                 val label = networkLabelOf(spaceName)
                 if (label.isBlank()) continue
                 val childIds = c.room.getAllState(spaceId, ChildEventContent::class).first().keys
-                for (childId in childIds) result[childId] = label
+                for (childId in childIds) {
+                    result[childId] = label
+                    // Beeper puts WhatsApp community groups under their own
+                    // space ("1 euro film", "crocs 2026 squad"), a child of the
+                    // account space — those rooms show no network and vanish
+                    // from the network filter (feedback 2026-08-27). Record
+                    // the sub-space so the second pass labels its rooms.
+                    if (childId in spaceIds) groupSpaceChildren[childId] = label
+                }
+            }
+            // Second pass: the rooms inside each community/group sub-space
+            // inherit the account's label (putIfAbsent — a direct account
+            // child already labeled wins).
+            for ((subSpaceId, label) in groupSpaceChildren) {
+                val subChildIds = c.room.getAllState(RoomId(subSpaceId), ChildEventContent::class).first().keys
+                for (childId in subChildIds) result.putIfAbsent(childId, label)
             }
         }
         networkByRoomCache = result
@@ -4836,12 +5182,19 @@ object MatrixRepository {
         }
         val text = previewText(te) ?: ""
         val encrypted = text.startsWith("[Encrypted")
+        // DMs and broadcast channels (you + the channel ghost) don't need a
+        // sender prefix — Beeper never marks Telegram channel rooms as direct,
+        // so the same ≤2-member test as the room list applies (2026-08-28).
+        // Channel echoes also bake your own name into the body ("FENN: post"),
+        // stripped here so the preview shows the post itself.
+        val broadcast = room.isDirect || (room.joinedMemberCount ?: 0L) <= 2L
+        val stripped = if (broadcast) stripOwnPrefix(text, senderNameOf(c, roomId, c.userId)) else text
         // Group-chat previews name the sender ("Anni: the message", "You: …" —
         // the WhatsApp/Beeper convention); DMs don't need it and an unresolved
         // "[Encrypted]" row has no readable sender.
-        val preview = if (encrypted || room.isDirect) text else {
+        val preview = if (encrypted || broadcast) stripped else {
             val sender = if (te.event.sender == c.userId) "You" else senderNameOf(c, roomId, te.event.sender)
-            "$sender: $text"
+            "$sender: $stripped"
         }
         return Triple(
             preview,
@@ -5126,6 +5479,9 @@ object MatrixRepository {
         sendStatus: String? = null,
         read: Boolean = false,
         reactions: List<String> = emptyList(),
+        editedBody: String? = null,
+        edited: Boolean = false,
+        ownName: String? = null,
     ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message? {
         // The resolved content decides the row type: a decrypted image event
         // renders as an image row (its bytes fetched via GetMessageMedia), an
@@ -5133,10 +5489,11 @@ object MatrixRepository {
         // every other showable event renders as text. Text bodies are the full
         // message — the 80-char preview cap is only for the room list.
         val content = te.content?.getOrNull()
-        // ponytail: m.replace edits are dropped (not merged into their target) —
-        // the app has no edit UI and Beeper's re-import edits target originals
-        // we never sync (whatsapp.com bridge rooms); merge only if real local
-        // edits appear.
+        // Edit events (m.replace) never become a row — they REPLACE their
+        // target, and the target row is rebuilt with the edited body + the
+        // edited flag by [computeMessagesPage] (feedback 2026-08-27). Beeper's
+        // re-import edits target originals we never sync (whatsapp.com bridge
+        // rooms), so un-matched edits still render as nothing here.
         if (isReplaceEdit(te)) return null
         val (body, contentType) = when (content) {
             is RoomMessageEventContent.FileBased.Image ->
@@ -5153,7 +5510,11 @@ object MatrixRepository {
                 // (09:08 wall after a WhatsApp number change) resolve to empty
                 // text, and an empty bubble reads as "no messages" (LP3: the
                 // Lillian room). Drop them so the real conversation shows.
-                val text = stripReplyQuote(content.body)
+                // The edited body (the m.new_content of an m.replace) replaces
+                // the original when the target is in the page (2026-08-27).
+                // Broadcast channels bake the user's own name into echoed posts
+                // ("FENN: post") — stripped when ownName is set (2026-08-28).
+                val text = stripOwnPrefix(stripReplyQuote(editedBody ?: content.body), ownName)
                 if (text.isBlank()) return null
                 text to if (content is RoomMessageEventContent.TextBased.Notice) "notice" else "text"
             }
@@ -5172,14 +5533,23 @@ object MatrixRepository {
             contentType = contentType,
             read = read,
             reactions = reactions,
-            // The voice-note row shows the length + playing progress.
-            durationMs = (content as? RoomMessageEventContent.FileBased.Audio)?.info?.duration,
+            // The voice-note row shows the length + playing progress. Bridged
+            // notes often carry no info.duration (Signal — feedback 2026-08-27):
+            // fall back to the length measured at prefetch/play time.
+            durationMs = (content as? RoomMessageEventContent.FileBased.Audio)?.let { audio ->
+                audio.info?.duration ?: voiceDurationMsByEvent[te.event.id.full]
+            },
             // The image's caption (the m.image body — most clients put the
             // caption there, separate from the file name). A caption that
-            // equals the file name is not a caption (feedback round 2026-08-19).
+            // equals the file name is not a caption (feedback round 2026-08-19);
+            // neither is a bare file name — Signal's m.image body IS
+            // "image.jpg" with no caption (feedback 2026-08-27).
             caption = (content as? RoomMessageEventContent.FileBased.Image)?.let { image ->
-                image.body.takeIf { it.isNotBlank() && it != image.fileName }
+                image.body.takeIf {
+                    it.isNotBlank() && it != image.fileName && !isBareImageFilename(it)
+                }
             },
+            edited = edited && contentType == "text",
         )
     }
 
@@ -5187,6 +5557,22 @@ object MatrixRepository {
         withTimeoutOrNull(ROOM_BUDGET_MS) {
             c.user.getById(roomId, sender).firstOrNull()?.name
         } ?: sender.localpart
+
+    /** A bare image file name ("image.jpg") is not a caption — no whitespace,
+     *  ends with a common image extension. Signal's m.image body is exactly
+     *  that when the photo has no caption (feedback 2026-08-27). */
+    private fun isBareImageFilename(body: String): Boolean {
+        if (body.any { it.isWhitespace() }) return false
+        val dot = body.lastIndexOf('.')
+        if (dot <= 0 || dot == body.length - 1) return false
+        val ext = body.substring(dot + 1)
+        return ext.length <= 5 && ext.all { it.isLetter() } &&
+            ext.lowercase() in BARE_IMAGE_EXTENSIONS
+    }
+
+    private val BARE_IMAGE_EXTENSIONS = setOf(
+        "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "svg", "avif",
+    )
 
     /** Human-readable text for a timeline event; null for events with nothing to show.
      *  Used for the room list's last-message preview, so bodies are capped. */
@@ -5237,6 +5623,15 @@ object MatrixRepository {
         val index = body.indexOf("\n\n")
         return if (index != -1) body.substring(index + 2).trimStart() else body
     }
+
+    /** In broadcast rooms (you + the channel ghost) Beeper echoes your own
+     *  channel posts back with your display name baked into the body ("FENN:
+     *  post" — Telegram channels, feedback 2026-08-28). Strip that redundant
+     *  prefix; ownName is null outside broadcast rooms, so it's a no-op there.
+     *  Not applied unconditionally: a group member writing "FENN: good point"
+     *  must keep their words. */
+    private fun stripOwnPrefix(text: String, ownName: String?): String =
+        if (ownName != null && text.startsWith("$ownName: ")) text.removePrefix("$ownName: ") else text
 
     private const val MAX_PREVIEW_LENGTH = 80
     /** How many recent timeline events to scan for Beeper send-status events. */
@@ -5396,6 +5791,15 @@ object MatrixRepository {
     private const val MEDIA_CONTENT_RETRY_DELAY_MS = 1_500L
     /** How many display JPEGs the LRU keeps (each ~100-300 KB). */
     private const val MAX_MEDIA_CACHE_ENTRIES = 24
+    /** Voice-note cache bound (each file ~30-200 KB at 32 kbps Opus). */
+    private const val VOICE_CACHE_MAX_FILES = 30
+    /** Newest audio notes to prefetch when a thread page is built. */
+    private const val VOICE_PREFETCH_COUNT = 4
+    /** Events scanned for the auto-advance search (a room's newest window). */
+    private const val VOICE_AUTO_ADVANCE_WINDOW = 60
+    /** A following note auto-plays only within this gap of the finished one
+     *  ("immediately after" — feedback 2026-08-27). */
+    private const val VOICE_AUTO_ADVANCE_WINDOW_MS = 60_000L
     /** The tool's photo-picker activity, flattened for the tool to launch. The
      *  package is the TOOL's own id — the single-APK merge (2026-08-19) made
      *  the former companion a library inside com.lightphone.chats, so the old

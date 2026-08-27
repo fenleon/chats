@@ -229,6 +229,25 @@ class ThreadViewModel(
     val playingPositionAtMs = MutableStateFlow(0L)
 
     /**
+     * True until the poll anchors the counter after a play/resume tap: the
+     * label holds the seeded position (pause point / 0:00) instead of running
+     * on wall clock, which ran AHEAD of the companion while it spun the player
+     * up, then snapped back on the next poll — the "timer goes back" jump
+     * (feedback 2026-08-28). Cleared when the poll reports a live position.
+     */
+    val counterPending = MutableStateFlow(true)
+
+    /**
+     * Event id + position of a voice note PAUSED in the companion (feedback
+     * 2026-08-27). The paused row keeps showing the pause point instead of the
+     * full length, and resume starts from it — no 00:00 flash, no bounce back
+     * up when the next poll lands. The server holds the real pause state;
+     * this is the tool's display mirror.
+     */
+    val pausedEventId = MutableStateFlow<String?>(null)
+    val pausedPositionMs = MutableStateFlow<Long?>(null)
+
+    /**
      * (eventId, message) of a voice-note playback that failed to fetch/play —
      * the row shows the error briefly instead of a silent no-op (feedback
      * 2026-08-19). Cleared after a few seconds.
@@ -339,6 +358,7 @@ class ThreadViewModel(
                 if (page?.audioPositionMs != null) {
                     playingPositionMs.value = page.audioPositionMs
                     playingPositionAtMs.value = android.os.SystemClock.elapsedRealtime()
+                    counterPending.value = false
                 }
                 // Merge, don't replace: the fresh newest page updates the tail while
                 // older pages the user scrolled into (via [loadOlder]) stay put. A
@@ -494,15 +514,54 @@ class ThreadViewModel(
      */
     fun playVoiceNote(eventId: String) {
         val toggling = playingEventId.value == eventId
-        if (!toggling) {
+        val resuming = !toggling && pausedEventId.value == eventId
+        when {
+            // Tap the playing row → PAUSE: hold the interpolated position so
+            // the row shows the pause point while paused, not the full length
+            // (feedback 2026-08-27).
+            toggling -> {
+                pausedEventId.value = eventId
+                // While the counter is unanchored (player still spinning up),
+                // the frozen seed IS the position — extrapolating over a
+                // player that hasn't started would run the estimate ahead.
+                pausedPositionMs.value = if (counterPending.value) {
+                    playingPositionMs.value ?: 0L
+                } else {
+                    (playingPositionMs.value ?: 0L) +
+                        (android.os.SystemClock.elapsedRealtime() - playingPositionAtMs.value)
+                }
+                playingEventId.value = null
+            }
+            // Tap the paused row → RESUME from the pause point: seed the
+            // counter there instead of 00:00, so it neither flashes nor
+            // bounces when the next poll reports the real position. The
+            // counter stays FROZEN at the seed until the poll anchors it —
+            // counting on wall clock before the companion's player is up runs
+            // ahead, and the poll then jumps the label BACK (feedback
+            // 2026-08-28: "the timer goes back 2 seconds").
+            resuming -> {
+                val resumeFrom = pausedPositionMs.value
+                pausedEventId.value = null
+                pausedPositionMs.value = null
+                playingPositionMs.value = resumeFrom
+                playingPositionAtMs.value = android.os.SystemClock.elapsedRealtime()
+                counterPending.value = true
+                playingEventId.value = eventId
+            }
             // A NEW note starts at 0:00 — the position state still holds the
             // previous note's last polled value, which otherwise showed a
             // stale "random" position for a beat until the first poll landed
-            // and snapped it to 0 (feedback 2026-08-23).
-            playingPositionMs.value = 0L
-            playingPositionAtMs.value = android.os.SystemClock.elapsedRealtime()
+            // and snapped it to 0 (feedback 2026-08-23). Frozen at 0:00 until
+            // the poll anchors, like resume.
+            else -> {
+                pausedEventId.value = null
+                pausedPositionMs.value = null
+                playingPositionMs.value = 0L
+                playingPositionAtMs.value = android.os.SystemClock.elapsedRealtime()
+                counterPending.value = true
+                playingEventId.value = eventId
+            }
         }
-        playingEventId.value = if (toggling) null else eventId
         viewModelScope.launch {
             val (playing, error) = ChatClient.playVoiceNote(room.id, eventId)
             playingEventId.value = if (playing) eventId else null
@@ -669,6 +728,9 @@ class ThreadScreen(
         val playingEventId by viewModel.playingEventId.collectAsState()
         val playingPositionMs by viewModel.playingPositionMs.collectAsState()
         val playingPositionAtMs by viewModel.playingPositionAtMs.collectAsState()
+        val counterPending by viewModel.counterPending.collectAsState()
+        val pausedEventId by viewModel.pausedEventId.collectAsState()
+        val pausedPositionMs by viewModel.pausedPositionMs.collectAsState()
         val voiceError by viewModel.voiceError.collectAsState()
         val muted by viewModel.muted.collectAsState()
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
@@ -817,6 +879,9 @@ class ThreadScreen(
                                             playing = row.message.id == playingEventId,
                                             playingPositionMs = playingPositionMs,
                                             playingPositionAtMs = playingPositionAtMs,
+                                            counterPending = counterPending,
+                                            paused = row.message.id == pausedEventId,
+                                            pausedPositionMs = pausedPositionMs,
                                             voiceError = voiceError,
                                             onEnsureMedia = viewModel::ensureMedia,
                                             onPlayVoiceNote = viewModel::playVoiceNote,
@@ -1114,6 +1179,9 @@ private fun MessageRow(
     playing: Boolean,
     playingPositionMs: Long?,
     playingPositionAtMs: Long,
+    counterPending: Boolean,
+    paused: Boolean,
+    pausedPositionMs: Long?,
     voiceError: Pair<String, String>?,
     onEnsureMedia: (String, Boolean) -> Unit,
     onPlayVoiceNote: (String) -> Unit,
@@ -1232,6 +1300,9 @@ private fun MessageRow(
                     playing = playing,
                     playingPositionMs = playingPositionMs,
                     playingPositionAtMs = playingPositionAtMs,
+                    counterPending = counterPending,
+                    paused = paused,
+                    pausedPositionMs = pausedPositionMs,
                     error = voiceError?.takeIf { it.first == message.id }?.second,
                     onTogglePlay = { onPlayVoiceNote(message.id) },
                 )
@@ -1248,6 +1319,15 @@ private fun MessageRow(
                         modifier = Modifier.padding(top = 1.dp),
                     )
                 }
+            }
+            // An edited message shows a quiet "edited" tag under the body
+            // (feedback 2026-08-27) — same grammar as the delivery labels.
+            if (message.edited) {
+                LightText(
+                    text = "edited",
+                    variant = LightTextVariant.Superfine,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
             }
             // Phase 14: reactions, as a quiet tag under the message (same
             // grammar as the "not delivered" marker). Each entry reads
@@ -1387,6 +1467,9 @@ private fun AudioMessageContent(
     playing: Boolean,
     playingPositionMs: Long?,
     playingPositionAtMs: Long,
+    counterPending: Boolean,
+    paused: Boolean,
+    pausedPositionMs: Long?,
     error: String?,
     onTogglePlay: () -> Unit,
 ) {
@@ -1406,11 +1489,19 @@ private fun AudioMessageContent(
     val label = when {
         playing -> {
             val base = playingPositionMs ?: 0L
-            val pos = base + (nowMs - playingPositionAtMs)
+            // Unanchored (player spinning up after a tap): hold the seeded
+            // position — the pause point on resume, 0:00 on a new note — until
+            // the poll confirms the companion's real position. Counting on
+            // wall clock here ran ahead of the companion and the next poll
+            // jumped the label BACK (feedback 2026-08-28).
+            val pos = if (counterPending) base else base + (nowMs - playingPositionAtMs)
             // Just the running position while playing (the row already showed
             // its length when idle).
             formatDuration(durationMs?.let { pos.coerceAtMost(it) } ?: pos)
         }
+        // Paused: the persistent pause point, not the full length (feedback
+        // 2026-08-27).
+        paused && pausedPositionMs != null -> formatDuration(pausedPositionMs)
         durationMs != null -> formatDuration(durationMs)
         else -> message.body
     }
@@ -1428,7 +1519,8 @@ private fun AudioMessageContent(
         LightText(
             text = label,
             variant = LightTextVariant.Paragraph,
-            lighten = playing,
+            // Solid white while playing — the ticking position reads like
+            // the rest of the message (feedback 2026-08-27).
             modifier = Modifier.padding(start = 1f.gridUnitsAsDp()),
         )
     }
