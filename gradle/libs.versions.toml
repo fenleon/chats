@@ -2,10 +2,10 @@
 agp = "8.12.3"
 kotlin = "2.3.20"
 compose-activity = "1.13.0"
-kotlinx-coroutines = "1.10.2"
-ktor = "3.4.2"
-room = "2.7.0"
-trixnity = "4.22.7"
+kotlinx-coroutines = "1.11.0"
+ktor = "3.5.2"
+room = "2.8.4"
+trixnity = "5.8.0"
 sdk = "0.1.0"
 connector = "3.3.2"
 
@@ -14,9 +14,11 @@ compose-activity = { module = "androidx.activity:activity-compose", version.ref 
 kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinx-coroutines" }
 # Trixnity Matrix SDK — the companion's protocol layer (login/sync, Room repos, media).
 # Version pair proven by the Beeper4LightOS bootstrap (see chats/PLAN.md).
-trixnity-client = { module = "net.folivo:trixnity-client", version.ref = "trixnity" }
-trixnity-repository-room = { module = "net.folivo:trixnity-client-repository-room", version.ref = "trixnity" }
-trixnity-media-okio = { module = "net.folivo:trixnity-client-media-okio", version.ref = "trixnity" }
+trixnity-client = { module = "de.connect2x.trixnity:trixnity-client", version.ref = "trixnity" }
+trixnity-repository-room = { module = "de.connect2x.trixnity:trixnity-client-repository-room", version.ref = "trixnity" }
+trixnity-media-okio = { module = "de.connect2x.trixnity:trixnity-client-media-okio", version.ref = "trixnity" }
+# libOlm crypto driver (same pickle format as v4 — no crypto migration).
+trixnity-cryptodriver-libolm = { module = "de.connect2x.trixnity:trixnity-client-cryptodriver-libolm", version.ref = "trixnity" }
 ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
 ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
 ktor-serialization-json = { module = "io.ktor:ktor-serialization-kotlinx-json", version.ref = "ktor" }

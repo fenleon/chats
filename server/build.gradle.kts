@@ -32,6 +32,9 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        // v5 Room repositories declare their transaction-bound methods with
+        // Kotlin context parameters (context(ReadTransaction) / context(WriteTransaction)).
+        freeCompilerArgs.add("-Xcontext-parameters")
     }
 }
 
@@ -57,6 +60,7 @@ dependencies {
     implementation(libs.trixnity.client)
     implementation(libs.trixnity.repository.room)
     implementation(libs.trixnity.media.okio)
+    implementation(libs.trixnity.cryptodriver.libolm) // libOlm driver — same pickle format as v4
     implementation(libs.ktor.client.okhttp)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.json)

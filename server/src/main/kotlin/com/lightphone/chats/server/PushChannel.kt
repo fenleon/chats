@@ -14,9 +14,9 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import net.folivo.trixnity.clientserverapi.model.push.PusherData
-import net.folivo.trixnity.clientserverapi.model.push.SetPushers
-import net.folivo.trixnity.client.MatrixClient
+import de.connect2x.trixnity.clientserverapi.model.push.PusherData
+import de.connect2x.trixnity.clientserverapi.model.push.SetPushers
+import de.connect2x.trixnity.client.MatrixClient
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request

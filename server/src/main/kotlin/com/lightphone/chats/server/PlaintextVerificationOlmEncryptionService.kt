@@ -1,18 +1,13 @@
 package com.lightphone.chats.server
 
-import net.folivo.trixnity.core.model.RoomId
-import net.folivo.trixnity.core.model.UserId
-import net.folivo.trixnity.core.model.events.ClientEvent
-import net.folivo.trixnity.core.model.events.DecryptedMegolmEvent
-import net.folivo.trixnity.core.model.events.DecryptedOlmEvent
-import net.folivo.trixnity.core.model.events.EventContent
-import net.folivo.trixnity.core.model.events.MessageEventContent
-import net.folivo.trixnity.core.model.events.m.key.verification.VerificationRequest
-import net.folivo.trixnity.core.model.events.m.key.verification.VerificationStep
-import net.folivo.trixnity.core.model.events.m.room.EncryptedMessageEventContent.MegolmEncryptedMessageEventContent
-import net.folivo.trixnity.core.model.events.m.room.EncryptedToDeviceEventContent.OlmEncryptedToDeviceEventContent
-import net.folivo.trixnity.core.model.events.m.room.EncryptionEventContent
-import net.folivo.trixnity.crypto.olm.OlmEncryptionService
+import de.connect2x.trixnity.core.model.UserId
+import de.connect2x.trixnity.core.model.events.ClientEvent
+import de.connect2x.trixnity.core.model.events.EventContent
+import de.connect2x.trixnity.core.model.events.PlaintextOlmEvent
+import de.connect2x.trixnity.core.model.events.m.key.verification.VerificationRequest
+import de.connect2x.trixnity.core.model.events.m.key.verification.VerificationStep
+import de.connect2x.trixnity.core.model.events.m.room.EncryptedToDeviceEventContent.OlmEncryptedToDeviceEventContent
+import de.connect2x.trixnity.crypto.olm.OlmEncryptionService
 
 /**
  * Delegates to the real [OlmEncryptionService] but refuses to encrypt
@@ -29,40 +24,60 @@ import net.folivo.trixnity.crypto.olm.OlmEncryptionService
  * require encrypting these events, so matching Beeper's plaintext convention
  * is spec-legal and is the only way the SAS exchange completes against Beeper
  * clients. Room keys, megolm and ordinary olm traffic are unaffected.
+ *
+ * v5 (2026-08-28): the megolm methods moved to [de.connect2x.trixnity.crypto.olm.MegolmEncryptionService]
+ * (no overrides here anymore), `encryptOlm` lost its `forceNewSession` arg and
+ * gained a batch overload, `decryptOlm` returns [PlaintextOlmEvent], and
+ * `recoverOlm` is new. The batch overload must force plaintext too — v5's
+ * megolm key distribution goes through it.
  */
 class PlaintextVerificationOlmEncryptionService(
     private val delegate: OlmEncryptionService,
 ) : OlmEncryptionService {
+
+    private fun shouldForcePlaintext(content: EventContent) =
+        content is VerificationStep || content is VerificationRequest
+
     override suspend fun encryptOlm(
         content: EventContent,
-        userId: UserId,
-        deviceId: String,
-        forceNewSession: Boolean,
+        recipientUserId: UserId,
+        recipientDeviceId: String,
     ): Result<OlmEncryptedToDeviceEventContent> {
-        android.util.Log.d("MatrixRepository", "encryptOlm(${content::class.simpleName}, $deviceId)")
+        android.util.Log.d("MatrixRepository", "encryptOlm(${content::class.simpleName}, $recipientDeviceId)")
         // VerificationStep covers ready/start/accept/key/mac/done/cancel; the
         // request is the odd one out — it implements VerificationRequest, not
         // VerificationStep.
-        if (content is VerificationStep || content is VerificationRequest) {
+        if (shouldForcePlaintext(content)) {
             android.util.Log.d("MatrixRepository", "encryptOlm: forcing plaintext for ${content::class.simpleName}")
             return Result.failure(
                 IllegalStateException("verification events are sent unencrypted (Beeper convention)"),
             )
         }
-        return delegate.encryptOlm(content, userId, deviceId, forceNewSession)
+        return delegate.encryptOlm(content, recipientUserId, recipientDeviceId)
     }
+
+    override suspend fun encryptOlm(
+        content: EventContent,
+        recipients: Set<Pair<UserId, String>>,
+    ): Map<Pair<UserId, String>, Result<OlmEncryptedToDeviceEventContent>> {
+        if (shouldForcePlaintext(content)) {
+            android.util.Log.d(
+                "MatrixRepository",
+                "encryptOlm(batch): forcing plaintext for ${content::class.simpleName}",
+            )
+            val failure = Result.failure<OlmEncryptedToDeviceEventContent>(
+                IllegalStateException("verification events are sent unencrypted (Beeper convention)"),
+            )
+            return recipients.associateWith { failure }
+        }
+        return delegate.encryptOlm(content, recipients)
+    }
+
+    override suspend fun recoverOlm(
+        olmRecovery: OlmEncryptionService.OlmRecovery,
+    ): Result<OlmEncryptedToDeviceEventContent?> = delegate.recoverOlm(olmRecovery)
 
     override suspend fun decryptOlm(
         event: ClientEvent.ToDeviceEvent<OlmEncryptedToDeviceEventContent>,
-    ): Result<DecryptedOlmEvent<*>> = delegate.decryptOlm(event)
-
-    override suspend fun encryptMegolm(
-        content: MessageEventContent,
-        roomId: RoomId,
-        settings: EncryptionEventContent,
-    ): Result<MegolmEncryptedMessageEventContent> = delegate.encryptMegolm(content, roomId, settings)
-
-    override suspend fun decryptMegolm(
-        encryptedEvent: ClientEvent.RoomEvent<MegolmEncryptedMessageEventContent>,
-    ): Result<DecryptedMegolmEvent<*>> = delegate.decryptMegolm(encryptedEvent)
+    ): Result<PlaintextOlmEvent<*>> = delegate.decryptOlm(event)
 }

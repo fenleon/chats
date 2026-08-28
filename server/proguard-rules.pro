@@ -8,7 +8,7 @@
 # Trixnity loads its olm crypto backend reflectively (optional engine) — without a
 # keep, R8 strips it and session restore dies with:
 #   NoClassDefFoundError: ...OlmLibraryWrapper (obfuscated as J5.d)
--keep class net.folivo.trixnity.olm.** { *; }
+-keep class de.connect2x.trixnity.libolm.** { *; }
 
 # Optional AndroidX window extensions (may be absent on some devices; unused here).
 -dontwarn androidx.window.extensions.area.ExtensionWindowAreaPresentation

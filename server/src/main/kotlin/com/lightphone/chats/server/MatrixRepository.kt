@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -62,81 +63,88 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
-import net.folivo.trixnity.client.MatrixClient
-import net.folivo.trixnity.client.MatrixClientConfiguration
-import net.folivo.trixnity.client.createTrixnityDefaultModuleFactories
-import net.folivo.trixnity.client.fromStore
-import net.folivo.trixnity.client.key
-import net.folivo.trixnity.client.key.KeySecretService
-import net.folivo.trixnity.client.key.KeyTrustService
-import net.folivo.trixnity.client.login
-import net.folivo.trixnity.client.media.MediaService
-import net.folivo.trixnity.client.media.MediaStore
-import net.folivo.trixnity.client.media.okio.createOkioMediaStoreModule
-import net.folivo.trixnity.client.room
-import net.folivo.trixnity.client.room.GetTimelineEventConfig
-import net.folivo.trixnity.client.room.GetTimelineEventsConfig
-import net.folivo.trixnity.client.room.TimelineEventHandler
-import net.folivo.trixnity.client.room.message.image
-import net.folivo.trixnity.client.room.message.reply
-import net.folivo.trixnity.client.room.message.text
-import net.folivo.trixnity.client.serverDiscovery
-import net.folivo.trixnity.client.store.GlobalAccountDataStore
-import net.folivo.trixnity.client.store.OlmCryptoStore
-import net.folivo.trixnity.client.store.TimelineEvent
-import net.folivo.trixnity.client.store.Room as MatrixRoom
-import net.folivo.trixnity.client.store.joinedMemberCount
-import net.folivo.trixnity.client.store.repository.RoomStateRepository
-import net.folivo.trixnity.client.store.repository.RoomStateRepositoryKey
-import net.folivo.trixnity.client.store.repository.RoomUserReceiptsRepository
-import net.folivo.trixnity.client.store.repository.RepositoryTransactionManager
-import net.folivo.trixnity.client.store.repository.room.TrixnityRoomDatabase
-import net.folivo.trixnity.client.store.repository.room.createRoomRepositoriesModule
-import net.folivo.trixnity.client.user
-import net.folivo.trixnity.client.verification
-import net.folivo.trixnity.client.verification.ActiveDeviceVerification
-import net.folivo.trixnity.client.verification.ActiveSasVerificationMethod
-import net.folivo.trixnity.client.verification.ActiveSasVerificationState
-import net.folivo.trixnity.client.verification.ActiveVerificationState
-import net.folivo.trixnity.clientserverapi.client.SyncState
-import net.folivo.trixnity.clientserverapi.model.authentication.IdentifierType
-import net.folivo.trixnity.clientserverapi.model.authentication.LoginType
-import net.folivo.trixnity.clientserverapi.model.rooms.GetEvents.Direction
-import net.folivo.trixnity.clientserverapi.model.rooms.GetEvents.Direction.BACKWARDS
-import net.folivo.trixnity.clientserverapi.model.users.Filters
-import net.folivo.trixnity.core.model.EventId
-import net.folivo.trixnity.core.model.RoomId
-import net.folivo.trixnity.core.model.UserId
-import net.folivo.trixnity.core.model.events.MessageEventContent
-import net.folivo.trixnity.core.model.events.UnsignedRoomEventData
-import net.folivo.trixnity.core.model.events.m.room.MemberEventContent
-import net.folivo.trixnity.core.model.events.m.Presence
-import net.folivo.trixnity.core.model.events.m.PushRulesEventContent
-import net.folivo.trixnity.core.model.events.m.ReceiptType
-import net.folivo.trixnity.core.model.events.m.RelatesTo
-import net.folivo.trixnity.core.model.events.m.key.verification.VerificationMethod
-import net.folivo.trixnity.core.model.events.m.room.CreateEventContent
-import net.folivo.trixnity.core.model.events.m.ReactionEventContent
-import net.folivo.trixnity.core.model.events.m.TagEventContent
-import net.folivo.trixnity.core.model.events.m.room.EncryptedFile
-import net.folivo.trixnity.core.model.events.m.room.EncryptedMessageEventContent
-import net.folivo.trixnity.core.model.events.m.room.Membership
-import net.folivo.trixnity.core.model.events.m.room.RoomMessageEventContent
-import net.folivo.trixnity.core.model.events.m.space.ChildEventContent
-import net.folivo.trixnity.core.model.events.m.secretstorage.DefaultSecretKeyEventContent
-import net.folivo.trixnity.core.model.events.m.secretstorage.SecretKeyEventContent
-import net.folivo.trixnity.core.model.events.RoomAccountDataEventContent
-import net.folivo.trixnity.core.model.events.UnknownEventContent
-import net.folivo.trixnity.core.serialization.events.DefaultEventContentSerializerMappings
-import net.folivo.trixnity.core.serialization.events.EventContentSerializerMappings
-import net.folivo.trixnity.core.serialization.events.createEventContentSerializerMappings
-import net.folivo.trixnity.core.serialization.events.roomAccountDataOf
-import net.folivo.trixnity.core.model.push.PushAction
-import net.folivo.trixnity.core.model.push.PushRuleKind
-import net.folivo.trixnity.clientserverapi.model.push.SetPushRule
-import net.folivo.trixnity.crypto.key.decodeRecoveryKey
-import net.folivo.trixnity.crypto.olm.OlmEncryptionService
-import net.folivo.trixnity.crypto.olm.OlmEncryptionServiceImpl
+import de.connect2x.trixnity.clientserverapi.model.push.SetPushRule
+import de.connect2x.trixnity.clientserverapi.model.user.Filters
+import de.connect2x.trixnity.core.model.events.MessageEventContent
+import de.connect2x.trixnity.core.model.events.RoomAccountDataEventContent
+import de.connect2x.trixnity.core.model.events.m.PushRulesEventContent
+import de.connect2x.trixnity.core.model.events.m.TagEventContent
+import de.connect2x.trixnity.core.model.push.PushAction
+import de.connect2x.trixnity.core.model.push.PushRuleKind
+import de.connect2x.trixnity.core.serialization.events.EventContentSerializerMappings
+import de.connect2x.trixnity.core.serialization.events.default
+import de.connect2x.trixnity.core.serialization.events.invoke
+import de.connect2x.trixnity.core.serialization.events.roomAccountDataOf
+import de.connect2x.trixnity.client.CryptoDriverModule
+import de.connect2x.trixnity.client.MatrixClient
+import de.connect2x.trixnity.clientserverapi.client.MatrixClientAuthProviderData
+import de.connect2x.trixnity.client.MatrixClientConfiguration
+import de.connect2x.trixnity.client.MediaStoreModule
+import de.connect2x.trixnity.client.RepositoriesModule
+import de.connect2x.trixnity.client.create
+import de.connect2x.trixnity.client.createTrixnityDefaultModuleFactories
+import de.connect2x.trixnity.client.key
+import de.connect2x.trixnity.client.key.KeySecretService
+import de.connect2x.trixnity.client.key.KeyTrustService
+import de.connect2x.trixnity.client.media.MediaService
+import de.connect2x.trixnity.client.media.MediaStore
+import de.connect2x.trixnity.client.media.okio.okio
+import de.connect2x.trixnity.client.notification
+import de.connect2x.trixnity.client.room
+import de.connect2x.trixnity.client.room.GetTimelineEventConfig
+import de.connect2x.trixnity.client.room.GetTimelineEventsConfig
+import de.connect2x.trixnity.client.room.TimelineEventHandler
+import de.connect2x.trixnity.client.room.message.image
+import de.connect2x.trixnity.client.room.message.reply
+import de.connect2x.trixnity.client.room.message.text
+import de.connect2x.trixnity.client.serverDiscovery
+import de.connect2x.trixnity.client.store.GlobalAccountDataStore
+import de.connect2x.trixnity.client.store.OlmCryptoStore
+import de.connect2x.trixnity.client.store.Room as MatrixRoom
+import de.connect2x.trixnity.client.store.StoreTransactionManager
+import de.connect2x.trixnity.client.store.TimelineEvent
+import de.connect2x.trixnity.client.store.joinedMemberCount
+import de.connect2x.trixnity.client.store.repository.RoomStateRepository
+import de.connect2x.trixnity.client.store.repository.RoomStateRepositoryKey
+import de.connect2x.trixnity.client.store.repository.RoomUserReceiptsRepository
+import de.connect2x.trixnity.client.store.repository.room.TrixnityRoomDatabase
+import de.connect2x.trixnity.client.store.repository.room.room
+import de.connect2x.trixnity.client.user
+import de.connect2x.trixnity.client.verification
+import de.connect2x.trixnity.client.verification.ActiveDeviceVerification
+import de.connect2x.trixnity.client.verification.ActiveSasVerificationMethod
+import de.connect2x.trixnity.client.verification.ActiveSasVerificationState
+import de.connect2x.trixnity.client.verification.ActiveVerificationState
+import de.connect2x.trixnity.clientserverapi.client.SyncState
+import de.connect2x.trixnity.clientserverapi.client.classicLogin
+import de.connect2x.trixnity.clientserverapi.model.authentication.IdentifierType
+import de.connect2x.trixnity.clientserverapi.model.authentication.LoginType
+import de.connect2x.trixnity.clientserverapi.model.room.GetEvents.Direction
+import de.connect2x.trixnity.clientserverapi.model.room.GetEvents.Direction.BACKWARDS
+import de.connect2x.trixnity.core.model.EventId
+import de.connect2x.trixnity.core.model.RoomId
+import de.connect2x.trixnity.core.model.UserId
+import de.connect2x.trixnity.core.model.events.UnsignedRoomEventData
+import de.connect2x.trixnity.core.model.events.m.room.MemberEventContent
+import de.connect2x.trixnity.core.model.events.m.Presence
+import de.connect2x.trixnity.core.model.events.m.ReceiptType
+import de.connect2x.trixnity.core.model.events.m.RelatesTo
+import de.connect2x.trixnity.core.model.events.m.key.verification.VerificationMethod
+import de.connect2x.trixnity.core.model.events.m.room.CreateEventContent
+import de.connect2x.trixnity.core.model.events.m.ReactionEventContent
+import de.connect2x.trixnity.core.model.events.m.room.EncryptedFile
+import de.connect2x.trixnity.core.model.events.m.room.EncryptedMessageEventContent
+import de.connect2x.trixnity.core.model.events.m.room.Membership
+import de.connect2x.trixnity.core.model.events.m.room.RoomMessageEventContent
+import de.connect2x.trixnity.core.model.events.m.space.ChildEventContent
+import de.connect2x.trixnity.core.model.events.m.secretstorage.DefaultSecretKeyEventContent
+import de.connect2x.trixnity.core.model.events.m.secretstorage.SecretKeyEventContent
+import de.connect2x.trixnity.core.model.events.UnknownEventContent
+import de.connect2x.trixnity.crypto.key.decodeRecoveryKey
+import de.connect2x.trixnity.crypto.olm.OlmEncryptionService
+import de.connect2x.trixnity.crypto.olm.OlmEncryptionServiceImpl
+import de.connect2x.trixnity.client.cryptodriver.libolm.libOlm
+import de.connect2x.trixnity.utils.ReadTransaction
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Path.Companion.toPath
 import org.koin.dsl.module
@@ -354,7 +362,7 @@ object MatrixRepository {
     val isSyncEnabled: Boolean get() = syncEnabled
 
     /** Sync cadence. ACTIVE = continuous long-poll while the screen is on;
-     *  SLOW = periodic [net.folivo.trixnity.client.MatrixClient.syncOnce] once
+     *  SLOW = periodic [de.connect2x.trixnity.client.MatrixClient.syncOnce] once
      *  the screen's been off for a while — the long-poll's per-response
      *  parse/decrypt/store processing is the main standby cost on an
      *  always-active bridged account (battery, 2026-08-14). */
@@ -728,7 +736,7 @@ object MatrixRepository {
      * standby CPU/logd volume all night); WARN+ always stays visible.
      */
     private fun enableTrixnityLogging() {
-        val root = java.util.logging.Logger.getLogger("net.folivo")
+        val root = java.util.logging.Logger.getLogger("de.connect2x")
         root.level = if (debugLogging()) java.util.logging.Level.FINE else java.util.logging.Level.WARNING
         if (root.handlers.none { it is TrixnityLogcatHandler }) {
             root.addHandler(TrixnityLogcatHandler())
@@ -811,17 +819,23 @@ object MatrixRepository {
             // discovery runs when the host serves one, else the URL is used as-is.
             val baseUrl = homeserver.trim().serverDiscovery(httpClientEngine = httpClientEngine).getOrThrow()
 
-            val loginResult = MatrixClient.login(
+            val loginResult = MatrixClientAuthProviderData.classicLogin(
                 baseUrl = baseUrl,
                 identifier = IdentifierType.User(user.trim()),
                 password = if (tokenLogin) null else passwordOrToken,
                 token = if (tokenLogin) passwordOrToken else null,
                 loginType = if (tokenLogin) LoginType.Token() else LoginType.Password,
                 initialDeviceDisplayName = "Chats (Light Phone)",
-                repositoriesModule = createRoomRepositoriesModule(databaseBuilder(ctx)),
-                mediaStoreModule = createOkioMediaStoreModule(mediaDir(ctx)),
-                configuration = clientConfiguration("chats"),
             ).getOrThrow()
+                .let { authProviderData ->
+                    MatrixClient.create(
+                        repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+                        mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
+                        cryptoDriverModule = CryptoDriverModule.libOlm(),
+                        authProviderData = authProviderData,
+                        configuration = clientConfiguration("chats"),
+                    ).getOrThrow()
+                }
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit()
                 .putString(KEY_HOMESERVER, baseUrl.toString())
@@ -908,17 +922,23 @@ object MatrixRepository {
                 http.close()
             }
 
-            val loginResult = MatrixClient.login(
+            val loginResult = MatrixClientAuthProviderData.classicLogin(
                 baseUrl = Url(BEEPER_HOMESERVER),
                 identifier = IdentifierType.User(username.trim()),
                 password = null,
                 token = loginToken,
                 loginType = LoginType.Unknown("org.matrix.login.jwt", buildJsonObject {}),
                 initialDeviceDisplayName = "Chats (Light Phone)",
-                repositoriesModule = createRoomRepositoriesModule(databaseBuilder(ctx)),
-                mediaStoreModule = createOkioMediaStoreModule(mediaDir(ctx)),
-                configuration = clientConfiguration("chats-beeper"),
             ).getOrThrow()
+                .let { authProviderData ->
+                    MatrixClient.create(
+                        repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+                        mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
+                        cryptoDriverModule = CryptoDriverModule.libOlm(),
+                        authProviderData = authProviderData,
+                        configuration = clientConfiguration("chats-beeper"),
+                    ).getOrThrow()
+                }
             prefs.edit()
                 .putString(KEY_HOMESERVER, BEEPER_HOMESERVER)
                 .putString(KEY_USER_ID, loginResult.userId.full)
@@ -1009,11 +1029,11 @@ object MatrixRepository {
             val methods = withTimeoutOrNull(ROOM_BUDGET_MS) {
                 c.verification.getSelfVerificationMethods().first()
             } ?: error("no self-verification methods available")
-            if (methods !is net.folivo.trixnity.client.verification.VerificationService.SelfVerificationMethods.CrossSigningEnabled) {
+            if (methods !is de.connect2x.trixnity.client.verification.VerificationService.SelfVerificationMethods.CrossSigningEnabled) {
                 error("cross-signing is not set up on this account")
             }
             if (methods.methods
-                    .none { it is net.folivo.trixnity.client.verification.SelfVerificationMethod.AesHmacSha2RecoveryKey }
+                    .none { it is de.connect2x.trixnity.client.verification.SelfVerificationMethod.AesHmacSha2RecoveryKey }
             ) error("no recovery-key method available")
             // Strip everything but letters/digits (dash- or space-grouped keys,
             // pasted or typed). Case is preserved — the key is case-sensitive and
@@ -1396,9 +1416,11 @@ object MatrixRepository {
             // room-account-data whitelist (one-time, prefs-gated).
             migrateSyncFilterIfNeeded(ctx)
             val restored = runCatching {
-                MatrixClient.fromStore(
-                    repositoriesModule = createRoomRepositoriesModule(databaseBuilder(ctx)),
-                    mediaStoreModule = createOkioMediaStoreModule(mediaDir(ctx)),
+                MatrixClient.create(
+                    repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+                    mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
+                    cryptoDriverModule = CryptoDriverModule.libOlm(),
+                    authProviderData = null, // restore from the store (built-in Account→Authentication migration)
                     configuration = clientConfiguration("chats"),
                 ).getOrThrow()
             }.onFailure { e ->
@@ -1549,7 +1571,7 @@ object MatrixRepository {
     }
 
     /** Fills a room's timeline gap from the server (Trixnity's
-     *  [net.folivo.trixnity.client.room.TimelineEventHandler.unsafeFillTimelineGaps]
+     *  [de.connect2x.trixnity.client.room.TimelineEventHandler.unsafeFillTimelineGaps]
      *  — a windowed GET /rooms/{id}/messages + store + chain re-link, single
      *  attempt) and re-reads the chain. The public [RoomService.fillTimelineGaps]
      *  wrapper is NOT used: it retries indefinitely on the client scope (a
@@ -2336,10 +2358,10 @@ object MatrixRepository {
 
     /** Trixnity's KeyBackupService via the client's DI; null when the key
      *  backup module isn't registered (e.g. an account without one). */
-    private fun keyBackupOf(c: MatrixClient): net.folivo.trixnity.client.key.KeyBackupService? =
+    private fun keyBackupOf(c: MatrixClient): de.connect2x.trixnity.client.key.KeyBackupService? =
         runCatching {
-            c.di.get<net.folivo.trixnity.client.key.KeyBackupService>(
-                org.koin.core.qualifier.named<net.folivo.trixnity.client.key.KeyBackupService>(),
+            c.di.get<de.connect2x.trixnity.client.key.KeyBackupService>(
+                org.koin.core.qualifier.named<de.connect2x.trixnity.client.key.KeyBackupService>(),
             )
         }.getOrNull()
 
@@ -2742,7 +2764,7 @@ object MatrixRepository {
      *  order, so this last module wins over the default mappings single. */
     private fun archiveMappingsModule() = module {
         single<EventContentSerializerMappings> {
-            DefaultEventContentSerializerMappings + createEventContentSerializerMappings {
+            EventContentSerializerMappings.default + EventContentSerializerMappings {
                 roomAccountDataOf(BEEPER_INBOX_DONE_EVENT_TYPE, BeeperInboxDoneContentSerializer)
             }
         }
@@ -2901,6 +2923,7 @@ object MatrixRepository {
      * the app. LID contacts carry no number in the room data (Beeper
      * resolves LIDs server-side).
      */
+    context(transaction: ReadTransaction)
     private suspend fun bridgeBotOf(c: MatrixClient, matrixRoomId: RoomId): String {
         bridgeBotByRoom[matrixRoomId.full]?.let { return it }
         val stateRepo = c.di.get<RoomStateRepository>(RoomStateRepository::class)
@@ -2927,7 +2950,7 @@ object MatrixRepository {
             // The Room-backed repositories only work inside a store transaction
             // (the flow APIs set it up themselves; direct repo reads need the
             // explicit scope, or Room answers "read transaction is missing").
-            val txManager = c.di.get<RepositoryTransactionManager>(RepositoryTransactionManager::class)
+            val txManager = c.di.get<StoreTransactionManager>(StoreTransactionManager::class)
             txManager.readTransaction {
                 val receipts = c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class)
                     .get(matrixRoomId)
@@ -3016,7 +3039,7 @@ object MatrixRepository {
         val trust = withTimeoutOrNull(KEY_BACKUP_VERIFY_TIMEOUT_MS) {
             c.key.getTrustLevel(c.userId, c.deviceId).firstOrNull()
         } ?: return true
-        return trust is net.folivo.trixnity.crypto.key.DeviceTrustLevel.CrossSigned && trust.verified
+        return trust is de.connect2x.trixnity.crypto.key.DeviceTrustLevel.CrossSigned && trust.verified
     }
 
     /** Loads the megolm sessions for the given events' undecrypted content from
@@ -3259,7 +3282,10 @@ object MatrixRepository {
 
     private suspend fun rotateStaleMegolmOnce(c: MatrixClient, matrixRoomId: RoomId, reason: String) {
         runCatching {
-            c.di.get<OlmCryptoStore>(OlmCryptoStore::class).updateOutboundMegolmSession(matrixRoomId) { null }
+            // v5: outbound-megolm updates are transaction-bound (context(StoreWriteTransaction)).
+            c.di.get<StoreTransactionManager>(StoreTransactionManager::class).writeTransaction {
+                c.di.get<OlmCryptoStore>(OlmCryptoStore::class).updateOutboundMegolmSession(matrixRoomId) { null }
+            }
         }.onSuccess {
             megolmRotatedRooms[matrixRoomId.full] = android.os.SystemClock.elapsedRealtime()
             android.util.Log.d(TAG, "rotated stale megolm session for $matrixRoomId (bridge FAIL: $reason)")
@@ -3525,12 +3551,12 @@ object MatrixRepository {
         // One retry: a single flaky fetch failing once shouldn't fail playback
         // outright — the first attempt can hit a slow window (2026-08-23).
         // Each attempt is logged separately so a silent tap maps to one cause.
-        var download: Result<net.folivo.trixnity.client.media.PlatformMedia>? = null
+        var download: Result<de.connect2x.trixnity.client.media.PlatformMedia>? = null
         for (attempt in 1..2) {
             val result = withTimeoutOrNull(MEDIA_BUDGET_MS) {
                 when {
-                    file != null -> mediaService.getEncryptedMedia(file, saveToCache = false)
-                    url != null -> mediaService.getMedia(url, saveToCache = false)
+                    file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = false)
+                    url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = false)
                     else -> return@withTimeoutOrNull null
                 }
             }
@@ -3893,12 +3919,12 @@ object MatrixRepository {
         val url = content.url?.takeIf { it.isNotBlank() }
         if (file == null && url == null) return null
         val mediaService = c.di.get<MediaService>(MediaService::class)
-        var download: Result<net.folivo.trixnity.client.media.PlatformMedia>? = null
+        var download: Result<de.connect2x.trixnity.client.media.PlatformMedia>? = null
         for (attempt in 1..2) {
             val result = withTimeoutOrNull(MEDIA_BUDGET_MS) {
                 when {
-                    file != null -> mediaService.getEncryptedMedia(file, saveToCache = false)
-                    url != null -> mediaService.getMedia(url, saveToCache = false)
+                    file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = false)
+                    url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = false)
                     else -> return@withTimeoutOrNull null
                 }
             }
@@ -4227,8 +4253,8 @@ object MatrixRepository {
         val mediaService = c.di.get<MediaService>(MediaService::class)
         val bytes = withTimeoutOrNull(MEDIA_BUDGET_MS) {
             val result = when {
-                file != null -> mediaService.getEncryptedMedia(file, saveToCache = true)
-                url != null -> mediaService.getMedia(url, saveToCache = true)
+                file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = true)
+                url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = true)
                 else -> return@withTimeoutOrNull null
             }
             if (result.isFailure) {
@@ -4296,7 +4322,7 @@ object MatrixRepository {
         // Opening the thread makes the room's notification moot.
         appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
         // Optimistically clear the room's unread in the served list — the
-        // store's unreadMessageCount only drops after the read-marker echo
+        // notification count only drops after the read-marker echo
         // round-trips through sync (a full tick on a big account), which used
         // to leave the badge up long after the thread was opened. The
         // resolver keeps serving 0 until the echo confirms or a newer event
@@ -4423,7 +4449,7 @@ object MatrixRepository {
 
     /** The current per-room account-data path: `/user/{userId}/rooms/{roomId}/account_data/{type}`. */
     private fun accountDataUrl(c: MatrixClient, roomId: String, type: String): String =
-        c.api.baseClient.baseUrl.toString().trimEnd('/') +
+        c.baseUrl.toString().trimEnd('/') +
             "/_matrix/client/v3/user/" + c.userId.full.encodeURLPathPart() +
             "/rooms/" + roomId.encodeURLPathPart() +
             "/account_data/" + type
@@ -4454,7 +4480,7 @@ object MatrixRepository {
                 status == 404 -> false
                 else -> null
             }
-        } catch (e: net.folivo.trixnity.core.MatrixServerException) {
+        } catch (e: de.connect2x.trixnity.core.MatrixServerException) {
             // Trixnity's HttpCallValidator turns non-2xx into this (before
             // ktor's own throw); a 404 is the definitive "not archived"
             // answer, other statuses keep the store claim.
@@ -4587,34 +4613,51 @@ object MatrixRepository {
                         // notified), and later emissions notify for new ones.
                         val job = scope.launch {
                             try {
-                                roomFlow.filterNotNull().collect { updated ->
-                                    // Resolver skip-gate signal (efficiency audit
-                                    // 2026-08-14): any room-state change (message,
-                                    // unread count, membership) wakes the
-                                    // room-list resolver instead of its old
-                                    // unconditional 2 s pass loop.
-                                    val sig = RoomSig(
-                                        updated.lastRelevantEventId?.full,
-                                        updated.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
-                                        updated.unreadMessageCount,
-                                        updated.membership?.name,
-                                    )
-                                    if (roomSigSeen[key] != sig) {
-                                        roomSigSeen[key] = sig
-                                        roomListDirty = true
+                                // The v5 badge feed: room.unreadMessageCount is
+                                // gone, so the notification service's per-room
+                                // notification count drives the list badge. Its
+                                // first emission is a cache read; changes mark
+                                // the resolver dirty (skip-gate, audit 2026-08-14).
+                                // Tied to this job via coroutineScope so a room
+                                // collector ending (or failing) drops both.
+                                coroutineScope {
+                                    launch {
+                                        c.notification.getCount(roomId).collect { count ->
+                                            if (unreadCounts[key] != count) {
+                                                unreadCounts[key] = count
+                                                roomListDirty = true
+                                            }
+                                        }
                                     }
-                                    val lastId = updated.lastRelevantEventId?.full ?: return@collect
-                                    if (updated.membership != Membership.JOIN) return@collect
-                                    val prev = seen[key]
-                                    if (prev == null) {
-                                        // Baseline: the first loaded state is
-                                        // already-synced history, never notified.
-                                        seen[key] = lastId
-                                        return@collect
-                                    }
-                                    if (prev != lastId) {
-                                        seen[key] = lastId
-                                        notifyForEvent(c, roomId, lastId, updated)
+                                    roomFlow.filterNotNull().collect { updated ->
+                                        // Resolver skip-gate signal (efficiency audit
+                                        // 2026-08-14): any room-state change (message,
+                                        // membership) wakes the room-list resolver
+                                        // instead of its old unconditional 2 s pass
+                                        // loop (unread changes come via the count
+                                        // collector above).
+                                        val sig = RoomSig(
+                                            updated.lastRelevantEventId?.full,
+                                            updated.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
+                                            updated.membership?.name,
+                                        )
+                                        if (roomSigSeen[key] != sig) {
+                                            roomSigSeen[key] = sig
+                                            roomListDirty = true
+                                        }
+                                        val lastId = updated.lastRelevantEventId?.full ?: return@collect
+                                        if (updated.membership != Membership.JOIN) return@collect
+                                        val prev = seen[key]
+                                        if (prev == null) {
+                                            // Baseline: the first loaded state is
+                                            // already-synced history, never notified.
+                                            seen[key] = lastId
+                                            return@collect
+                                        }
+                                        if (prev != lastId) {
+                                            seen[key] = lastId
+                                            notifyForEvent(c, roomId, lastId, updated)
+                                        }
                                     }
                                 }
                             } catch (e: Exception) {
@@ -4746,7 +4789,7 @@ object MatrixRepository {
             ) null else senderNameOf(c, roomId, te.event.sender),
             preview = preview,
             direct = room.isDirect,
-            unreadCount = room.unreadMessageCount,
+            unreadCount = unreadCounts[roomId.full]?.toLong() ?: 0L,
         )
     }
 
@@ -4808,7 +4851,7 @@ object MatrixRepository {
      *  difference sets [roomListDirty] (the resolver's skip gate, audit 2026-08-14). */
     private val roomSigSeen = java.util.concurrent.ConcurrentHashMap<String, RoomSig>()
     /** Room ids the user has opened (MarkRead fired) → (event id marked read,
-     *  its timestamp). The store's unreadMessageCount only drops after the
+     *  its timestamp). The notification count only drops after the
      *  read-marker echo round-trips through sync (a full tick on a big
      *  account), so the served list shows 0 until the echo confirms or a
      *  message NEWER than the marked one arrives (feedback 2026-08-15: the
@@ -4858,15 +4901,23 @@ object MatrixRepository {
     private data class RoomSig(
         val lastEventId: String?,
         val lastTsMs: Long,
-        val unreadCount: Long,
         val membership: String?,
     )
 
     /**
+     * Per-room unread badge source (v5: `room.unreadMessageCount` is gone).
+     * Fed by `c.notification.getCount(roomId)` — the v5 NotificationService's
+     * per-room notification count (not a message count; badge semantics are
+     * boolean/notification-count from here on). The collector runs in
+     * [observeNotifications] per joined room.
+     */
+    private val unreadCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /**
      * Unread count to show in the list. While a MarkRead is pending (the
      * store hasn't echoed it yet — see [pendingReadClear]) the count reads 0;
-     * the suppression lifts when the echo confirms (store unread 0) or a
-     * message NEWER than the one marked read arrives (real unread again —
+     * the suppression lifts when the echo confirms (notification count 0) or
+     * a message NEWER than the one marked read arrives (real unread again —
      * compared by timestamp, so a lagging summary can't undo the clear for
      * events the page simply didn't carry, 2026-08-23).
      */
@@ -4894,6 +4945,7 @@ object MatrixRepository {
         roomSigSeen.clear()
         bridgeBotByRoom.clear()
         pendingReadClear.clear()
+        unreadCounts.clear()
         effectiveLastCache.clear()
         ghostResolveInFlight.clear()
         _roomList.value = emptyList()
@@ -5138,7 +5190,7 @@ object MatrixRepository {
                         cleared?.second,
                         room.lastRelevantEventId?.full,
                         room.lastRelevantEventTimestamp?.toEpochMilliseconds(),
-                        if (verified || !room.encrypted) room.unreadMessageCount else 0,
+                        if (verified || !room.encrypted) (unreadCounts[key]?.toLong() ?: 0L) else 0,
                     ),
                     lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
                     lastEventId = room.lastRelevantEventId?.full,
@@ -5210,7 +5262,7 @@ object MatrixRepository {
         }
         // An unverified device can't decrypt — suppress unread for encrypted
         // rooms only; unencrypted ones stay readable.
-        val storeUnread = if (verified || !room.encrypted) room.unreadMessageCount else 0
+        val storeUnread = if (verified || !room.encrypted) (unreadCounts[key]?.toLong() ?: 0L) else 0
         val cleared = pendingReadClear[key]
         val unread = servedUnread(
             key,
@@ -5575,7 +5627,7 @@ object MatrixRepository {
         // Cache-hit avoids a store transaction on steady-state room passes;
         // the cold read owns its own scope like readReceiptsByEvent does.
         val declared = bridgeBotByRoom[roomId.full] ?: withTimeoutOrNull(ROOM_BUDGET_MS) {
-            val txManager = c.di.get<RepositoryTransactionManager>(RepositoryTransactionManager::class)
+            val txManager = c.di.get<StoreTransactionManager>(StoreTransactionManager::class)
             txManager.readTransaction { bridgeBotOf(c, roomId) }
         }.orEmpty()
         val humans = if (declared.isNotEmpty()) {

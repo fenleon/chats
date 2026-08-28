@@ -9,8 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
-import net.folivo.trixnity.clientserverapi.client.SyncState
-import net.folivo.trixnity.core.model.events.m.Presence
+import de.connect2x.trixnity.clientserverapi.client.SyncState
+import de.connect2x.trixnity.core.model.events.m.Presence
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -18,7 +18,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
- * Foreground host for the Matrix sync loop. Trixnity's [net.folivo.trixnity.client.MatrixClient.startSync]
+ * Foreground host for the Matrix sync loop. Trixnity's [de.connect2x.trixnity.client.MatrixClient.startSync]
  * long-polls the homeserver inside the client; this service keeps the process
  * alive so messages arrive while the tool is closed. The companion is a plain
  * app, so the tool runtime's service ban doesn't apply here (the whole point of
@@ -90,7 +90,7 @@ class ChatSyncService : Service() {
      * (login state != LOGGED_IN) — retrying a dead token would just hammer
      * the server; that case is handled by [MatrixRepository].
      */
-    private suspend fun startSyncWatchdog(c: net.folivo.trixnity.client.MatrixClient) {
+    private suspend fun startSyncWatchdog(c: de.connect2x.trixnity.client.MatrixClient) {
         var stuckSinceMs = 0L
         var lastState: SyncState? = null
         c.syncState.collect { state ->
@@ -114,7 +114,7 @@ class ChatSyncService : Service() {
             val running = state == SyncState.RUNNING || state == SyncState.STARTED ||
                 state == SyncState.INITIAL_SYNC
             val now = android.os.SystemClock.elapsedRealtime()
-            if (running || c.loginState.value != net.folivo.trixnity.client.MatrixClient.LoginState.LOGGED_IN) {
+            if (running || c.loginState.value != de.connect2x.trixnity.client.MatrixClient.LoginState.LOGGED_IN) {
                 stuckSinceMs = 0L
                 return@collect
             }
@@ -166,11 +166,11 @@ class ChatSyncService : Service() {
 
         /** The client instance the sync loop is currently running on. */
         @Volatile
-        private var syncedClient: net.folivo.trixnity.client.MatrixClient? = null
+        private var syncedClient: de.connect2x.trixnity.client.MatrixClient? = null
 
         /** The client the sync watchdog is currently attached to. */
         @Volatile
-        private var watchdogClient: net.folivo.trixnity.client.MatrixClient? = null
+        private var watchdogClient: de.connect2x.trixnity.client.MatrixClient? = null
 
         /** True while this service is running. */
         @Volatile
