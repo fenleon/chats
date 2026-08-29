@@ -27,6 +27,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.formatRelativeTimestamp
 import com.thelightphone.sdk.InitialScreen
 import com.thelightphone.sdk.LightScreen
@@ -59,6 +60,9 @@ import kotlinx.coroutines.launch
 
 /** Grow the list slice when the last visible row is within this many of the end. */
 private const val REVEAL_THRESHOLD = 4
+
+/** Live flag poll for the long-press contact panel (same cadence as the thread). */
+private const val PANEL_FLAG_SYNC_MS = 3_000L
 
 /** Shown while the initial sync pulls the whole account (can take minutes). */
 private const val DOWNLOADING_TEXT = "Downloading your chat history…"
@@ -110,6 +114,71 @@ class ChatListViewModel : LightViewModel<Unit>() {
     var pendingNotifyRoomId: String? = null
     /** Selected bridged-network label (Phase 7); null = all networks. */
     val networkFilter = MutableStateFlow<String?>(null)
+
+    /**
+     * Contact-panel state for the long-press entry (2026-08-29): long-pressing
+     * a room row opens the same contact panel as the thread's name, seeded from
+     * the row's flags and polled while the panel is open so a Beeper-side
+     * toggle reaches it live (same pattern as ThreadViewModel's flag sync).
+     */
+    val panelMuted = MutableStateFlow(false)
+    val panelPinned = MutableStateFlow(false)
+    val panelArchived = MutableStateFlow(false)
+    private var panelRoomId: String? = null
+    private var panelFlagSyncJob: Job? = null
+
+    /** Seeds the panel from the row and starts the live flag poll. */
+    fun openContactPanel(room: LightServiceMethod.GetRooms.Room) {
+        // Kill any poll leaked by an earlier panel before starting this one:
+        // startPanelFlagSync's guard would otherwise keep polling the FIRST
+        // panel's room and clobber this panel's flags with them (2026-08-29:
+        // archive toggles flipped back to ARCHIVE after 3 s for exactly that).
+        panelFlagSyncJob?.cancel()
+        panelFlagSyncJob = null
+        panelRoomId = room.id
+        panelMuted.value = room.muted
+        panelPinned.value = room.pinned
+        panelArchived.value = room.archived
+        startPanelFlagSync(room.id)
+    }
+
+    /** Stops the poll when the panel is dismissed (X pops back to the list). */
+    fun closeContactPanel() {
+        panelFlagSyncJob?.cancel()
+        panelFlagSyncJob = null
+        panelRoomId = null
+    }
+
+    private fun startPanelFlagSync(roomId: String) {
+        if (panelFlagSyncJob?.isActive == true) return
+        panelFlagSyncJob = viewModelScope.launch {
+            while (true) {
+                delay(PANEL_FLAG_SYNC_MS)
+                val flags = ChatClient.getRoomFlags(roomId) ?: continue
+                panelMuted.value = flags.muted
+                panelPinned.value = flags.pinned
+                panelArchived.value = flags.archived
+            }
+        }
+    }
+
+    fun togglePanelMuted() {
+        val next = !panelMuted.value
+        panelMuted.value = next
+        panelRoomId?.let { viewModelScope.launch { ChatClient.setRoomMuted(it, next) } }
+    }
+
+    fun togglePanelPinned() {
+        val next = !panelPinned.value
+        panelPinned.value = next
+        panelRoomId?.let { viewModelScope.launch { ChatClient.setRoomPinned(it, next) } }
+    }
+
+    fun togglePanelArchived() {
+        val next = !panelArchived.value
+        panelArchived.value = next
+        panelRoomId?.let { viewModelScope.launch { ChatClient.setRoomArchived(it, next) } }
+    }
 
     /**
      * One-shot launch request for the companion's POST_NOTIFICATIONS
@@ -352,11 +421,14 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
 
         // Phase 7 filters: the network selector narrows the list; the full
         // room set stays in the ViewModel. (The unread toggle moved to the
-        // Search screen, feedback 2026-08-21.)
+        // Search screen, feedback 2026-08-21.) Archived rooms hide unless
+        // pinned (pinned wins, 2026-08-28); pinned rooms sort to the top —
+        // stable, so server recency holds within the pinned group.
         val filteredRooms = remember(rooms, networkFilter) {
             rooms.filter { room ->
-                networkFilter == null || room.network == networkFilter
-            }
+                (networkFilter == null || room.network == networkFilter) &&
+                    !(room.archived && !room.pinned) // archived hidden unless pinned wins
+            }.sortedByDescending { it.pinned } // stable — server recency holds within groups
         }
         // Network labels for the Networks panel, from the rooms the companion
         // tagged (Beeper account spaces only — group chats are excluded
@@ -489,13 +561,14 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                 filteredRooms.isNotEmpty() -> LightLazyScrollView(
                                     // Rows are ~70dp; a uniform estimate keeps the lazy
                                     // scrollbar sane (the SDK computes it per-item).
-                                    uniformItemHeightGridUnits = 4.6f,
+                                    uniformItemHeightGridUnits = 4.5f,
                                     listState = listState,
                                 ) {
                                     items(filteredRooms.take(visibleCount), key = { it.id }) { room ->
                                         RoomRow(
                                             room = room,
                                             onOpen = { openThread(room) },
+                                            onLongPress = { openContact(room) },
                                         )
                                     }
                                 }
@@ -558,6 +631,32 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         navigateTo(screenFactory = { ThreadScreen(it, room) })
     }
 
+    /**
+     * The contact overlay from the room list (2026-08-29): long-pressing a row
+     * opens the same contact panel as the thread's top-bar name, seeded from
+     * the row's flags and polling the companion while open; the X pops back to
+     * the list.
+     */
+    private fun openContact(room: LightServiceMethod.GetRooms.Room) {
+        viewModel.openContactPanel(room)
+        navigateTo(screenFactory = {
+            ContactScreen(
+                it,
+                room.id,
+                room.name,
+                room.network,
+                contactIdentifier(room.contactId, room.name),
+                room.contactPhone,
+                muted = viewModel.panelMuted,
+                onToggleMute = viewModel::togglePanelMuted,
+                pinned = viewModel.panelPinned,
+                onTogglePin = viewModel::togglePanelPinned,
+                archived = viewModel.panelArchived,
+                onToggleArchive = viewModel::togglePanelArchived,
+            )
+        }) { viewModel.closeContactPanel() }
+    }
+
     private fun openSearch() {
         // The active network filter (all / WhatsApp / Instagram) carries into
         // the search results (feedback 2026-08-21).
@@ -573,18 +672,23 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
 private fun RoomRow(
     room: LightServiceMethod.GetRooms.Room,
     onOpen: () -> Unit,
+    onLongPress: () -> Unit,
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .lightClickable(onClick = onOpen)
+            // Long-press opens the contact panel (2026-08-29) — the SDK's
+            // lightClickable gained an optional onLongClick for this.
+            .lightClickable(onClick = onOpen, onLongClick = onLongPress)
             // Left matches the Phone tool's recents rows (LP3-verified
             // 2026-08-21): 0.5-gu margin, then the unread star's 1-gu slot.
             // The room name lands at 2.75 gu — flush with the bottom-left
             // bottom-bar icon's left edge (the SDK centers the 2-gu icon in
             // a 3.5-gu touch box, so the icon sits at 2 + 0.75 gu). The
-            // right leaves the time clear of the scrollbar.
-            .padding(start = 0.5f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 14.dp, bottom = 14.dp),
+            // right leaves the time clear of the scrollbar. 12dp vertical
+            // padding fits exactly 6 rows on the panel (LP3 480dpi, user
+            // 2026-08-29 — 17dp fit only 5 on the real device).
+            .padding(start = 0.5f.gridUnitsAsDp(), end = 0.5f.gridUnitsAsDp(), top = 12.dp, bottom = 12.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -626,10 +730,13 @@ private fun RoomRow(
             // (feedback 2026-08-17: back on the right after the under-name
             // Detail date; the unread count was removed at the same time).
             // Solid white, same as everything else (feedback 2026-08-21).
-            LightText(
-                text = formatRelativeTimestamp(room.lastTimestampMs),
-                variant = LightTextVariant.Fine,
-            )
+            // Pinned rows drop the latest-message time (user, 2026-08-28).
+            if (!room.pinned) {
+                LightText(
+                    text = formatRelativeTimestamp(room.lastTimestampMs),
+                    variant = LightTextVariant.Fine,
+                )
+            }
         }
     }
 }

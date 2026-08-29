@@ -118,6 +118,29 @@ object ChatClient {
         )
     }
 
+    /** Pins/unpins [roomId] (m.favourite tag, synced; contact panel, 2026-08-28). */
+    suspend fun setRoomPinned(roomId: String, pinned: Boolean) {
+        callRemoteServiceMethod(
+            LightServiceMethod.SetRoomPinned,
+            LightServiceMethod.SetRoomPinned.Request(roomId, pinned),
+        )
+    }
+
+    /** The room's current pinned/muted/archived flags (contact panel live poll). */
+    suspend fun getRoomFlags(roomId: String): LightServiceMethod.GetRoomFlags.Response? =
+        callRemoteServiceMethod(
+            LightServiceMethod.GetRoomFlags,
+            LightServiceMethod.GetRoomFlags.Request(roomId),
+        ).getOrNull()
+
+    /** Archives/unarchives [roomId] (Beeper inbox.done, synced; contact panel, 2026-08-28). */
+    suspend fun setRoomArchived(roomId: String, archived: Boolean) {
+        callRemoteServiceMethod(
+            LightServiceMethod.SetRoomArchived,
+            LightServiceMethod.SetRoomArchived.Request(roomId, archived),
+        )
+    }
+
     /** Tells the companion which room is on screen (null = list/settings/background). */
     suspend fun setActiveRoom(roomId: String?) {
         callRemoteServiceMethod(

@@ -14,13 +14,17 @@ import androidx.room.Room
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.request.delete
+import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.Url
 import io.ktor.http.contentType
+import io.ktor.http.encodeURLPathPart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,7 +46,15 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.descriptors.buildClassSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonDecoder
+import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -91,17 +103,21 @@ import net.folivo.trixnity.clientserverapi.model.authentication.IdentifierType
 import net.folivo.trixnity.clientserverapi.model.authentication.LoginType
 import net.folivo.trixnity.clientserverapi.model.rooms.GetEvents.Direction
 import net.folivo.trixnity.clientserverapi.model.rooms.GetEvents.Direction.BACKWARDS
+import net.folivo.trixnity.clientserverapi.model.users.Filters
 import net.folivo.trixnity.core.model.EventId
 import net.folivo.trixnity.core.model.RoomId
 import net.folivo.trixnity.core.model.UserId
+import net.folivo.trixnity.core.model.events.MessageEventContent
 import net.folivo.trixnity.core.model.events.UnsignedRoomEventData
 import net.folivo.trixnity.core.model.events.m.room.MemberEventContent
 import net.folivo.trixnity.core.model.events.m.Presence
+import net.folivo.trixnity.core.model.events.m.PushRulesEventContent
 import net.folivo.trixnity.core.model.events.m.ReceiptType
 import net.folivo.trixnity.core.model.events.m.RelatesTo
 import net.folivo.trixnity.core.model.events.m.key.verification.VerificationMethod
 import net.folivo.trixnity.core.model.events.m.room.CreateEventContent
 import net.folivo.trixnity.core.model.events.m.ReactionEventContent
+import net.folivo.trixnity.core.model.events.m.TagEventContent
 import net.folivo.trixnity.core.model.events.m.room.EncryptedFile
 import net.folivo.trixnity.core.model.events.m.room.EncryptedMessageEventContent
 import net.folivo.trixnity.core.model.events.m.room.Membership
@@ -109,7 +125,15 @@ import net.folivo.trixnity.core.model.events.m.room.RoomMessageEventContent
 import net.folivo.trixnity.core.model.events.m.space.ChildEventContent
 import net.folivo.trixnity.core.model.events.m.secretstorage.DefaultSecretKeyEventContent
 import net.folivo.trixnity.core.model.events.m.secretstorage.SecretKeyEventContent
+import net.folivo.trixnity.core.model.events.RoomAccountDataEventContent
 import net.folivo.trixnity.core.model.events.UnknownEventContent
+import net.folivo.trixnity.core.serialization.events.DefaultEventContentSerializerMappings
+import net.folivo.trixnity.core.serialization.events.EventContentSerializerMappings
+import net.folivo.trixnity.core.serialization.events.createEventContentSerializerMappings
+import net.folivo.trixnity.core.serialization.events.roomAccountDataOf
+import net.folivo.trixnity.core.model.push.PushAction
+import net.folivo.trixnity.core.model.push.PushRuleKind
+import net.folivo.trixnity.clientserverapi.model.push.SetPushRule
 import net.folivo.trixnity.crypto.key.decodeRecoveryKey
 import net.folivo.trixnity.crypto.olm.OlmEncryptionService
 import net.folivo.trixnity.crypto.olm.OlmEncryptionServiceImpl
@@ -372,15 +396,18 @@ object MatrixRepository {
     private const val COUNTS_WAKE_MIN_INTERVAL_MS = 300_000L
 
     /**
-     * Slow-sync cadence while the push channel is connected (2026-08-17): the
-     * SSE wake delivers messages instantly (each push = one syncOnce), so the
-     * rounds are pure redundancy — stretch them to a 30-min safety net that
-     * still catches a silent SSE/Beeper failure. Without a live channel the
-     * 5-min cadence runs.
-     *  ponytail: 30 min is a session value — if push proves rock-solid over
-     *  nights, drop the net entirely (O4 end state).
+     * Per-room timeline window the sync filters request (PLAN §8.1, 2026-08-28):
+     * bounds each room's per-/sync payload — the 30-50 s CPU per sync on the
+     * 1284-room account was mostly pages of timeline events nobody read. 50 is
+     * high enough to never truncate a busy bridged room's burst: Trixnity marks
+     * `limited` syncs but never backfills, so a truncated burst is a silent
+     * message gap. The syncOnce (background rounds + push wakes) uses 20 —
+     * cheaper while idle, and push wakes drain active bursts.
+     *  ponytail: 20 is a session value — bump toward 50 if gaps appear on the
+     *  LP3 (each round is cheap now, so 50 costs little).
      */
-    private const val SLOW_SYNC_PUSH_NET_MS = 1_800_000L
+    private const val SYNC_TIMELINE_LIMIT = 50L
+    private const val SYNC_ONCE_TIMELINE_LIMIT = 20L
 
     /** Screen on/off → sync cadence. Registered on the app context in [init],
      *  so it lives as long as the process (which the FGS keeps alive). */
@@ -413,7 +440,6 @@ object MatrixRepository {
     fun init(context: Context) {
         val app = context.applicationContext
         if (appContext == null) appContext = app
-        MuteStore.init(app)
         enableTrixnityLogging()
         // Settings → Sync pause (audit 2026-08-14): a paused companion starts
         // no sync loop and no foreground service — the battery escape hatch.
@@ -580,8 +606,7 @@ object MatrixRepository {
         slowSyncJob = startSlowSyncRounds(c)
         android.util.Log.d(
             TAG,
-            "sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s, " +
-                "push-gated ${SLOW_SYNC_PUSH_NET_MS / 1000}s when SSE connected)",
+            "sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s)",
         )
     }
 
@@ -614,14 +639,12 @@ object MatrixRepository {
                 // wake's syncOnce (two /sync per wake, ~2x the per-push cost).
                 // The wake's own round already delivers; the cadence below is
                 // the redundancy net.
-                // Push-health-gated cadence (2026-08-17): while the SSE channel
-                // is connected, pushes deliver messages instantly (each wakes
-                // one syncOnce), so the rounds are pure redundancy — stretch to
-                // a 30-min safety net that still catches a silent SSE/Beeper
-                // failure. Without a live channel (no config, reconnecting,
-                // stopped) fall back to the 5-min cadence.
-                val cadenceMs = if (PushChannel.isConnected) SLOW_SYNC_PUSH_NET_MS else SLOW_SYNC_INTERVAL_MS
-                delay(cadenceMs)
+                // Single 5-min cadence (PLAN §8.2, 2026-08-28): the push-gated
+                // 30-min stretch is gone — a silently-dead push meant a 30-min
+                // receive delay, and each round is cheap with the sync filter
+                // (§8.1), so the safety net runs at the same 5-min cadence
+                // with or without a live push channel.
+                delay(SLOW_SYNC_INTERVAL_MS)
                 timedSyncOnce(c, "round")
                     .onFailure { android.util.Log.w(TAG, "slow sync round failed: ${it.message}") }
             }
@@ -656,8 +679,10 @@ object MatrixRepository {
      * notification and the room flows update. While active the long-poll
      * already delivers it, so the push is redundant and skipped. The slow-sync
      * rounds are the fallback delivery (a silent SSE drop must not mean missed
-     * messages) — push-gated to a 30-min net while the SSE is connected
-     * (2026-08-17, see startSlowSyncRounds).
+     * messages) — the same 5-min cadence with or without a live channel
+     * (PLAN §8.2, 2026-08-28: was a 30-min push-gated net; a silently-dead
+     * push meant a 30-min receive delay, and rounds are cheap with the sync
+     * filter).
      *
      * [countsOnly] = the push carried no room/event id (Beeper's read-receipt /
      * unread-count payloads). Those must not each run a full ~30-50 s syncOnce
@@ -925,6 +950,47 @@ object MatrixRepository {
         startSyncLoop(ctx)
         PushChannel.start(ctx, newClient)
         return newClient
+    }
+
+    /**
+     * One-time /sync filter migration (LP3 2026-08-28): Trixnity uploads the
+     * sync filter once at client setup and caches its id in the Account row;
+     * the LP3's cached filter predates `com.beeper.inbox.done` joining
+     * the whitelist ([applyDefaultFilter]), so /sync strips it — and because
+     * the sync token advanced past those changes while stripped, incremental
+     * sync never re-delivers them (Jeff/Tiki never reflected on the LP3).
+     * Clearing filterId/backgroundFilterId forces the client's setup to
+     * upload a fresh filter; clearing syncBatchToken forces a full initial
+     * sync under it.
+     *
+     * Must run BEFORE the client is built ([ensureClient]): the client's
+     * setup flow uploads a missing filter itself, while startSync
+     * checkNotNulls the stored filterId — clearing it on a live client races
+     * the upload and throws. AccountStore.updateAccount can't be used here:
+     * it passes keyExists=false, which skips the repository write on a cold
+     * cache (the updater sees null and nothing persists — verified
+     * 2026-08-29), so the Account row is cleared via SQL directly. Prefs-gated
+     * once per account, keyed by [SYNC_FILTER_MAPPINGS_VERSION].
+     */
+    private suspend fun migrateSyncFilterIfNeeded(ctx: Context) {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val userId = prefs.getString(KEY_USER_ID, null) ?: return
+        val prefsKey = "sync_filter_mappings_v_$userId"
+        if (prefs.getInt(prefsKey, 0) >= SYNC_FILTER_MAPPINGS_VERSION) return
+        runCatching {
+            val db = databaseBuilder(ctx).build()
+            try {
+                db.openHelper.writableDatabase.execSQL(
+                    "UPDATE Account SET filterId = NULL, backgroundFilterId = NULL, syncBatchToken = NULL",
+                )
+            } finally {
+                db.close()
+            }
+            android.util.Log.d(TAG, "sync-filter migration: cleared cached filter + token for $userId (v$SYNC_FILTER_MAPPINGS_VERSION)")
+            prefs.edit().putInt(prefsKey, SYNC_FILTER_MAPPINGS_VERSION).apply()
+        }.onFailure { e ->
+            android.util.Log.w(TAG, "sync-filter migration failed: ${e.message}")
+        }
     }
 
     /**
@@ -1325,6 +1391,10 @@ object MatrixRepository {
         initMutex.withLock {
             client?.let { return it }
             val ctx = appContext ?: return null
+            // Clear a stale sync filter BEFORE the client is built — the
+            // setup flow then uploads a fresh filter covering the current
+            // room-account-data whitelist (one-time, prefs-gated).
+            migrateSyncFilterIfNeeded(ctx)
             val restored = runCatching {
                 MatrixClient.fromStore(
                     repositoriesModule = createRoomRepositoriesModule(databaseBuilder(ctx)),
@@ -1680,20 +1750,176 @@ object MatrixRepository {
                 if (cached != null && cached.limit >= limit && lastRefreshedEventId[roomId] == lastId) {
                     return@launch
                 }
-                runCatching {
-                    val page = computeMessagesPage(roomId, null, limit)
+                // Incremental refresh (PLAN §8.3, 2026-08-28): when the cache
+                // covers the request and we know the last-refreshed chain head,
+                // append only the events that arrived since — the full
+                // [computeMessagesPage] (SQL chain walk + key-backup restores +
+                // receipt/status walks, 10-40 s on the LP3) is what made a new
+                // message show late in an open thread. Falls back to the full
+                // rebuild whenever the delta isn't trivially appendable.
+                val prevId = lastRefreshedEventId[roomId]
+                val updated = if (cached != null && cached.limit >= limit && prevId != null) {
+                    runCatching { incrementMessagePage(c, roomId, prevId, lastId, cached) }.getOrNull()
+                } else null
+                if (updated != null) {
                     messagePageCache[roomId] = MessagePageEntry(
-                        page,
-                        limit,
+                        updated,
+                        cached!!.limit,
                         android.os.SystemClock.elapsedRealtime(),
                     )
                     lastRefreshedEventId[roomId] = lastId
-                    saveMessagePageToDisk(roomId, page)
+                    saveMessagePageToDisk(roomId, updated)
+                } else {
+                    runCatching {
+                        val page = computeMessagesPage(roomId, null, limit)
+                        messagePageCache[roomId] = MessagePageEntry(
+                            page,
+                            limit,
+                            android.os.SystemClock.elapsedRealtime(),
+                        )
+                        lastRefreshedEventId[roomId] = lastId
+                        saveMessagePageToDisk(roomId, page)
+                    }
                 }
             } finally {
                 messagePageRefreshInFlight.remove(roomId)
             }
         }
+    }
+
+    /**
+     * Incremental newest-page refresh (PLAN §8.3): collects only the events
+     * that arrived since the last refresh (a bounded SQL chain walk — no
+     * decrypt restores, no receipt/status walks) and appends their rows to the
+     * cached page, patching edits/reactions/read-receipts into existing rows.
+     * Returns null when the delta isn't trivially appendable — the caller then
+     * falls back to the full [computeMessagesPage] (decrypt restores, gap
+     * backfill, the pending-echo dance, timestamp re-sort).
+     */
+    private suspend fun incrementMessagePage(
+        c: MatrixClient,
+        roomId: String,
+        prevId: String,
+        lastId: String,
+        cached: MessagePageEntry,
+    ): MessagesPage? {
+        val matrixRoomId = RoomId(roomId)
+        // The store chain from the current head back to the last-refreshed
+        // head — the same raw-SQL walk the full rebuild uses, bounded.
+        val walked = readTimelineChainFromDb(c, matrixRoomId, lastId, INCREMENTAL_MAX_DELTA) ?: return null
+        val raw = walked.first
+        val delta = raw.takeWhile { it.event.id.full != prevId }
+        // prevId not reached: the boundary is lost (limited-sync truncation)
+        // or the burst exceeds the cap — rebuild from scratch.
+        if (delta.size == raw.size) return null
+        // Bails: anything the incremental path can't resolve exactly.
+        if (delta.any { it.gap != null }) return null
+        if (delta.any { te -> te.content?.getOrNull() == null && te.event.content is EncryptedMessageEventContent }) return null
+        // The pending-echo replacement dance (optimistic row → real echo)
+        // stays with the full rebuild.
+        val pendingTxnIds = buildSet {
+            pendingTextEchoes(roomId).forEach { add(it.txnId) }
+            pendingAudioEchoes(roomId).forEach { add(it.txnId) }
+        }
+        if (delta.any { te ->
+                val id = txnIdOf(te)
+                id != null && id in pendingTxnIds
+            }) return null
+        // Broadcast-rooms own-name (same rule as the full rebuild).
+        val ownName = if (withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()?.joinedMemberCount
+        }?.let { it <= 2L } == true) {
+            senderNameOf(c, matrixRoomId, c.userId)
+        } else null
+        // Edits: an edit replaces its target — patch body + edited flag. The
+        // delta is newer than the whole cached page, so the newest edit wins
+        // (first occurrence in newest-first order), like the full rebuild.
+        val editByTarget = HashMap<String, Pair<String, Long>>()
+        for (te in delta) {
+            val content = te.content?.getOrNull() as? RoomMessageEventContent ?: continue
+            val replace = content.relatesTo as? RelatesTo.Replace ?: continue
+            val newBody = (replace.newContent as? RoomMessageEventContent)?.body
+                ?.takeIf { it.isNotBlank() } ?: continue
+            editByTarget.putIfAbsent(replace.eventId.full, newBody to te.event.originTimestamp)
+        }
+        // Reactions: m.reaction events in the delta patch their target rows.
+        // Same dedup + label shape as the full rebuild's window walk, scoped to
+        // the delta (the target must be in the page for the label to land).
+        //  ponytail: dedup is per-delta; a cross-delta re-reaction could double
+        //  a label — harmless, and the next full rebuild cleans it.
+        val reactionsByTarget = HashMap<String, MutableList<String>>()
+        val reactionSeen = HashSet<String>()
+        for (te in delta) {
+            val content = te.content?.getOrNull() ?: (te.event.content as? ReactionEventContent)
+            if (content !is ReactionEventContent) continue
+            val relates = content.relatesTo as? RelatesTo.Annotation ?: continue
+            val targetId = relates.eventId.full
+            val key = relates.key?.takeIf { it.isNotBlank() } ?: continue
+            if (!reactionSeen.add("${te.event.sender.full}|$key")) continue
+            val who = if (te.event.sender == c.userId) "You" else senderNameOf(c, matrixRoomId, te.event.sender)
+            reactionsByTarget.getOrPut(targetId) { mutableListOf() }.add("$who reacted with $key")
+        }
+        val sendStatuses = sendStatusesByEventIdCached(c, matrixRoomId)
+        // Receipts (cheap — a receipts-repo read, no chain re-walk beyond the
+        // SQL above): the other party's read position, recomputed over the
+        // page chain + delta so existing rows' "read" tags stay fresh.
+        val pageChain = delta + (readTimelineChainFromDb(c, matrixRoomId, prevId, cached.limit + 1)?.first.orEmpty())
+        val readEventIds = readReceiptsByEvent(c, matrixRoomId, pageChain)
+        // New rows, newest-first (delta chain order — same loop as the full
+        // rebuild's, minus the decrypt/status machinery).
+        val newRows = mutableListOf<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>()
+        for (te in delta) {
+            val edit = editByTarget[te.event.id.full]
+            messageFrom(
+                c, matrixRoomId, te,
+                sendStatuses[te.event.id.full],
+                read = te.event.id.full in readEventIds,
+                reactions = reactionsByTarget[te.event.id.full].orEmpty(),
+                editedBody = edit?.first,
+                edited = edit != null,
+                ownName = ownName,
+            )?.let { newRows.add(it) }
+        }
+        // Patch edits + reactions + read state into the existing rows.
+        val patched = cached.page.messages.map { m ->
+            var out = m
+            val edit = editByTarget[m.id]
+            if (edit != null && m.contentType == "text" && !m.id.startsWith(LOCAL_PENDING_ID_PREFIX)) {
+                out = out.copy(body = stripOwnPrefix(stripReplyQuote(edit.first), ownName), edited = true)
+            }
+            val added = reactionsByTarget[m.id]
+            if (added != null) {
+                val merged = out.reactions + added.filter { it !in out.reactions }
+                if (merged != out.reactions) out = out.copy(reactions = merged)
+            }
+            if (!out.read && out.id in readEventIds) out = out.copy(read = true)
+            out
+        }
+        // The page is timestamp-sorted (bridged rooms ingest late — the full
+        // rebuild sorts, the append only holds when the new rows land at the
+        // newest end). Bails otherwise.
+        val newOldestFirst = newRows.reversed()
+        if (newOldestFirst.zipWithNext().any { (a, b) -> a.timestampMs > b.timestampMs }) return null
+        val newestConfirmed = patched.lastOrNull { !it.id.startsWith(LOCAL_PENDING_ID_PREFIX) }
+        if (newestConfirmed != null && newOldestFirst.firstOrNull()?.timestampMs?.let { it < newestConfirmed.timestampMs } == true) {
+            return null
+        }
+        // Append, keeping the cache's size class (limit+1 slack like the full
+        // rebuild); trailing pending rows stay the newest end.
+        val confirmed = patched.filter { !it.id.startsWith(LOCAL_PENDING_ID_PREFIX) }
+        val pendings = patched.filter { it.id.startsWith(LOCAL_PENDING_ID_PREFIX) }
+        val all = confirmed + newOldestFirst
+        val trimmedAway = all.size > cached.limit + 1
+        val kept = if (trimmedAway) all.takeLast(cached.limit + 1) else all
+        if (newOldestFirst.isNotEmpty()) {
+            android.util.Log.d(TAG, "refreshMessagePage: room=$roomId incremental +${newOldestFirst.size} rows (delta=${delta.size} events)")
+            prefetchVoiceNotes(c, matrixRoomId, delta)
+        }
+        return MessagesPage(
+            messages = kept + pendings,
+            hasMore = cached.page.hasMore || trimmedAway,
+            encrypted = cached.page.encrypted,
+        )
     }
 
     /**
@@ -2461,6 +2687,66 @@ object MatrixRepository {
     /** Type of Beeper's per-message delivery-state events (unencrypted, posted
      *  by the bridge right after the message). */
     private val BEEPER_SEND_STATUS_EVENT_TYPE = "com.beeper.message_send_status"
+
+    /** Type of Beeper's per-room archive marker (account data): rooms the user
+     *  archived on Beeper — hidden from the main room list, silent, reachable
+     *  only via search VIEW ALL (chats, 2026-08-28). Beeper's REAL archive
+     *  state is `com.beeper.inbox.done`, whose content carries
+     *  `at_ts`/`at_order`/`updated_ts` when archived and is reset to `{}` on
+     *  unarchive (never deleted). The type is `com.beeper.inbox.done` — NOT
+     *  `com.beeper.chats.inbox.done` (the round-4 guess; the LP3's real
+     *  `com.beeper.inbox.done` rows verified on-device 2026-08-29: Tiki's
+     *  archive + the `!updates` room, while the `.chats.` rows in the store
+     *  were our own writes and Beeper's apps ignore them). `auto_archive`
+     *  (`com.beeper.chats.auto_archive`) is a write-only orphan Beeper's app
+     *  ignores — the LP3 wrote it in rounds 1-3 and reads it no more (LP3+
+     *  Beeper experiment, 2026-08-28). */
+    private const val BEEPER_INBOX_DONE_EVENT_TYPE = "com.beeper.inbox.done"
+
+    /** Beeper's archive account-data content: `{"at_order":…,"at_ts":…,"updated_ts":…}`
+     *  = archived, `{}` = unarchived — row presence is NOT the flag, the
+     *  content is. Registered in the event-content mappings (see
+     *  [archiveMappingsModule]) so the store-backed typed read in
+     *  [roomFlagsByRoom] works — the default mappings only decode it as
+     *  [UnknownEventContent], whose fixed type is null and the typed store get
+     *  rejects that. */
+    data class BeeperInboxDoneContent(
+        val atOrder: Long? = null,
+        val atTs: Long? = null,
+        val updatedTs: Long? = null,
+    ) : RoomAccountDataEventContent
+
+    /** Reads the three fields leniently (Beeper's shape is not contractual —
+     *  unknown keys and malformed numbers are ignored) and writes back the
+     *  same shape, so our archive/unarchive PUTs mirror Beeper's own. */
+    private object BeeperInboxDoneContentSerializer : KSerializer<BeeperInboxDoneContent> {
+        override val descriptor = buildClassSerialDescriptor(BEEPER_INBOX_DONE_EVENT_TYPE)
+        override fun deserialize(decoder: Decoder): BeeperInboxDoneContent {
+            val obj = (decoder as? JsonDecoder)?.decodeJsonElement() as? JsonObject ?: return BeeperInboxDoneContent()
+            fun longOf(key: String): Long? = (obj[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+            return BeeperInboxDoneContent(longOf("at_order"), longOf("at_ts"), longOf("updated_ts"))
+        }
+        override fun serialize(encoder: Encoder, value: BeeperInboxDoneContent) {
+            val enc = (encoder as? JsonEncoder) ?: return
+            enc.encodeJsonElement(buildJsonObject {
+                value.atOrder?.let { put("at_order", it) }
+                value.atTs?.let { put("at_ts", it) }
+                value.updatedTs?.let { put("updated_ts", it) }
+            })
+        }
+    }
+
+    /** Registers the Beeper archive marker with the client's event-content
+     *  mappings (defaults + this one; the override pattern mirrors
+     *  [plaintextVerificationModule]). Koin registers module definitions in
+     *  order, so this last module wins over the default mappings single. */
+    private fun archiveMappingsModule() = module {
+        single<EventContentSerializerMappings> {
+            DefaultEventContentSerializerMappings + createEventContentSerializerMappings {
+                roomAccountDataOf(BEEPER_INBOX_DONE_EVENT_TYPE, BeeperInboxDoneContentSerializer)
+            }
+        }
+    }
 
     /** Type of the room-state event flagging bridge/service bots ("functional
      *  members", Element's MSC): e.g. Beeper's @whatsappbot. Those users post
@@ -4037,13 +4323,168 @@ object MatrixRepository {
     }
 
     /**
-     * Mutes or unmutes a room's notifications (tool contact panel,
-     * 2026-08-23). The mute is a local device preference — the room list and
-     * unread badge keep updating, only [notifyForEvent] is gated.
+     * Pins or unpins a room (m.favourite tag, synced to Beeper, 2026-08-28):
+     * pinned rooms sort to the top of the room list (recency among pins) and
+     * their rows drop the latest timestamp. Optimistic — the flags cache
+     * updates immediately, the sync echo confirms on the next rebuild.
      */
-    fun setRoomMuted(roomId: String, muted: Boolean) {
-        MuteStore.setMuted(roomId, muted)
-        android.util.Log.d(TAG, "setRoomMuted: room=$roomId muted=$muted")
+    suspend fun setRoomPinned(roomId: String, pinned: Boolean) {
+        val c = client ?: return
+        updateRoomFlagsLocal(roomId) { it.copy(pinned = pinned) }
+        val result = if (pinned) {
+            c.api.room.setTag(c.userId, RoomId(roomId), "m.favourite", TagEventContent.Tag(order = 1.0))
+        } else {
+            c.api.room.deleteTag(c.userId, RoomId(roomId), "m.favourite")
+        }
+        if (result.isFailure) {
+            // The server rejected the write — don't leave the optimistic flip
+            // as a phantom (Beeper's writes are slow; the failure surfaces
+            // only after the PUT/GET, but the UI already flipped).
+            updateRoomFlagsLocal(roomId) { it.copy(pinned = !pinned) }
+            android.util.Log.w(TAG, "setRoomPinned: server rejected room=$roomId pinned=$pinned: ${result.exceptionOrNull()?.message}")
+        } else {
+            android.util.Log.d(TAG, "setRoomPinned: room=$roomId pinned=$pinned")
+        }
+    }
+
+    /**
+     * Mutes or unmutes a room's notifications (tool contact panel,
+     * 2026-08-23; synced via Matrix push rules 2026-08-28 — a global ROOM
+     * dont_notify rule per room, matching Beeper's own representation). The
+     * room list and unread badge keep updating, only [notifyForEvent] is
+     * gated. Optimistic like [setRoomPinned].
+     */
+    suspend fun setRoomMuted(roomId: String, muted: Boolean) {
+        val c = client ?: return
+        updateRoomFlagsLocal(roomId) { it.copy(muted = muted) }
+        val result = if (muted) {
+            c.api.push.setPushRule(
+                "global", PushRuleKind.ROOM, roomId,
+                SetPushRule.Request(actions = setOf(PushAction.Unknown("dont_notify", JsonPrimitive("dont_notify")))),
+            )
+        } else {
+            c.api.push.deletePushRule("global", PushRuleKind.ROOM, roomId)
+        }
+        if (result.isFailure) {
+            updateRoomFlagsLocal(roomId) { it.copy(muted = !muted) }
+            android.util.Log.w(TAG, "setRoomMuted: server rejected room=$roomId muted=$muted: ${result.exceptionOrNull()?.message}")
+        } else {
+            android.util.Log.d(TAG, "setRoomMuted: room=$roomId muted=$muted")
+        }
+    }
+
+    /**
+     * Archives or unarchives a room (Beeper's `com.beeper.inbox.done`
+     * room account data, synced, 2026-08-28): archived rooms hide from the
+     * main list and go silent, reachable only via search VIEW ALL. Mirrors
+     * Beeper's own writes (LP3 experiment 2026-08-28): archive PUTs
+     * `{"at_order":…,"at_ts":…,"updated_ts":…}`, unarchive PUTs `{}` — Beeper
+     * never DELETEs the row (the DELETE route 405s on Beeper's server), so
+     * neither do we. Trixnity 4.22.7's typed `setAccountData` PUTs to the
+     * legacy `/rooms/{roomId}/account_data` path, which modern Synapse no
+     * longer serves (M_UNRECOGNIZED, swallowed in a Result — silent failure),
+     * so the current `/user/{userId}/rooms/{roomId}/account_data` path is
+     * issued raw through the client's own ktor HttpClient and the bearer
+     * token rides along. Optimistic like [setRoomPinned].
+     */
+    suspend fun setRoomArchived(roomId: String, archived: Boolean) {
+        val c = client ?: return
+        updateRoomFlagsLocal(roomId) { it.copy(archived = archived) }
+        val url = accountDataUrl(c, roomId, BEEPER_INBOX_DONE_EVENT_TYPE)
+        val now = System.currentTimeMillis()
+        val body = if (archived) {
+            buildJsonObject {
+                put("at_order", now)
+                put("at_ts", now)
+                put("updated_ts", now)
+            }
+        } else {
+            JsonObject(emptyMap())
+        }
+        val status = try {
+            c.api.baseClient.baseClient.put(url) {
+                contentType(ContentType.Application.Json)
+                setBody(body.toString())
+            }.status.value
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "setRoomArchived: put failed room=$roomId archived=$archived: ${e.message}")
+            updateRoomFlagsLocal(roomId) { it.copy(archived = !archived) }
+            return
+        }
+        if (status in 200..299) {
+            android.util.Log.d(TAG, "setRoomArchived: room=$roomId archived=$archived status=$status")
+        } else {
+            // Honest: the server rejected the write — don't leave the
+            // optimistic flip as a phantom.
+            android.util.Log.w(TAG, "setRoomArchived: server rejected room=$roomId archived=$archived status=$status")
+            updateRoomFlagsLocal(roomId) { it.copy(archived = !archived) }
+        }
+    }
+
+    /** The current per-room account-data path: `/user/{userId}/rooms/{roomId}/account_data/{type}`. */
+    private fun accountDataUrl(c: MatrixClient, roomId: String, type: String): String =
+        c.api.baseClient.baseUrl.toString().trimEnd('/') +
+            "/_matrix/client/v3/user/" + c.userId.full.encodeURLPathPart() +
+            "/rooms/" + roomId.encodeURLPathPart() +
+            "/account_data/" + type
+
+    /**
+     * Server truth for Beeper's inbox.done marker: GET 200 whose content
+     * carries `at_ts` → archived; 200 with `{}`, or 404 → not archived;
+     * other/error → null (unknown — keep the store claim rather than unhide
+     * on a blip). Needed because Trixnity's sync store never clears removed
+     * room account data (LP3 2026-08-28: Sophie / Anni / 1€ FILM stayed
+     * "archived" long after Beeper removed the marker — sync delivers
+     * additions only, removals are absences the store ignores).
+     */
+    private suspend fun isRoomArchivedOnServer(c: MatrixClient, roomId: String): Boolean? =
+        try {
+            val resp = c.api.baseClient.baseClient.get(accountDataUrl(c, roomId, BEEPER_INBOX_DONE_EVENT_TYPE))
+            val status = resp.status.value
+            android.util.Log.d(TAG, "archive verify: room=$roomId status=$status")
+            when {
+                status == 200 -> {
+                    val obj = runCatching {
+                        Json { ignoreUnknownKeys = true }.parseToJsonElement(resp.bodyAsText()).jsonObject
+                    }.getOrNull()
+                    // Content is the body directly (spec); tolerate a wrap.
+                    val atTs = obj?.get("at_ts") ?: (obj?.get("content") as? JsonObject)?.get("at_ts")
+                    atTs != null
+                }
+                status == 404 -> false
+                else -> null
+            }
+        } catch (e: net.folivo.trixnity.core.MatrixServerException) {
+            // Trixnity's HttpCallValidator turns non-2xx into this (before
+            // ktor's own throw); a 404 is the definitive "not archived"
+            // answer, other statuses keep the store claim.
+            android.util.Log.d(TAG, "archive verify: room=$roomId status=${e.statusCode.value}")
+            if (e.statusCode.value == 404) false else null
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "archive verify failed for $roomId: ${e.message}")
+            null
+        }
+
+    /** The room's effective pinned/muted/archived flags (optimistic writes win;
+     *  the store collectors keep the cache fresh within seconds of a
+     *  Beeper-side change — the contact panel polls this, 2026-08-28). */
+    suspend fun getRoomFlags(roomId: String): RoomFlags =
+        roomFlagsOverlay[roomId] ?: roomFlagsCache[roomId] ?: RoomFlags()
+
+    /**
+     * Applies one optimistic flag write to both the cache and the overlay
+     * (which re-applies it on top of any rebuild until the server echo
+     * confirms), then wakes the room-list resolver so the change reaches the
+     * tool's next list read.
+     */
+    private fun updateRoomFlagsLocal(roomId: String, transform: (RoomFlags) -> RoomFlags) {
+        val base = roomFlagsOverlay[roomId] ?: roomFlagsCache[roomId] ?: RoomFlags()
+        val updated = transform(base)
+        roomFlagsCache = roomFlagsCache + (roomId to updated)
+        roomFlagsOverlay = roomFlagsOverlay + (roomId to updated)
+        flagsOnlyWake = true
+        roomListDirty = true
+        wakeRoomList()
     }
 
     // --- Notifications (Phase 4) --------------------------------------------
@@ -4119,6 +4560,18 @@ object MatrixRepository {
     private fun observeNotifications(c: MatrixClient) {
         android.util.Log.d(TAG, "notification watcher starting for ${c.userId.full}")
         val watcher = scope.launch {
+            // Flag-change watcher (LP3 feedback 2026-08-28): a global push-rule
+            // change (any device toggled mute) re-reads the flags cache so the
+            // room list / contact panel reflect it within seconds instead of on
+            // the next TTL rebuild. The first emission is the baseline.
+            scope.launch {
+                try {
+                    c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
+                        .get(PushRulesEventContent::class).collect { invalidateAllRoomFlags() }
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "flag watcher: push-rule collector ended: ${e.message}")
+                }
+            }.also { notificationWatcherJobs.add(it) }
             try {
                 // roomId.full -> last relevant event id seen so far ("" = none yet).
                 val seen = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -4169,6 +4622,33 @@ object MatrixRepository {
                             }
                         }
                         notificationWatcherJobs.add(job)
+                        // Flag-change collectors for this room (LP3 feedback
+                        // 2026-08-28): the m.favourite tag (pin) and Beeper
+                        // inbox.done account data (archive) change on any
+                        // device's toggle — re-read the flags cache so the
+                        // change reaches the tool within seconds. The first
+                        // emission per room is the baseline (just one early
+                        // rebuild).
+                        val tagJob = scope.launch {
+                            try {
+                                c.room.getAccountData(roomId, TagEventContent::class, "").collect {
+                                    invalidateRoomFlags(key)
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.w(TAG, "flag watcher: tag collector ended for $key: ${e.message}")
+                            }
+                        }
+                        notificationWatcherJobs.add(tagJob)
+                        val archiveJob = scope.launch {
+                            try {
+                                c.room.getAccountData(roomId, BeeperInboxDoneContent::class, "").collect {
+                                    invalidateRoomFlags(key)
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.w(TAG, "flag watcher: archive collector ended for $key: ${e.message}")
+                            }
+                        }
+                        notificationWatcherJobs.add(archiveJob)
                         watched++
                         if (watched % 200 == 0) {
                             android.util.Log.d(TAG, "notification watcher: $watched rooms registered")
@@ -4197,11 +4677,15 @@ object MatrixRepository {
         if (!ctx.getSystemService(NotificationManager::class.java).areNotificationsEnabled()) return
         if (activeRoomId == roomId.full) return
         if (room.membership != Membership.JOIN) return
-        // Muted room (tool contact panel, 2026-08-23): stop notifying; the
-        // unread badge and the room list stay. Checked before the decrypt
-        // wait so a muted room costs nothing per message.
-        if (MuteStore.isMuted(roomId.full)) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping muted room $roomId")
+        // Muted/archived room (chats 2026-08-23 / 2026-08-28): stop notifying;
+        // the unread badge and the room list stay (muted), or the room is
+        // hidden from the list entirely and reachable only via search
+        // (archived). Checked before the decrypt wait so a muted room costs
+        // nothing per message. Cache miss (flags not yet built) = notify, same
+        // as before the flags cache existed.
+        val flags = roomFlagsCache[roomId.full]
+        if (flags?.muted == true || flags?.archived == true) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping ${if (flags.archived == true) "archived" else "muted"} room $roomId")
             return
         }
         // Wait briefly for decryption so the preview shows the real text (the
@@ -4343,6 +4827,20 @@ object MatrixRepository {
     @Volatile
     private var roomListDirty = true
 
+    /** Last full room map the resolver collected — the flags-only fast path
+     *  re-stamps cached rows from it without re-collecting (see
+     *  [flagsOnlyWake]). */
+    private var lastRoomsMap: Map<RoomId, Flow<MatrixRoom?>>? = null
+
+    /** Set when a PIN/MUTE/ARCHIVE write lands locally ([updateRoomFlagsLocal]):
+     *  the resolver re-stamps the cached rows with the fresh flags and
+     *  publishes immediately instead of waiting for the full pass's room
+     *  collect + preview budget (LP3 feedback 2026-08-28: pin/unpin didn't
+     *  reflect instantly). The full pass still runs — the write set
+     *  [roomListDirty] — it just no longer gates the flag change. */
+    @Volatile
+    private var flagsOnlyWake = false
+
     /** Wakes the resolver's idle sleep immediately (screen-on, push-wake, the
      *  tool opening the list). Without it, a message that arrived while the
      *  screen was off left the panel stale for the rest of the screen-off
@@ -4404,6 +4902,8 @@ object MatrixRepository {
         messagePageCache.clear()
         activeRoomRefreshJob?.cancel()
         activeRoomRefreshJob = null
+        flagsOnlyWake = false
+        lastRoomsMap = null
     }
 
     /**
@@ -4458,9 +4958,32 @@ object MatrixRepository {
                     continue
                 }
                 roomListDirty = false
+                // Flags-only fast path: a local PIN/MUTE/ARCHIVE write doesn't
+                // need the full room collect + preview pass (up to 15 s each on
+                // a big account) before the tool sees it — re-stamp the cached
+                // rows with the fresh flags and publish now. The full pass
+                // below still runs (the write set roomListDirty) and confirms.
+                if (flagsOnlyWake && lastRoomsMap != null && roomListCache.isNotEmpty()) {
+                    flagsOnlyWake = false
+                    runCatching {
+                        val fastFlags = roomFlagsByRoom(c, lastRoomsMap!!)
+                        for ((key, entry) in roomListCache) {
+                            val f = fastFlags[key] ?: continue
+                            roomListCache[key] = entry.copy(
+                                room = entry.room.copy(
+                                    pinned = f.pinned,
+                                    archived = f.archived,
+                                    muted = f.muted,
+                                ),
+                            )
+                        }
+                        publishRoomList()
+                    }
+                }
                 try {
                     val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
                         ?: emptyMap()
+                    lastRoomsMap = rooms
                     val passDeadline = android.os.SystemClock.elapsedRealtime() + ROOM_LIST_PASS_BUDGET_MS
                     // Collect each room's current state (the store cache is warm,
                     // so these emit immediately) newest-first; rooms still loading
@@ -4494,7 +5017,11 @@ object MatrixRepository {
                     // Built from the FULL room map (cached) — the budget-bound
                     // loaded subset may not include the (older) space rooms.
                     val networks = networkByRoom(c, rooms)
-                    seedRoomList(loaded, verified, networks)
+                    // Pinned/archived/muted per room (m.favourite tag, Beeper
+                    // inbox.done account data, global push rules) — cached
+                    // like the network map (2026-08-28).
+                    val flags = roomFlagsByRoom(c, rooms)
+                    seedRoomList(loaded, verified, networks, flags)
                     // Phase 14 feedback: every joined room gets a preview attempt
                     // (the user's list looked inconsistent — rooms beyond the old
                     // 30-room preview window showed no latest message at all).
@@ -4509,6 +5036,7 @@ object MatrixRepository {
                             resolvePreview = true,
                             verified = verified,
                             networks = networks,
+                            flags = flags,
                         )
                     }
                     // Publish the resolved list BEFORE the eager page
@@ -4589,6 +5117,7 @@ object MatrixRepository {
         rooms: List<Pair<RoomId, MatrixRoom>>,
         verified: Boolean,
         networks: Map<String, String>,
+        flags: Map<String, RoomFlags>,
     ) {
         var seeded = 0
         for ((roomId, room) in rooms) {
@@ -4622,7 +5151,9 @@ object MatrixRepository {
                     isDirect = room.isDirect || (room.joinedMemberCount ?: 0L) <= 2L,
                     contactId = contactIdOf(room),
                     network = networks[key],
-                    muted = MuteStore.isMuted(key),
+                    archived = flags[key]?.archived ?: false,
+                    pinned = flags[key]?.pinned ?: false,
+                    muted = flags[key]?.muted ?: false,
                 ),
                 nameResolved = false,
                 previewResolved = false,
@@ -4649,6 +5180,7 @@ object MatrixRepository {
         resolvePreview: Boolean,
         verified: Boolean,
         networks: Map<String, String>,
+        flags: Map<String, RoomFlags>,
     ) {
         val key = roomId.full
         // Rooms the user left drop out of the list live (membership filter).
@@ -4771,7 +5303,9 @@ object MatrixRepository {
                 // for the member-state read). Null for groups/seed rows.
                 contactPhone = contactIdOf(room)?.let { contactPhoneOf(c, roomId, it) },
                 network = networks[key],
-                muted = MuteStore.isMuted(key),
+                archived = flags[key]?.archived ?: false,
+                pinned = flags[key]?.pinned ?: false,
+                muted = flags[key]?.muted ?: false,
             ),
             nameResolved = true,
             previewResolved = previewResolved,
@@ -4852,6 +5386,124 @@ object MatrixRepository {
         networkByRoomCache = result
         networkByRoomBuiltAtMs = now
         return result
+    }
+
+    /** Pinned/archived/muted flags for one room, from synced Matrix/Beeper
+     *  state (chats, 2026-08-28). */
+    data class RoomFlags(
+        val pinned: Boolean = false,
+        val archived: Boolean = false,
+        val muted: Boolean = false,
+    )
+
+    /** Flags-cache (see [roomFlagsByRoom]): rebuilt at most every TTL, like the
+     *  network map. Our own PIN/MUTE/ARCHIVE toggles mutate it optimistically;
+     *  external Beeper changes invalidate it via the store collectors in
+     *  [observeNotifications], so they land within seconds — not on the next
+     *  TTL rebuild (LP3 feedback 2026-08-28). */
+    @Volatile private var roomFlagsCache: Map<String, RoomFlags> = emptyMap()
+    @Volatile private var roomFlagsBuiltAtMs = 0L
+
+    /** Optimistic local writes (PIN/MUTE/ARCHIVE taps): re-applied on top of
+     *  every rebuild so a TTL-expiry rebuild can't clobber them with a stale
+     *  store read (the sync echo of our own write hasn't landed yet), and
+     *  dropped once a rebuild reads the confirmed server value. This is what
+     *  makes pin/unpin reorder the list instantly (LP3 feedback 2026-08-28). */
+    @Volatile private var roomFlagsOverlay: Map<String, RoomFlags> = emptyMap()
+
+    /** Rooms whose tag / inbox.done / push-rule state changed on the server
+     *  (the store collectors saw it) — the cache must be re-read. Consumed
+     *  and cleared by the next [roomFlagsByRoom] build. */
+    @Volatile private var roomFlagsInvalidated: Set<String> = emptySet()
+    @Volatile private var roomFlagsInvalidatedAll = false
+    private val flagsLock = Any()
+    private val ROOM_FLAGS_TTL_MS = NETWORK_MAP_TTL_MS // reuse the same TTL
+
+    /** Marks one room's flags as changed on the server (tag / inbox.done
+     *  collectors in [observeNotifications]) and wakes the room-list resolver
+     *  so the change reaches the tool's next list read. [flagsOnlyWake] routes
+     *  it through the fast re-stamp path — a remote toggle lands in the list
+     *  within a second instead of waiting for the full pass (LP3 feedback
+     *  2026-08-29: Beeper-side mute/archive was sporadic/never on the LP3). */
+    private fun invalidateRoomFlags(roomId: String) {
+        synchronized(flagsLock) {
+            roomFlagsInvalidated = roomFlagsInvalidated + roomId
+        }
+        flagsOnlyWake = true
+        roomListDirty = true
+        wakeRoomList()
+    }
+
+    /** Marks every room's flags as possibly changed (global push rules). */
+    private fun invalidateAllRoomFlags() {
+        synchronized(flagsLock) { roomFlagsInvalidatedAll = true }
+        flagsOnlyWake = true
+        roomListDirty = true
+        wakeRoomList()
+    }
+
+    /**
+     * Pinned/archived/muted per room, from synced state: the room's m.favourite
+     * tag (pinned), Beeper's `com.beeper.inbox.done` account data
+     * (archived), and a global ROOM dont_notify push rule (muted). TTL +
+     * budget mirrors [networkByRoom]; a failed build keeps the previous cache.
+     * Rebuilds early when a server-side change was observed (store collectors
+     * in [observeNotifications]); our own optimistic writes ([roomFlagsOverlay])
+     * survive the rebuild until the server echo confirms them.
+     */
+    private suspend fun roomFlagsByRoom(
+        c: MatrixClient,
+        rooms: Map<RoomId, Flow<MatrixRoom?>>,
+    ): Map<String, RoomFlags> {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val changed: Boolean
+        synchronized(flagsLock) {
+            changed = roomFlagsInvalidated.isNotEmpty() || roomFlagsInvalidatedAll
+            roomFlagsInvalidated = emptySet()
+            roomFlagsInvalidatedAll = false
+        }
+        if (roomFlagsCache.isNotEmpty() && now - roomFlagsBuiltAtMs < ROOM_FLAGS_TTL_MS && !changed) {
+            return roomFlagsCache + roomFlagsOverlay
+        }
+        val result = mutableMapOf<String, RoomFlags>()
+        withTimeoutOrNull(NETWORK_MAP_BUDGET_MS) {
+            val pushRules = try {
+                c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
+                    .get(PushRulesEventContent::class).first()?.content?.global?.room.orEmpty()
+            } catch (_: Exception) { emptyList() }
+            for ((roomId, _) in rooms) {
+                val key = roomId.full
+                val tags = c.room.getAccountData(roomId, TagEventContent::class, "").first()
+                // The store never clears removed account data, so a stale row
+                // can be a phantom (unarchived in Beeper long ago) — confirm
+                // the claim on the network (only archived rooms cost a GET;
+                // unknown → keep the store claim). Archived = content carries
+                // at_ts: Beeper's unarchive resets the content to {} rather
+                // than deleting the row, so row presence is not the flag.
+                val inboxDone = c.room.getAccountData(roomId, BeeperInboxDoneContent::class, "").firstOrNull()
+                val archivedClaim = inboxDone?.atTs != null
+                val archived = if (archivedClaim) isRoomArchivedOnServer(c, key) ?: true else false
+                result[key] = RoomFlags(
+                    pinned = tags?.tags?.containsKey(TagEventContent.TagName.Favourite) == true,
+                    archived = archived,
+                    // dont_notify has no PushAction constant — compare by name
+                    // (raw equality is JsonElement-sensitive).
+                    muted = pushRules.any { it.ruleId == key && it.actions.any { action -> action.name == "dont_notify" } },
+                )
+                // Our optimistic write now matches the server — drop the
+                // overlay entry (confirmed). Not-yet-echoed writes stay.
+                val overlay = roomFlagsOverlay[key]
+                if (overlay != null && overlay == result[key]) {
+                    synchronized(flagsLock) { roomFlagsOverlay = roomFlagsOverlay - key }
+                }
+            }
+        }
+        result.putAll(roomFlagsOverlay)
+        if (result.isNotEmpty()) {
+            roomFlagsCache = result
+            roomFlagsBuiltAtMs = now
+        }
+        return roomFlagsCache + roomFlagsOverlay
     }
 
     /** "WhatsApp (+61420460590)" → "WhatsApp"; a plain name keeps itself. */
@@ -5330,7 +5982,34 @@ object MatrixRepository {
     private fun clientConfiguration(name: String): MatrixClientConfiguration.() -> Unit = {
         this.name = name
         httpClientEngine = this@MatrixRepository.httpClientEngine
-        modulesFactories = createTrixnityDefaultModuleFactories() + ::plaintextVerificationModule
+        modulesFactories = createTrixnityDefaultModuleFactories() + ::plaintextVerificationModule + ::archiveMappingsModule
+        // Sync payload slimming (PLAN §8.1, 2026-08-28): the default filter
+        // ships every presence update + a huge per-room timeline on the
+        // 1284-room account (30-50 s CPU per /sync). Presence is never
+        // displayed — set_presence=offline only stops OUR updates, this filter
+        // stops receiving theirs — and the timeline limit bounds each room's
+        // per-sync window. Trixnity's applyDefaultFilter() merges over it,
+        // keeping lazy-load members + the event-type whitelists.
+        syncFilter = Filters(
+            presence = Filters.EventFilter(notTypes = setOf("*")),
+            room = Filters.RoomFilter(timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT)),
+        )
+        syncOnceFilter = Filters(
+            presence = Filters.EventFilter(notTypes = setOf("*")),
+            room = Filters.RoomFilter(timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_ONCE_TIMELINE_LIMIT)),
+        )
+        // Room "last relevant event" = actual messages only (reference-messenger
+        // shape): m.replace edits (Beeper's re-import wall) and reactions no
+        // longer advance lastRelevantEventId — so they don't wake the
+        // notification watcher or bump the room list. The edits still sync and
+        // store; the page-level isReplaceEdit checks stay (they serve
+        // pages/previews, which this filter does not touch).
+        lastRelevantEventFilter = { event ->
+            val content = event.content
+            val isReplace = content is MessageEventContent && content.relatesTo is RelatesTo.Replace
+            val isMessage = content is RoomMessageEventContent || content is EncryptedMessageEventContent
+            (!isReplace) && isMessage
+        }
     }
 
     /**
@@ -5648,6 +6327,11 @@ object MatrixRepository {
     private const val NETWORK_MAP_TTL_MS = 300_000L
     /** Bound for a full network-map build (600+ room flows on a big account). */
     private const val NETWORK_MAP_BUDGET_MS = 15_000L
+    /** Bump to force a fresh /sync filter upload + full initial sync once per
+     *  account (see [migrateSyncFilterIfNeeded]) — e.g. when a new room
+     *  account-data type joins the filter's whitelist and existing clients'
+     *  cached filters would strip it. */
+    private const val SYNC_FILTER_MAPPINGS_VERSION = 4
     private const val ROOMS_BUDGET_MS = 15_000L
     private const val ROOM_BUDGET_MS = 3_000L
     private const val MESSAGES_BUDGET_MS = 15_000L
@@ -5670,6 +6354,11 @@ object MatrixRepository {
      *  screenful on the LP3 thread (feedback 2026-08-23: "fast load on
      *  initial show …"; tuned 8 → 6). */
     private const val INCREMENTAL_FIRST_PAGE = 6
+    /** Max events the incremental refresh (PLAN §8.3) walks to find the
+     *  last-refreshed chain head. A burst beyond this — or a lost boundary
+     *  (limited-sync truncation) — bails to the full rebuild, which handles
+     *  the walk itself. 100 ≈ two sync windows at the §8.1 limit. */
+    private const val INCREMENTAL_MAX_DELTA = 100
     /** Max extra chain walks an older page may take to skip a run of dropped
      *  events (the m.replace edit wall) before giving up — bounded so a
      *  pathological chain can't turn one page read into a long walk. The

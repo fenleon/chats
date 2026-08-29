@@ -1,7 +1,6 @@
 package com.lightphone.chats.screens
 
 import android.graphics.BitmapFactory
-import android.telephony.PhoneNumberUtils
 import android.text.format.DateUtils
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -43,8 +42,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
+import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.dayOf
-import com.lightphone.chats.formatBridgePhone
 import com.lightphone.chats.formatMessageTime
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -194,6 +193,64 @@ class ThreadViewModel(
     }
 
     /**
+     * Pin state for the contact panel (2026-08-28): starts from the room
+     * list's value and updates locally on toggle — same honest-within-session
+     * pattern as [muted].
+     */
+    val pinned = MutableStateFlow(room.pinned)
+
+    /** Toggles [pinned] locally and persists it server-side (m.favourite tag). */
+    fun togglePinned() {
+        val next = !pinned.value
+        pinned.value = next
+        viewModelScope.launch { ChatClient.setRoomPinned(room.id, next) }
+    }
+
+    /**
+     * Archive state for the contact panel (2026-08-28): starts from the room
+     * list's value and updates locally on toggle — same honest-within-session
+     * pattern as [muted]. Archived rooms hide from the main list and go
+     * silent, reachable only via search VIEW ALL.
+     */
+    val archived = MutableStateFlow(room.archived)
+
+    /** Toggles [archived] locally and persists it server-side (Beeper inbox.done). */
+    fun toggleArchived() {
+        val next = !archived.value
+        archived.value = next
+        viewModelScope.launch { ChatClient.setRoomArchived(room.id, next) }
+    }
+
+    /**
+     * Keeps the contact panel honest with OTHER devices (LP3 feedback
+     * 2026-08-28): polls the companion's synced flags every few seconds and
+     * updates [muted]/[pinned]/[archived], so a pin/mute/archive done on a
+     * Beeper device reaches the panel live (items 1/5). Runs while the thread
+     * — and the contact panel over it — is on screen (started on
+     * [onScreenShow], NOT stopped on [onScreenHide]); stops when the app
+     * backgrounds and dies with the ViewModel on back-navigation.
+     */
+    private var flagSyncJob: Job? = null
+
+    fun startFlagSync() {
+        if (flagSyncJob?.isActive == true) return
+        flagSyncJob = viewModelScope.launch {
+            while (true) {
+                delay(FLAG_SYNC_MS)
+                val flags = ChatClient.getRoomFlags(room.id) ?: continue
+                muted.value = flags.muted
+                pinned.value = flags.pinned
+                archived.value = flags.archived
+            }
+        }
+    }
+
+    fun stopFlagSync() {
+        flagSyncJob?.cancel()
+        flagSyncJob = null
+    }
+
+    /**
      * Display JPEG bytes per image-message event id (Phase 13). This is a view
      * of the process-wide [chatsMediaCache] (event ids are globally unique), so
      * a photo already fetched in any thread renders instantly on re-open — no
@@ -305,10 +362,14 @@ class ThreadViewModel(
             e2eeVerified.value = ChatClient.e2eeState()?.verified
         }
         startPolling()
+        startFlagSync()
     }
 
     override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
         super.onScreenHide(screen)
+        // Message polling stops when covered (e.g. the contact panel), but the
+        // flag sync deliberately keeps running — the panel needs Beeper-side
+        // pin/mute/archive changes live (LP3 feedback 2026-08-28).
         stopPolling()
     }
 
@@ -318,6 +379,7 @@ class ThreadViewModel(
         // this room may notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
         stopPolling()
+        stopFlagSync()
     }
 
     /**
@@ -676,6 +738,8 @@ class ThreadViewModel(
         const val OLDER_PAGE_SIZE = 6
         /** Poll cadence while the thread is on screen (feedback pass). */
         const val THREAD_POLL_MS = 3_000L
+        /** Contact-panel flag poll (pin/mute/archive from other devices). */
+        const val FLAG_SYNC_MS = 3_000L
         /** How close (ms) a real echo's timestamp must be to a "local-…" row. */
         const val OPTIMISTIC_MATCH_WINDOW_MS = 5 * 60 * 1000L
         /** Media fetch retries when the first read comes back null. */
@@ -1029,36 +1093,14 @@ class ThreadScreen(
                 room.network,
                 contactIdentifier(room.contactId, room.name),
                 room.contactPhone,
-                muted = viewModel.muted.value,
+                muted = viewModel.muted,
                 onToggleMute = viewModel::toggleMuted,
+                pinned = viewModel.pinned,
+                onTogglePin = viewModel::togglePinned,
+                archived = viewModel.archived,
+                onToggleArchive = viewModel::toggleArchived,
             )
         })
-    }
-
-    /**
-     * The room's other participant for 1:1s — the single non-bot hero
-     * (Beeper bridged DMs list the contact; bridge bots like
-     * @whatsappbot are excluded). Null for groups. Drives the contact
-     * overlay's phone/username line (chats, feedback 2026-08-21). NOTE: the
-     * m.bridge channel's `fi.mau.receiver` is the USER'S OWN number, not the
-     * contact's (verified 2026-08-22 across many LID DMs) — the contact's
-     * number is only present for `whatsapp_<number>` heroes; LID heroes
-     * (`whatsapp_lid-…`, the WhatsApp privacy migration) carry no number in
-     * the room data at all (Beeper resolves LIDs server-side).
-     */
-    private fun contactIdentifier(contactId: String?, displayName: String): String? {
-        val localpart = contactId?.substringAfter("@")?.substringBefore(":")
-        if (localpart != null) {
-            val rest = localpart.removePrefix("whatsapp_")
-            if (rest != localpart) { // a WhatsApp bridged ID
-                if (rest.startsWith("lid-")) {
-                    return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
-                }
-                return formatBridgePhone(rest)
-            }
-            return localpart
-        }
-        return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
     }
 }
 

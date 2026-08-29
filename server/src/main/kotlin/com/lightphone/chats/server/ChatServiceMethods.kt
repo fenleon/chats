@@ -102,8 +102,34 @@ object ChatServiceMethods {
 
                 LightServiceMethod.SetRoomMuted.id -> {
                     val request = LightServiceMethod.SetRoomMuted.decodeRequest(payload!!)
-                    MatrixRepository.setRoomMuted(request.roomId, request.muted)
+                    runBlocking { MatrixRepository.setRoomMuted(request.roomId, request.muted) }
                     LightResult.Success(LightServiceMethod.SetRoomMuted.encodeResponse(Unit))
+                }
+
+                LightServiceMethod.SetRoomPinned.id -> {
+                    val request = LightServiceMethod.SetRoomPinned.decodeRequest(payload!!)
+                    runBlocking { MatrixRepository.setRoomPinned(request.roomId, request.pinned) }
+                    LightResult.Success(LightServiceMethod.SetRoomPinned.encodeResponse(Unit))
+                }
+
+                LightServiceMethod.GetRoomFlags.id -> {
+                    val request = LightServiceMethod.GetRoomFlags.decodeRequest(payload!!)
+                    val flags = runBlocking { MatrixRepository.getRoomFlags(request.roomId) }
+                    LightResult.Success(
+                        LightServiceMethod.GetRoomFlags.encodeResponse(
+                            LightServiceMethod.GetRoomFlags.Response(
+                                pinned = flags.pinned,
+                                muted = flags.muted,
+                                archived = flags.archived,
+                            ),
+                        ),
+                    )
+                }
+
+                LightServiceMethod.SetRoomArchived.id -> {
+                    val request = LightServiceMethod.SetRoomArchived.decodeRequest(payload!!)
+                    runBlocking { MatrixRepository.setRoomArchived(request.roomId, request.archived) }
+                    LightResult.Success(LightServiceMethod.SetRoomArchived.encodeResponse(Unit))
                 }
 
                 LightServiceMethod.GetConnectionState.id -> {

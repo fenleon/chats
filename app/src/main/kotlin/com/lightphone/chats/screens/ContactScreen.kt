@@ -1,17 +1,16 @@
 package com.lightphone.chats.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -28,11 +27,15 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 /**
  * The contact overlay (feedback 2026-08-21): tapping the thread's top-bar
  * room name opens a minimal contact page — Name, network (WhatsApp /
  * Instagram), and the other party's identifier. No top bar; the bottom bar
- * carries only an X in the middle to dismiss.
+ * carries only an X in the middle to dismiss. The identity block stays
+ * centered in the upper area; the PIN / MUTE / ARCHIVE toggles stack below
+ * it, bottom-anchored just above the bottom bar (LP3 feedback 2026-08-28).
  *
  * Data source is a first pass, not settled: the identifier is the other
  * party's Matrix ID localpart, which on Beeper bridges is usually the bridge
@@ -54,19 +57,52 @@ class ContactScreen(
      */
     private val phone: String? = null,
     /**
-     * Whether the room is muted (2026-08-23): the MUTE button under the
-     * network line reads MUTE / UNMUTE; muting stops notifications for the
-     * room while the unread badge stays.
+     * Mute state (2026-08-23): the MUTE button under the network line reads
+     * MUTE / UNMUTE; muting stops notifications for the room while the unread
+     * badge stays. A StateFlow — the thread keeps it in sync with other
+     * devices while the panel is open (LP3 feedback 2026-08-28).
      */
-    private val muted: Boolean = false,
+    private val muted: StateFlow<Boolean> = MutableStateFlow(false),
     /** Flips the room's mute server-side; the panel mirrors the new state locally. */
     private val onToggleMute: () -> Unit = {},
+    /**
+     * Pin state (2026-08-28): the PIN button reads PIN / UNPIN; pinned chats
+     * sort to the top of the room list and their rows drop the latest
+     * timestamp. StateFlow like [muted].
+     */
+    private val pinned: StateFlow<Boolean> = MutableStateFlow(false),
+    /** Flips the room's pin server-side (m.favourite tag); the panel mirrors locally. */
+    private val onTogglePin: () -> Unit = {},
+    /**
+     * Archive state (2026-08-28): the ARCHIVE button reads ARCHIVE /
+     * UNARCHIVE; archived rooms hide from the main list and go silent,
+     * reachable only via search VIEW ALL. StateFlow like [muted].
+     */
+    private val archived: StateFlow<Boolean> = MutableStateFlow(false),
+    /** Flips the room's archive server-side (Beeper inbox.done); the panel mirrors locally. */
+    private val onToggleArchive: () -> Unit = {},
 ) : SimpleLightScreen<Unit>(sealedActivity) {
+
+    /** One full-width toggle button in the stacked block (LP3 feedback 2026-08-28). */
+    @Composable
+    private fun ToggleButton(label: String, onClick: () -> Unit) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .lightClickable(onClick = onClick)
+                .padding(vertical = 0.5f.gridUnitsAsDp()),
+            contentAlignment = Alignment.Center,
+        ) {
+            LightText(text = label, variant = LightTextVariant.Button)
+        }
+    }
 
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
-        var isMuted by remember { mutableStateOf(muted) }
+        val isMuted by muted.collectAsState()
+        val isPinned by pinned.collectAsState()
+        val isArchived by archived.collectAsState()
 
         LightTheme(colors = themeColors) {
             Column(
@@ -74,10 +110,15 @@ class ContactScreen(
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
+                // Identity block centered in the upper area — the toggles live
+                // in their own lower block, so the name stays put (LP3
+                // feedback 2026-08-28: adding buttons had pushed it up). The
+                // 1.12:1 weight ratio puts the toggle group's center at the
+                // midpoint between the X and the name (measured 2026-08-29).
                 Box(
                     modifier = Modifier
-                        .weight(1f)
-                        .fillMaxSize(),
+                        .weight(1.12f)
+                        .fillMaxWidth(),
                     contentAlignment = Alignment.Center,
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -114,26 +155,30 @@ class ContactScreen(
                                 modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                             )
                         }
-                        // Mute toggle (2026-08-23): under the network line at
-                        // Settings-panel spacing; UNMUTE replaces MUTE once on.
-                        // Notifications stop, the unread badge stays. Button
-                        // variant = the bottom-bar text size (feedback
-                        // 2026-08-23: "as big as the text in the bottom bar").
-                        // Sits lower on the panel (feedback 2026-08-27).
-                        LightText(
-                            text = if (isMuted) "UNMUTE" else "MUTE",
-                            variant = LightTextVariant.Button,
-                            modifier = Modifier
-                                .padding(top = 4f.gridUnitsAsDp())
-                                .lightClickable(onClick = {
-                                    isMuted = !isMuted
-                                    onToggleMute()
-                                })
-                                .padding(
-                                    horizontal = 2f.gridUnitsAsDp(),
-                                    vertical = 0.75f.gridUnitsAsDp(),
-                                ),
-                        )
+                    }
+                }
+                // Toggle block (LP3 feedback 2026-08-28): three full-width
+                // buttons stacked on top of each other, top-aligned in the
+                // lower half so the group sits right under the identity block —
+                // that lands the buttons' center at the midpoint between the
+                // X and the name text ("always centered between the X and the
+                // text above the network subtext"), with a tight 0.25gu gap
+                // between buttons. Identity and toggles both weight 1f, so the
+                // split is stable whatever the button labels or screen size.
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentAlignment = Alignment.TopCenter,
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(0.25f.gridUnitsAsDp()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        ToggleButton(if (isPinned) "UNPIN" else "PIN", onTogglePin)
+                        ToggleButton(if (isMuted) "UNMUTE" else "MUTE", onToggleMute)
+                        ToggleButton(if (isArchived) "UNARCHIVE" else "ARCHIVE", onToggleArchive)
                     }
                 }
                 LightBottomBar(
@@ -142,7 +187,10 @@ class ContactScreen(
                         null,
                         LightBarButton.LightIcon(
                             icon = LightIcons.CLOSE,
-                            onClick = { goBack() },
+                            // Pop with a Unit result so the caller's navigateTo
+                            // callback fires — the room list's panel stops its
+                            // flag poll on dismissal (ThreadScreen pattern, 2026-08-29).
+                            onClick = { goBack(Unit) },
                             contentDescription = "Close contact",
                         ),
                         null,

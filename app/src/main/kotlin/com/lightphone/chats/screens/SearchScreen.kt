@@ -49,8 +49,8 @@ import kotlinx.coroutines.launch
  * search action lives in the keyboard's bottom zone, DESIGN.md §16), tap the
  * SEARCH icon, and the results view lists matching rooms alphabetically. A
  * 1-character query matches; an empty search lists every chat. Results are
- * DIRECT chats by default — the bottom-middle "VIEW GROUP CHATS" toggle
- * reveals group chats (feedback 2026-08-21). The chat list's active network
+ * DIRECT chats by default — the bottom-middle "VIEW ALL" toggle reveals
+ * groups + archived rooms (2026-08-28). The chat list's active network
  * filter (all / WhatsApp / Instagram) carries into the search. Selecting a
  * row opens that room's thread.
  *
@@ -67,8 +67,9 @@ class SearchViewModel(
     val query = MutableStateFlow("")
     /** All rooms the companion reports; filtered + sorted by [matchingRooms]. */
     val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
-    /** Exclusive mode: false (default) = direct chats only; true = group chats only. */
-    val groupOnly = MutableStateFlow(false)
+    /** Exclusive mode: true (default) = direct, non-archived chats only;
+     *  false = everything (groups + archived). The bottom toggle flips it. */
+    val dmsOnly = MutableStateFlow(true)
     /** True once a search was run — the results view stays up across navigation. */
     val showResults = MutableStateFlow(false)
 
@@ -87,8 +88,8 @@ class SearchViewModel(
 
     /**
      * Matching rooms, alphabetically: a blank query matches everything.
-     * Exclusive mode — direct chats by default, or group chats only when the
-     * toggle is pressed (feedback 2026-08-21). The chat list's active network
+     * VIEW DIRECT by default (direct, non-archived chats); VIEW ALL includes
+     * groups + archived rooms (2026-08-28). The chat list's active network
      * filter (all / WhatsApp / Instagram) applies.
      */
     fun matchingRooms(): List<LightServiceMethod.GetRooms.Room> {
@@ -96,7 +97,7 @@ class SearchViewModel(
         return rooms.value
             .filter { room ->
                 (networkFilter == null || room.network == networkFilter) &&
-                    (if (groupOnly.value) !room.isDirect else room.isDirect) &&
+                    (!dmsOnly.value || (room.isDirect && !room.archived)) &&
                     (q.isEmpty() || room.name.contains(q, ignoreCase = true))
             }
             .sortedBy { it.name.lowercase() }
@@ -117,7 +118,7 @@ class SearchScreen(
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val showResults by viewModel.showResults.collectAsState()
-        val groupOnly by viewModel.groupOnly.collectAsState()
+        val dmsOnly by viewModel.dmsOnly.collectAsState()
 
         LightTheme(colors = themeColors) {
             Box(modifier = Modifier.fillMaxSize()) {
@@ -128,9 +129,9 @@ class SearchScreen(
                 ) {
                     if (showResults) {
                         ResultsView(
-                            groupOnly = groupOnly,
-                            onToggleGroupOnly = {
-                                viewModel.groupOnly.value = !viewModel.groupOnly.value
+                            dmsOnly = dmsOnly,
+                            onToggleDmsOnly = {
+                                viewModel.dmsOnly.value = !viewModel.dmsOnly.value
                             },
                             onBackToQuery = { viewModel.showResults.value = false },
                             onOpenRoom = ::openThread,
@@ -200,12 +201,12 @@ private fun QueryView(
 }
 
 /** The results view: matching rooms alphabetically ("no chats found" when
- *  nothing matches), a bottom-middle exclusive DIRECT/GROUP CHATS mode
- *  switch, and a back arrow returning to the query. Direct chats by default. */
+ *  nothing matches), a bottom-middle VIEW DIRECT / VIEW ALL mode switch, and
+ *  a back arrow returning to the query. VIEW DIRECT by default. */
 @Composable
 private fun ColumnScope.ResultsView(
-    groupOnly: Boolean,
-    onToggleGroupOnly: () -> Unit,
+    dmsOnly: Boolean,
+    onToggleDmsOnly: () -> Unit,
     onBackToQuery: () -> Unit,
     onOpenRoom: (LightServiceMethod.GetRooms.Room) -> Unit,
     results: List<LightServiceMethod.GetRooms.Room>,
@@ -237,12 +238,12 @@ private fun ColumnScope.ResultsView(
     LightBottomBar(
         modifier = Modifier.navigationBarsPadding(),
         items = listOf(
-            // Bottom-middle (single-item bar): exclusive mode switch — direct
-            // chats by default; "VIEW GROUP CHATS" swaps to group chats only
-            // and flips the label (feedback 2026-08-21).
+            // Bottom-middle (single-item bar): exclusive mode switch — direct,
+            // non-archived chats by default; "VIEW ALL" swaps in groups +
+            // archived rooms and flips the label (2026-08-28).
             LightBarButton.Text(
-                text = if (groupOnly) "VIEW DIRECT CHATS" else "VIEW GROUP CHATS",
-                onClick = onToggleGroupOnly,
+                text = if (dmsOnly) "VIEW ALL" else "VIEW DIRECT",
+                onClick = onToggleDmsOnly,
             ),
         ),
     )

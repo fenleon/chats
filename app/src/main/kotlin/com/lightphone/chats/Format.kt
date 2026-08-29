@@ -1,5 +1,6 @@
 package com.lightphone.chats
 
+import android.telephony.PhoneNumberUtils
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -90,6 +91,32 @@ fun formatBridgePhone(raw: String): String {
         national
     }
     return "+$cc $body"
+}
+
+/**
+ * The room's other participant for 1:1s — the single non-bot hero (Beeper
+ * bridged DMs list the contact; bridge bots like @whatsappbot are excluded).
+ * Null for groups. Drives the contact overlay's phone/username line (chats,
+ * feedback 2026-08-21; shared by the thread and the room list's long-press
+ * panel 2026-08-29). NOTE: the m.bridge channel's `fi.mau.receiver` is the
+ * USER'S OWN number, not the contact's (verified 2026-08-22 across many LID
+ * DMs) — the contact's number is only present for `whatsapp_<number>` heroes;
+ * LID heroes (`whatsapp_lid-…`, the WhatsApp privacy migration) carry no
+ * number in the room data at all (Beeper resolves LIDs server-side).
+ */
+fun contactIdentifier(contactId: String?, displayName: String): String? {
+    val localpart = contactId?.substringAfter("@")?.substringBefore(":")
+    if (localpart != null) {
+        val rest = localpart.removePrefix("whatsapp_")
+        if (rest != localpart) { // a WhatsApp bridged ID
+            if (rest.startsWith("lid-")) {
+                return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
+            }
+            return formatBridgePhone(rest)
+        }
+        return localpart
+    }
+    return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
 }
 
 /** 24-hour time for the room list rows — "14:02" (feedback 2026-08-21: the

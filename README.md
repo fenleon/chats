@@ -12,7 +12,7 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 > **Current Status:** Beta
 >
-> **Current Version:** 0.6.6 (versionCode 57)
+> **Current Version:** 0.7.0 (versionCode 58)
 
 ---
 
@@ -36,8 +36,9 @@ The chat list, a 1:1 thread, a group thread, search, the networks panel, setting
 
 - **WhatsApp, Instagram & more** — your existing chats from Beeper's bridged networks, with a network selector (All / WhatsApp / Instagram) so you can focus on one at a time
 - **1:1 and group chats** — a single-line chat list (unread counts, relative timestamps) that reveals more on scroll
+- **Archive, pin & mute** — archive a chat and it hides from the list (reachable via search's View All), pin it to the top, or mute it; all three sync with your other Beeper devices
 - **Search** — find any chat by name from the chat list, with a direct/group mode switch; results respect the selected network
-- **Contact overlay** — tap a thread's room name to see the contact's name, phone number (when the bridge data carries one), and network
+- **Contact overlay** — tap a thread's room name (or long-press a room in the chat list) to see the contact's name, phone number (when the bridge data carries one), and network, with PIN / MUTE / ARCHIVE controls that sync live with your other devices
 - **Hardware buttons work** — volume, camera, and the brightness wheel are relayed to the platform, so the native controls behave inside Chats
 - **End-to-end encryption** — every conversation is encrypted end to end, with simple emoji-based device verification and recovery-key login for new devices
 - **Or a Matrix homeserver of your own** — Chats isn't tied to Beeper; it works with any Matrix homeserver
