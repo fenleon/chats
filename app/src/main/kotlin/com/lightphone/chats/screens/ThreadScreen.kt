@@ -842,9 +842,13 @@ class ThreadScreen(
             viewModel.consumeVoiceComponent()
         }
 
-        // An unverified device cannot decrypt an encrypted room — say so
-        // plainly (and immediately, no spinner) instead of "Loading…" forever.
-        val needsDecryptionNotice = e2eeVerified == false && roomEncrypted
+        // An empty page in an encrypted room means the stored events couldn't
+        // be decrypted — unverified device, or a fresh login whose key requests
+        // haven't landed (LP3 2026-08-29: threads that were full before a
+        // logout/login read "No messages yet." — the server flags the page via
+        // MessagesPage.encrypted when an encrypted room's events all stayed
+        // undecryptable). Say so instead of lying about being empty.
+        val needsDecryptionNotice = roomEncrypted && messages.isEmpty()
 
         // The newest message in the thread: the only one that carries the
         // seen/delivered tag (older messages show a marker only when a send
@@ -907,12 +911,18 @@ class ThreadScreen(
                 Box(modifier = Modifier.weight(1f)) {
                     when {
                         loading && messages.isEmpty() -> StatusText("Loading messages…")
-                        // An encrypted room on an unverified device returns an
-                        // empty page — say why instead of "No messages yet."
-                        needsDecryptionNotice && messages.isEmpty() -> StatusText(DECRYPTION_NOTICE)
+                        // An encrypted room whose content can't be decrypted
+                        // returns an empty page — say why instead of "No
+                        // messages yet." (the text differs: unverified device
+                        // vs. verified device still waiting for keys).
+                        needsDecryptionNotice && messages.isEmpty() -> StatusText(
+                            if (e2eeVerified == false) DECRYPTION_NOTICE else DECRYPTION_NOTICE_KEYS_PENDING
+                        )
                         messages.isEmpty() -> StatusText("No messages yet.")
                         else -> Column(modifier = Modifier.fillMaxSize()) {
-                            if (needsDecryptionNotice) DecryptionNotice()
+                            if (needsDecryptionNotice) DecryptionNotice(
+                                if (e2eeVerified == false) DECRYPTION_NOTICE else DECRYPTION_NOTICE_KEYS_PENDING
+                            )
                             // Messages grouped by time gap / sender / day (the
                             // day tag lives on the group-start timestamp —
                             // feedback 2026-08-21: the centered day dividers
@@ -1107,10 +1117,16 @@ class ThreadScreen(
 private const val DECRYPTION_NOTICE =
     "Encrypted — verify this device to read messages (Settings → Account → Encrypted messages)"
 
+/** Verified device, but the megolm sessions for this room's history haven't
+ *  arrived (fresh login without a key backup): the events are stored, the keys
+ *  are pending from the account's other devices. */
+private const val DECRYPTION_NOTICE_KEYS_PENDING =
+    "Encrypted — history can't be read yet, keys from your other devices are pending (Settings → Account → Encrypted messages)"
+
 @Composable
-private fun DecryptionNotice() {
+private fun DecryptionNotice(text: String) {
     LightText(
-        text = DECRYPTION_NOTICE,
+        text = text,
         variant = LightTextVariant.Detail,
         lighten = true,
         modifier = Modifier

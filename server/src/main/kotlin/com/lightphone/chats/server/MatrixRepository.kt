@@ -1262,7 +1262,19 @@ object MatrixRepository {
             }
             is ActiveVerificationState.Done -> {
                 e2eeStateCache = null // verification changed — recompute on next read
-                scope.launch { restoreMegolmSessions() }
+                // The backup-key secret lands via /sync a moment after Done, but
+                // the login-time restore ran before it existed and set the 24h
+                // cooldown. Clear it and retry on a short ladder so the crawl
+                // actually runs once the key is local (LP3 2026-08-29: Done →
+                // key arrived ~2s later, restore skipped by the stale cooldown).
+                scope.launch {
+                    val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return@launch
+                    repeat(3) { attempt ->
+                        delay(10_000L * (attempt + 1))
+                        prefs.edit().remove(KEY_RESTORE_LAST_RUN_MS).apply()
+                        restoreMegolmSessions()
+                    }
+                }
                 roomListDirty = true // newly verified device → unread counts recompute
                 VerificationUi.Done
             }
@@ -1326,7 +1338,12 @@ object MatrixRepository {
         val backupVersion = runCatching { keyBackup.version.firstOrNull() }.getOrNull()
         android.util.Log.d(TAG, "restore: backup version = $backupVersion")
         if (backupVersion == null) {
-            android.util.Log.w(TAG, "restore: no server-side key backup configured on this account")
+            // No server-side backup — the per-room loadMegolmSession would
+            // time out (2 s) on every room for nothing (LP3 2026-08-29 fresh
+            // login: 296 × 2 s of logcat noise every day). Bail; the on-demand
+            // page path still restores the moment a backup appears.
+            android.util.Log.w(TAG, "restore: no server-side key backup configured — skipping the daily crawl")
+            return
         }
         val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() } ?: return
         android.util.Log.d(TAG, "restore: scanning ${rooms.size} rooms")
@@ -2703,7 +2720,15 @@ object MatrixRepository {
         // did, so equal timestamps keep the old tie order; then append the
         // pending rows (also oldest-first) at the newest end.
         val oldestFirst = confirmed.reversed().sortedWith(compareBy { it.timestampMs }) + pending.reversed()
-        return MessagesPage(messages = oldestFirst, hasMore = hasMore)
+        // An encrypted room whose stored events all stayed undecryptable builds
+        // zero rows — say WHY (the tool shows the decryption notice) instead of
+        // letting the empty page read as "No messages yet." (LP3 2026-08-29: a
+        // fresh login holds no megolm sessions and the account has no key
+        // backup, so history can't decrypt until keys arrive). Only the newest
+        // page carries the flag; a genuinely empty room (no events at all)
+        // stays a plain empty page.
+        val undecryptable = roomEncrypted && beforeEventId == null && events.isNotEmpty() && oldestFirst.isEmpty()
+        return MessagesPage(messages = oldestFirst, hasMore = hasMore, encrypted = undecryptable)
     }
 
     /** Type of Beeper's per-message delivery-state events (unencrypted, posted
@@ -5517,14 +5542,19 @@ object MatrixRepository {
         if (roomFlagsCache.isNotEmpty() && now - roomFlagsBuiltAtMs < ROOM_FLAGS_TTL_MS && !changed) {
             return roomFlagsCache + roomFlagsOverlay
         }
-        val result = mutableMapOf<String, RoomFlags>()
-        withTimeoutOrNull(NETWORK_MAP_BUDGET_MS) {
-            val pushRules = try {
-                c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
-                    .get(PushRulesEventContent::class).first()?.content?.global?.room.orEmpty()
-            } catch (_: Exception) { emptyList() }
-            for ((roomId, _) in rooms) {
-                val key = roomId.full
+        // Seed from the last-known flags so a room that times out KEEPS its
+        // previous state instead of silently unpinning. The old whole-loop
+        // budget cut the 296-room walk partway and cached the partial prefix —
+        // the LP3 served exactly 1 pinned room though the store held 3
+        // (2026-08-29: Sophie pinned, Anni + Note to self dropped).
+        val result = roomFlagsCache.toMutableMap()
+        val pushRules = try {
+            c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
+                .get(PushRulesEventContent::class).first()?.content?.global?.room.orEmpty()
+        } catch (_: Exception) { emptyList() }
+        for ((roomId, _) in rooms) {
+            val key = roomId.full
+            withTimeoutOrNull(ROOM_FLAGS_ROOM_BUDGET_MS) {
                 val tags = c.room.getAccountData(roomId, TagEventContent::class, "").first()
                 // The store never clears removed account data, so a stale row
                 // can be a phantom (unarchived in Beeper long ago) — confirm
@@ -5551,10 +5581,8 @@ object MatrixRepository {
             }
         }
         result.putAll(roomFlagsOverlay)
-        if (result.isNotEmpty()) {
-            roomFlagsCache = result
-            roomFlagsBuiltAtMs = now
-        }
+        roomFlagsCache = result
+        roomFlagsBuiltAtMs = now
         return roomFlagsCache + roomFlagsOverlay
     }
 
@@ -5910,11 +5938,17 @@ object MatrixRepository {
         )
     }
 
-    /** Publishes the cache as the sorted, SDK-shaped list (and persists it). */
+    /** Publishes the cache as the sorted, SDK-shaped list (and persists it).
+     *  Pinned rooms float to the top (Beeper convention — the m.favourite tag;
+     *  LP3 2026-08-29: a pinned DM sorted to the bottom by recency and read as
+     *  "missing"), then newest-first. */
     private fun publishRoomList() {
         val rooms = roomListCache.values
             .map { it.room }
-            .sortedByDescending { it.lastTimestampMs }
+            .sortedWith(
+                compareByDescending<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> { it.pinned == true }
+                    .thenByDescending { it.lastTimestampMs }
+            )
         _roomList.value = rooms
         saveRoomListToDisk(rooms)
     }
@@ -6379,6 +6413,10 @@ object MatrixRepository {
     private const val NETWORK_MAP_TTL_MS = 300_000L
     /** Bound for a full network-map build (600+ room flows on a big account). */
     private const val NETWORK_MAP_BUDGET_MS = 15_000L
+    /** Per-room budget for the flags walk ([roomFlagsByRoom]): one room's store
+     *  reads + the archive network GET fit in this; a room that exceeds it
+     *  keeps its last-known flags instead of being dropped (2026-08-29). */
+    private const val ROOM_FLAGS_ROOM_BUDGET_MS = 2_000L
     /** Bump to force a fresh /sync filter upload + full initial sync once per
      *  account (see [migrateSyncFilterIfNeeded]) — e.g. when a new room
      *  account-data type joins the filter's whitelist and existing clients'

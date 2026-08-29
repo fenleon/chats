@@ -51,6 +51,14 @@ kotlin {
     }
 }
 
+// zxing-cpp (the SDK's camera QR/barcode decoder, added for Passes' bit-matrix
+// rendering) requires compileSdk 37; chats never scans codes. Per-dependency
+// excludes don't prune it through the composite-build project substitution,
+// so drop the group for the whole configuration.
+configurations.configureEach {
+    exclude(group = "com.github.markusfisch")
+}
+
 dependencies {
     // SDK modules come from the included ../light-sdk build (see settings.gradle.kts).
     // The QR scanner + CameraX come transitively via sdk:ui; the chat tool never scans codes.

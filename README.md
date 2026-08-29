@@ -12,7 +12,7 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 > **Current Status:** Beta
 >
-> **Current Version:** 0.7.0 (versionCode 58)
+> **Current Version:** 0.8.0 (versionCode 59)
 
 ---
 
@@ -40,7 +40,7 @@ The chat list, a 1:1 thread, a group thread, search, the networks panel, setting
 - **Search** — find any chat by name from the chat list, with a direct/group mode switch; results respect the selected network
 - **Contact overlay** — tap a thread's room name (or long-press a room in the chat list) to see the contact's name, phone number (when the bridge data carries one), and network, with PIN / MUTE / ARCHIVE controls that sync live with your other devices
 - **Hardware buttons work** — volume, camera, and the brightness wheel are relayed to the platform, so the native controls behave inside Chats
-- **End-to-end encryption** — every conversation is encrypted end to end, with simple emoji-based device verification and recovery-key login for new devices
+- **End-to-end encryption** — every conversation is encrypted end to end, with simple emoji-based device verification and recovery-key login for new devices; after verifying, history decrypts automatically from your server-side key backup, and a thread that can't be read yet says why instead of looking empty
 - **Or a Matrix homeserver of your own** — Chats isn't tied to Beeper; it works with any Matrix homeserver
 - **Notifications** — one calm notification per room as messages arrive; a push channel (ntfy) wakes the sync the moment a message arrives, so delivery is instant
 - **Voice notes** — record (with a live length read-out), send, and play (Opus — the standard voice-message format, roughly half the size of the earlier AAC); playback handles the bridge's malformed Ogg streams, and a note you just sent plays straight from the thread
@@ -51,7 +51,7 @@ The chat list, a 1:1 thread, a group thread, search, the networks panel, setting
 - **Day-grouped timestamps** — time-of-day for today, "yesterday", weekday names, then dates
 - **Instant re-open** — room list and threads are cached to disk
 - **Handles very large accounts** — the conversation list stays reliable even with thousands of rooms; any room that gets a new message surfaces immediately
-- **Battery-conscious sync** — with the screen off, sync stretches to a slow idle cadence (push-wake keeps delivery instant); a Settings toggle pauses sync entirely (and the foreground service) when you don't need it
+- **Battery-conscious sync** — a custom sync filter drops presence and bounds each room's timeline server-side (much cheaper syncs on very large accounts), with the screen off sync idles at a single 5-minute cadence (push-wake keeps delivery instant); a Settings toggle pauses sync entirely (and the foreground service) when you don't need it
 - **Optional Wi-Fi-only media downloads**
 
 ---
