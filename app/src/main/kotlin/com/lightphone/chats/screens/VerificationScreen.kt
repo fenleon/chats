@@ -215,12 +215,21 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                             .fillMaxSize(),
                         contentAlignment = Alignment.Center,
                     ) {
-                        LightText(
-                            text = "Verified. Encrypted messages can now decrypt.",
-                            variant = LightTextVariant.Copy,
-                            align = TextAlign.Center,
+                        Column(
                             modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
-                        )
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            LightText(
+                                text = "Verification complete!",
+                                variant = LightTextVariant.Copy,
+                                align = TextAlign.Center,
+                            )
+                            LightText(
+                                text = "Messages are now decrypted.",
+                                variant = LightTextVariant.Copy,
+                                align = TextAlign.Center,
+                            )
+                        }
                     }
                     LightBottomBar(
                         modifier = Modifier.navigationBarsPadding(),
@@ -249,7 +258,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                         )
                     },
                     center = LightTopBarCenter.Text(
-                        if (state?.state == "compare" && !confirmOpen) "Check your other device" else "Verify",
+                        if (state?.state == "compare" && !confirmOpen) "Check your other device" else "Verify Device",
                     ),
                 )
 
@@ -273,9 +282,13 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                             )
 
                             "waiting" -> CenteredPanel(WAITING_TEXT)
-                            "accept", "start" -> CenteredPanel("Your other device wants to verify. Accept?")
+                            "accept", "start" -> AcceptPanel(onAccept = { viewModel.act("accept") })
                             "verifying" -> CenteredPanel("Verifying…")
-                            "compare" -> ComparePanel(state?.emoji.orEmpty())
+                            "compare" -> ComparePanel(
+                                emojis = state?.emoji.orEmpty(),
+                                onMatch = { viewModel.act("match") },
+                                onNoMatch = { viewModel.act("no_match") },
+                            )
                             "cancelled" -> CenteredPanel("Verification was cancelled or failed.")
                             "error" -> CenteredPanel(state?.detail ?: "Verification failed.")
                             else -> CenteredPanel("Checking…")
@@ -299,7 +312,8 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
 
     /** The bottom-bar action set for the current panel (feedback 2026-08-19:
      *  X dismiss/cancel; the panel's action; the compare page has no X, the
-     *  waiting and cancelled panels' X sits centered). */
+     *  waiting and cancelled panels' X sits centered — 2026-08-29: accept/start
+     *  and compare put their actions in the content area, X centered). */
     private fun bottomBarItems(
         confirmOpen: Boolean,
         state: String?,
@@ -327,24 +341,18 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
             state == "accept" || state == "start" -> listOf(
                 // Both panels route through "accept" — the server prefers the
                 // pending SAS-accept over starting the SAS itself (the states
-                // churn fast, LP3 2026-08-19).
+                // churn fast, LP3 2026-08-19). ACCEPT moved into the content
+                // area above the bar (2026-08-29); the X cancels, centered.
+                null,
                 cancelButton(),
                 null,
-                LightBarButton.Text(
-                    text = "ACCEPT",
-                    onClick = { viewModel.act("accept") },
-                ),
             )
             state == "verifying" -> listOf(null, cancelButton(), null)
             state == "compare" -> listOf(
-                // X (cancel) left + THEY MATCH center — the two text buttons
-                // crowded each other; "they don't match" is covered by the X
-                // (feedback 2026-08-19).
+                // THEY MATCH / THEY DON'T MATCH are stacked buttons in the
+                // content area (2026-08-29); the X cancels, centered.
+                null,
                 cancelButton(),
-                LightBarButton.Text(
-                    text = "THEY MATCH",
-                    onClick = { viewModel.act("match") },
-                ),
                 null,
             )
             state == "cancelled" || state == "error" -> listOf(
@@ -441,32 +449,81 @@ private fun CenteredPanel(text: String) {
     }
 }
 
-/** The emoji-comparison panel: the SAS emojis, with the confirmation line
- *  centred underneath (feedback 2026-08-19). */
+/** The accept/start panel (2026-08-29): centered question, ACCEPT as a button
+ *  bottom-anchored above the bottom bar; the X cancel stays in the bar. */
 @Composable
-private fun ComparePanel(emojis: List<String>) {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            // All seven on one line so the SAS set reads as a single
-            // comparison (Heading keeps them small enough to fit).
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-            ) {
-                emojis.forEach { emoji ->
-                    LightText(text = emoji, variant = LightTextVariant.Heading)
-                }
-            }
-            Spacer(Modifier.height(1f.gridUnitsAsDp()))
+private fun AcceptPanel(onAccept: () -> Unit) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
             LightText(
-                text = "Confirm the Emojis match the ones shown on your other device",
+                text = "Your other device wants to verify. Accept?",
                 variant = LightTextVariant.Copy,
                 align = TextAlign.Center,
                 modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
             )
         }
+        PanelActionButton("ACCEPT", onClick = onAccept)
+    }
+}
+
+/** One full-width action button in the content area (the ContactScreen
+ *  ToggleButton grammar, 2026-08-29). */
+@Composable
+private fun PanelActionButton(label: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .lightClickable(onClick = onClick)
+            .padding(vertical = 0.5f.gridUnitsAsDp()),
+        contentAlignment = Alignment.Center,
+    ) {
+        LightText(text = label, variant = LightTextVariant.Button)
+    }
+}
+
+/** The emoji-comparison panel: the SAS emojis with the confirmation line
+ *  centred (feedback 2026-08-19); THEY MATCH / THEY DON'T MATCH stacked as
+ *  buttons above the bottom bar (2026-08-29 — previously THEY MATCH sat in
+ *  the bar). */
+@Composable
+private fun ComparePanel(
+    emojis: List<String>,
+    onMatch: () -> Unit,
+    onNoMatch: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                // All seven on one line so the SAS set reads as a single
+                // comparison (Heading keeps them small enough to fit).
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                ) {
+                    emojis.forEach { emoji ->
+                        LightText(text = emoji, variant = LightTextVariant.Heading)
+                    }
+                }
+                Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                LightText(
+                    text = "Confirm the Emojis match the ones shown on your other device",
+                    variant = LightTextVariant.Copy,
+                    align = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                )
+            }
+        }
+        PanelActionButton("THEY MATCH", onClick = onMatch)
+        PanelActionButton("THEY DON'T MATCH", onClick = onNoMatch)
     }
 }

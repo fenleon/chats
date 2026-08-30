@@ -598,13 +598,12 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                             onClick = { openSettings() },
                             contentDescription = "Settings",
                         ),
-                        // Feedback 2026-08-21: the VIEW UNREAD toggle moved to
-                        // the Search screen — the bottom-middle slot is the
-                        // search entry point now.
+                        // The bottom-middle slot is the contacts list entry
+                        // point (2026-08-29); search moved into that panel.
                         LightBarButton.LightIcon(
-                            icon = LightIcons.SEARCH,
-                            onClick = { openSearch() },
-                            contentDescription = "Search chats",
+                            icon = LightIcons.CONTACTS,
+                            onClick = { openContacts() },
+                            contentDescription = "Contacts",
                         ),
                         // Feedback pass: the network filter lives behind the
                         // bottom-right menu (3-dash) which opens the Networks
@@ -657,10 +656,10 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         }) { viewModel.closeContactPanel() }
     }
 
-    private fun openSearch() {
-        // The active network filter (all / WhatsApp / Instagram) carries into
-        // the search results (feedback 2026-08-21).
-        navigateTo(screenFactory = { SearchScreen(it, viewModel.networkFilter.value) })
+    private fun openContacts() {
+        // The starting point carries in (2026-08-30): opened from All the
+        // panel shows every contact; from a filtered list only that network's.
+        navigateTo(screenFactory = { ContactsScreen(it, viewModel.networkFilter.value) })
     }
 
     private fun openSettings() {

@@ -851,8 +851,8 @@ class ThreadScreen(
         val needsDecryptionNotice = roomEncrypted && messages.isEmpty()
 
         // The newest message in the thread: the only one that carries the
-        // seen/delivered tag (older messages show a marker only when a send
-        // failed). The list is oldest-first, so the last item is the newest.
+        // "seen" tag (older messages show a marker only when a send failed).
+        // The list is oldest-first, so the last item is the newest.
         // Read status only makes sense in a 1:1 — groups get no tag at all.
         val latestMessageId = remember(messages) { messages.lastOrNull()?.id }
 
@@ -1115,13 +1115,13 @@ class ThreadScreen(
 }
 
 private const val DECRYPTION_NOTICE =
-    "Encrypted — verify this device to read messages (Settings → Account → Encrypted messages)"
+    "Encrypted — verify this device to read messages (Settings → Account → Verify Device)"
 
 /** Verified device, but the megolm sessions for this room's history haven't
  *  arrived (fresh login without a key backup): the events are stored, the keys
  *  are pending from the account's other devices. */
 private const val DECRYPTION_NOTICE_KEYS_PENDING =
-    "Encrypted — history can't be read yet, keys from your other devices are pending (Settings → Account → Encrypted messages)"
+    "Encrypted — history can't be read yet, keys from your other devices are pending (Settings → Account → Verify Device)"
 
 @Composable
 private fun DecryptionNotice(text: String) {
@@ -1424,21 +1424,17 @@ private fun MessageRow(
                     modifier = Modifier.padding(top = 1.dp),
                 )
             } else if (message.isMine && showReadStatus && showDeliveryTag) {
-                // Phase 13: the seen/delivered marker (off via Settings →
-                // Show read status) — only on the newest message of a 1:1
-                // thread, so past messages and group chats stay quiet.
-                // Only claim what is actually known (feedback 2026-08-17:
-                // "seen" showed when only delivered, and fresh sends showed
-                // "delivered" before any delivery evidence existed): "seen"
-                // needs the other party's m.read receipt (or a Beeper READ
-                // status); "delivered" needs a Beeper status that means
-                // delivered. A message with no status event yet (still in
-                // flight, or no bridge report) gets no tag.
-                val tag = when {
-                    message.read || message.sendStatus == "READ" -> "seen"
-                    message.sendStatus == "DELIVERED" -> "delivered"
-                    else -> null
-                }
+                // Phase 13: the read-status marker (off via Settings → Show
+                // read status) — only on the newest message of a 1:1 thread,
+                // so past messages and group chats stay quiet. Only "seen"
+                // gets a tag, and only when it's actually known (feedback
+                // 2026-08-17): it needs the other party's m.read receipt (or
+                // a Beeper READ status). The "delivered" tag was dropped
+                // (2026-08-30) — SENDING stopping already implies delivery,
+                // and a fresh send showed "delivered" before any delivery
+                // evidence existed. A message with no status event yet (still
+                // in flight, or no bridge report) gets no tag.
+                val tag = if (message.read || message.sendStatus == "READ") "seen" else null
                 if (tag != null) {
                     LightText(
                         text = tag,

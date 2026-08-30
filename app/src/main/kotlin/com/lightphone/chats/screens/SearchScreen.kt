@@ -40,6 +40,8 @@ import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.defaultKeyboardOptions
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -73,13 +75,43 @@ class SearchViewModel(
     /** True once a search was run — the results view stays up across navigation. */
     val showResults = MutableStateFlow(false)
 
+    private var pollJob: Job? = null
+
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
         // Refresh the room set (also on return from a thread — a new chat may
         // have arrived); the results list keeps its current rows meanwhile.
-        viewModelScope.launch { rooms.value = ChatClient.getRooms() }
+        refreshRooms()
+        startPolling()
+    }
+
+    override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
+        super.onScreenHide(screen)
+        stopPolling()
+    }
+
+    /** Re-fetches the census while the screen stays open (a cold process can
+     *  answer the first call with an empty list while the companion's
+     *  resolver seeds — the poll fills the results in, same as the main list). */
+    private fun startPolling() {
+        if (pollJob?.isActive == true) return
+        pollJob = viewModelScope.launch {
+            while (true) {
+                delay(POLL_INTERVAL_MS)
+                refreshRooms()
+            }
+        }
+    }
+
+    private fun stopPolling() {
+        pollJob?.cancel()
+        pollJob = null
+    }
+
+    private fun refreshRooms() {
+        viewModelScope.launch { rooms.value = ChatClient.getAllRooms() }
     }
 
     fun updateQuery(newQuery: String) {
@@ -90,17 +122,24 @@ class SearchViewModel(
      * Matching rooms, alphabetically: a blank query matches everything.
      * VIEW DIRECT by default (direct, non-archived chats); VIEW ALL includes
      * groups + archived rooms (2026-08-28). The chat list's active network
-     * filter (all / WhatsApp / Instagram) applies.
+     * filter (all / WhatsApp / Instagram) applies. [rooms] is passed in from
+     * the screen's collected state — reading the flow's .value directly
+     * would never recompose when the fetch lands (2026-08-30).
      */
-    fun matchingRooms(): List<LightServiceMethod.GetRooms.Room> {
+    fun matchingRooms(rooms: List<LightServiceMethod.GetRooms.Room>): List<LightServiceMethod.GetRooms.Room> {
         val q = query.value.trim()
-        return rooms.value
+        return rooms
             .filter { room ->
                 (networkFilter == null || room.network == networkFilter) &&
                     (!dmsOnly.value || (room.isDirect && !room.archived)) &&
                     (q.isEmpty() || room.name.contains(q, ignoreCase = true))
             }
             .sortedBy { it.name.lowercase() }
+    }
+
+    private companion object {
+        /** Results refresh cadence — matches the main list's poll. */
+        const val POLL_INTERVAL_MS = 5_000L
     }
 }
 
@@ -119,6 +158,7 @@ class SearchScreen(
         val themeColors by LightThemeController.colors.collectAsState()
         val showResults by viewModel.showResults.collectAsState()
         val dmsOnly by viewModel.dmsOnly.collectAsState()
+        val rooms by viewModel.rooms.collectAsState()
 
         LightTheme(colors = themeColors) {
             Box(modifier = Modifier.fillMaxSize()) {
@@ -135,7 +175,7 @@ class SearchScreen(
                             },
                             onBackToQuery = { viewModel.showResults.value = false },
                             onOpenRoom = ::openThread,
-                            results = viewModel.matchingRooms(),
+                            results = viewModel.matchingRooms(rooms),
                         )
                     } else {
                         QueryView(

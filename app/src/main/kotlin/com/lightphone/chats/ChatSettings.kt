@@ -8,7 +8,7 @@ import kotlinx.coroutines.flow.first
 
 /**
  * Tool-local settings, persisted in the SDK's DataStore
- * ([SealedLightContext.dataStore]). The seen/delivered marker + data-saver
+ * ([SealedLightContext.dataStore]). The "seen" marker + data-saver
  * preferences live here: Settings toggles them, the thread reads the flows.
  */
 object ChatSettings {
@@ -16,7 +16,7 @@ object ChatSettings {
     private val KEY_SHOW_READ_STATUS = booleanPreferencesKey("chats.show_read_status")
     private val KEY_DOWNLOAD_OVER_MOBILE = booleanPreferencesKey("chats.download_over_mobile")
 
-    /** Whether the thread shows "seen"/"delivered" under outgoing messages. Default on. */
+    /** Whether the thread shows "seen" under outgoing messages. Default on. */
     val showReadStatus = MutableStateFlow(true)
 
     /** Data Saver Mode: true = media downloads restricted to Wi-Fi. The Settings

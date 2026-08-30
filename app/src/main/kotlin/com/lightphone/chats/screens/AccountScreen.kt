@@ -34,6 +34,7 @@ import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcon
+import com.thelightphone.sdk.ui.LightIconConfiguration
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
@@ -66,6 +67,9 @@ class AccountViewModel : LightViewModel<Unit>() {
     val beeperEmail = MutableStateFlow("")
     val beeperCode = MutableStateFlow("")
     val codeStatus = MutableStateFlow<String?>(null)
+    /** True once REQUEST CODE succeeded — the bar button reads REQUEST AGAIN
+     *  until a login (or logout) resets the flow (2026-08-29). */
+    val codeRequested = MutableStateFlow(false)
 
     val homeserver = MutableStateFlow("")
     val user = MutableStateFlow("")
@@ -77,15 +81,15 @@ class AccountViewModel : LightViewModel<Unit>() {
     val e2ee = MutableStateFlow<LightServiceMethod.GetE2eeState.Response?>(null)
     /**
      * Whether the e2ee verdict has settled. The first read on a cold trust
-     * store can lag a poll behind the truth, so "Not Verified" only shows
+     * store can lag a poll behind the truth, so "Verify Device" only shows
      * after a verified read OR two consecutive unverified reads — until then
      * the row reads "Checking…" (feedback 2026-08-20: "not verified" flashed
      * on launch before loading to "verified").
      */
     val e2eeSettled = MutableStateFlow(false)
     /** The verification state machine's state string ("none" | "waiting" |
-     *  "accept" | "start" | "verifying" | "compare" | …) — the Encrypted
-     *  messages row reads it to show "Verifying" mid-process. */
+     *  "accept" | "start" | "verifying" | "compare" | …) — the Verify Device
+     *  row reads it to show "Verifying" mid-process. */
     val verification = MutableStateFlow<String?>(null)
     val busy = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
@@ -176,6 +180,7 @@ class AccountViewModel : LightViewModel<Unit>() {
                 if (failure != null) {
                     error.value = failure
                 } else {
+                    codeRequested.value = true
                     codeStatus.value = "Code sent to $email — check your email"
                     onSuccess(email)
                 }
@@ -210,6 +215,7 @@ class AccountViewModel : LightViewModel<Unit>() {
                     password.value = ""
                     beeperCode.value = ""
                     codeStatus.value = null
+                    codeRequested.value = false
                     refreshStatus()
                 } else {
                     error.value = failure
@@ -229,6 +235,7 @@ class AccountViewModel : LightViewModel<Unit>() {
                 password.value = ""
                 beeperCode.value = ""
                 codeStatus.value = null
+                codeRequested.value = false
                 refreshStatus()
             } finally {
                 busy.value = false
@@ -271,6 +278,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
         val beeperEmail by viewModel.beeperEmail.collectAsState()
         val beeperCode by viewModel.beeperCode.collectAsState()
         val codeStatus by viewModel.codeStatus.collectAsState()
+        val codeRequested by viewModel.codeRequested.collectAsState()
         val homeserver by viewModel.homeserver.collectAsState()
         val user by viewModel.user.collectAsState()
         val password by viewModel.password.collectAsState()
@@ -428,7 +436,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                             // user enters the code via the Enter code field
                             // (feedback 2026-08-19).
                             LightBarButton.Text(
-                                text = if (busy) "…" else "REQUEST CODE",
+                                text = if (busy) "…" else if (codeRequested) "REQUEST AGAIN" else "REQUEST CODE",
                                 onClick = if (busy) null else {
                                     {
                                         viewModel.requestCode { email ->
@@ -644,9 +652,9 @@ private fun ServerOptionRow(
 }
 
 /** The request-code confirmation overlay (feedback 2026-08-19): centered
- *  "A code has been sent to <email>. Check your email." with an X dismiss in
- *  the bottom centre; dismissing returns to the account panel, where the
- *  Enter code field now appears. */
+ *  "A code has been sent to <email>." / "Check your email." on separate lines
+ *  (2026-08-29) with an X dismiss in the bottom centre; dismissing returns to
+ *  the account panel, where the Enter code field now appears. */
 class CodeSentPanel(
     sealedActivity: SealedLightActivity,
     private val email: String,
@@ -669,12 +677,21 @@ class CodeSentPanel(
                         .fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) {
-                    LightText(
-                        text = "A code has been sent to $email. Check your email.",
-                        variant = LightTextVariant.Copy,
-                        align = TextAlign.Center,
+                    Column(
                         modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
-                    )
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        LightText(
+                            text = "A code has been sent to $email.",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                        LightText(
+                            text = "Check your email.",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                    }
                 }
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
@@ -766,7 +783,8 @@ private fun AccountStatus(
                 state.roomsTotal > 0 && state.roomsResolved >= state.roomsTotal
             // Feedback 2026-08-19: the status line reads plainly — "sync
             // paused" when the toggle is off, "offline" when there's simply
-            // no connection.
+            // no connection. The thread count shares the same line
+            // (2026-08-29): "Syncing · 34 of 52 threads".
             val statusText = when {
                 allSynced -> "Synced"
                 state.state == "syncing" -> "Syncing"
@@ -775,19 +793,27 @@ private fun AccountStatus(
                 state.state == "connecting" -> "connecting"
                 else -> state.state.replaceFirstChar { it.uppercase() }
             }
+            val countText = when {
+                state.roomsTotal <= 0 -> null
+                state.roomsResolved >= state.roomsTotal -> pluralThreads(state.roomsTotal)
+                else -> "${state.roomsResolved} of ${pluralThreads(state.roomsTotal)}"
+            }
             LightText(
-                text = statusText,
+                text = countText?.let { "$statusText · $it" } ?: statusText,
                 variant = LightTextVariant.Detail,
             )
-            // Sync progress: how many rooms have been synced/resolved so far.
-            if (state.roomsTotal > 0) {
-                val total = state.roomsTotal
-                val resolved = state.roomsResolved
+            // Key-backup restore crawl (2026-08-29): "Recovering… x of y
+            // rooms" while the daily restore runs; "All messages restored"
+            // once it finished AND sync has fully caught up.
+            if (state.restoreScanning && state.restoreRoomsTotal > 0) {
                 LightText(
-                    text = when {
-                        resolved >= total -> pluralThreads(total)
-                        else -> "${resolved} of ${pluralThreads(total)}"
-                    },
+                    text = "Recovering… ${state.restoreScanned} of ${state.restoreRoomsTotal} rooms",
+                    variant = LightTextVariant.Fine,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            } else if (state.restoreCompleted && allSynced) {
+                LightText(
+                    text = "All messages restored",
                     variant = LightTextVariant.Fine,
                     modifier = Modifier.padding(top = 1.dp),
                 )
@@ -800,15 +826,13 @@ private fun AccountStatus(
 private fun pluralThreads(count: Int): String =
     if (count == 1) "1 thread" else "$count threads"
 
-/** "Encrypted messages" row; opens the device-verification screen while
- *  unverified, and reads as a status-only row once verified. No toggle — the
- *  state reads "Verified" / "Verifying" (mid-verification, so a back-out keeps
- *  the process visible) / "Not Verified". While the verdict hasn't settled
- *  (a cold trust store can lag a poll — feedback 2026-08-20) it reads
- *  "Checking…" and is not tappable, so launch never claims a false
- *  "Not Verified". Value-row anatomy — "Encrypted messages" is the Detail-sized
- *  top text, the state the Heading-sized main text (DESIGN.md §6, feedback
- *  2026-08-19). */
+/** Device-verification row (2026-08-29): the action reads "Verify Device"
+ *  while unverified, and is a status-only row once verified. No toggle — the
+ *  state reads "Device Verified" / "Verifying" (mid-verification, so a
+ *  back-out keeps the process visible) / "Verify Device". While the verdict
+ *  hasn't settled (a cold trust store can lag a poll — feedback 2026-08-20)
+ *  it reads "Checking…" and is not tappable, so launch never claims a false
+ *  "Verify Device". The old "Encrypted messages" label is gone. */
 @Composable
 private fun EncryptionRow(
     e2ee: LightServiceMethod.GetE2eeState.Response?,
@@ -816,32 +840,19 @@ private fun EncryptionRow(
     verifying: Boolean,
     onClick: (() -> Unit)?,
 ) {
-    Row(
+    LightText(
+        text = when {
+            e2ee?.verified == true -> "Device Verified"
+            verifying -> "Verifying"
+            !settled -> "Checking…"
+            else -> "Verify Device"
+        },
+        variant = LightTextVariant.Heading,
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(enabled = onClick != null, onClick = { onClick?.invoke() })
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
-    ) {
-        Column {
-            LightText(
-                text = "Encrypted messages",
-                // Value-row top-text label — Detail-sized (DESIGN.md §6,
-                // feedback 2026-08-19).
-                variant = LightTextVariant.Detail,
-            )
-            LightText(
-                text = when {
-                    e2ee?.verified == true -> "Verified"
-                    verifying -> "Verifying"
-                    !settled -> "Checking…"
-                    else -> "Not Verified"
-                },
-                // Almost touching the label (feedback 2026-08-19).
-                variant = LightTextVariant.Heading,
-                modifier = Modifier.offset(y = (-3).dp),
-            )
-        }
-    }
+    )
 }
 
 /** The LP3 keyboard editor for a single settings field. Result: the edited
@@ -849,12 +860,15 @@ private fun EncryptionRow(
  *  return, or voice keys (the passes code-entry style, feedback 2026-08-19);
  *  the input centers vertically between the top bar and the keyboard. The
  *  submit label defaults to SAVE (field editors); the code entry passes
- *  SUBMIT (feedback 2026-08-19). */
+ *  SUBMIT (feedback 2026-08-19); an optional [submitIcon] renders the
+ *  submit as an icon instead of the label button (contacts search,
+ *  2026-08-30). */
 class FieldEditorScreen(
     sealedActivity: SealedLightActivity,
     private val title: String,
     private val initial: String,
     private val submitLabel: String = "SAVE",
+    private val submitIcon: LightIconConfiguration? = null,
 ) : SimpleLightScreen<String>(sealedActivity) {
 
     @Composable
@@ -885,6 +899,7 @@ class FieldEditorScreen(
                 modifier = Modifier.background(LightThemeTokens.colors.background),
                 centered = true,
                 submitLabel = submitLabel,
+                submitIcon = submitIcon,
             )
         }
     }

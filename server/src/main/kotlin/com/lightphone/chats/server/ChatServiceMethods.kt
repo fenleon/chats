@@ -57,6 +57,12 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.GetRooms.encodeResponse(response))
                 }
 
+                LightServiceMethod.GetAllRooms.id -> {
+                    val rooms = runBlocking { MatrixRepository.getAllRooms() }
+                    val response = LightServiceMethod.GetRooms.Response(rooms)
+                    LightResult.Success(LightServiceMethod.GetRooms.encodeResponse(response))
+                }
+
                 LightServiceMethod.GetMessages.id -> {
                     val request = LightServiceMethod.GetMessages.decodeRequest(payload!!)
                     val page = runBlocking {

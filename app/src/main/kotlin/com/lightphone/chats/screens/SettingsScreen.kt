@@ -49,7 +49,7 @@ import kotlinx.coroutines.launch
 /**
  * Tool settings: the account panel (login setup + verification) lives behind
  * the Account row, the sync toggle pauses the companion's loop, and toggles
- * control the "seen"/"delivered" markers + data-saver media downloads. The
+ * control the "seen" marker + data-saver media downloads. The
  * status-heavy content — account state, sync progress, encryption — moved to
  * [AccountScreen].
  */

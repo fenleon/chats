@@ -54,6 +54,12 @@ object ChatClient {
         callRemoteServiceMethod(LightServiceMethod.GetRooms, Unit)
             .getOrNull()?.rooms.orEmpty()
 
+    /** Every room the companion knows (full census, trimmed rows — no preview
+     *  or unread). The contacts list + search need any room, old or quiet. */
+    suspend fun getAllRooms(): List<LightServiceMethod.GetRooms.Room> =
+        callRemoteServiceMethod(LightServiceMethod.GetAllRooms, Unit)
+            .getOrNull()?.rooms.orEmpty()
+
     /**
      * A page of messages, oldest first; [beforeEventId] pages further back.
      * The response carries [LightServiceMethod.GetMessages.Response.hasMore],

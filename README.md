@@ -12,7 +12,7 @@ Chats is currently in **beta**. It is suitable for daily use; features and behav
 
 > **Current Status:** Beta
 >
-> **Current Version:** 0.8.0 (versionCode 59)
+> **Current Version:** 0.8.1 (versionCode 60)
 
 ---
 
