@@ -3016,25 +3016,31 @@ object MatrixRepository {
     /** Type of Beeper's per-room archive marker (account data): rooms the user
      *  archived on Beeper — hidden from the main room list, silent, reachable
      *  only via search VIEW ALL (chats, 2026-08-28). Beeper's REAL archive
-     *  state is `com.beeper.inbox.done`, whose content carries
-     *  `at_ts`/`at_order`/`updated_ts` when archived and is reset to `{}` on
+     *  state is `com.beeper.inbox.done`, whose content is reset to `{}` on
      *  unarchive (never deleted). The type is `com.beeper.inbox.done` — NOT
      *  `com.beeper.chats.inbox.done` (the round-4 guess; the LP3's real
      *  `com.beeper.inbox.done` rows verified on-device 2026-08-29: Tiki's
      *  archive + the `!updates` room, while the `.chats.` rows in the store
-     *  were our own writes and Beeper's apps ignore them). `auto_archive`
-     *  (`com.beeper.chats.auto_archive`) is a write-only orphan Beeper's app
-     *  ignores — the LP3 wrote it in rounds 1-3 and reads it no more (LP3+
-     *  Beeper experiment, 2026-08-28). */
+     *  were our own writes). `auto_archive` (`com.beeper.chats.auto_archive`)
+     *  is NOT a write-only orphan: Beeper's desktop client actively reads it
+     *  as room account data `{archive_at_ms, created_at_ms, archive_at_client,
+     *  trigger}` and sets/clears the room's auto-archive from it (bundle
+     *  analysis 2026-08-30). The LP3's own auto_archive writes were ignored
+     *  because of their shape, not the type — chats neither reads nor writes
+     *  it. */
     private const val BEEPER_INBOX_DONE_EVENT_TYPE = "com.beeper.inbox.done"
 
-    /** Beeper's archive account-data content: `{"at_order":…,"at_ts":…,"updated_ts":…}`
+    /** Beeper's archive account-data content: `{"at_order":…,"updated_ts":…}`
      *  = archived, `{}` = unarchived — row presence is NOT the flag, the
-     *  content is. Registered in the event-content mappings (see
-     *  [archiveMappingsModule]) so the store-backed typed read in
-     *  [roomFlagsByRoom] works — the default mappings only decode it as
-     *  [UnknownEventContent], whose fixed type is null and the typed store get
-     *  rejects that. */
+     *  content is. The canonical Beeper shape carries only `at_order` +
+     *  `updated_ts` (the desktop client reads exactly those two; bundle
+     *  analysis 2026-08-30 — Beeper never writes `at_ts`, the `at_ts` seen
+     *  on-device was the LP3's own earlier writes). `atTs` stays as a
+     *  lenient-deserialization field for those legacy rows. Registered in
+     *  the event-content mappings (see [archiveMappingsModule]) so the
+     *  store-backed typed read in [roomFlagsByRoom] works — the default
+     *  mappings only decode it as [UnknownEventContent], whose fixed type is
+     *  null and the typed store get rejects that. */
     data class BeeperInboxDoneContent(
         val atOrder: Long? = null,
         val atTs: Long? = null,
@@ -4716,15 +4722,16 @@ object MatrixRepository {
      * Archives or unarchives a room (Beeper's `com.beeper.inbox.done`
      * room account data, synced, 2026-08-28): archived rooms hide from the
      * main list and go silent, reachable only via search VIEW ALL. Mirrors
-     * Beeper's own writes (LP3 experiment 2026-08-28): archive PUTs
-     * `{"at_order":…,"at_ts":…,"updated_ts":…}`, unarchive PUTs `{}` — Beeper
-     * never DELETEs the row (the DELETE route 405s on Beeper's server), so
-     * neither do we. Trixnity 4.22.7's typed `setAccountData` PUTs to the
-     * legacy `/rooms/{roomId}/account_data` path, which modern Synapse no
-     * longer serves (M_UNRECOGNIZED, swallowed in a Result — silent failure),
-     * so the current `/user/{userId}/rooms/{roomId}/account_data` path is
-     * issued raw through the client's own ktor HttpClient and the bearer
-     * token rides along. Optimistic like [setRoomPinned].
+     * Beeper's own writes (canonical shape, bundle analysis 2026-08-30):
+     * archive PUTs `{"at_order":…,"updated_ts":…}`, unarchive PUTs `{}` —
+     * Beeper never DELETEs the row (the DELETE route 405s on Beeper's
+     * server), so neither do we. Trixnity 4.22.7's typed `setAccountData`
+     * PUTs to the legacy `/rooms/{roomId}/account_data` path, which modern
+     * Synapse no longer serves (M_UNRECOGNIZED, swallowed in a Result —
+     * silent failure), so the current
+     * `/user/{userId}/rooms/{roomId}/account_data` path is issued raw
+     * through the client's own ktor HttpClient and the bearer token rides
+     * along. Optimistic like [setRoomPinned].
      */
     suspend fun setRoomArchived(roomId: String, archived: Boolean) {
         val c = client ?: return
@@ -4734,7 +4741,6 @@ object MatrixRepository {
         val body = if (archived) {
             buildJsonObject {
                 put("at_order", now)
-                put("at_ts", now)
                 put("updated_ts", now)
             }
         } else {
@@ -4769,7 +4775,9 @@ object MatrixRepository {
 
     /**
      * Server truth for Beeper's inbox.done marker: GET 200 whose content
-     * carries `at_ts` → archived; 200 with `{}`, or 404 → not archived;
+     * carries any canonical field (`at_order`/`updated_ts` — Beeper's
+     * shape, bundle analysis 2026-08-30; `at_ts` tolerated for the LP3's
+     * legacy rows) → archived; 200 with `{}`, or 404 → not archived;
      * other/error → null (unknown — keep the store claim rather than unhide
      * on a blip). Needed because Trixnity's sync store never clears removed
      * room account data (LP3 2026-08-28: Sophie / Anni / 1€ FILM stayed
@@ -4787,8 +4795,10 @@ object MatrixRepository {
                         Json { ignoreUnknownKeys = true }.parseToJsonElement(resp.bodyAsText()).jsonObject
                     }.getOrNull()
                     // Content is the body directly (spec); tolerate a wrap.
-                    val atTs = obj?.get("at_ts") ?: (obj?.get("content") as? JsonObject)?.get("at_ts")
-                    atTs != null
+                    val content = (obj ?: JsonObject(emptyMap())).let {
+                        (it["content"] as? JsonObject)?.takeIf { c -> c.isNotEmpty() } ?: it
+                    }
+                    listOf("at_order", "at_ts", "updated_ts").any { content[it] != null }
                 }
                 status == 404 -> false
                 else -> null
@@ -5946,10 +5956,13 @@ object MatrixRepository {
                 // can be a phantom (unarchived in Beeper long ago) — confirm
                 // the claim on the network (only archived rooms cost a GET;
                 // unknown → keep the store claim). Archived = content carries
-                // at_ts: Beeper's unarchive resets the content to {} rather
-                // than deleting the row, so row presence is not the flag.
+                // any canonical field (at_order/updated_ts — Beeper's shape,
+                // bundle analysis 2026-08-30; at_ts tolerated for the LP3's
+                // legacy rows): Beeper's unarchive resets the content to {}
+                // rather than deleting the row, so row presence is not the
+                // flag.
                 val inboxDone = c.room.getAccountData(roomId, BeeperInboxDoneContent::class, "").firstOrNull()
-                val archivedClaim = inboxDone?.atTs != null
+                val archivedClaim = inboxDone?.atOrder != null || inboxDone?.atTs != null || inboxDone?.updatedTs != null
                 val archived = if (archivedClaim) isRoomArchivedOnServer(c, key) ?: true else false
                 result[key] = RoomFlags(
                     pinned = tags?.tags?.containsKey(TagEventContent.TagName.Favourite) == true,
