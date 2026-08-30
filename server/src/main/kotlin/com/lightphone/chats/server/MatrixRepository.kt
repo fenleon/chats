@@ -1913,6 +1913,21 @@ object MatrixRepository {
                 // LP3 screen long after the page build was fixed (2026-08-21).
                 val cached = messagePageCache[roomId]
                 if (cached != null && cached.limit >= limit && lastRefreshedEventId[roomId] == lastId) {
+                    // Read receipts are ephemeral — they never move the room's
+                    // last TIMELINE event, so this quiet-room guard would freeze
+                    // the "seen" tag on a room the other party read without
+                    // replying (feedback 2026-08-30). Patch the cached page's
+                    // read flags cheaply (one bounded chain read + receipts-repo
+                    // read) instead of a full rebuild; null = nothing changed,
+                    // so the cache/disk stay untouched.
+                    runCatching {
+                        patchReadReceipts(c, roomId, cached)?.let { updated ->
+                            messagePageCache[roomId] = MessagePageEntry(
+                                updated, cached.limit, android.os.SystemClock.elapsedRealtime(),
+                            )
+                            saveMessagePageToDisk(roomId, updated)
+                        }
+                    }
                     return@launch
                 }
                 // Incremental refresh (PLAN §8.3, 2026-08-28): when the cache
@@ -1950,6 +1965,37 @@ object MatrixRepository {
                 messagePageRefreshInFlight.remove(roomId)
             }
         }
+    }
+
+    /**
+     * Recomputes only a cached newest page's "read" flags. Read receipts arrive
+     * via sync ephemeral and never change the room's last timeline event, so
+     * [refreshMessagePage]'s quiet-room guard skips the rebuild and the seen
+     * tag would stay frozen on a room the other party read without replying
+     * (feedback 2026-08-30). Same receipt walk as the page build over the
+     * cached chain (delta empty); null when nothing changed, so the caller
+     * keeps the cache and disk as-is.
+     */
+    private suspend fun patchReadReceipts(
+        c: MatrixClient,
+        roomId: String,
+        cached: MessagePageEntry,
+    ): MessagesPage? {
+        val prevId = lastRefreshedEventId[roomId] ?: return null
+        val chain = readTimelineChainFromDb(c, RoomId(roomId), prevId, cached.limit + 1)?.first
+            ?.takeLast(cached.limit + 1).orEmpty()
+        if (chain.isEmpty()) return null
+        val readEventIds = readReceiptsByEvent(c, RoomId(roomId), chain)
+        if (readEventIds.isEmpty()) return null
+        var changed = false
+        val patched = cached.page.messages.map { m ->
+            if (!m.read && m.id in readEventIds) {
+                changed = true
+                m.copy(read = true)
+            } else m
+        }
+        if (!changed) return null
+        return MessagesPage(patched, cached.page.hasMore, cached.page.encrypted)
     }
 
     /**
@@ -2565,6 +2611,73 @@ object MatrixRepository {
             contentType = contentType,
             durationMs = durationMs,
         )
+    }
+
+    /**
+     * After a process restart the in-memory pending-echo maps are gone, but
+     * Trixnity's outbox is persisted — a message still queued (sync down /
+     * slow round pending) or acked-but-not-yet-echoed would show NO row in the
+     * thread until the echo lands, reading as "message took minutes to send"
+     * (feedback 2026-08-30). Rebuild the pending maps from the outbox once per
+     * client attach: every non-draft row becomes an optimistic echo, reusing
+     * the live-send machinery ([pendingEchoRow], [insertPendingEchoes], the
+     * room-list pending bump). Entries self-clean when the echo lands
+     * ([insertPendingEchoes] removes them); an already-echoed row resurrects
+     * with the REAL event id, so [injectPendingEchoes]'s id dedup hides it.
+     */
+    private suspend fun reconstructOutboxPendings(c: MatrixClient) {
+        val rows = withTimeoutOrNull(OUTBOX_RECONSTRUCT_BUDGET_MS) {
+            c.room.getOutbox().first()
+        } ?: return
+        var rebuilt = 0
+        for (flow in rows) {
+            val om = withTimeoutOrNull(OUTBOX_RECONSTRUCT_BUDGET_MS) { flow.first() } ?: continue
+            if (om.isDraft) continue
+            val ts = om.createdAt.toEpochMilliseconds()
+            val roomKey = om.roomId.full
+            when (val content = om.content) {
+                is RoomMessageEventContent.TextBased -> if (putPendingIfAbsent(
+                        pendingTextEcho, roomKey, om.transactionId,
+                        PendingTextSend(om.transactionId, ts, content.body),
+                    )) rebuilt++
+                is RoomMessageEventContent.FileBased.Image -> if (putPendingIfAbsent(
+                        pendingImageEcho, roomKey, om.transactionId,
+                        PendingImageSend(om.transactionId, ts, content.body.ifBlank { "Photo" }),
+                    )) rebuilt++
+                // Voice notes enqueue as an Unknown audio content (hand-built
+                // m.audio + org.matrix.msc3245.voice, see [sendVoiceNote]).
+                is RoomMessageEventContent.FileBased.Audio -> if (putPendingIfAbsent(
+                        pendingAudioEcho, roomKey, om.transactionId,
+                        PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null),
+                    )) rebuilt++
+                is RoomMessageEventContent.Unknown ->
+                    if (content.type == RoomMessageEventContent.FileBased.Audio.TYPE &&
+                        putPendingIfAbsent(
+                            pendingAudioEcho, roomKey, om.transactionId,
+                            PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null),
+                        )
+                    ) rebuilt++
+                else -> {}
+            }
+        }
+        if (rebuilt > 0) {
+            // The resurrected sends' rooms bump to the top with the pending
+            // preview, like [wakeAfterSend] does for a live send.
+            roomListDirty = true
+            wakeRoomList()
+            android.util.Log.d(TAG, "outbox: rebuilt $rebuilt pending echo rows after restart")
+        }
+    }
+
+    /** Adds [value] under [txnId] only when absent — never clobbers a live send. */
+    private fun <T : PendingSend> putPendingIfAbsent(
+        map: java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<String, T>>,
+        roomKey: String,
+        txnId: String,
+        value: T,
+    ): Boolean {
+        val roomMap = map.computeIfAbsent(roomKey) { java.util.concurrent.ConcurrentHashMap() }
+        return roomMap.putIfAbsent(txnId, value) == null
     }
 
     private suspend fun computeMessagesPage(
@@ -5486,10 +5599,16 @@ object MatrixRepository {
         // its head timestamp from the DB chain (the same bounded walk
         // [effectiveLastEvent] uses) so the row keeps a real time.
         if (serverLastId == null) {
+            // Head timestamp from the RAW DB chain (any event type): a head
+            // that isn't a message (bridge status ack, edit, reaction) must
+            // still give the row a real time — [effectiveLastEvent] walks back
+            // to the renderable message for the display time below. The raw
+            // chain read is also gap-immune (it follows previous-event links;
+            // the API view truncates at a gap marker — the Annette-room class,
+            // 2026-08-23).
             room.lastEventId?.full?.let { lastId ->
                 val headTs = withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
-                    collectRelevantTimelineEvents(c, roomId, lastId, EFFECTIVE_LAST_FAST, fast = true).first
-                        .firstOrNull { it.event.id.full == lastId }?.event?.originTimestamp
+                    readTimelineChainFromDb(c, roomId, lastId, 1)?.first?.firstOrNull()?.event?.originTimestamp
                 }
                 if (headTs != null) {
                     serverLastId = lastId
@@ -6397,6 +6516,9 @@ object MatrixRepository {
         // The room-list resolver's first pass seeds + warms the full room map,
         // so the tool's getRooms (a pure cache read) returns instantly.
         startRoomListResolver(c)
+        // Re-seed the in-memory pending maps from the outbox after a process
+        // restart, so queued/acked-but-not-yet-echoed sends still show a row.
+        scope.launch { reconstructOutboxPendings(c) }
     }
 
     private fun observeSyncState(c: MatrixClient) {
@@ -6748,6 +6870,9 @@ object MatrixRepository {
     private const val QUICK_DECRYPT_WAIT_MS = 100L
     /** Local outbox read for the pending-row state (event id / send error). */
     private const val OUTBOX_READ_TIMEOUT_MS = 500L
+    /** Whole-outbox read for the restart pending reconstruction (one query;
+     *  empty outbox → instant). */
+    private const val OUTBOX_RECONSTRUCT_BUDGET_MS = 5_000L
     /** Id prefix of optimistic pending rows (see [pendingEchoRow]) — the row
      *  id matches the tool's "local-<txn>" id so the tool's own row dedupes. */
     private const val LOCAL_PENDING_ID_PREFIX = "local-"
