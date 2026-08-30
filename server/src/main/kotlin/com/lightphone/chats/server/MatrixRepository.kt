@@ -450,6 +450,10 @@ object MatrixRepository {
      *  CPU on this account (battery 2026-08-17 audit). */
     private var lastPushWakeSyncAtMs = 0L
 
+    /** Pending debounced push-wake sync (see [onPushDelivered]); restarted per
+     *  real-message push so a burst coalesces to one syncOnce. */
+    private var pushWakeJob: Job? = null
+
     /** Screen must stay off this long before dropping to slow sync. */
     private const val SLOW_SYNC_GRACE_MS = 60_000L
 
@@ -472,6 +476,11 @@ object MatrixRepository {
      *  the next event push / slow round catches up. Matches the old 5-min round
      *  cadence, which was proven acceptable for badge freshness. */
     private const val COUNTS_WAKE_MIN_INTERVAL_MS = 300_000L
+
+    /** Real-message push-wake debounce (2026-08-31): a burst of messages is N
+     *  wakes but needs one syncOnce — the trailing-edge debounce drains the
+     *  window's pending wakes into a single sync, at ~1s latency. */
+    private const val PUSH_WAKE_DEBOUNCE_MS = 1_000L
 
     /**
      * Per-room timeline window the sync filters request (PLAN §8.1, 2026-08-28):
@@ -772,16 +781,36 @@ object MatrixRepository {
      * collapse to one sync per [COUNTS_WAKE_MIN_INTERVAL_MS]: the FIRST push
      * still syncs (it can be the only signal for a real message, e.g.
      * note-to-self on Beeper's fork), and an event push right before covers
-     * the state anyway. Real event pushes (message arriving) always sync.
+     * the state anyway. Real event pushes (message arriving) sync once per
+     * burst — trailing-edge debounced [PUSH_WAKE_DEBOUNCE_MS] so N messages
+     * cost one syncOnce (~1s latency).
      */
     suspend fun onPushDelivered(countsOnly: Boolean = false) {
         val c = client ?: return
         if (syncMode != SyncMode.SLOW) return
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (countsOnly && now - lastPushWakeSyncAtMs < COUNTS_WAKE_MIN_INTERVAL_MS) {
-            android.util.Log.d(TAG, "counts push collapsed (last wake ${(now - lastPushWakeSyncAtMs) / 1000}s ago)")
+        if (countsOnly) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastPushWakeSyncAtMs < COUNTS_WAKE_MIN_INTERVAL_MS) {
+                android.util.Log.d(TAG, "counts push collapsed (last wake ${(now - lastPushWakeSyncAtMs) / 1000}s ago)")
+                return
+            }
+            runPushWake(c)
             return
         }
+        // Real-message push: coalesce bursts. The window's last push wins — the
+        // sync runs once at the end instead of once per push.
+        pushWakeJob?.cancel()
+        pushWakeJob = scope.launch {
+            delay(PUSH_WAKE_DEBOUNCE_MS)
+            if (client !== c || syncMode != SyncMode.SLOW) return@launch
+            runPushWake(c)
+        }
+    }
+
+    /** The wake itself: cancel the fallback rounds, run ONE syncOnce, restart
+     *  the rounds if the screen is still dark. Shared by counts-only pushes
+     *  (immediate) and debounced real-message wakes. */
+    private suspend fun runPushWake(c: MatrixClient) {
         slowSyncJob?.cancel()
         slowSyncJob = null
         timedSyncOnce(c, "push")
@@ -1083,8 +1112,22 @@ object MatrixRepository {
      * the sync token advanced past those changes while stripped, incremental
      * sync never re-delivers them (Jeff/Tiki never reflected on the LP3).
      * Clearing filterId/backgroundFilterId forces the client's setup to
-     * upload a fresh filter; clearing syncBatchToken forces a full initial
-     * sync under it.
+     * upload a fresh filter.
+     *
+     * v4 (2026-08-28) also cleared syncBatchToken — a full initial sync under
+     * the fresh filter, needed to re-deliver state that had already passed.
+     * v5 (2026-08-31) keeps the token: the ephemeral notTypes slimming (see
+     * [clientConfiguration]) only affects future windows — ephemeral events
+     * are never re-delivered — so a full re-sync would just burn CPU.
+     *
+     * v4/v5 bug (found on-device 2026-08-31): the SQL targeted
+     * filterId/backgroundFilterId columns that don't exist in the
+     * de.connect2x fork — it stores BOTH filter ids as JSON in a single
+     * `filter` TEXT column. The UPDATE threw SQLITE_ERROR and runCatching
+     * swallowed it, so both migrations silently failed on the LP3 and the old
+     * filter stayed live. v6 clears the `filter` column itself, forcing the
+     * client's setup to re-upload both filters. The token stays untouched
+     * (ephemeral is never re-delivered, no full re-sync needed).
      *
      * Must run BEFORE the client is built ([ensureClient]): the client's
      * setup flow uploads a missing filter itself, while startSync
@@ -1103,13 +1146,11 @@ object MatrixRepository {
         runCatching {
             val db = databaseBuilder(ctx).build()
             try {
-                db.openHelper.writableDatabase.execSQL(
-                    "UPDATE Account SET filterId = NULL, backgroundFilterId = NULL, syncBatchToken = NULL",
-                )
+                db.openHelper.writableDatabase.execSQL("UPDATE Account SET filter = NULL")
             } finally {
                 db.close()
             }
-            android.util.Log.d(TAG, "sync-filter migration: cleared cached filter + token for $userId (v$SYNC_FILTER_MAPPINGS_VERSION)")
+            android.util.Log.d(TAG, "sync-filter migration: cleared cached filter for $userId (v$SYNC_FILTER_MAPPINGS_VERSION)")
             prefs.edit().putInt(prefsKey, SYNC_FILTER_MAPPINGS_VERSION).apply()
         }.onFailure { e ->
             android.util.Log.w(TAG, "sync-filter migration failed: ${e.message}")
@@ -6497,13 +6538,28 @@ object MatrixRepository {
         // stops receiving theirs — and the timeline limit bounds each room's
         // per-sync window. Trixnity's applyDefaultFilter() merges over it,
         // keeping lazy-load members + the event-type whitelists.
+        //
+        // Ephemeral slimming (2026-08-31): applyDefaultFilter REPLACES types
+        // with its own whitelist, so narrowing must go through notTypes, which
+        // survives the merge. Nothing renders incoming typing (the composer
+        // only sends it), and it is the noisiest per-sync element in active
+        // rooms — both filters drop m.typing. The syncOnce filter (background
+        // rounds + push wakes) also drops m.receipt: seen/delivered only matter
+        // while the tool is open, and the long-poll (syncFilter) delivers them
+        // fresh the moment it is.
         syncFilter = Filters(
             presence = Filters.EventFilter(notTypes = setOf("*")),
-            room = Filters.RoomFilter(timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT)),
+            room = Filters.RoomFilter(
+                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT),
+                ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing")),
+            ),
         )
         syncOnceFilter = Filters(
             presence = Filters.EventFilter(notTypes = setOf("*")),
-            room = Filters.RoomFilter(timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_ONCE_TIMELINE_LIMIT)),
+            room = Filters.RoomFilter(
+                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_ONCE_TIMELINE_LIMIT),
+                ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing", "m.receipt")),
+            ),
         )
         // Room "last relevant event" = actual messages only (reference-messenger
         // shape): m.replace edits (Beeper's re-import wall) and reactions no
@@ -6845,7 +6901,7 @@ object MatrixRepository {
      *  account (see [migrateSyncFilterIfNeeded]) — e.g. when a new room
      *  account-data type joins the filter's whitelist and existing clients'
      *  cached filters would strip it. */
-    private const val SYNC_FILTER_MAPPINGS_VERSION = 4
+    private const val SYNC_FILTER_MAPPINGS_VERSION = 6
     private const val ROOMS_BUDGET_MS = 15_000L
     private const val ROOM_BUDGET_MS = 3_000L
     private const val MESSAGES_BUDGET_MS = 15_000L
