@@ -13,6 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -55,9 +56,10 @@ import java.io.File
  * startActivity and the companion can't launch activities from the background,
  * so the tool calls `StartVoiceNoteSend` (which records the room) and then
  * starts this activity via `SimpleLightScreen.startServerActivity` — the same
- * pattern as [PhotoSendActivity]. Tap the mic to record (Opus in an ogg
- * container — the MSC3245 canonical voice-message format, ~2-3× smaller than
- * the old AAC/m4a at speech bitrates), tap again to stop; the recording is
+ * pattern as [PhotoSendActivity]. Recording starts as soon as the panel opens
+ * (feedback 2026-08-30: no idle "tap to record" step) — Opus in an ogg
+ * container (the MSC3245 canonical voice-message format, ~2-3× smaller than
+ * the old AAC/m4a at speech bitrates); tap to stop; the recording is
  * uploaded to Matrix as an m.audio message and sent in the recorded room.
  * RECORD_AUDIO is requested at
  * runtime (the manifest declares it; the launcher activity grants it on
@@ -128,6 +130,12 @@ class VoiceNoteActivity : ComponentActivity() {
             finish()
             return
         }
+        // Start the take BEFORE the first frame renders, so the panel opens
+        // already in the recording state — the idle mic icon must not flash
+        // (feedback 2026-08-31). A missing RECORD_AUDIO grant asks first; the
+        // launcher callback starts the recording (or shows the mic-denied
+        // retry) once the user answers.
+        ensureMicThenRecord()
         setContent {
             val themeColors by LightThemeController.colors.collectAsState()
             // Haptics on the recording screen follow the real LightOS setting,
@@ -139,6 +147,11 @@ class VoiceNoteActivity : ComponentActivity() {
 
             CompositionLocalProvider(LocalHapticsEnabled provides hapticsEnabled) {
                 LightTheme(colors = themeColors) {
+                // Height of the timer slot under the icon — also reserved
+                // above the icon, so the icon (not the icon+timer block) sits
+                // on the panel's vertical center with the timer hanging below
+                // it (feedback 2026-08-30).
+                val timerSlotHeight = 3f.gridUnitsAsDp()
                 // m:ss ticker while recording (MediaRecorder has no position
                 // query — the elapsed time comes from the wall clock).
                 LaunchedEffect(recording) {
@@ -172,6 +185,12 @@ class VoiceNoteActivity : ComponentActivity() {
                         contentAlignment = Alignment.Center,
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            // The timer slot's height is reserved above the
+                            // icon too, so the ICON sits on the panel's
+                            // vertical center — the timer hangs below it
+                            // (feedback 2026-08-30: "the icons should be
+                            // lower so that they are centred").
+                            Spacer(modifier = Modifier.height(timerSlotHeight))
                             // Record → tap to stop → play the take back → SEND
                             // in the bottom bar (RETRY, X, SEND — feedback
                             // 2026-08-27). Icons carry the states (feedback
@@ -226,11 +245,11 @@ class VoiceNoteActivity : ComponentActivity() {
                             // Fixed-height slot: the timer appears/disappears
                             // without shifting the icon above it (feedback
                             // 2026-08-27: "the icon and text move up when you
-                            // press record"). 2 grid units — gridUnitsAsDp is
-                            // composable, so it's inlined here (not a
-                            // companion constant).
+                            // press record"). 3 grid units — tall enough for
+                            // the Fine line; the old 2-unit slot clipped the
+                            // text vertically (feedback 2026-08-30).
                             Box(
-                                modifier = Modifier.height(2f.gridUnitsAsDp()),
+                                modifier = Modifier.height(timerSlotHeight),
                                 contentAlignment = Alignment.Center,
                             ) {
                                 val timerText = when {
@@ -248,7 +267,6 @@ class VoiceNoteActivity : ComponentActivity() {
                                         variant = LightTextVariant.Fine,
                                         // Solid white like the thread's
                                         // timestamps (feedback 2026-08-27).
-                                        modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
                                     )
                                 }
                             }
@@ -265,8 +283,9 @@ class VoiceNoteActivity : ComponentActivity() {
                     LightBottomBar(
                         modifier = Modifier.navigationBarsPadding(),
                         items = listOf(
-                            // RETRY: delete the take, back to "tap to record"
-                            // (feedback 2026-08-27).
+                            // RETRY: delete the take and start a fresh
+                            // recording (feedback 2026-08-30: no tap-to-record
+                            // step).
                             if ((previewing || sendFailed) && !sending) {
                                 LightBarButton.Text(
                                     text = "RETRY",
@@ -389,8 +408,9 @@ class VoiceNoteActivity : ComponentActivity() {
     }
 
     /**
-     * RETRY (feedback 2026-08-27): deletes the take and returns to "tap to
-     * record" — a fresh recording replaces the discarded one.
+     * RETRY (feedback 2026-08-27): deletes the take and starts a fresh
+     * recording — there is no idle "tap to record" step anymore (feedback
+     * 2026-08-30), so the new take begins immediately.
      */
     private fun retryRecording() {
         runCatching { previewPlayer?.release() }
@@ -402,6 +422,7 @@ class VoiceNoteActivity : ComponentActivity() {
         playing = false
         sendFailed = false
         finalDurationSeconds = 0
+        ensureMicThenRecord()
     }
 
     private fun startRecording() {
