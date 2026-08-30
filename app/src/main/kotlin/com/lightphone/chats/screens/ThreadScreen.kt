@@ -42,6 +42,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
+import com.lightphone.chats.VolumePanelOverlay
+import com.lightphone.chats.VolumePanelState
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
@@ -312,6 +314,67 @@ class ThreadViewModel(
     val voiceError = MutableStateFlow<Pair<String, String>?>(null)
 
     /**
+     * In-app volume panel state (null = hidden), the shared LightOS replica
+     * (feedback 2026-08-30): while a voice note is playing/paused the volume
+     * rocker shows this panel instead of LightOS's (which is ringer-only for
+     * third-party tools). The bar level is cached and stepped locally; the
+     * server adjusts the real media stream (see ServerBootstrapProvider).
+     */
+    val volumePanel = MutableStateFlow<VolumePanelState?>(null)
+    private var mediaVolumeLevel: Int? = null
+    private var mediaVolumeMax: Int = 0
+
+    fun dismissVolumePanel() {
+        volumePanel.value = null
+    }
+
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent): Boolean {
+        val volumeKey = keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP ||
+            keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN
+        val voiceActive = playingEventId.value != null || pausedEventId.value != null
+        if (volumeKey && voiceActive && event.action == android.view.KeyEvent.ACTION_DOWN &&
+            event.repeatCount == 0
+        ) {
+            if (mediaVolumeLevel == null) {
+                // Cold start: seed the cache first, then show the new level.
+                viewModelScope.launch {
+                    ChatClient.volumeLevel()?.let { (level, max) ->
+                        mediaVolumeLevel = level
+                        mediaVolumeMax = max
+                        showVolumePanel(keyCode)
+                    }
+                }
+            } else {
+                showVolumePanel(keyCode)
+            }
+            // Not handled here: the key falls through to the companion, which
+            // adjusts the media stream (one step per press — repeats are
+            // filtered above, and the server ignores them too).
+            return false
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    private fun showVolumePanel(keyCode: Int) {
+        val current = mediaVolumeLevel ?: return
+        val newLevel = when (keyCode) {
+            android.view.KeyEvent.KEYCODE_VOLUME_UP -> (current + 1).coerceAtMost(mediaVolumeMax.coerceAtLeast(1))
+            else -> (current - 1).coerceAtLeast(0)
+        }
+        mediaVolumeLevel = newLevel
+        volumePanel.value = VolumePanelState.Media(newLevel, mediaVolumeMax)
+    }
+
+    private fun refreshVolumeLevel() {
+        viewModelScope.launch {
+            ChatClient.volumeLevel()?.let { (level, max) ->
+                mediaVolumeLevel = level
+                mediaVolumeMax = max
+            }
+        }
+    }
+
+    /**
      * Optimistic rows from a send, waiting for their sync echo (feedback
      * pass). The poll replaces them with the real events as they land.
      */
@@ -361,6 +424,7 @@ class ThreadViewModel(
         viewModelScope.launch {
             e2eeVerified.value = ChatClient.e2eeState()?.verified
         }
+        refreshVolumeLevel()
         startPolling()
         startFlagSync()
     }
@@ -1031,6 +1095,13 @@ class ThreadScreen(
                 )
             }
             }
+            // The in-app volume panel replica (feedback 2026-08-30): the volume
+            // rocker shows it over the thread while a voice note plays/pauses.
+            val volumePanel by viewModel.volumePanel.collectAsState()
+            VolumePanelOverlay(
+                state = volumePanel,
+                onDismiss = { viewModel.dismissVolumePanel() },
+            )
         }
 
         // Show the newest messages on open (and after sending); not on older

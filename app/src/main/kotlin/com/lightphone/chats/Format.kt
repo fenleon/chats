@@ -11,9 +11,10 @@ import java.time.format.DateTimeFormatter
  * feedback 2026-08-21: the AM/PM label was too big for the rows), "Yest." for
  * the previous day, the short weekday name within the last week (Mon, Tue,
  * Wed, Thu, Fri, Sat, Sun), "Aug 12" (month abbreviation retained) for
- * anything older — with the year appended ("Aug 12, 2025") when the message
- * predates the current year (feedback 2026-08-21). (Feedback 2026-08-17: the
- * row time went back to the short hand.)
+ * anything older — with the month + year ("Aug 2025", no day) when the message
+ * predates the current year (feedback 2026-08-30: the day was dropped from
+ * previous-year rows). (Feedback 2026-08-17: the row time went back to the
+ * short hand.)
  */
 fun formatRelativeTimestamp(timestampMs: Long): String {
     if (timestampMs <= 0) return ""
@@ -26,7 +27,7 @@ fun formatRelativeTimestamp(timestampMs: Long): String {
         date == today.minusDays(1) -> "Yest."
         date.isAfter(today.minusDays(7)) -> SHORT_DAY_NAMES[date.dayOfWeek.value - 1]
         date.year == today.year -> date.format(MONTH_DAY_FORMAT)
-        else -> date.format(MONTH_DAY_YEAR_FORMAT)
+        else -> date.format(MONTH_YEAR_FORMAT)
     }
 }
 
@@ -131,6 +132,10 @@ private val MESSAGE_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern
 /** "Aug 12" / "Dec 01" — month abbreviation + zero-padded day. */
 private val MONTH_DAY_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM dd")
 
+/** "Aug 2025" — month abbreviation + year for previous-year room rows
+ *  (feedback 2026-08-30: the day dropped, the year stays). */
+private val MONTH_YEAR_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM yyyy")
+
 /** "Dec 10, 2025" — month abbreviation + day + year, for previous-year
- *  timestamps (feedback 2026-08-21). */
+ *  timestamps in the THREAD's message times (feedback 2026-08-21). */
 private val MONTH_DAY_YEAR_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM dd, yyyy")

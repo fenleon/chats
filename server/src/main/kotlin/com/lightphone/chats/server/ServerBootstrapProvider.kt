@@ -4,9 +4,11 @@ import android.Manifest
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.Signature
 import android.database.Cursor
+import android.media.AudioManager
 import android.net.Uri
 import android.util.Log
 import android.view.KeyEvent
@@ -52,21 +54,59 @@ class ServerBootstrapProvider : ContentProvider() {
             customServiceMethodResolver = { callingId, methodId, payload ->
                 ChatServiceMethods.dispatch(methodId, payload)
             }
-            // Chats consumes no hardware keys — every event goes to LightOS
-            // (volume panel, brightness wheel, camera).
+            // Hardware keys: while a voice note is playing/paused, the volume
+            // rocker adjusts the media stream here (one step per press) — the
+            // tool's in-app volume panel replica mirrors it, and the native
+            // LightOS panel is ringer-only for third-party tools, so volume
+            // must NOT be relayed then (feedback 2026-08-30). Otherwise every
+            // event goes to LightOS (volume panel, brightness wheel, camera).
             onDeviceKeyEvent = { _, event ->
-                // Camera/focus keys: relay DOWN only (LP3 feedback 2026-08-23 —
-                // pressing the camera button did nothing until the tool exited,
-                // then the camera popped open and the flashlight stayed dead).
-                // LightOS handles the camera like the volume panel (take over,
-                // then relaunch the tool via componentToRelaunch); if the
-                // relaunch fires on KEY_UP, the singleTask tool instantly
-                // re-covers the just-opened camera and holds the HAL, which
-                // matches both symptoms. Volume/other keys keep both events.
-                val isCameraKey =
-                    event.keyCode == KeyEvent.KEYCODE_CAMERA || event.keyCode == KeyEvent.KEYCODE_FOCUS
-                if (event.action != KeyEvent.ACTION_UP || !isCameraKey) {
+                val volumeKeyDown = event.action == KeyEvent.ACTION_DOWN &&
+                    (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+                        event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)
+                // isThreadOnScreen: only while a thread is open — from the list
+                // there's no panel to mirror the change, so don't silently
+                // adjust (or swallow the key) then.
+                if (volumeKeyDown && MatrixRepository.isVoiceNoteActive() &&
+                    MatrixRepository.isThreadOnScreen()
+                ) {
+                    if ((event.repeatCount ?: 0) == 0) { // one step per press; drop auto-repeat
+                        val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                        when (event.keyCode) {
+                            KeyEvent.KEYCODE_VOLUME_UP -> audio.adjustStreamVolume(
+                                AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, 0,
+                            )
+                            KeyEvent.KEYCODE_VOLUME_DOWN -> audio.adjustStreamVolume(
+                                AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, 0,
+                            )
+                        }
+                    }
+                } else {
+                    // Every other event goes to LightOS unchanged. The SDK's
+                    // LightActivity forwards ALL actions (DOWN/UP/MULTIPLE) for
+                    // mapped keys — incl. the shutter (27/80) — with
+                    // componentToRelaunch, and LightOS is the handler. The
+                    // 2026-08-23 "relay shutter DOWN only" experiment deviated
+                    // from that contract and LP3-tested unchanged (2026-08-30:
+                    // camera still opened hidden, colour flipped, stale camera
+                    // on tool exit) — removed to match the SDK flow exactly.
                     PlatformRelay.sendDeviceKeyEvent(event)
+                    // Camera key: the relay opens LightOS's camera, but a
+                    // relayed event never foregrounds com.lightos (the real key
+                    // is captured in MainActivity.onKeyDown with deviceId=2 /
+                    // source=0x101 and the camera screen opens visibly; the
+                    // relayed one mounts the camera hidden and flips greyscale
+                    // with nothing on screen). Launch HOME so com.lightos (the
+                    // home app) comes to front with the camera screen already
+                    // open, matching the toolbox-key behaviour (LP3 2026-08-30).
+                    if (event.keyCode == KeyEvent.KEYCODE_CAMERA &&
+                        event.action == KeyEvent.ACTION_DOWN && (event.repeatCount ?: 0) == 0
+                    ) {
+                        context.startActivity(
+                            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
                 }
             }
             // Runtime permission flow (audit 2026-08-23): the tool requests

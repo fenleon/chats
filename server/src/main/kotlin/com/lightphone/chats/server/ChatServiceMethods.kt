@@ -257,6 +257,18 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.StartVoiceNoteSend.encodeResponse(response))
                 }
 
+                // Media volume for the tool's in-app volume panel (feedback
+                // 2026-08-30): the SDK routes GetVolumeLevel here via
+                // customServiceMethodResolver.
+                LightServiceMethod.GetVolumeLevel.id -> {
+                    val response = MatrixRepository.mediaVolumeLevel()
+                    if (response == null) {
+                        LightResult.Error(LightResult.ErrorCode.Unknown, "volume unavailable")
+                    } else {
+                        LightResult.Success(LightServiceMethod.GetVolumeLevel.encodeResponse(response))
+                    }
+                }
+
                 LightServiceMethod.SetSyncEnabled.id -> {
                     val request = LightServiceMethod.SetSyncEnabled.decodeRequest(payload!!)
                     runBlocking { MatrixRepository.setSyncEnabled(request.enabled) }

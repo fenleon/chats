@@ -6,6 +6,7 @@ import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.SystemClock
 import android.text.format.DateUtils
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -101,6 +102,13 @@ class VoiceNoteActivity : ComponentActivity() {
     /** The last send failed — keep the take + SEND so the user can retry
      *  instead of a silent drop (2026-08-19 feedback round). */
     private var sendFailed by mutableStateOf(false)
+    /**
+     * In-app volume panel state (null = hidden) — the shared LightOS replica
+     * (feedback 2026-08-30): while a take exists to preview, the volume rocker
+     * shows this panel and adjusts the media stream, instead of LightOS's
+     * ringer-only panel.
+     */
+    private var volumePanel by mutableStateOf<VolumePanelState?>(null)
 
     private val requestMicPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -166,8 +174,12 @@ class VoiceNoteActivity : ComponentActivity() {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             // Record → tap to stop → play the take back → SEND
                             // in the bottom bar (RETRY, X, SEND — feedback
-                            // 2026-08-27). A mic denial shows a message + ALLOW
-                            // instead of a silent drop.
+                            // 2026-08-27). Icons carry the states (feedback
+                            // 2026-08-30: no text labels for the control flow —
+                            // mic to open, stop while recording, play when
+                            // stopped); only the permission-denied and sending
+                            // states keep words. A mic denial shows a message +
+                            // ALLOW instead of a silent drop.
                             Box(
                                 modifier = Modifier
                                     .size(96.dp)
@@ -179,46 +191,44 @@ class VoiceNoteActivity : ComponentActivity() {
                             ) {
                                 LightIcon(
                                     icon = when {
-                                        recording -> LightIcons.MICROPHONE
+                                        recording -> LightIcons.STOP
                                         previewing && playing -> LightIcons.PAUSE
                                         previewing -> LightIcons.PLAY
                                         // micDenied and idle both show the mic
-                                        // (the label differs below).
+                                        // (the message differs below).
                                         else -> LightIcons.MICROPHONE
                                     },
                                     size = 3f,
                                     contentDescription = when {
                                         micDenied -> "Allow microphone"
                                         recording -> "Stop recording"
-                                        previewing -> if (playing) "Stop preview" else "Play preview"
+                                        previewing -> if (playing) "Pause preview" else "Play preview"
                                         else -> "Record voice note"
                                     },
                                 )
                             }
-                            // The whole label is a tap target too, not just the
-                            // icon (feedback 2026-08-27).
-                            LightText(
-                                text = when {
-                                    micDenied -> "Microphone permission is needed to record."
-                                    sending -> "Sending…"
-                                    recording -> "Recording… tap to stop"
-                                    previewing && playing -> "Playing… tap to stop"
-                                    previewing -> "Tap to play back"
-                                    else -> "Tap to record"
-                                },
-                                variant = LightTextVariant.Copy,
-                                // Solid white like the thread's labels, not
-                                // dimmed (feedback 2026-08-22).
-                                modifier = Modifier
-                                    .padding(top = 2f.gridUnitsAsDp())
-                                    .lightClickable(enabled = !sending, onClick = { onCenterTap() }),
-                            )
+                            // Only the states that NEED words show any: the
+                            // mic denial and the send progress. The control
+                            // states are purely icon + timer (feedback
+                            // 2026-08-30).
+                            when {
+                                micDenied -> LightText(
+                                    text = "Microphone permission is needed to record.",
+                                    variant = LightTextVariant.Copy,
+                                    modifier = Modifier.padding(top = 2f.gridUnitsAsDp()),
+                                )
+                                sending -> LightText(
+                                    text = "Sending…",
+                                    variant = LightTextVariant.Copy,
+                                    modifier = Modifier.padding(top = 2f.gridUnitsAsDp()),
+                                )
+                            }
                             // Fixed-height slot: the timer appears/disappears
-                            // without shifting the icon + label above it
-                            // (feedback 2026-08-27: "the icon and text move
-                            // up when you press record"). 2 grid units —
-                            // gridUnitsAsDp is composable, so it's inlined
-                            // here (not a companion constant).
+                            // without shifting the icon above it (feedback
+                            // 2026-08-27: "the icon and text move up when you
+                            // press record"). 2 grid units — gridUnitsAsDp is
+                            // composable, so it's inlined here (not a
+                            // companion constant).
                             Box(
                                 modifier = Modifier.height(2f.gridUnitsAsDp()),
                                 contentAlignment = Alignment.Center,
@@ -232,7 +242,10 @@ class VoiceNoteActivity : ComponentActivity() {
                                 if (timerText != null) {
                                     LightText(
                                         text = timerText,
-                                        variant = LightTextVariant.Superfine,
+                                        // One step up from the old Superfine —
+                                        // the counting time reads bigger under
+                                        // the icon (feedback 2026-08-30).
+                                        variant = LightTextVariant.Fine,
                                         // Solid white like the thread's
                                         // timestamps (feedback 2026-08-27).
                                         modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
@@ -282,6 +295,12 @@ class VoiceNoteActivity : ComponentActivity() {
                         ),
                     )
                 }
+                // The in-app volume panel replica (feedback 2026-08-30): the
+                // volume rocker shows it over the panel while a take exists.
+                VolumePanelOverlay(
+                    state = volumePanel,
+                    onDismiss = { volumePanel = null },
+                )
                 }
             }
         }
@@ -294,8 +313,23 @@ class VoiceNoteActivity : ComponentActivity() {
      * server's onDeviceKeyEvent (LightOS forwards to the tool), but this plain
      * activity sits outside that path (feedback 2026-08-22: "the recording
      * panel does not have volume / brightness").
+     *
+     * While a take exists ([previewing]) the volume rocker is consumed here
+     * instead: it adjusts the media stream (the take plays over it) and shows
+     * the in-app volume panel replica — the native LightOS panel is ringer-only
+     * for third-party tools (feedback 2026-08-30).
      */
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        val volumeKey = event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+        if (volumeKey && previewing) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                adjustMediaVolume(event.keyCode)
+            }
+            // Both the DOWN and its UP are consumed — a stray UP relayed to
+            // LightOS would be a half-gesture.
+            return true
+        }
         PlatformRelay.sendDeviceKeyEvent(
             LightServiceMethod.DeviceKeyEvent.Request(
                 keyCode = event.keyCode,
@@ -307,6 +341,28 @@ class VoiceNoteActivity : ComponentActivity() {
             ),
         )
         return super.dispatchKeyEvent(event)
+    }
+
+    /** One media-stream step per press + the in-app volume panel mirror. */
+    private fun adjustMediaVolume(keyCode: Int) {
+        val audio = getSystemService(android.content.Context.AUDIO_SERVICE)
+            as android.media.AudioManager
+        when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> audio.adjustStreamVolume(
+                android.media.AudioManager.STREAM_MUSIC,
+                android.media.AudioManager.ADJUST_RAISE,
+                0,
+            )
+            KeyEvent.KEYCODE_VOLUME_DOWN -> audio.adjustStreamVolume(
+                android.media.AudioManager.STREAM_MUSIC,
+                android.media.AudioManager.ADJUST_LOWER,
+                0,
+            )
+        }
+        volumePanel = VolumePanelState.Media(
+            audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC),
+            audio.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC),
+        )
     }
 
     private fun ensureMicThenRecord() {

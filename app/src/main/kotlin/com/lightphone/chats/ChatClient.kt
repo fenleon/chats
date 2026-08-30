@@ -238,6 +238,14 @@ object ChatClient {
     }
 
     /**
+     * Media volume (level, max) for the in-app volume panel (feedback
+     * 2026-08-30): the SDK server answers GetVolumeLevel from the platform.
+     */
+    suspend fun volumeLevel(): Pair<Int, Int>? =
+        callRemoteServiceMethod(LightServiceMethod.GetVolumeLevel, Unit)
+            .getOrNull()?.let { it.level to it.max }
+
+    /**
      * Starts the record-a-voice-note flow for [roomId]. @return the flattened
      * component name of the companion's recording activity, which the tool
      * launches via `SimpleLightScreen.startServerActivity`.

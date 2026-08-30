@@ -12,6 +12,7 @@ import android.net.NetworkCapabilities
 import android.os.PowerManager
 import androidx.room.Room
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
+import com.thelightphone.sdk.shared.LightServiceMethod
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.request.delete
@@ -256,6 +257,26 @@ object MatrixRepository {
     private var audioFocusRequest: android.media.AudioFocusRequest? = null
 
     fun audioPlayingEventId(): String? = playingAudioEventId
+
+    /** True while a voice note is playing OR paused — the volume rocker then
+     *  controls the media stream in-app instead of relaying to LightOS
+     *  (feedback 2026-08-30). */
+    fun isVoiceNoteActive(): Boolean = playingAudioEventId != null || pausedAudioEventId != null
+
+    /** Whether a thread is currently on screen (the tool's SetActiveRoom) — the
+     *  server-side half of the volume-panel gate (feedback 2026-08-30). */
+    fun isThreadOnScreen(): Boolean = activeRoomId != null
+
+    /** Media volume (level, max) — the tool's in-app volume panel bar
+     *  (feedback 2026-08-30). */
+    fun mediaVolumeLevel(): LightServiceMethod.GetVolumeLevel.Response? {
+        val audio = appContext?.getSystemService(android.content.Context.AUDIO_SERVICE)
+            as? android.media.AudioManager ?: return null
+        return LightServiceMethod.GetVolumeLevel.Response(
+            level = audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC),
+            max = audio.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC),
+        )
+    }
 
     /** Playback position (ms) of the playing voice note, or null when idle. */
     fun audioPositionMs(): Long? =
