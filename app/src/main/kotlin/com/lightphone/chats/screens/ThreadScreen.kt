@@ -1213,7 +1213,6 @@ private fun DecryptionNotice(text: String) {
     LightText(
         text = text,
         variant = LightTextVariant.Detail,
-        lighten = true,
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 12.dp),
@@ -1410,7 +1409,6 @@ private fun MessageRow(
                 LightText(
                     text = message.senderName,
                     variant = LightTextVariant.Detail,
-                    lighten = true,
                 )
             }
             // Feedback pass: only the first message of a group carries the time —
@@ -1599,7 +1597,6 @@ private fun ImageMessageContent(
         LightText(
             text = message.body,
             variant = LightTextVariant.Paragraph,
-            lighten = true,
             modifier = Modifier.padding(top = 1.dp),
         )
         // The caption still shows under the placeholder — the text row is all
@@ -1712,7 +1709,6 @@ private fun AudioMessageContent(
         LightText(
             text = "Couldn't play — $error",
             variant = LightTextVariant.Superfine,
-            lighten = true,
             modifier = Modifier.padding(top = 1.dp),
         )
     }
@@ -1737,7 +1733,6 @@ private fun StatusText(text: String) {
     LightText(
         text = text,
         variant = LightTextVariant.Copy,
-        lighten = true,
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 24.dp),
     )
 }

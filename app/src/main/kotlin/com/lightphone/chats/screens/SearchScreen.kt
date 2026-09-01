@@ -271,7 +271,6 @@ private fun ColumnScope.ResultsView(
             LightText(
                 text = "no chats found",
                 variant = LightTextVariant.Copy,
-                lighten = true,
                 modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 24.dp),
             )
         } else {

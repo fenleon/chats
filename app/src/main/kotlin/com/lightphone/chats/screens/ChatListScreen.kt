@@ -764,7 +764,6 @@ private fun OfflineBanner(text: String) {
     LightText(
         text = text,
         variant = LightTextVariant.Detail,
-        lighten = true,
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 10.dp),
@@ -776,7 +775,6 @@ private fun StatusText(text: String) {
     LightText(
         text = text,
         variant = LightTextVariant.Copy,
-        lighten = true,
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 24.dp),
     )
 }

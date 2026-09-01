@@ -335,7 +335,6 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 LightText(
                                     text = "Your session expired — sign in again.",
                                     variant = LightTextVariant.Detail,
-                                    lighten = true,
                                     modifier = Modifier.padding(
                                         horizontal = 2f.gridUnitsAsDp(),
                                         vertical = 0.5f.gridUnitsAsDp(),
