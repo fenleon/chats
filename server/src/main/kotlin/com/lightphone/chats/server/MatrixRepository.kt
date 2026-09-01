@@ -77,6 +77,7 @@ import de.connect2x.trixnity.core.serialization.events.default
 import de.connect2x.trixnity.core.serialization.events.invoke
 import de.connect2x.trixnity.core.serialization.events.roomAccountDataOf
 import de.connect2x.trixnity.client.CryptoDriverModule
+import de.connect2x.trixnity.core.EventHandler
 import de.connect2x.trixnity.client.MatrixClient
 import de.connect2x.trixnity.clientserverapi.client.MatrixClientAuthProviderData
 import de.connect2x.trixnity.client.MatrixClientConfiguration
@@ -87,6 +88,7 @@ import de.connect2x.trixnity.client.createTrixnityDefaultModuleFactories
 import de.connect2x.trixnity.client.key
 import de.connect2x.trixnity.client.key.KeySecretService
 import de.connect2x.trixnity.client.key.KeyTrustService
+import de.connect2x.trixnity.client.key.OutgoingRoomKeyRequestEventHandler
 import de.connect2x.trixnity.client.media.MediaService
 import de.connect2x.trixnity.client.media.MediaStore
 import de.connect2x.trixnity.client.media.okio.okio
@@ -148,6 +150,9 @@ import de.connect2x.trixnity.client.cryptodriver.libolm.libOlm
 import de.connect2x.trixnity.utils.ReadTransaction
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Path.Companion.toPath
+import org.koin.core.module.dsl.bind
+import org.koin.core.module.dsl.singleOf
+import org.koin.core.qualifier.named
 import org.koin.dsl.module
 import kotlin.time.Duration.Companion.seconds
 
@@ -175,6 +180,11 @@ object MatrixRepository {
     private const val KEY_SYNC_ENABLED = "sync_enabled"
     /** When the one-shot megolm restore scan last ran (daily gate, 2026-08-15). */
     private const val KEY_RESTORE_LAST_RUN_MS = "restore_last_run_ms"
+    /** True when a full restore crawl completed. Persisted (2026-09-01) so the
+     *  Account screen's "All messages restored" line survives process restarts —
+     *  the crawl runs at most once per 24h, so the in-memory flag alone could
+     *  never show after a reboot/install/force-stop. Cleared at login. */
+    private const val KEY_RESTORE_COMPLETED = "restore_completed"
     private const val DB_NAME = "matrix_client"
     private const val MEDIA_DIR = "matrix_media"
 
@@ -462,6 +472,18 @@ object MatrixRepository {
      *  too high, loosen if battery still burns. */
     private const val SLOW_SYNC_INTERVAL_MS = 300_000L
 
+    /** Push-gated lazy cadence (2026-08-31): while the SSE push channel is
+     *  provably connected, rounds stretch to 15 min — the push is the
+     *  zero-latency wake for real messages, so rounds are only the redundancy
+     *  net. A dead channel flips [PushChannel.isConnected] false within its
+     *  90s read timeout and the next round drops back to
+     *  [SLOW_SYNC_INTERVAL_MS]; the per-round re-check self-heals, so a
+     *  silently-dead push costs at most one 15-min gap (the 08-28 30-min
+     *  stretch failed because it never re-checked).
+     *  ponytail: 15 min is a session value — tighten if the monitor shows
+     *  receive latency, loosen if battery still burns. */
+    private const val SLOW_SYNC_LAZY_INTERVAL_MS = 900_000L
+
     /** In-process sync-loop restart backoff (supervision, 2026-08-29). */
     private const val SYNC_LOOP_RESTART_MIN_MS = 1_000L
     private const val SYNC_LOOP_RESTART_MAX_MS = 30_000L
@@ -532,6 +554,14 @@ object MatrixRepository {
         // no sync loop and no foreground service — the battery escape hatch.
         syncEnabled = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_SYNC_ENABLED, true)
+        // Seed the restore-completed flag from prefs (2026-09-01): the crawl is
+        // throttled to once per 24h, so after a restart the in-memory
+        // [RestoreProgress] would claim "not completed" until the next real
+        // crawl — the Account screen's "All messages restored" could never show.
+        _restoreProgress.value = RestoreProgress(
+            completed = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_RESTORE_COMPLETED, false),
+        )
         // Screen-driven cadence: long-poll while the screen is on, periodic
         // syncOnce after it's been off for a while (battery, 2026-08-14).
         app.registerReceiver(
@@ -722,6 +752,7 @@ object MatrixRepository {
     /** The periodic syncOnce rounds (also restarted by a push-wake — see [onPushDelivered]). */
     private fun startSlowSyncRounds(c: MatrixClient): Job {
         val job = scope.launch {
+            var lastInterval = 0L
             while (isActive) {
                 if (client !== c) return@launch // logged out / re-logged in under us
                 // Delay before the first round (audit 2026-08-23): a wake
@@ -730,12 +761,22 @@ object MatrixRepository {
                 // wake's syncOnce (two /sync per wake, ~2x the per-push cost).
                 // The wake's own round already delivers; the cadence below is
                 // the redundancy net.
-                // Single 5-min cadence (PLAN §8.2, 2026-08-28): the push-gated
-                // 30-min stretch is gone — a silently-dead push meant a 30-min
-                // receive delay, and each round is cheap with the sync filter
-                // (§8.1), so the safety net runs at the same 5-min cadence
-                // with or without a live push channel.
-                delay(SLOW_SYNC_INTERVAL_MS)
+                // Push-gated cadence (2026-08-31, PLAN §8.2): while the push
+                // channel is connected the rounds run lazy — pushes wake us
+                // for real messages, so a 15-min net is enough; when it's
+                // down we fall back to the 5-min cadence (a dead push must
+                // not mean a long receive delay, 08-28 lesson — the per-round
+                // re-check keeps that bounded to one lazy interval).
+                val interval =
+                    if (PushChannel.isConnected) SLOW_SYNC_LAZY_INTERVAL_MS else SLOW_SYNC_INTERVAL_MS
+                if (interval != lastInterval) {
+                    lastInterval = interval
+                    android.util.Log.d(
+                        TAG,
+                        "slow sync interval: ${interval / 1000}s (push ${if (PushChannel.isConnected) "connected" else "down"})",
+                    )
+                }
+                delay(interval)
                 timedSyncOnce(c, "round")
                     .onFailure { android.util.Log.w(TAG, "slow sync round failed: ${it.message}") }
             }
@@ -1094,6 +1135,9 @@ object MatrixRepository {
         observeClient(newClient)
         restoreAttempted = false
         _restoreProgress.value = RestoreProgress()
+        // A fresh login must not inherit the previous account's "all messages
+        // restored" claim (2026-09-01; logout already clears all prefs).
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_RESTORE_COMPLETED).apply()
         slowSyncJob?.cancel()
         slowSyncJob = null
         screenOffJob?.cancel()
@@ -1527,6 +1571,11 @@ object MatrixRepository {
         }
         android.util.Log.d(TAG, "restore: done — $roomsTouched rooms with encrypted content")
         _restoreProgress.value = RestoreProgress(scanned = scanned, roomsTotal = rooms.size, completed = true)
+        // Persist (2026-09-01): the in-memory flag dies with the process and
+        // the 24h gate keeps the next crawl a no-op, so without this the
+        // Account screen's "All messages restored" could only show in the
+        // process that ran the crawl. Cleared at login / logout.
+        prefs.edit().putBoolean(KEY_RESTORE_COMPLETED, true).apply()
     }
 
     suspend fun logout() {
@@ -2761,17 +2810,6 @@ object MatrixRepository {
             senderNameOf(c, matrixRoomId, c.userId)
         } else null
 
-        // Fast path: an encrypted room on an unverified device can't decrypt —
-        // say so immediately instead of fetching events and waiting on
-        // decryption that can never land.
-        val roomEncrypted = withTimeoutOrNull(ROOM_BUDGET_MS) {
-            c.room.getAll().first()[matrixRoomId]?.filterNotNull()?.first()?.encrypted
-        } == true
-        if (roomEncrypted && !isDeviceVerified(c)) {
-            android.util.Log.d(TAG, "getMessages: $matrixRoomId is encrypted and device is unverified — returning immediately")
-            return MessagesPage(emptyList(), false, encrypted = true)
-        }
-
         // The newest page (null cursor) pages BACKWARDS from the room's newest
         // event instead of using getLastTimelineEvents' newest-page stream:
         // that stream serves the handler's in-memory/cache view, which after a
@@ -2870,6 +2908,15 @@ object MatrixRepository {
                 hasMore = h2
             }
         }
+        // Key-request trigger: any event still undecryptable after the retries
+        // has a session this device doesn't hold — ask our own other devices
+        // (ungated by design, see [requestMissingRoomKeys]). Runs AFTER the
+        // skip-walk so the walk's accumulated events are included — before,
+        // only the page's own events reached the trigger and genuinely-missing
+        // sessions in walked-over regions were never requested (LP3 2026-09-01:
+        // the FILM `$P7YgV85…` and G5zV1tm stuck sessions sit in a re-import
+        // region pagination jumps past).
+        requestMissingRoomKeys(c, matrixRoomId, events)
         android.util.Log.d(
             TAG,
             "getMessages: room=$matrixRoomId before=$beforeEventId limit=$limit page=${events.size} hasMore=$hasMore",
@@ -3046,6 +3093,9 @@ object MatrixRepository {
         // backup, so history can't decrypt until keys arrive). Only the newest
         // page carries the flag; a genuinely empty room (no events at all)
         // stays a plain empty page.
+        val roomEncrypted = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()?.encrypted
+        } == true
         val undecryptable = roomEncrypted && beforeEventId == null && events.isNotEmpty() && oldestFirst.isEmpty()
         return MessagesPage(messages = oldestFirst, hasMore = hasMore, encrypted = undecryptable)
     }
@@ -3448,6 +3498,37 @@ object MatrixRepository {
         }
         android.util.Log.d(TAG, "restoreRoomSessions: loaded $loaded/${sessionIds.size} sessions for $matrixRoomId")
         return loaded
+    }
+
+    /** Asks our own other devices for the megolm sessions of undecryptable
+     *  events. Nothing in Trixnity 5.8 triggers a key request automatically,
+     *  and the stock [OutgoingRoomKeyRequestEventHandler] refuses to request
+     *  from unverified devices, so the interface resolves to our permissive
+     *  override (PermissiveOutgoingRoomKeyRequestEventHandler). Requests are
+     *  deduped inside the handler, so calling this on every page build costs
+     *  one store read per missing session. Runs ungated (not behind the
+     *  futile-restore cooldown or the `fast` flag): a cooldown that skips the
+     *  key-backup restore must not also suppress the cheap request.
+     */
+    private suspend fun requestMissingRoomKeys(c: MatrixClient, matrixRoomId: RoomId, events: List<TimelineEvent>) {
+        val missing = events.mapNotNull { te ->
+            if (te.content?.getOrNull() != null) null
+            else (te.event.content as? EncryptedMessageEventContent.MegolmEncryptedMessageEventContent)
+                ?.let { it.sessionId to te.event.id.full }
+        }
+        if (missing.isEmpty()) return
+        val outgoing = runCatching { c.di.get<OutgoingRoomKeyRequestEventHandler>() }.getOrNull() ?: return
+        // One request per missing session, logged with the event ids that
+        // produced it — the handler logs the request itself; the event ids tie
+        // a request back to the stuck events (2026-09-01 verification lever:
+        // are the FILM/G5zV1tm re-import-region sessions reached now?).
+        missing.groupBy({ it.first }, { it.second }).forEach { (sessionId, eventIds) ->
+            android.util.Log.d(
+                TAG,
+                "requestMissingRoomKeys: $matrixRoomId session $sessionId from events ${eventIds.distinct()}",
+            )
+            outgoing.requestRoomKeys(matrixRoomId, sessionId)
+        }
     }
 
     /** An own send leaves its echo waiting on the server; without a wake,
@@ -6281,6 +6362,23 @@ object MatrixRepository {
             )
             return (prev?.effectiveEventId ?: serverLastId) to (prev?.effectiveTs ?: serverTs)
         }
+        // A room whose newest event is pure state (member join, reaction,
+        // bridge ack) and which has NEVER resolved a real message (prev ==
+        // null) has nothing to stamp: the server's head time is a state
+        // re-delivery, not activity, and surfacing it as fresh fakes a
+        // timestamp (LP3 2026-08-31: the WhatsApp bridge re-delivered a
+        // member-join burst at 17:55; three message-less rooms popped to the
+        // top as "17:55" though Beeper shows no messages). Park the row at
+        // the bottom (ts 0, no preview) until the ghost walk finds real
+        // content or a real message arrives — the fast path re-checks on
+        // every server-last change, so a genuine arrival still surfaces.
+        if (prev == null && serverLast?.let { !isRenderableRow(it) } == true) {
+            enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
+            effectiveLastCache[key] = EffectiveLast(
+                serverLastId, null, 0L, retryAtMs = now + GHOST_WALK_RETRY_MS,
+            )
+            return null to 0L
+        }
         enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
         effectiveLastCache[key] = EffectiveLast(
             serverLastId, prev?.effectiveEventId ?: serverLastId, prev?.effectiveTs ?: serverTs,
@@ -6332,9 +6430,15 @@ object MatrixRepository {
                     // undecryptable rooms). Back off hard instead of retrying
                     // every 2 minutes — the room isn't going to resolve, and the
                     // fast path re-checks it on every server-last change anyway
-                    // (battery 2026-08-17 audit).
+                    // (battery 2026-08-17 audit). Keep the current effective
+                    // values (the message-less park's null/0, or the last-known-
+                    // good message) — re-stamping the raw head here would
+                    // resurrect a fake state-event time (2026-08-31).
+                    val kept = effectiveLastCache[key]
                     effectiveLastCache[key] = EffectiveLast(
-                        serverLastId, serverLastId, serverTs,
+                        serverLastId,
+                        kept?.effectiveEventId ?: serverLastId,
+                        kept?.effectiveTs ?: serverTs,
                         retryAtMs = android.os.SystemClock.elapsedRealtime() + GHOST_WALK_FAIL_BACKOFF_MS,
                     )
                 }
@@ -6530,7 +6634,7 @@ object MatrixRepository {
     private fun clientConfiguration(name: String): MatrixClientConfiguration.() -> Unit = {
         this.name = name
         httpClientEngine = this@MatrixRepository.httpClientEngine
-        modulesFactories = createTrixnityDefaultModuleFactories() + ::plaintextVerificationModule + ::archiveMappingsModule
+        modulesFactories = createTrixnityDefaultModuleFactories() + ::plaintextVerificationModule + ::archiveMappingsModule + ::permissiveKeyRequestModule
         // Sync payload slimming (PLAN §8.1, 2026-08-28): the default filter
         // ships every presence update + a huge per-room timeline on the
         // 1284-room account (30-50 s CPU per /sync). Presence is never
@@ -6586,6 +6690,42 @@ object MatrixRepository {
             PlaintextVerificationOlmEncryptionService(get<OlmEncryptionServiceImpl>()).also {
                 android.util.Log.i("MatrixRepository", "plaintext-verification olm wrapper armed")
             }
+        }
+    }
+
+    /**
+     * Registers our trust-gate-free room-key-request responder. Registered
+     * alongside Trixnity's stock handler (the stock one is keyed by its
+     * concrete type, so no override happens — it just stays inert because
+     * nothing on our accounts is cross-signed). A named qualifier keeps the
+     * key distinct from any other EventHandler bean; [MatrixClientImpl]
+     * collects handlers via `getAll<EventHandler>()`, which ignores qualifiers.
+     *
+     * The outgoing side is a real override: [OutgoingRoomKeyRequestEventHandler]
+     * is bound by the stock module to [PermissiveOutgoingRoomKeyRequestEventHandler]'s
+     * sibling stock impl; this module is appended after the default modules, so
+     * the unqualified interface lookup (the trigger in [restoreRoomSessions])
+     * resolves to ours. The `bind<EventHandler>()` mirrors the stock module's,
+     * so [MatrixClientImpl]'s `getAll<EventHandler>()` also STARTS ours — the
+     * forwarded-key import subscription lives in `startInCoroutineScope`. The
+     * stock impl still starts alongside (its 1-day stale-request cleanup), and
+     * its verified-sender gate keeps it inert on our accounts.
+     */
+    private fun permissiveKeyRequestModule() = module {
+        single<EventHandler>(named("permissiveKeyRequestHandler")) {
+            PermissiveIncomingRoomKeyRequestEventHandler(
+                userInfo = get(),
+                api = get(),
+                olmEventHandler = get(),
+                olmEncryptionService = get(),
+                accountStore = get(),
+                olmStore = get(),
+                driver = get(),
+            )
+        }
+        singleOf(::PermissiveOutgoingRoomKeyRequestEventHandler) {
+            bind<OutgoingRoomKeyRequestEventHandler>()
+            bind<EventHandler>()
         }
     }
 
