@@ -1455,6 +1455,27 @@ private fun MessageRow(
                     // last word always touches the right edge (see
                     // [OutgoingBodyText]).
                     OutgoingBodyText(message.body, bodyMaxWidthPx)
+                } else if (message.body.startsWith("Incoming call")) {
+                    // Bridged call notices ("Incoming call. Use the WhatsApp
+                    // app to answer." — Beeper's bridges can't relay calls, so
+                    // the contact's ghost posts a plain m.text; the phone icon
+                    // marks the row as a call, like the built-in Phone tool
+                    // (feedback 2026-09-01).
+                    Row(
+                        modifier = Modifier.padding(top = 1.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        LightIcon(
+                            icon = LightIcons.CALL,
+                            size = 1.5f,
+                            contentDescription = null, // the text carries it
+                        )
+                        LightText(
+                            text = message.body,
+                            variant = LightTextVariant.Paragraph,
+                            modifier = Modifier.padding(start = 0.75f.gridUnitsAsDp()),
+                        )
+                    }
                 } else {
                     LightText(
                         text = message.body,
