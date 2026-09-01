@@ -246,13 +246,32 @@ class ChatListViewModel : LightViewModel<Unit>() {
      * Re-fetches the list while it stays visible (the companion's room-list
      * cache fills in placeholders + updates live rooms in the background, so a
      * periodic quiet refresh keeps the list current without user action).
+     *
+     * Revision gate (2026-09-01, the Beeper comparison): the poll first asks
+     * the list's cheap revision and only fetches the full (400-room) payload
+     * when it moved — an idle list costs one tiny binder read every 5 s, not
+     * the whole [GetRooms] transfer. The connection state still refreshes each
+     * tick so the offline banner stays live.
      */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
+            // Seed with the revision the show-time refresh reflected, so the
+            // first poll skips a list that hasn't moved since.
+            var lastRevision = ChatClient.roomListRevision()
             while (true) {
                 delay(POLL_INTERVAL_MS)
-                refresh(quiet = true)
+                val revision = ChatClient.roomListRevision()
+                // 0 = nothing published yet (cold restore) — the show-time
+                // refresh + retry budget handle settling, don't churn here.
+                if (revision > 0 && revision != lastRevision) {
+                    lastRevision = revision
+                    refresh(quiet = true)
+                } else {
+                    // List unchanged — keep the banner live with the tiny
+                    // connection read instead of the full payload.
+                    ChatClient.connectionState()?.let { connection.value = it }
+                }
             }
         }
     }

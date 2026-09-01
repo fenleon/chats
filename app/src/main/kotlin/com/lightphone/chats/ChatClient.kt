@@ -54,6 +54,16 @@ object ChatClient {
         callRemoteServiceMethod(LightServiceMethod.GetRooms, Unit)
             .getOrNull()?.rooms.orEmpty()
 
+    /**
+     * The room list's current revision — the list poll's cheap gate: when it
+     * hasn't moved since the last [getRooms], the full 400-room payload stays
+     * on the server (2026-09-01, the Beeper comparison). 0 = nothing published
+     * yet (cold start) — the show-time refresh + retries handle that.
+     */
+    suspend fun roomListRevision(): Long =
+        callRemoteServiceMethod(LightServiceMethod.GetRoomListRevision, Unit)
+            .getOrNull()?.revision ?: 0L
+
     /** Every room the companion knows (full census, trimmed rows — no preview
      *  or unread). The contacts list + search need any room, old or quiet. */
     suspend fun getAllRooms(): List<LightServiceMethod.GetRooms.Room> =
@@ -75,6 +85,17 @@ object ChatClient {
             LightServiceMethod.GetMessages,
             LightServiceMethod.GetMessages.Request(roomId, beforeEventId, limit),
         ).getOrNull()
+
+    /**
+     * The room's cached newest-page revision — the thread poll's cheap gate:
+     * when it hasn't moved since the last [getMessages], the page round trip
+     * is skipped (2026-09-01, the Beeper comparison). 0 = page not computed.
+     */
+    suspend fun messagePageRevision(roomId: String): Long =
+        callRemoteServiceMethod(
+            LightServiceMethod.GetMessagePageRevision,
+            LightServiceMethod.GetMessagePageRevision.Request(roomId),
+        ).getOrNull()?.revision ?: 0L
 
     /**
      * Sends [body] to [roomId]. The response carries the outbox transaction id

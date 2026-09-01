@@ -2042,6 +2042,7 @@ object MatrixRepository {
                                 updated, cached.limit, android.os.SystemClock.elapsedRealtime(),
                             )
                             saveMessagePageToDisk(roomId, updated)
+                            bumpMessagePageRevision(roomId)
                         }
                     }
                     return@launch
@@ -2065,6 +2066,7 @@ object MatrixRepository {
                     )
                     lastRefreshedEventId[roomId] = lastId
                     saveMessagePageToDisk(roomId, updated)
+                    bumpMessagePageRevision(roomId)
                 } else {
                     runCatching {
                         val page = computeMessagesPage(roomId, null, limit)
@@ -2075,6 +2077,7 @@ object MatrixRepository {
                         )
                         lastRefreshedEventId[roomId] = lastId
                         saveMessagePageToDisk(roomId, page)
+                        bumpMessagePageRevision(roomId)
                     }
                 }
             } finally {
@@ -2306,6 +2309,7 @@ object MatrixRepository {
                 android.os.SystemClock.elapsedRealtime(),
             )
             saveMessagePageToDisk(roomId, first)
+            bumpMessagePageRevision(roomId)
             refreshMessagePage(roomId, limit)
             return first
         }
@@ -3551,6 +3555,11 @@ object MatrixRepository {
     private fun wakeAfterSend(roomId: String) {
         roomListDirty = true
         wakeRoomList()
+        // The in-flight send's optimistic row is injected into SERVED pages —
+        // bump the page revision so the thread's gating poll fetches and shows
+        // it now instead of waiting for the server echo (feedback 2026-08-15:
+        // "the voice note didn't appear").
+        bumpMessagePageRevision(roomId)
         // Publish the sent room's pending bump NOW — [publishRoomList] alone
         // waits for the resolver's next full pass, which on a big bridged
         // account is gated by the resolve loop's ghost-walk work (measured
@@ -5283,6 +5292,7 @@ object MatrixRepository {
                     page, THREAD_PAGE_SIZE, android.os.SystemClock.elapsedRealtime(),
                 )
                 saveMessagePageToDisk(roomKey, page)
+                bumpMessagePageRevision(roomKey)
             }
         }
     }
@@ -5328,6 +5338,36 @@ object MatrixRepository {
      *  badge lingered after viewing). */
     private val pendingReadClear = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
     private val _roomList = MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>(emptyList())
+
+    /**
+     * Monotonic revision of the published room list (2026-09-01): bumped on
+     * every [publishRoomList] and on [resetRoomList]. The tool polls
+     * [roomListRevision] (a Long, cheap) instead of re-fetching the whole
+     * 400-room [getRooms] payload every 5 s — the binder transfer happens only
+     * when the list actually moved. 0 = never published (cold start).
+     */
+    @Volatile
+    private var roomListRevision = 0L
+
+    /** The current room-list revision for the tool's gating poll. */
+    fun roomListRevision(): Long = roomListRevision
+
+    /**
+     * Monotonic revision of a room's cached newest page (2026-09-01): bumped
+     * wherever the page cache's content changes (new/edited events,
+     * read-receipt patches, pending-echo state). The thread's 3s poll reads
+     * this instead of pulling a full [getMessages] page while nothing moved.
+     * 0 = no page cached for the room yet.
+     */
+    private val messagePageRevision =
+        java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** The cached-page revision for [roomId] (0 = never computed). */
+    fun messagePageRevision(roomId: String): Long = messagePageRevision[roomId] ?: 0L
+
+    private fun bumpMessagePageRevision(roomId: String) {
+        messagePageRevision[roomId] = (messagePageRevision[roomId] ?: 0L) + 1
+    }
 
     @Volatile
     private var roomListJob: Job? = null
@@ -5439,10 +5479,12 @@ object MatrixRepository {
         roomListJob?.cancel()
         roomListJob = null
         messagePageCache.clear()
+        messagePageRevision.clear()
         activeRoomRefreshJob?.cancel()
         activeRoomRefreshJob = null
         flagsOnlyWake = false
         lastRoomsMap = null
+        roomListRevision++ // a reset IS a list change — the tool must re-fetch
     }
 
     /**
@@ -5634,6 +5676,7 @@ object MatrixRepository {
                                     page, THREAD_PAGE_SIZE, android.os.SystemClock.elapsedRealtime(),
                                 )
                                 saveMessagePageToDisk(key, page)
+                                bumpMessagePageRevision(key)
                                 precomputed++
                             }
                         }
@@ -6522,6 +6565,7 @@ object MatrixRepository {
             )
         _roomList.value = rooms
         saveRoomListToDisk(rooms)
+        roomListRevision++
     }
 
     // --- internals -----------------------------------------------------------

@@ -451,13 +451,27 @@ class ThreadViewModel(
      * (feedback pass): picks up the send echo and Beeper send-status events
      * within a few seconds, with no spinner and no scroll jump. The server
      * serves the cached newest page for the active room, so each poll is cheap.
+     *
+     * Revision gate (2026-09-01, the Beeper comparison): the poll first asks
+     * the page's cheap revision and skips the [GetMessages] round trip while
+     * it hasn't moved — an open thread on a quiet room costs one tiny binder
+     * read every 3 s instead of a full page transfer. A playing voice note
+     * keeps the poll alive regardless: its position advances without any page
+     * change, and only a poll reads it back.
      */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
+            // Seed with the revision the initial load reflected, so the first
+            // poll skips a page that hasn't moved since.
+            var lastRevision = ChatClient.messagePageRevision(room.id)
             while (true) {
                 delay(THREAD_POLL_MS)
-                loadNewest(quiet = true)
+                val revision = ChatClient.messagePageRevision(room.id)
+                if (revision != lastRevision || playingEventId.value != null) {
+                    lastRevision = revision
+                    loadNewest(quiet = true)
+                }
             }
         }
     }

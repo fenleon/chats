@@ -279,6 +279,21 @@ object ChatServiceMethods {
                     )
                 }
 
+                LightServiceMethod.GetRoomListRevision.id -> {
+                    val response = LightServiceMethod.GetRoomListRevision.Response(
+                        MatrixRepository.roomListRevision(),
+                    )
+                    LightResult.Success(LightServiceMethod.GetRoomListRevision.encodeResponse(response))
+                }
+
+                LightServiceMethod.GetMessagePageRevision.id -> {
+                    val request = LightServiceMethod.GetMessagePageRevision.decodeRequest(payload!!)
+                    val response = LightServiceMethod.GetMessagePageRevision.Response(
+                        MatrixRepository.messagePageRevision(request.roomId),
+                    )
+                    LightResult.Success(LightServiceMethod.GetMessagePageRevision.encodeResponse(response))
+                }
+
                 else -> LightResult.Error(
                     LightResult.ErrorCode.Unknown,
                     "unknown method: $methodId",
