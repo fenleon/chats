@@ -50,11 +50,11 @@ import kotlinx.coroutines.launch
  * their newest room); Group lists every non-direct room. Archived rooms
  * appear in whichever tab their direct/group flag lands them in. The panel
  * is seeded from the chat list's active network filter (2026-08-30): opened
- * from All it shows every contact (title "Chats", network name as each
+ * from All it shows every contact (title "All Contacts", network name as each
  * row's subtext — trial feature); opened from WhatsApp only that network's
- * rooms (title "WhatsApp", no subtext). SEARCH top-right filters the ACTIVE
+ * rooms (title "WhatsApp Contacts", no subtext). SEARCH top-right filters the ACTIVE
  * tab's list (an in-panel query, not the room search): the editor title is
- * "Search Chats"/"Search {Network}" with the SEARCH icon, and the panel
+ * "Search All Contacts"/"Search {Network} Contacts" with the SEARCH icon, and the panel
  * title shows the searched term in quotes while a query is active
  * (feedback 2026-09-01). Tapping a row
  * opens that thread; back from the thread pops the contacts list too,
@@ -189,13 +189,14 @@ class ContactsScreen(
                     ),
                     // Title grammar (2026-08-30): the active search shows the
                     // searched term in quotes (feedback 2026-09-01); otherwise
-                    // the network the panel was opened from ("WhatsApp"), or
-                    // "Chats" from All.
+                    // the network the panel was opened from ("WhatsApp
+                    // Contacts"), or "All Contacts" from All (feedback
+                    // 2026-09-01).
                     center = LightTopBarCenter.Text(
                         when {
                             query.isNotBlank() -> "'$query'"
-                            network != null -> network
-                            else -> "Chats"
+                            network != null -> "$network Contacts"
+                            else -> "All Contacts"
                         },
                     ),
                     rightButton = LightBarButton.LightIcon(
@@ -221,7 +222,6 @@ class ContactsScreen(
                                 else -> "No groups yet"
                             },
                             variant = LightTextVariant.Copy,
-                            lighten = true,
                             modifier = Modifier.padding(
                                 horizontal = 2f.gridUnitsAsDp(),
                                 vertical = 24.dp,
@@ -261,14 +261,14 @@ class ContactsScreen(
         // The query editor reuses the account screen's field editor: LP3
         // keyboard, no emoji/return/voice, SEARCH submits. Empty clears the
         // filter; backing out without submitting keeps the previous query.
-        // Title grammar (2026-08-30): "Search Chats" from All, "Search
-        // {Network}" inside a network; the SEARCH button is now the search
-        // icon.
+        // Title grammar (2026-08-30): "Search All Contacts" from All, "Search
+        // {Network} Contacts" inside a network (feedback 2026-09-01); the
+        // SEARCH button is now the search icon.
         navigateTo(
             screenFactory = {
                 FieldEditorScreen(
                     it,
-                    if (network == null) "Search Chats" else "Search $network",
+                    if (network == null) "Search All Contacts" else "Search $network Contacts",
                     viewModel.query.value,
                     "SEARCH",
                     submitIcon = LightIcons.SEARCH,
@@ -355,11 +355,12 @@ private fun ContactRow(
             overflow = TextOverflow.Ellipsis,
         )
         if (subtext != null) {
-            // The network label, Detail — smaller than the room name
-            // (feedback 2026-08-30: subtext was too big).
+            // The network label, Superfine — smaller than the room name
+            // (feedback 2026-08-30: subtext was too big; 2026-09-01: Detail
+            // still too big).
             LightText(
                 text = subtext,
-                variant = LightTextVariant.Detail,
+                variant = LightTextVariant.Superfine,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
