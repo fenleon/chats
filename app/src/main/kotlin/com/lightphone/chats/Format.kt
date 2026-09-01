@@ -1,6 +1,7 @@
 package com.lightphone.chats
 
 import android.telephony.PhoneNumberUtils
+import com.thelightphone.sdk.shared.LightServiceMethod
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -99,25 +100,64 @@ fun formatBridgePhone(raw: String): String {
  * bridged DMs list the contact; bridge bots like @whatsappbot are excluded).
  * Null for groups. Drives the contact overlay's phone/username line (chats,
  * feedback 2026-08-21; shared by the thread and the room list's long-press
- * panel 2026-08-29). NOTE: the m.bridge channel's `fi.mau.receiver` is the
- * USER'S OWN number, not the contact's (verified 2026-08-22 across many LID
- * DMs) — the contact's number is only present for `whatsapp_<number>` heroes;
- * LID heroes (`whatsapp_lid-…`, the WhatsApp privacy migration) carry no
- * number in the room data at all (Beeper resolves LIDs server-side).
+ * panel 2026-08-29). The companion resolves the real identifier via the
+ * bridge's contact API (WhatsApp numbers incl. LID, Instagram usernames) and
+ * rides it in [LightServiceMethod.GetRooms.Room.contactPhone] — that value
+ * wins here. The heuristic below is the fallback when the bridge doesn't
+ * serve one. NOTE: the m.bridge channel's `fi.mau.receiver` is the USER'S
+ * OWN number, not the contact's (verified 2026-08-22 across many LID DMs) —
+ * the contact's number is only present for `whatsapp_<number>` heroes; LID
+ * heroes (`whatsapp_lid-…`, the WhatsApp privacy migration) carry no number
+ * in the room data at all (Beeper resolves LIDs server-side).
+ *
+ * Non-phone ids render with a leading '@' — "@karin3na", never a bare
+ * username (feedback 2026-09-01); phone ids stay as-is.
  */
-fun contactIdentifier(contactId: String?, displayName: String): String? {
-    val localpart = contactId?.substringAfter("@")?.substringBefore(":")
-    if (localpart != null) {
-        val rest = localpart.removePrefix("whatsapp_")
-        if (rest != localpart) { // a WhatsApp bridged ID
-            if (rest.startsWith("lid-")) {
-                return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
+fun contactIdentifier(contactId: String?, displayName: String, resolved: String? = null): String? {
+    val raw = when {
+        !resolved.isNullOrBlank() ->
+            if (PhoneNumberUtils.isGlobalPhoneNumber(resolved)) formatBridgePhone(resolved) else resolved
+        else -> {
+            val localpart = contactId?.substringAfter("@")?.substringBefore(":")
+            if (localpart != null) {
+                val rest = localpart.removePrefix("whatsapp_")
+                if (rest != localpart) { // a WhatsApp bridged ID
+                    if (rest.startsWith("lid-")) {
+                        return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
+                    }
+                    formatBridgePhone(rest)
+                } else {
+                    localpart
+                }
+            } else {
+                displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
             }
-            return formatBridgePhone(rest)
         }
-        return localpart
     }
-    return displayName.takeIf { PhoneNumberUtils.isGlobalPhoneNumber(it) }
+    return raw?.takeIf { it.isNotBlank() }?.let { if (it.isPhoneLike()) it else "@$it" }
+}
+
+/** Whether a display id is a phone number: an optional leading + and 7-15
+ *  digits, ignoring the spaces [formatBridgePhone] adds. Everything else
+ *  (usernames, ghost localparts) is a user id and renders with '@'. */
+private fun String.isPhoneLike(): Boolean {
+    val digits = filter { it.isDigit() }
+    return digits.length in 7..15 && (startsWith("+") || all { it.isDigit() })
+}
+
+/**
+ * Whether a room row matches a search query: its name, its resolved contact
+ * identifier (number/username — the companion fills
+ * [LightServiceMethod.GetRooms.Room.contactPhone] from the bridge), or a
+ * digit-only partial match of that identifier (a phone typed with
+ * spaces/plus). Shared by the Search + Contacts screens (2026-09-01).
+ */
+fun roomMatchesQuery(room: LightServiceMethod.GetRooms.Room, q: String): Boolean {
+    if (room.name.contains(q, ignoreCase = true)) return true
+    val id = room.contactPhone
+    if (id?.contains(q, ignoreCase = true) == true) return true
+    val qDigits = q.filter { it.isDigit() }
+    return qDigits.length >= 3 && id?.filter { it.isDigit() }?.contains(qDigits) == true
 }
 
 /** 24-hour time for the room list rows — "14:02" (feedback 2026-08-21: the

@@ -663,7 +663,8 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                 room.id,
                 room.name,
                 room.network,
-                contactIdentifier(room.contactId, room.name),
+                community = room.community,
+                contactIdentifier(room.contactId, room.name, room.contactPhone),
                 room.contactPhone,
                 muted = viewModel.panelMuted,
                 onToggleMute = viewModel::togglePanelMuted,
@@ -678,7 +679,11 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
     private fun openContacts() {
         // The starting point carries in (2026-08-30): opened from All the
         // panel shows every contact; from a filtered list only that network's.
-        navigateTo(screenFactory = { ContactsScreen(it, viewModel.networkFilter.value) })
+        // The list's current census seeds the panel's first frame — no empty
+        // flash while the first GetRooms round-trips (feedback 2026-09-01).
+        navigateTo(
+            screenFactory = { ContactsScreen(it, viewModel.networkFilter.value, viewModel.rooms.value) },
+        )
     }
 
     private fun openSettings() {

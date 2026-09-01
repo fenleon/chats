@@ -31,29 +31,41 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 /**
  * The contact overlay (feedback 2026-08-21): tapping the thread's top-bar
- * room name opens a minimal contact page — Name, network (WhatsApp /
- * Instagram), and the other party's identifier. No top bar; the bottom bar
- * carries only an X in the middle to dismiss. The identity block stays
- * centered in the upper area; the PIN / MUTE / ARCHIVE toggles stack below
- * it, bottom-anchored just above the bottom bar (LP3 feedback 2026-08-28).
+ * room name opens a minimal contact page — Name, the other party's
+ * identifier (same size as the name, second line; 2026-09-01), and the
+ * network underneath as the small subtext (WhatsApp / Instagram). No top
+ * bar; the bottom bar carries only an X in the middle to dismiss. The
+ * identity block stays centered in the upper area; the PIN / MUTE / ARCHIVE
+ * toggles stack below it, bottom-anchored just above the bottom bar (LP3
+ * feedback 2026-08-28).
  *
- * Data source is a first pass, not settled: the identifier is the other
- * party's Matrix ID localpart, which on Beeper bridges is usually the bridge
- * UID (a phone number for WhatsApp, a username for Instagram) — the closest
- * available data without bridge-API access. The user offered the LP3's phone
- * contact panel as a design reference; revisit the layout when it's shared.
+ * Data source: the identifier is the contact's real number/username,
+ * resolved by the companion from the bridge's contact API when the room
+ * data doesn't carry it (WhatsApp LID heroes, Instagram usernames —
+ * 2026-09-01); the room-data localpart heuristic is the fallback. The user
+ * offered the LP3's phone contact panel as a design reference; revisit the
+ * layout when it's shared.
  */
 class ContactScreen(
     sealedActivity: SealedLightActivity,
     private val roomId: String,
     private val name: String,
     private val network: String?,
+    /**
+     * For rooms inside a bridged community (WhatsApp community groups): the
+     * community's own name. Renders as the second Heading line when the room
+     * has no identifier — the group fills the slot the id occupies for 1:1s
+     * (feedback 2026-09-01).
+     */
+    private val community: String? = null,
     private val identifier: String?,
     /**
-     * The contact's phone number, resolved by the companion from the room
-     * data (a @whatsapp_<number> ghost, or the number the bridge used as the
-     * displayname before syncing the profile name). Shown when the identifier
-     * line has nothing better (feedback 2026-08-23).
+     * The contact's identifier, resolved by the companion from the room data
+     * (a @whatsapp_<number> ghost, the number the bridge used as the
+     * displayname before syncing the profile name) or the bridge's contact
+     * API (LID-resolved numbers, Instagram usernames). Renders as the second
+     * Heading line under the name; the identifier wins when it IS the number
+     * (phone-ghost contacts), otherwise the companion-resolved phone.
      */
     private val phone: String? = null,
     /**
@@ -129,13 +141,17 @@ class ContactScreen(
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        // The phone number sits directly under the name at the
-                        // same size (feedback 2026-08-22: only the contact
-                        // overlay shows it, under the name, Heading like the
-                        // name — not the small Fine line below the network).
-                        // The identifier wins when it IS the number (phone-ghost
-                        // contacts); otherwise the companion-resolved phone.
-                        (identifier ?: phone)?.let {
+                        // The id (number/username) as the second line, the same
+                        // size as the name; the network tag stays small
+                        // underneath (feedback 2026-09-01: the id came back off
+                        // the network line onto its own Heading line, the
+                        // network stays the Detail subtext). Groups with no id
+                        // show the community name in this slot — except the
+                        // community's own room, where the community IS the name
+                        // (LP3 2026-09-01).
+                        (identifier ?: phone ?: community?.takeUnless {
+                            it.equals(name, ignoreCase = true)
+                        })?.takeIf { it.isNotBlank() }?.let {
                             LightText(
                                 text = it,
                                 variant = LightTextVariant.Heading,
@@ -145,13 +161,16 @@ class ContactScreen(
                                 modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                             )
                         }
-                        network?.let {
+                        network?.takeIf { it.isNotBlank() }?.let {
                             LightText(
                                 text = it,
                                 variant = LightTextVariant.Detail,
                                 // Solid white — the network line reads like the
                                 // name above it, not dimmed (feedback
                                 // 2026-08-27).
+                                align = TextAlign.Center,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                             )
                         }

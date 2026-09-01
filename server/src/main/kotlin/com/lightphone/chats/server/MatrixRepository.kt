@@ -18,11 +18,13 @@ import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.request.header
+import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
 import io.ktor.http.Url
 import io.ktor.http.contentType
 import io.ktor.http.encodeURLPathPart
@@ -51,6 +53,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.descriptors.buildClassSerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
@@ -68,6 +71,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import de.connect2x.trixnity.clientserverapi.model.push.SetPushRule
 import de.connect2x.trixnity.clientserverapi.model.user.Filters
+import de.connect2x.trixnity.core.MatrixServerException
 import de.connect2x.trixnity.core.model.events.MessageEventContent
 import de.connect2x.trixnity.core.model.events.RoomAccountDataEventContent
 import de.connect2x.trixnity.core.model.events.m.PushRulesEventContent
@@ -81,6 +85,7 @@ import de.connect2x.trixnity.core.serialization.events.roomAccountDataOf
 import de.connect2x.trixnity.client.CryptoDriverModule
 import de.connect2x.trixnity.core.EventHandler
 import de.connect2x.trixnity.client.MatrixClient
+import de.connect2x.trixnity.clientserverapi.client.ClassicMatrixClientAuthProviderData
 import de.connect2x.trixnity.clientserverapi.client.MatrixClientAuthProviderData
 import de.connect2x.trixnity.client.MatrixClientConfiguration
 import de.connect2x.trixnity.client.MediaStoreModule
@@ -180,6 +185,7 @@ object MatrixRepository {
     private const val PREFS = "chats_account"
     private const val KEY_HOMESERVER = "homeserver"
     private const val KEY_USER_ID = "user_id"
+    private const val KEY_ACCESS_TOKEN = "access_token"
     private const val KEY_LOGIN_MODE = "login_mode"
     private const val KEY_BEEPER_REQUEST_ID = "beeper_request_id"
     private const val KEY_SYNC_ENABLED = "sync_enabled"
@@ -994,7 +1000,7 @@ object MatrixRepository {
             // discovery runs when the host serves one, else the URL is used as-is.
             val baseUrl = homeserver.trim().serverDiscovery(httpClientEngine = httpClientEngine).getOrThrow()
 
-            val loginResult = MatrixClientAuthProviderData.classicLogin(
+            val authProviderData = MatrixClientAuthProviderData.classicLogin(
                 baseUrl = baseUrl,
                 identifier = IdentifierType.User(user.trim()),
                 password = if (tokenLogin) null else passwordOrToken,
@@ -1002,6 +1008,10 @@ object MatrixRepository {
                 loginType = if (tokenLogin) LoginType.Token() else LoginType.Password,
                 initialDeviceDisplayName = "Chats (Light Phone)",
             ).getOrThrow()
+            // The raw ktor client (used for Beeper's provision API, see
+            // [bridgeContacts]) does not attach the bearer — persist it here.
+            val accessToken = (authProviderData as? ClassicMatrixClientAuthProviderData)?.accessToken
+            val loginResult = authProviderData
                 .let { authProviderData ->
                     MatrixClient.create(
                         repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
@@ -1015,6 +1025,7 @@ object MatrixRepository {
                 .edit()
                 .putString(KEY_HOMESERVER, baseUrl.toString())
                 .putString(KEY_USER_ID, loginResult.userId.full)
+                .putString(KEY_ACCESS_TOKEN, accessToken)
                 .putString(KEY_LOGIN_MODE, "homeserver")
                 .apply()
             finishLogin(ctx, loginResult)
@@ -1099,7 +1110,7 @@ object MatrixRepository {
                 http.close()
             }
 
-            val loginResult = MatrixClientAuthProviderData.classicLogin(
+            val authProviderData = MatrixClientAuthProviderData.classicLogin(
                 baseUrl = Url(BEEPER_HOMESERVER),
                 identifier = IdentifierType.User(username.trim()),
                 password = null,
@@ -1107,6 +1118,8 @@ object MatrixRepository {
                 loginType = LoginType.Unknown("org.matrix.login.jwt", buildJsonObject {}),
                 initialDeviceDisplayName = "Chats (Light Phone)",
             ).getOrThrow()
+            val accessToken = (authProviderData as? ClassicMatrixClientAuthProviderData)?.accessToken
+            val loginResult = authProviderData
                 .let { authProviderData ->
                     MatrixClient.create(
                         repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
@@ -1119,6 +1132,7 @@ object MatrixRepository {
             prefs.edit()
                 .putString(KEY_HOMESERVER, BEEPER_HOMESERVER)
                 .putString(KEY_USER_ID, loginResult.userId.full)
+                .putString(KEY_ACCESS_TOKEN, accessToken)
                 .putString(KEY_LOGIN_MODE, "beeper")
                 .remove(KEY_BEEPER_REQUEST_ID)
                 .apply()
@@ -1987,7 +2001,10 @@ object MatrixRepository {
     private fun preloadRoomListFromDisk() {
         val disk = loadRoomListFromDisk()
         if (disk.isEmpty()) return
-        disk.forEach { room ->
+        // Same stale-duplicate filter as publish — a cold start must not flash
+        // the hidden community rooms before the first resolver pass.
+        val visible = hideStaleCommunityDuplicates(disk)
+        visible.forEach { room ->
             roomListCache.putIfAbsent(
                 room.id,
                 RoomListEntry(
@@ -1999,8 +2016,8 @@ object MatrixRepository {
                 ),
             )
         }
-        _roomList.value = disk
-        android.util.Log.d(TAG, "room list: preloaded ${disk.size} rooms from disk cache")
+        _roomList.value = visible
+        android.util.Log.d(TAG, "room list: preloaded ${visible.size} rooms from disk cache")
     }
 
     @Volatile
@@ -5610,12 +5627,21 @@ object MatrixRepository {
                     // Per-network labels from Beeper's spaces (m.space.child).
                     // Built from the FULL room map (cached) — the budget-bound
                     // loaded subset may not include the (older) space rooms.
-                    val networks = networkByRoom(c, rooms)
+                    val (networks, communities) = networkByRoom(c, rooms)
                     // Pinned/archived/muted per room (m.favourite tag, Beeper
                     // inbox.done account data, global push rules) — cached
                     // like the network map (2026-08-28).
                     val flags = roomFlagsByRoom(c, rooms)
-                    seedRoomList(loaded, verified, networks, flags)
+                    // Bridge contact lists (Beeper provision API): pre-fetch
+                    // per bridge so the row resolve below is a pure cache hit —
+                    // a network fetch can't sit inside the per-room deadline
+                    // (the pass would stall on the first room of each bridge).
+                    // Lazy + TTL-cached, skipped when the deadline is near.
+                    for (bridgeId in loaded.mapNotNull { contactIdOf(it.second)?.let(::bridgeIdOf) }.distinct()) {
+                        if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
+                        bridgeContacts(c, bridgeId)
+                    }
+                    seedRoomList(loaded, verified, networks, communities, flags)
                     // Phase 14 feedback: every joined room gets a preview attempt
                     // (the user's list looked inconsistent — rooms beyond the old
                     // 30-room preview window showed no latest message at all).
@@ -5630,6 +5656,7 @@ object MatrixRepository {
                             resolvePreview = true,
                             verified = verified,
                             networks = networks,
+                            communities = communities,
                             flags = flags,
                         )
                     }
@@ -5712,6 +5739,7 @@ object MatrixRepository {
         rooms: List<Pair<RoomId, MatrixRoom>>,
         verified: Boolean,
         networks: Map<String, String>,
+        communities: Map<String, String>,
         flags: Map<String, RoomFlags>,
     ) {
         var seeded = 0
@@ -5749,6 +5777,7 @@ object MatrixRepository {
                     isDirect = isDirectRoom(room),
                     contactId = contactIdOf(room),
                     network = networks[key],
+                    community = communities[key],
                     archived = flags[key]?.archived ?: false,
                     pinned = flags[key]?.pinned ?: false,
                     muted = flags[key]?.muted ?: false,
@@ -5778,6 +5807,7 @@ object MatrixRepository {
         resolvePreview: Boolean,
         verified: Boolean,
         networks: Map<String, String>,
+        communities: Map<String, String>,
         flags: Map<String, RoomFlags>,
     ) {
         val key = roomId.full
@@ -5943,9 +5973,17 @@ object MatrixRepository {
                 isDirect = isDirectRoom(room),
                 contactId = contactIdOf(room),
                 // Resolved here (not in the seed pass — this one has a client
-                // for the member-state read). Null for groups/seed rows.
-                contactPhone = contactIdOf(room)?.let { contactPhoneOf(c, roomId, it) },
+                // for the member-state read). Null for groups/seed rows. The
+                // room data first (cheap, exact for @whatsapp_<number> ghosts),
+                // then the bridge's own contact list — the authoritative
+                // source for numbers the room data never carries (LID heroes,
+                // Instagram usernames; see [bridgeContactIdentifier]).
+                contactPhone = contactIdOf(room)?.let { contactId ->
+                    contactPhoneOf(c, roomId, contactId)
+                        ?: bridgeContactIdentifier(c, contactId)
+                },
                 network = networks[key],
+                community = communities[key],
                 archived = flags[key]?.archived ?: false,
                 pinned = flags[key]?.pinned ?: false,
                 muted = flags[key]?.muted ?: false,
@@ -5959,6 +5997,9 @@ object MatrixRepository {
     /** Network-map cache (see [networkByRoom]): rebuilt at most every TTL. */
     @Volatile
     private var networkByRoomCache: Map<String, String> = emptyMap()
+    /** Community-name map (same rebuild pass — sub-space explicitNames). */
+    @Volatile
+    private var communityByRoomCache: Map<String, String> = emptyMap()
     @Volatile
     private var networkByRoomBuiltAtMs = 0L
 
@@ -5973,6 +6014,11 @@ object MatrixRepository {
      * creates spaces for WhatsApp group/community chats, named after the group
      * itself — those must not become selectable accounts.
      *
+     * Also returns the community map (room id → the community sub-space's own
+     * name, e.g. "1 euro film"): Beeper nests WhatsApp community groups under
+     * their own space, a child of the account space — the sub-space's explicit
+     * name is the community the user sees in Beeper (feedback 2026-09-01).
+     *
      * Reads the FULL room map (not the budget-bound newest subset — the space
      * rooms are older than the room activity) and caches the result, since
      * space membership changes rarely.
@@ -5980,24 +6026,27 @@ object MatrixRepository {
     private suspend fun networkByRoom(
         c: MatrixClient,
         rooms: Map<RoomId, Flow<MatrixRoom?>>,
-    ): Map<String, String> {
+    ): Pair<Map<String, String>, Map<String, String>> {
         val now = android.os.SystemClock.elapsedRealtime()
         if (networkByRoomCache.isNotEmpty() && now - networkByRoomBuiltAtMs < NETWORK_MAP_TTL_MS) {
-            return networkByRoomCache
+            return networkByRoomCache to communityByRoomCache
         }
         val result = mutableMapOf<String, String>()
+        val communities = mutableMapOf<String, String>()
         // Community/group sub-spaces of account spaces inherit the account's
         // label (see below) — their ids are collected on the first pass.
-        val groupSpaceChildren = mutableMapOf<String, String>()
+        val groupSpaceChildren = mutableMapOf<String, Pair<String, String>>()
         withTimeoutOrNull(NETWORK_MAP_BUDGET_MS) {
             // Every space id (account spaces AND community/group spaces): an
             // account space's child that is itself a space is a sub-space
             // whose own children still belong to the same network.
             val spaceIds = HashSet<String>()
+            val spaceNameBySpaceId = HashMap<String, String>()
             for ((spaceId, spaceFlow) in rooms) {
                 val space = spaceFlow.filterNotNull().firstOrNull() ?: continue
                 if (space.createEventContent?.type is CreateEventContent.RoomType.Space) {
                     spaceIds += spaceId.full
+                    spaceNameBySpaceId[spaceId.full] = space.name?.explicitName.orEmpty()
                 }
             }
             for ((spaceId, spaceFlow) in rooms) {
@@ -6015,20 +6064,27 @@ object MatrixRepository {
                     // account space — those rooms show no network and vanish
                     // from the network filter (feedback 2026-08-27). Record
                     // the sub-space so the second pass labels its rooms.
-                    if (childId in spaceIds) groupSpaceChildren[childId] = label
+                    if (childId in spaceIds) {
+                        groupSpaceChildren[childId] = label to spaceNameBySpaceId[childId].orEmpty()
+                    }
                 }
             }
             // Second pass: the rooms inside each community/group sub-space
             // inherit the account's label (putIfAbsent — a direct account
-            // child already labeled wins).
-            for ((subSpaceId, label) in groupSpaceChildren) {
+            // child already labeled wins) and the community's name.
+            for ((subSpaceId, pair) in groupSpaceChildren) {
+                val (label, communityName) = pair
                 val subChildIds = c.room.getAllState(RoomId(subSpaceId), ChildEventContent::class).first().keys
-                for (childId in subChildIds) result.putIfAbsent(childId, label)
+                for (childId in subChildIds) {
+                    result.putIfAbsent(childId, label)
+                    communities.putIfAbsent(childId, communityName)
+                }
             }
         }
         networkByRoomCache = result
+        communityByRoomCache = communities
         networkByRoomBuiltAtMs = now
-        return result
+        return result to communities
     }
 
     /** Pinned/archived/muted flags for one room, from synced Matrix/Beeper
@@ -6301,6 +6357,254 @@ object MatrixRepository {
     private fun String.isPhoneNumber(): Boolean =
         replace(" ", "").replace("-", "").matches(Regex("^\\+?\\d{7,15}$"))
 
+    // ── Bridge contact resolution (Beeper provision API) ─────────────────────
+    // Beeper resolves bridged identifiers server-side: the room data only ever
+    // carries a number for @whatsapp_<number> ghosts — WhatsApp's privacy-LID
+    // migration (whatsapp_lid-…), Instagram usernames, etc. are invisible to
+    // it. The bridge's own provision endpoint serves the authoritative list:
+    // GET {hs}/_matrix/client/unstable/com.beeper.bridge/{bridgeId}/_matrix/provision/v3/contacts?user_id={mxid} →
+    // {contacts: [{id, name, avatar_url, identifiers, mxid, dm_room_mxid}]}.
+    // Fetched lazily per bridge (see [bridgeContacts]) and cached; no polling.
+    private val BRIDGE_KEYS = setOf(
+        "whatsapp", "instagramgo", "signal", "telegram", "imessagego", "gmessages",
+        "discordgo", "slackgo", "twitter", "linkedin", "facebookgo", "googlechat",
+        "line", "tumblrdms",
+    )
+
+    private data class BridgeContact(
+        val id: String? = null,
+        val name: String? = null,
+        val identifiers: List<String> = emptyList(),
+        val mxid: String? = null,
+    )
+
+    private val bridgeJson = Json { ignoreUnknownKeys = true }
+
+    /** Per-bridge contact index: bridge key → (contact mxid → contact). */
+    @Volatile
+    private var bridgeContactsCache: Map<String, Map<String, BridgeContact>> = emptyMap()
+    /** When each bridge's list was fetched (elapsedRealtime), for the TTL. */
+    @Volatile
+    private var bridgeContactsFetchedAtMs: Map<String, Long> = emptyMap()
+    /** Last failed fetch per bridge (elapsedRealtime), for the retry backoff. */
+    @Volatile
+    private var bridgeContactsFailedAtMs: Map<String, Long> = emptyMap()
+
+    /** Per-contact resolve cache: contact mxid → (entry), for bridges that
+     *  serve no contact list (e.g. instagramgo). Same TTL as the list. */
+    private data class ResolveEntry(val fetchedAtMs: Long, val contact: BridgeContact?)
+    @Volatile
+    private var resolvedContactsCache: Map<String, ResolveEntry> = emptyMap()
+
+    /** The bridge key from a bridged contact's Matrix id — the localpart
+     *  prefix IS the provision bridgeId ("whatsapp_lid-…" → "whatsapp",
+     *  "instagramgo-…" → "instagramgo"). Whitelisted so ordinary user ids
+     *  (whose localpart may contain "-"/"_") never hit the provision API. */
+    private fun bridgeIdOf(contactId: String): String? {
+        val localpart = contactId.substringAfter("@").substringBefore(":")
+        val key = localpart.substringBefore("_").substringBefore("-")
+        return key.takeIf { it in BRIDGE_KEYS }
+    }
+
+    /** Parses the provision contacts body ({contacts: [{id, name, avatar_url,
+     *  identifiers, mxid, dm_room_mxid}]}). Tolerant of both identifier shapes
+     *  — plain strings and {value} objects (the element type didn't decompile
+     *  in Beeper 4.55.1) — and of missing/unknown fields. Identifiers come with
+     *  a scheme prefix ("tel:+49…", "telegram:karin3na") which is stripped.
+     *  Contacts without an mxid are dropped (the index is keyed by it). Null on
+     *  malformed input. */
+    private fun parseBridgeContacts(body: String): Map<String, BridgeContact>? {
+        val contacts = runCatching {
+            bridgeJson.parseToJsonElement(body).jsonObject["contacts"]?.jsonArray
+        }.getOrNull() ?: return null
+        return contacts.mapNotNull { el ->
+            val obj = runCatching { el.jsonObject }.getOrNull() ?: return@mapNotNull null
+            val mxid = obj["mxid"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+            val identifiers = obj["identifiers"]?.jsonArray?.mapNotNull { idEl ->
+                val raw = when (idEl) {
+                    is JsonPrimitive -> idEl.contentOrNull
+                    else -> runCatching { idEl.jsonObject["value"]?.jsonPrimitive?.contentOrNull }.getOrNull()
+                }
+                // Identifiers carry a scheme prefix ("tel:+49…", "telegram:karin3na");
+                // strip it so [isPhoneNumber] and the username fallback see the bare value.
+                raw?.substringAfter(':', raw)
+            }.orEmpty()
+            mxid to BridgeContact(
+                id = obj["id"]?.jsonPrimitive?.contentOrNull,
+                name = obj["name"]?.jsonPrimitive?.contentOrNull,
+                identifiers = identifiers,
+                mxid = mxid,
+            )
+        }.toMap()
+    }
+
+    /** The session access token, persisted at login ([KEY_ACCESS_TOKEN]).
+     *  Trixnity's raw ktor client only attaches the bearer on its typed
+     *  request path — raw GETs (here, and [setRoomArchived]'s PUT) ride bare,
+     *  and Beeper's provision API 404s without it (curl-verified 2026-09-01:
+     *  no-auth → 404 M_UNRECOGNIZED, with bearer → 200). Sessions restored
+     *  from before this key existed read it once from Trixnity's own
+     *  `Authentication` table (Room, `value` JSON) and cache it in prefs. */
+    private fun accessToken(ctx: Context): String? {
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        prefs.getString(KEY_ACCESS_TOKEN, null)?.let { return it }
+        val token = runCatching {
+            val db = android.database.sqlite.SQLiteDatabase.openDatabase(
+                ctx.getDatabasePath(DB_NAME).path, null,
+                android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
+            )
+            try {
+                db.rawQuery("SELECT value FROM Authentication LIMIT 1", null).use { cur ->
+                    if (!cur.moveToFirst()) return null
+                    val raw = cur.getString(0) ?: return null
+                    val providerData = bridgeJson.parseToJsonElement(raw)
+                        .jsonObject["providerData"]?.jsonPrimitive?.contentOrNull ?: return null
+                    bridgeJson.parseToJsonElement(providerData)
+                        .jsonObject["accessToken"]?.jsonPrimitive?.contentOrNull
+                }
+            } finally {
+                db.close()
+            }
+        }.getOrNull()
+        if (token != null) prefs.edit().putString(KEY_ACCESS_TOKEN, token).apply()
+        return token
+    }
+
+    /** The bridge's contact list (mxid → contact), fetched once per TTL. Null
+     *  when the fetch failed (retried after [BRIDGE_CONTACTS_RETRY_MS]); an
+     *  empty map when the bridge serves none (cached like a real list). The
+     *  provision call rides Trixnity's own ktor client, but the raw client
+     *  does not add the bearer — [accessToken] goes on explicitly. */
+    private suspend fun bridgeContacts(c: MatrixClient, bridgeId: String): Map<String, BridgeContact>? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        bridgeContactsCache[bridgeId]?.let {
+            if (now - (bridgeContactsFetchedAtMs[bridgeId] ?: 0L) < BRIDGE_CONTACTS_TTL_MS) return it
+        }
+        if (now - (bridgeContactsFailedAtMs[bridgeId] ?: 0L) < BRIDGE_CONTACTS_RETRY_MS) return null
+        val url = "$BEEPER_HOMESERVER/_matrix/client/unstable/com.beeper.bridge/$bridgeId/_matrix/provision/v3/contacts"
+        val token = appContext?.let { accessToken(it) }
+        val outcome = withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
+            try {
+                val resp = c.api.baseClient.baseClient.get(url) {
+                    parameter("user_id", c.userId.full)
+                    token?.let { header(HttpHeaders.Authorization, "Bearer $it") }
+                }
+                resp.status.value to resp.bodyAsText()
+            } catch (e: MatrixServerException) {
+                // A 404 from the list endpoint is deterministic (the bridge
+                // serves no contact list, e.g. instagramgo) — not a transient
+                // failure, so don't count it for the retry backoff.
+                if (e.statusCode.value == 404) 404 to "" else {
+                    android.util.Log.w(TAG, "bridge contacts: $bridgeId request failed", e)
+                    null
+                }
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "bridge contacts: $bridgeId request failed", e)
+                null
+            }
+        }
+        val contacts = when {
+            outcome == null -> null
+            outcome.first !in 200..299 -> null
+            else -> parseBridgeContacts(outcome.second)
+        }
+        if (contacts == null && outcome?.first == 404) {
+            // Bridge serves no contact list — cache empty so the 404 stops
+            // retrying; its identifiers come from [resolveBridgeIdentifier].
+            bridgeContactsCache = bridgeContactsCache + (bridgeId to emptyMap())
+            bridgeContactsFetchedAtMs = bridgeContactsFetchedAtMs + (bridgeId to now)
+            bridgeContactsFailedAtMs = bridgeContactsFailedAtMs - bridgeId
+            android.util.Log.d(TAG, "bridge contacts: $bridgeId → no contact list (per-contact resolve)")
+            return emptyMap()
+        }
+        if (contacts == null) {
+            bridgeContactsFailedAtMs = bridgeContactsFailedAtMs + (bridgeId to now)
+            android.util.Log.w(TAG, "bridge contacts: fetch failed for $bridgeId status=${outcome?.first}")
+            return null
+        }
+        val sample = contacts.keys.take(3).joinToString(", ") { it.substringAfter("@").substringBefore(":") }
+        android.util.Log.d(TAG, "bridge contacts: $bridgeId → ${contacts.size} contacts (e.g. $sample)")
+        bridgeContactsCache = bridgeContactsCache + (bridgeId to contacts)
+        bridgeContactsFetchedAtMs = bridgeContactsFetchedAtMs + (bridgeId to now)
+        bridgeContactsFailedAtMs = bridgeContactsFailedAtMs - bridgeId
+        return contacts
+    }
+
+    /** The contact's real identifier (phone number incl. LID-resolved, or
+     *  username) from the bridge's contact list, keyed by the contact's full
+     *  Matrix id. Bridges that serve no list (instagramgo) fall back to the
+     *  per-contact resolve_identifier endpoint (Beeper's own client does the
+     *  same — its Start New Chat picker uses the list, DMs resolve per ghost).
+     *  Null when the id isn't a known bridge ghost or nothing resolves — the
+     *  caller keeps its fallback. */
+    private suspend fun bridgeContactIdentifier(c: MatrixClient, contactId: String): String? {
+        val bridgeId = bridgeIdOf(contactId) ?: return null
+        val list = bridgeContacts(c, bridgeId)
+        list?.get(contactId)?.let { return it.identifier() }
+        // The list lookup missed (Beeper's list is partial — not every DM
+        // ghost is in it; WhatsApp LID heroes like mo/Hannah were dropping
+        // out) or the bridge serves no list at all (instagramgo's
+        // deterministic 404) → resolve per contact, which is what Beeper's
+        // own client does for DMs (curl-verified 2026-09-01: telegram →
+        // tel/username, instagramgo → username). A transient list FAILURE
+        // (null) returns null — the 60s retry covers it without per-contact
+        // hammering.
+        if (list != null) return resolveBridgeIdentifier(c, bridgeId, contactId)
+        return null
+    }
+
+    /** The display identifier from a bridge contact: phone number first,
+     *  else the first identifier (username), else the bridge id. */
+    private fun BridgeContact.identifier(): String? =
+        (identifiers.firstOrNull { it.isPhoneNumber() }
+            ?: identifiers.firstOrNull()
+            ?: id)?.takeIf { it.isNotBlank() }
+
+    /** Resolves one ghost's identifier via the provision resolve_identifier
+     *  endpoint — GET {hs}/_matrix/client/unstable/com.beeper.bridge/{bridgeId}
+     *  /_matrix/provision/v3/resolve_identifier/{bridgeId-relative id}?user_id=
+     *  (decompiled Beeper BridgeApi.retrieveContactList/resolveIdentifier,
+     *  response shape identical to a contact). The id is the ghost mxid's
+     *  localpart minus the "{bridgeKey}_" prefix — numeric for instagramgo
+     *  and telegram (curl-verified 2026-09-01: instagramgo → identifiers
+     *  ["instagram:animus.film"], telegram → ["tel:+49…","telegram:karin3na"]).
+     *  Cached per contact like the list; same TTL. */
+    private suspend fun resolveBridgeIdentifier(c: MatrixClient, bridgeId: String, contactId: String): String? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        resolvedContactsCache[contactId]?.let {
+            if (now - it.fetchedAtMs < BRIDGE_CONTACTS_TTL_MS) return it.contact?.identifier()
+        }
+        val localpart = contactId.substringAfter("@").substringBefore(":")
+        val id = localpart.removePrefix("${bridgeId}_")
+        if (id == localpart || id.isBlank()) return null
+        val url = "$BEEPER_HOMESERVER/_matrix/client/unstable/com.beeper.bridge/$bridgeId/" +
+            "_matrix/provision/v3/resolve_identifier/${id.encodeURLPathPart()}"
+        val token = appContext?.let { accessToken(it) }
+        val outcome = withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
+            try {
+                val resp = c.api.baseClient.baseClient.get(url) {
+                    parameter("user_id", c.userId.full)
+                    token?.let { header(HttpHeaders.Authorization, "Bearer $it") }
+                }
+                resp.status.value to resp.bodyAsText()
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "bridge resolve: $bridgeId/$id request failed", e)
+                null
+            }
+        }
+        val contact = when {
+            outcome == null -> null
+            outcome.first !in 200..299 -> null
+            else -> runCatching { parseBridgeContacts("""{"contacts":[${outcome.second}]}""")?.values?.firstOrNull() }.getOrNull()
+        }
+        resolvedContactsCache = (resolvedContactsCache + (contactId to ResolveEntry(now, contact)))
+            .filterValues { now - it.fetchedAtMs < BRIDGE_CONTACTS_TTL_MS }
+        if (contact == null) {
+            android.util.Log.w(TAG, "bridge resolve: $bridgeId/$id failed status=${outcome?.first}")
+        }
+        return contact?.identifier()
+    }
+
     /**
      * The room's newest event that renders as a message row, for the list's
      * sort + timestamp + preview (LP3 2026-08-17: the panel showed the
@@ -6552,13 +6856,38 @@ object MatrixRepository {
         )
     }
 
+    /**
+     * Drops stale community-room duplicates (LP3 2026-09-01): when the
+     * WhatsApp number changed, Beeper re-created community groups under new
+     * rooms; the old rooms linger outside the community sub-space (no
+     * [community] label) with the same name as the live group, their timeline
+     * undecryptable. A group room that carries no community is hidden when a
+     * same-network, same-named room IS in a community — the live twin wins.
+     * Directs are never hidden (DM duplicates from the number change stay —
+     * distinct contacts can share a name).
+     */
+    private fun hideStaleCommunityDuplicates(
+        rooms: List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>,
+    ): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
+        val inCommunity = rooms
+            .asSequence()
+            .filter { it.community != null }
+            .map { it.network to it.name.trim().lowercase() }
+            .toHashSet()
+        return rooms.filter { room ->
+            val stale = !room.isDirect && room.community == null &&
+                (room.network to room.name.trim().lowercase()) in inCommunity
+            if (stale) android.util.Log.d(TAG, "room list: hidden stale duplicate '${room.name}' (${room.id})")
+            !stale
+        }
+    }
+
     /** Publishes the cache as the sorted, SDK-shaped list (and persists it).
      *  Pinned rooms float to the top (Beeper convention — the m.favourite tag;
      *  LP3 2026-08-29: a pinned DM sorted to the bottom by recency and read as
      *  "missing"), then newest-first. */
     private fun publishRoomList() {
-        val rooms = roomListCache.values
-            .map { it.room }
+        val rooms = hideStaleCommunityDuplicates(roomListCache.values.map { it.room })
             .sortedWith(
                 compareByDescending<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> { it.pinned == true }
                     .thenByDescending { it.lastTimestampMs }
@@ -7158,6 +7487,17 @@ object MatrixRepository {
     private const val NETWORK_MAP_TTL_MS = 300_000L
     /** Bound for a full network-map build (600+ room flows on a big account). */
     private const val NETWORK_MAP_BUDGET_MS = 15_000L
+    /** Re-fetch a failed bridge contact list no sooner than this (a failure is
+     *  usually transient; the backoff stops the room-list pass hammering an
+     *  unreachable/auth-rejected endpoint every pass). */
+    private const val BRIDGE_CONTACTS_RETRY_MS = 60_000L
+    /** Rebuild a bridge's contact list at most this often (the bridge's own
+     *  address book — real numbers incl. LID-resolved, usernames; stable
+     *  between changes; battery: one fetch per bridge per hour, only when a
+     *  room on that bridge is in the list pass). */
+    private const val BRIDGE_CONTACTS_TTL_MS = 3_600_000L
+    /** Bound for one bridge contacts fetch (the provision API can be slow). */
+    private const val BRIDGE_CONTACTS_BUDGET_MS = 5_000L
     /** Per-room budget for the flags walk ([roomFlagsByRoom]): one room's store
      *  reads + the archive network GET fit in this; a room that exceeds it
      *  keeps its last-known flags instead of being dropped (2026-08-29). */

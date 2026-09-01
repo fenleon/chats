@@ -20,6 +20,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.roomMatchesQuery
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -132,7 +133,7 @@ class SearchViewModel(
             .filter { room ->
                 (networkFilter == null || room.network == networkFilter) &&
                     (!dmsOnly.value || (room.isDirect && !room.archived)) &&
-                    (q.isEmpty() || room.name.contains(q, ignoreCase = true))
+                    (q.isEmpty() || roomMatchesQuery(room, q))
             }
             .sortedBy { it.name.lowercase() }
     }

@@ -20,6 +20,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.contactIdentifier
+import com.lightphone.chats.roomMatchesQuery
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -63,6 +65,10 @@ import kotlinx.coroutines.launch
 class ContactsViewModel(
     /** The chat list's active network filter (null = all networks). */
     private val network: String? = null,
+    /** The census the panel was opened from — seeds the first frame so the
+     *  panel renders instantly instead of flashing the empty state while the
+     *  first GetRooms round-trips (feedback 2026-09-01). */
+    seedRooms: List<LightServiceMethod.GetRooms.Room> = emptyList(),
 ) : LightViewModel<Unit>() {
 
     enum class Tab { DIRECT, GROUP }
@@ -76,7 +82,7 @@ class ContactsViewModel(
     /** In-panel search query; filters whichever tab is active. Blank = all. */
     val query = MutableStateFlow("")
     /** All rooms the companion reports; filtered + grouped by [entries]. */
-    val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
+    val rooms = MutableStateFlow(seedRooms)
 
     private var pollJob: Job? = null
 
@@ -138,7 +144,7 @@ class ContactsViewModel(
                         .map { it.first() }
                 } else list
             }
-            .filter { q.isEmpty() || it.name.contains(q, ignoreCase = true) }
+            .filter { q.isEmpty() || roomMatchesQuery(it, q) }
             .sortedBy { it.name.lowercase() }
             .map { room ->
                 Contact(
@@ -160,12 +166,15 @@ class ContactsScreen(
      *  starting point matters: opened from All the panel lists every contact,
      *  from WhatsApp only WhatsApp rooms (2026-08-30). */
     private val network: String? = null,
+    /** The census the panel was opened from — seeds the first frame (see
+     *  [ContactsViewModel]). */
+    private val seedRooms: List<LightServiceMethod.GetRooms.Room> = emptyList(),
 ) : LightScreen<Unit, ContactsViewModel>(sealedActivity) {
 
     override val viewModelClass: Class<ContactsViewModel>
         get() = ContactsViewModel::class.java
 
-    override fun createViewModel(): ContactsViewModel = ContactsViewModel(network)
+    override fun createViewModel(): ContactsViewModel = ContactsViewModel(network, seedRooms)
 
     @Composable
     override fun Content() {
@@ -229,18 +238,40 @@ class ContactsScreen(
                         )
                     } else {
                         LightLazyScrollView(
-                            // Two-line rows (network subtext from All) need the
+                            // Two-line rows (id + network subtext) need the
                             // taller uniform estimate; single-line otherwise.
-                            uniformItemHeightGridUnits = if (network == null) 3.8f else 2.6f,
+                            uniformItemHeightGridUnits = 3.8f,
                         ) {
                             items(entries, key = { it.key }) { contact ->
+                                // The community's own room (announcement room)
+                                // is named after the community — showing the
+                                // community subtag there repeats the name
+                                // (LP3 2026-09-01: "BERLIN SCENE LAB" read
+                                // "WhatsApp · BERLIN SCENE LAB").
+                                val community = contact.room.community?.takeUnless {
+                                    it.equals(contact.room.name, ignoreCase = true)
+                                }
+                                val subtext = (
+                                    if (network == null) {
+                                        listOfNotNull(
+                                            contact.room.network,
+                                            identifierOf(contact) ?: community,
+                                        ).joinToString(" · ")
+                                    } else {
+                                        identifierOf(contact) ?: community
+                                    }
+                                    ).takeIf { !it.isNullOrBlank() }
                                 ContactRow(
                                     contact = contact,
-                                    // Trial feature (2026-08-30): from All the
-                                    // network name is the row's subtext; inside
-                                    // a network's own panel it would repeat —
-                                    // left off.
-                                    subtext = if (network == null) contact.room.network else null,
+                                    // Subtext grammar (2026-09-01): from All the
+                                    // row reads "{Network} · {id}" (network alone
+                                    // when the id hasn't resolved yet); inside a
+                                    // network's own panel just the id — the
+                                    // network would repeat. Groups with no id
+                                    // show their community name in the id slot
+                                    // (WhatsApp community groups, feedback
+                                    // 2026-09-01).
+                                    subtext = subtext,
                                     onOpen = { openThread(contact) },
                                 )
                             }
@@ -328,9 +359,19 @@ private fun TabLabel(
     }
 }
 
-/** A contact row: the name, Heading, with the network as a light subtext line
- *  when present (the "from All" trial, 2026-08-30); the same leading inset as
- *  the room list (the SearchResultRow anatomy). */
+/** The row's display id — number/username from the companion's bridge
+ *  resolution, formatted ([contactIdentifier] adds the '@' to non-phones);
+ *  null for groups and unresolved contacts. */
+private fun identifierOf(contact: ContactsViewModel.Contact): String? =
+    contactIdentifier(contact.room.contactId, contact.room.name, contact.room.contactPhone)
+
+/** A contact row: the name, Heading, with the id — and the network when the
+ *  panel was opened from All — as a light subtext line (2026-08-30 trial,
+ *  extended 2026-09-01: the id joined the network in the subtext). The
+ *  leading inset (1.75 gu) sits the name where the room list's names land —
+ *  the contacts rows have no unread-star column, so the 2.75-gu padding the
+ *  search rows need to align with the starred list would float the names
+ *  clear of the edge (feedback 2026-09-01: too much buffer). */
 @Composable
 private fun ContactRow(
     contact: ContactsViewModel.Contact,
@@ -342,7 +383,7 @@ private fun ContactRow(
             .fillMaxWidth()
             .lightClickable(onClick = onOpen)
             .padding(
-                start = 2.75f.gridUnitsAsDp(),
+                start = 1.75f.gridUnitsAsDp(),
                 end = 0.5f.gridUnitsAsDp(),
                 top = 0.5f.gridUnitsAsDp(),
                 bottom = 0.5f.gridUnitsAsDp(),
@@ -355,7 +396,7 @@ private fun ContactRow(
             overflow = TextOverflow.Ellipsis,
         )
         if (subtext != null) {
-            // The network label, Superfine — smaller than the room name
+            // The id/network line, Superfine — smaller than the room name
             // (feedback 2026-08-30: subtext was too big; 2026-09-01: Detail
             // still too big).
             LightText(
