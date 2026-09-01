@@ -30,6 +30,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -142,7 +144,10 @@ import de.connect2x.trixnity.core.model.events.m.room.RoomMessageEventContent
 import de.connect2x.trixnity.core.model.events.m.space.ChildEventContent
 import de.connect2x.trixnity.core.model.events.m.secretstorage.DefaultSecretKeyEventContent
 import de.connect2x.trixnity.core.model.events.m.secretstorage.SecretKeyEventContent
+import de.connect2x.trixnity.core.model.events.ClientEvent
 import de.connect2x.trixnity.core.model.events.UnknownEventContent
+import de.connect2x.trixnity.core.subscribeEventList
+import de.connect2x.trixnity.core.unsubscribeOnCompletion
 import de.connect2x.trixnity.crypto.key.decodeRecoveryKey
 import de.connect2x.trixnity.crypto.olm.OlmEncryptionService
 import de.connect2x.trixnity.crypto.olm.OlmEncryptionServiceImpl
@@ -6743,6 +6748,7 @@ object MatrixRepository {
         observeSyncState(c)
         observeLoginState(c)
         observeNotifications(c)
+        observeSyncKeyRequests(c)
         // The room-list resolver's first pass seeds + warms the full room map,
         // so the tool's getRooms (a pure cache read) returns instantly.
         startRoomListResolver(c)
@@ -6805,6 +6811,64 @@ object MatrixRepository {
                 scheduleSyncStop()
             }
         }
+    }
+
+    /**
+     * Background key-request trigger (2026-09-01, Beeper cross-check): Beeper's
+     * core asks its own devices for missing megolm sessions the moment a sync
+     * round leaves an event undecryptable; we only requested on page open (see
+     * [requestMissingRoomKeys]). Subscribes to the sync event emitter — the same
+     * one the long-poll loop and every syncOnce round feed — and per round
+     * requests the sessions of megolm-encrypted events we don't hold. The
+     * handler dedupes pending requests and cancels them on import, so a key
+     * shared in the same round (races this store check) costs one redundant
+     * to-device event at most. The page-open trigger stays: it covers store
+     * reads (pagination walks) the sync stream never delivered.
+     */
+    private fun observeSyncKeyRequests(c: MatrixClient) {
+        val job = scope.launch {
+            try {
+                c.api.sync
+                    .subscribeEventList<
+                        EncryptedMessageEventContent.MegolmEncryptedMessageEventContent,
+                        ClientEvent.RoomEvent<EncryptedMessageEventContent.MegolmEncryptedMessageEventContent>
+                    > { events ->
+                        runCatching {
+                            val outgoing = c.di.get<OutgoingRoomKeyRequestEventHandler>()
+                            val olmStore = c.di.get<OlmCryptoStore>()
+                            val missing = events.mapNotNull { e ->
+                                val sessionId = e.content.sessionId
+                                if (olmStore.getInboundMegolmSession(sessionId, e.roomId).firstOrNull() != null) null
+                                else e.roomId to sessionId
+                            }.distinct()
+                            if (missing.isNotEmpty()) {
+                                android.util.Log.d(
+                                    TAG,
+                                    "sync key-request: ${missing.size} missing session(s) (${missing.first().second} …)",
+                                )
+                                // Hand the sends off: the emitter runs subscribers
+                                // serially, and a to-device round trip per missing
+                                // session must not hold up the round's other
+                                // subscribers (store writes, notification watchers).
+                                scope.launch {
+                                    missing.forEach { (roomId, sessionId) ->
+                                        outgoing.requestRoomKeys(roomId, sessionId)
+                                    }
+                                }
+                            }
+                        }.onFailure { e ->
+                            android.util.Log.w(TAG, "sync key-request: round scan failed: ${e.message}")
+                        }
+                    }
+                    .unsubscribeOnCompletion(this)
+                awaitCancellation()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "sync key-request observer ended: ${e.message}")
+            }
+        }
+        notificationWatcherJobs.add(job)
     }
 
     /**
