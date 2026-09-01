@@ -55,7 +55,8 @@ import kotlinx.coroutines.launch
  * rooms (title "WhatsApp", no subtext). SEARCH top-right filters the ACTIVE
  * tab's list (an in-panel query, not the room search): the editor title is
  * "Search Chats"/"Search {Network}" with the SEARCH icon, and the panel
- * title becomes "Search Results" while a query is active. Tapping a row
+ * title shows the searched term in quotes while a query is active
+ * (feedback 2026-09-01). Tapping a row
  * opens that thread; back from the thread pops the contacts list too,
  * landing on the main list (the SearchScreen pattern, feedback 2026-08-22).
  */
@@ -186,12 +187,13 @@ class ContactsScreen(
                         onClick = { goBack() },
                         contentDescription = "Back to chats",
                     ),
-                    // Title grammar (2026-08-30): the active search shows
-                    // "Search Results"; otherwise the network the panel was
-                    // opened from ("WhatsApp"), or "Chats" from All.
+                    // Title grammar (2026-08-30): the active search shows the
+                    // searched term in quotes (feedback 2026-09-01); otherwise
+                    // the network the panel was opened from ("WhatsApp"), or
+                    // "Chats" from All.
                     center = LightTopBarCenter.Text(
                         when {
-                            query.isNotBlank() -> "Search Results"
+                            query.isNotBlank() -> "'$query'"
                             network != null -> network
                             else -> "Chats"
                         },

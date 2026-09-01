@@ -311,15 +311,9 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                         if (account?.loggedIn == true) {
                             // Logged in: just the account status + actions — the
                             // login form (email/code) would be dead weight here.
-                            AccountStatus(
-                                userId = account?.userId,
-                                connection = connection,
-                            )
-                            // Once verified the row is status-only — no tap into
-                            // the Verify screen (nothing to do there anymore).
-                            // Mid-verification the row reads "Verifying" so a
-                            // back-out doesn't look like the state was lost
-                            // (feedback 2026-08-19).
+                            // The device-verification row leads the panel
+                            // (feedback 2026-09-01); the account name is not
+                            // shown, only the sync status.
                             EncryptionRow(
                                 e2ee = e2ee,
                                 settled = e2eeSettled,
@@ -329,6 +323,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                     { navigateTo(screenFactory = { VerificationScreen(it) }) }
                                 },
                             )
+                            AccountStatus(connection = connection)
                         } else {
                             // Logged out: if the session just expired, say so
                             // instead of showing a bare login form (the user
@@ -766,18 +761,11 @@ class LogoutConfirmPanel(
 
 @Composable
 private fun AccountStatus(
-    userId: String?,
     connection: LightServiceMethod.GetConnectionState.Response?,
 ) {
     Column(
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
     ) {
-        LightText(
-            text = userId ?: "Logged in",
-            // Settings-page row size (Heading + Detail captions) — feedback
-            // 2026-08-19: the account panel text must match the settings page.
-            variant = LightTextVariant.Heading,
-        )
         connection?.let { state ->
             val allSynced = state.state == "syncing" &&
                 state.roomsTotal > 0 && state.roomsResolved >= state.roomsTotal

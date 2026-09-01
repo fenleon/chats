@@ -1462,6 +1462,16 @@ private fun MessageRow(
                         modifier = Modifier.padding(top = 1.dp),
                     )
                 }
+                // A video row carries its caption under the "[Video]" marker —
+                // the marker keeps the media context, the caption the content
+                // (feedback 2026-09-01).
+                message.caption?.let { caption ->
+                    LightText(
+                        text = caption,
+                        variant = LightTextVariant.Paragraph,
+                        modifier = Modifier.padding(top = 1.dp),
+                    )
+                }
             }
             // An edited message shows a quiet "edited" tag under the body
             // (feedback 2026-08-27) — same grammar as the delivery labels.
@@ -1571,6 +1581,15 @@ private fun ImageMessageContent(
             lighten = true,
             modifier = Modifier.padding(top = 1.dp),
         )
+        // The caption still shows under the placeholder — the text row is all
+        // the context there is (feedback 2026-09-01).
+        message.caption?.let { caption ->
+            LightText(
+                text = caption,
+                variant = LightTextVariant.Paragraph,
+                modifier = Modifier.padding(top = 1.dp),
+            )
+        }
         return
     }
     Image(
@@ -1578,7 +1597,10 @@ private fun ImageMessageContent(
         contentDescription = message.body,
         contentScale = ContentScale.Fit,
         modifier = Modifier
-            .fillMaxWidth()
+            // Sized to the photo's own aspect rather than stretched to the row
+            // width: a tall photo caps at MAX_IMAGE_HEIGHT_DP and hugs the
+            // sender's edge via the row's End/Start alignment — no centered
+            // side-bars beside portrait shots (feedback 2026-09-01).
             .heightIn(max = MAX_IMAGE_HEIGHT_DP)
             .padding(top = 1.dp)
             .lightClickable(onClick = { onOpenImage(bytes) }),

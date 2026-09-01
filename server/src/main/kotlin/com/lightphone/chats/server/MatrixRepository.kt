@@ -6993,6 +6993,13 @@ object MatrixRepository {
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "[Photo]") to "image"
             is RoomMessageEventContent.FileBased.Audio ->
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note") to "audio"
+            is RoomMessageEventContent.FileBased.Video ->
+                // A video (incl. WhatsApp animated GIFs, which arrive as
+                // m.video) renders as the "[Video]" marker — there's no
+                // playback — with its caption under it via [Message.caption]
+                // (feedback 2026-09-01: the caption alone lost the video
+                // context).
+                "[Video]" to "text"
             is RoomMessageEventContent.TextBased -> {
                 // m.notice = bridge system messages ("Turned off disappearing
                 // messages", timer-set notices… — the mautrix bridge sends them
@@ -7032,15 +7039,15 @@ object MatrixRepository {
             durationMs = (content as? RoomMessageEventContent.FileBased.Audio)?.let { audio ->
                 audio.info?.duration ?: voiceDurationMsByEvent[te.event.id.full]
             },
-            // The image's caption (the m.image body — most clients put the
-            // caption there, separate from the file name). A caption that
-            // equals the file name is not a caption (feedback round 2026-08-19);
-            // neither is a bare file name — Signal's m.image body IS
-            // "image.jpg" with no caption (feedback 2026-08-27).
-            caption = (content as? RoomMessageEventContent.FileBased.Image)?.let { image ->
-                image.body.takeIf {
-                    it.isNotBlank() && it != image.fileName && !isBareImageFilename(it)
-                }
+            // The media caption (the m.image / m.video body — most clients put
+            // the caption there, separate from the file name). A caption that
+            // equals the file name is not a caption (feedback round
+            // 2026-08-19); neither is a bare file name — Signal's m.image body
+            // IS "image.jpg" with no caption (feedback 2026-08-27).
+            caption = when (content) {
+                is RoomMessageEventContent.FileBased.Image -> captionOf(content)
+                is RoomMessageEventContent.FileBased.Video -> captionOf(content)
+                else -> null
             },
             edited = edited && contentType == "text",
         )
@@ -7051,20 +7058,30 @@ object MatrixRepository {
             c.user.getById(roomId, sender).firstOrNull()?.name
         } ?: sender.localpart
 
-    /** A bare image file name ("image.jpg") is not a caption — no whitespace,
-     *  ends with a common image extension. Signal's m.image body is exactly
-     *  that when the photo has no caption (feedback 2026-08-27). */
-    private fun isBareImageFilename(body: String): Boolean {
+    /** The sender's caption for a media message — the m.image / m.video body
+     *  (most clients put the caption there, separate from the file name). A
+     *  caption that equals the file name is not a caption (feedback round
+     *  2026-08-19); neither is a bare file name — Signal's m.image body IS
+     *  "image.jpg" with no caption (feedback 2026-08-27). */
+    private fun captionOf(file: RoomMessageEventContent.FileBased): String? =
+        file.body.takeIf {
+            it.isNotBlank() && it != file.fileName && !isBareFilename(it)
+        }
+
+    /** A bare media file name ("image.jpg", "VID_2024.mp4") is not a caption —
+     *  no whitespace, ends with a common image/video extension. */
+    private fun isBareFilename(body: String): Boolean {
         if (body.any { it.isWhitespace() }) return false
         val dot = body.lastIndexOf('.')
         if (dot <= 0 || dot == body.length - 1) return false
         val ext = body.substring(dot + 1)
         return ext.length <= 5 && ext.all { it.isLetter() } &&
-            ext.lowercase() in BARE_IMAGE_EXTENSIONS
+            ext.lowercase() in BARE_MEDIA_EXTENSIONS
     }
 
-    private val BARE_IMAGE_EXTENSIONS = setOf(
+    private val BARE_MEDIA_EXTENSIONS = setOf(
         "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "svg", "avif",
+        "mp4", "mov", "m4v", "mkv", "webm", "avi", "3gp",
     )
 
     /** Human-readable text for a timeline event; null for events with nothing to show.

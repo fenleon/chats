@@ -159,6 +159,7 @@ class SearchScreen(
         val showResults by viewModel.showResults.collectAsState()
         val dmsOnly by viewModel.dmsOnly.collectAsState()
         val rooms by viewModel.rooms.collectAsState()
+        val query by viewModel.query.collectAsState()
 
         LightTheme(colors = themeColors) {
             Box(modifier = Modifier.fillMaxSize()) {
@@ -176,6 +177,7 @@ class SearchScreen(
                             onBackToQuery = { viewModel.showResults.value = false },
                             onOpenRoom = ::openThread,
                             results = viewModel.matchingRooms(rooms),
+                            query = query,
                         )
                     } else {
                         QueryView(
@@ -242,7 +244,9 @@ private fun QueryView(
 
 /** The results view: matching rooms alphabetically ("no chats found" when
  *  nothing matches), a bottom-middle VIEW DIRECT / VIEW ALL mode switch, and
- *  a back arrow returning to the query. VIEW DIRECT by default. */
+ *  a back arrow returning to the query. VIEW DIRECT by default. The top bar
+ *  shows the searched term in quotes instead of "Search Results" (feedback
+ *  2026-09-01). */
 @Composable
 private fun ColumnScope.ResultsView(
     dmsOnly: Boolean,
@@ -250,6 +254,7 @@ private fun ColumnScope.ResultsView(
     onBackToQuery: () -> Unit,
     onOpenRoom: (LightServiceMethod.GetRooms.Room) -> Unit,
     results: List<LightServiceMethod.GetRooms.Room>,
+    query: String,
 ) {
     LightTopBar(
         leftButton = LightBarButton.LightIcon(
@@ -257,7 +262,9 @@ private fun ColumnScope.ResultsView(
             onClick = onBackToQuery,
             contentDescription = "Back to search",
         ),
-        center = LightTopBarCenter.Text("Search Results"),
+        center = LightTopBarCenter.Text(
+            if (query.isBlank()) "Search Results" else "'${query.trim()}'",
+        ),
     )
     Box(modifier = Modifier.weight(1f)) {
         if (results.isEmpty()) {
