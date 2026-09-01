@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.net.Uri
 import android.os.IBinder
 import android.os.Parcel
 import android.os.SystemClock
@@ -72,6 +73,36 @@ object PlatformRelay {
                 Log.e(TAG, "DeviceKeyEvent not relayed (code=${request.keyCode} action=${request.action}) in ${ms}ms")
             } else {
                 Log.d(TAG, "DeviceKeyEvent relayed (code=${request.keyCode} action=${request.action}) in ${ms}ms")
+            }
+        }
+    }
+
+    /**
+     * Open the dialer prefilled with [phoneNumber] (contact panel CALL,
+     * 2026-09-01). Explicit ACTION_DIAL to the AOSP dialer (the toolbox
+     * "Phone" entry on the LP3, same component on the emulator): an implicit
+     * DIAL resolves to com.lightos/.MainActivity, which just resumes home and
+     * swallows the intent; LightOS's OpenDialer RPC is also a no-op on current
+     * firmware. Fire-and-forget off the binder thread; NEW_TASK because we
+     * launch from a service context. The tool is foreground at tap time, so
+     * no background-activity-launch block.
+     */
+    fun openDialer(context: Context, phoneNumber: String) {
+        relayExecutor.execute {
+            try {
+                context.startActivity(
+                    Intent(Intent.ACTION_DIAL, Uri.parse("tel:$phoneNumber"))
+                        .setComponent(
+                            ComponentName(
+                                "com.android.dialer",
+                                "com.android.dialer.main.impl.MainActivity",
+                            ),
+                        )
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+                Log.d(TAG, "OpenDialer: launching dialer for $phoneNumber")
+            } catch (e: Exception) {
+                Log.e(TAG, "OpenDialer failed for $phoneNumber", e)
             }
         }
     }

@@ -113,6 +113,12 @@ class ServerBootstrapProvider : ContentProvider() {
             // POST_NOTIFICATIONS through the SDK flow; this APK hosts the AOSP
             // dialog activity (ChatsPermissionActivity) and adds the
             // notification permission to the grantable set.
+            // Contact panel CALL (2026-09-01): open the dialer prefilled with
+            // the contact's number. Explicit ACTION_DIAL to the AOSP dialer
+            // (the LP3 toolbox "Phone" entry): implicit DIAL resolves to
+            // com.lightos/.MainActivity which swallows the intent, and
+            // LightOS's OpenDialer RPC is a no-op on current firmware.
+            onOpenDialer = { _, phoneNumber -> PlatformRelay.openDialer(context, phoneNumber) }
             permissionActivity = ChatsPermissionActivity::class.java
             androidPermissionAllowed = { _, permissionName ->
                 permissionName in setOf(

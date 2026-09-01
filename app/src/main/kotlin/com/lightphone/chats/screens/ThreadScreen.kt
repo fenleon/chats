@@ -47,6 +47,7 @@ import com.lightphone.chats.VolumePanelState
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
+import com.lightphone.chats.isPhoneLike
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -221,6 +222,16 @@ class ThreadViewModel(
         val next = !archived.value
         archived.value = next
         viewModelScope.launch { ChatClient.setRoomArchived(room.id, next) }
+    }
+
+    /**
+     * Opens the native dialer prefilled with the contact's number (contact
+     * panel CALL, 2026-09-01). No-op without a dialable number — the panel
+     * only shows the CALL icon when [room.contactPhone] is one.
+     */
+    fun callContact() {
+        val number = room.contactPhone?.takeIf { it.isPhoneLike() } ?: return
+        viewModelScope.launch { ChatClient.openDialer(number) }
     }
 
     /**
@@ -1189,6 +1200,8 @@ class ThreadScreen(
                 community = room.community,
                 contactIdentifier(room.contactId, room.name, room.contactPhone),
                 room.contactPhone,
+                // Contact panel CALL (2026-09-01): only with a dialable number.
+                onCall = if (room.contactPhone?.isPhoneLike() == true) viewModel::callContact else null,
                 muted = viewModel.muted,
                 onToggleMute = viewModel::toggleMuted,
                 pinned = viewModel.pinned,

@@ -34,7 +34,8 @@ import kotlinx.coroutines.flow.StateFlow
  * room name opens a minimal contact page — Name, the other party's
  * identifier (same size as the name, second line; 2026-09-01), and the
  * network underneath as the small subtext (WhatsApp / Instagram). No top
- * bar; the bottom bar carries only an X in the middle to dismiss. The
+ * bar; the bottom bar carries an X in the middle to dismiss, and a CALL icon
+ * bottom-left when the contact has a dialable number (2026-09-01). The
  * identity block stays centered in the upper area; the PIN / MUTE / ARCHIVE
  * toggles stack below it, bottom-anchored just above the bottom bar (LP3
  * feedback 2026-08-28).
@@ -68,6 +69,12 @@ class ContactScreen(
      * (phone-ghost contacts), otherwise the companion-resolved phone.
      */
     private val phone: String? = null,
+    /**
+     * Opens the native dialer prefilled with the contact's number (CALL icon,
+     * bottom-left, 2026-09-01). Null = no dialable number — no CALL icon. The
+     * dialer prefills only; the user still presses call, no accidental calls.
+     */
+    private val onCall: (() -> Unit)? = null,
     /**
      * Mute state (2026-08-23): the MUTE button under the network line reads
      * MUTE / UNMUTE; muting stops notifications for the room while the unread
@@ -203,7 +210,17 @@ class ContactScreen(
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
-                        null,
+                        // Contact panel CALL (2026-09-01): bottom-left, only
+                        // when the contact has a dialable number.
+                        if (onCall != null) {
+                            LightBarButton.LightIcon(
+                                icon = LightIcons.CALL,
+                                onClick = onCall,
+                                contentDescription = "Call contact",
+                            )
+                        } else {
+                            null
+                        },
                         LightBarButton.LightIcon(
                             icon = LightIcons.CLOSE,
                             // Pop with a Unit result so the caller's navigateTo

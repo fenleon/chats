@@ -140,7 +140,7 @@ fun contactIdentifier(contactId: String?, displayName: String, resolved: String?
 /** Whether a display id is a phone number: an optional leading + and 7-15
  *  digits, ignoring the spaces [formatBridgePhone] adds. Everything else
  *  (usernames, ghost localparts) is a user id and renders with '@'. */
-private fun String.isPhoneLike(): Boolean {
+internal fun String.isPhoneLike(): Boolean {
     val digits = filter { it.isDigit() }
     return digits.length in 7..15 && (startsWith("+") || all { it.isDigit() })
 }

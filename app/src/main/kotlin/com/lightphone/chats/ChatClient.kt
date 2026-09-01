@@ -137,6 +137,18 @@ object ChatClient {
         )
     }
 
+    /**
+     * Opens the native dialer prefilled with [phoneNumber] (contact panel
+     * CALL, 2026-09-01): the companion relays OpenDialer to LightOS, which
+     * launches the dialer — the user still presses call, no accidental calls.
+     */
+    suspend fun openDialer(phoneNumber: String) {
+        callRemoteServiceMethod(
+            LightServiceMethod.OpenDialer,
+            LightServiceMethod.OpenDialer.Request(phoneNumber),
+        )
+    }
+
     /** Mutes/unmutes [roomId]'s notifications (contact panel, 2026-08-23). */
     suspend fun setRoomMuted(roomId: String, muted: Boolean) {
         callRemoteServiceMethod(

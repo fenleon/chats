@@ -27,6 +27,16 @@
         android:name="android.permission.CAMERA"
         tools:node="remove" />
 
+    <!-- ACTION_DIAL visibility (Android 11+): the server opens the dialer
+         prefilled from the contact panel CALL icon; without this the implicit
+         intent can't resolve (AppsFilter blocks chats -> dialer on the LP3). -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+            <data android:scheme="tel" />
+        </intent>
+    </queries>
+
     <!-- The tool's generated manifest provides the application class
          (LightSdkApplication), label, and theme; the library contributes only
          components + attributes that don't conflict (cleartext HTTP so a
