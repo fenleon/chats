@@ -471,6 +471,16 @@ object MatrixRepository {
      *  CPU on this account (battery 2026-08-17 audit). */
     private var lastPushWakeSyncAtMs = 0L
 
+    /** The default network dropped — the next [networkCallback] onAvailable
+     *  resets the sync loop (Beeper's `networkChanged`/`resetNetworkConnections`,
+     *  2026-09-01). */
+    @Volatile
+    private var networkWasLost = false
+
+    /** Elapsed-realtime of the last network-triggered sync reset. */
+    @Volatile
+    private var lastNetworkResetAtMs = 0L
+
     /** Pending debounced push-wake sync (see [onPushDelivered]); restarted per
      *  real-message push so a burst coalesces to one syncOnce. */
     private var pushWakeJob: Job? = null
@@ -515,19 +525,22 @@ object MatrixRepository {
      *  window's pending wakes into a single sync, at ~1s latency. */
     private const val PUSH_WAKE_DEBOUNCE_MS = 1_000L
 
+    /** Min gap between network-triggered sync restarts (flappy-radio guard,
+     *  2026-09-01 — see [networkCallback]). */
+    private const val NETWORK_RESET_MIN_INTERVAL_MS = 60_000L
+
     /**
      * Per-room timeline window the sync filters request (PLAN §8.1, 2026-08-28):
      * bounds each room's per-/sync payload — the 30-50 s CPU per sync on the
      * 1284-room account was mostly pages of timeline events nobody read. 50 is
      * high enough to never truncate a busy bridged room's burst: Trixnity marks
      * `limited` syncs but never backfills, so a truncated burst is a silent
-     * message gap. The syncOnce (background rounds + push wakes) uses 20 —
-     * cheaper while idle, and push wakes drain active bursts.
-     *  ponytail: 20 is a session value — bump toward 50 if gaps appear on the
-     *  LP3 (each round is cheap now, so 50 costs little).
+     * message gap. One limit for the long-poll AND the syncOnce (background
+     * rounds + push wakes — the syncOnce's 20 was raised to 50 on 2026-09-01:
+     * a bridged burst >20 truncated the wake's syncOnce and the rest only
+     * arrived on the next 5/15-min round).
      */
     private const val SYNC_TIMELINE_LIMIT = 50L
-    private const val SYNC_ONCE_TIMELINE_LIMIT = 20L
 
     /** Screen on/off → sync cadence. Registered on the app context in [init],
      *  so it lives as long as the process (which the FGS keeps alive). */
@@ -551,6 +564,45 @@ object MatrixRepository {
                     // page rebuild (SQL chain walk + key-backup restore + API
                     // re-reads). Nobody is looking while the screen is off.
                     stopActiveRoomRefresh()
+                }
+            }
+        }
+    }
+
+    /**
+     * Network-loss recovery (2026-09-01, mirrors Beeper's
+     * `networkChanged`/`resetNetworkConnections`): a transport drop can leave
+     * Trixnity's sync loop dead until its internal retry or the watchdog
+     * fires — reset it as soon as the network is back. Registered on the app
+     * context in [init], process-lifetime like [screenReceiver].
+     */
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onLost(network: android.net.Network) {
+            // Don't act yet — the radio may flap; the reset fires once the
+            // next onAvailable proves the transport is really back.
+            networkWasLost = true
+        }
+
+        override fun onAvailable(network: android.net.Network) {
+            if (!networkWasLost) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastNetworkResetAtMs < NETWORK_RESET_MIN_INTERVAL_MS) return
+            networkWasLost = false
+            lastNetworkResetAtMs = now
+            val c = client ?: return
+            scope.launch {
+                runCatching { c.stopSync() }
+                android.util.Log.d(TAG, "network back after loss — resetting sync loop")
+                if (isScreenInteractive() && syncEnabled) {
+                    // Restart through the supervised loop — a fresh supervisor
+                    // also resets its backoff, so a mid-30s delay doesn't delay
+                    // the resume. A dark screen must NOT start a long-poll and a
+                    // paused sync must stay paused: that branch goes through the
+                    // shared screen → cadence entry point (both gates live in it).
+                    inProcessSyncRunning = false
+                    startSyncLoop(appContext ?: return@launch)
+                } else {
+                    applySyncModeForScreenState()
                 }
             }
         }
@@ -583,6 +635,12 @@ object MatrixRepository {
             },
             Context.RECEIVER_NOT_EXPORTED,
         )
+        // Network-loss recovery (2026-09-01): reset the sync loop when the
+        // transport returns — Trixnity can sit dead until its internal retry.
+        // The initial onAvailable for the current default network is a no-op
+        // (networkWasLost starts false).
+        (app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+            ?.registerDefaultNetworkCallback(networkCallback)
         // Booted with the screen already dark: no SCREEN_OFF broadcast is
         // coming — drop to slow sync after the grace instead of long-polling
         // with nobody watching.
@@ -7039,7 +7097,7 @@ object MatrixRepository {
         syncOnceFilter = Filters(
             presence = Filters.EventFilter(notTypes = setOf("*")),
             room = Filters.RoomFilter(
-                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_ONCE_TIMELINE_LIMIT),
+                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT),
                 ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing", "m.receipt")),
             ),
         )
