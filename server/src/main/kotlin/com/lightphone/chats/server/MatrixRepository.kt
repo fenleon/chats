@@ -3526,6 +3526,22 @@ object MatrixRepository {
         return readEventIds
     }
 
+    /** The event id of our own latest m.read receipt in [matrixRoomId], or
+     *  null when the thread was never opened (no receipt) or the read state
+     *  isn't readable yet. Used by the notification watcher to tell "already
+     *  seen" from "genuinely unread" at room-registration time. */
+    private suspend fun ownReadReceiptId(c: MatrixClient, matrixRoomId: RoomId): String? =
+        withTimeoutOrNull(MESSAGES_BUDGET_MS) {
+            // Direct repository reads need an explicit store transaction (the
+            // flow APIs set it up themselves; see [readReceiptsByEvent]).
+            val txManager = c.di.get<StoreTransactionManager>(StoreTransactionManager::class)
+            txManager.readTransaction {
+                c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class)
+                    .get(matrixRoomId)[c.userId]
+                    ?.receipts?.get(ReceiptType.Read)?.eventId?.full
+            }
+        }
+
     /** Collects a room's timeline events (newest first), null cursor = newest page. */
     private suspend fun collectTimelineEvents(
         c: MatrixClient,
@@ -4854,8 +4870,15 @@ object MatrixRepository {
             }
             event
         }
-        val content = te?.content?.getOrNull()
-        if (content !is RoomMessageEventContent.FileBased.Image) return null
+        val content = when (val raw = te?.content?.getOrNull()) {
+            // Beeper's RCS bridge sends direct photos as m.file with an image/*
+            // mimetype instead of m.image (feedback 2026-09-01) — accept both,
+            // or RCS image attachments stay on their text fallback forever.
+            is RoomMessageEventContent.FileBased.Image -> raw
+            is RoomMessageEventContent.FileBased.File ->
+                if (raw.info?.mimeType?.startsWith("image/", ignoreCase = true) == true) raw else null
+            else -> null
+        } ?: return null
         // Some clients post m.image events with an empty url (a failed upload,
         // or a bot artifact) — those have no media to fetch, ever. Blanking the
         // uri here keeps the fetch branch below from calling
@@ -5231,19 +5254,51 @@ object MatrixRepository {
                     android.util.Log.w(TAG, "flag watcher: push-rule collector ended: ${e.message}")
                 }
             }.also { notificationWatcherJobs.add(it) }
+            // Settle flags (first-message ping drop fix, 2026-09-02): a room whose
+            // newest message is already unread when its collector starts — or whose
+            // first message arrives right after (it registered empty) — may notify
+            // instead of being baselined as history. "Settled" means the account is
+            // past (or never had) an initial-sync backfill: a fresh login streams
+            // every unread room through INITIAL_SYNC, and notifying then would
+            // replay old history as a notification storm. Warm restarts (stored
+            // session) never run INITIAL_SYNC, so the first STARTED/RUNNING
+            // emission settles immediately and live arrivals right after launch
+            // still notify. Atomic: written by this state collector, read by the
+            // per-room collectors below on other threads.
+            val seenInitialSync = java.util.concurrent.atomic.AtomicBoolean(false)
+            val settled = java.util.concurrent.atomic.AtomicBoolean(false)
+            scope.launch {
+                try {
+                    c.syncState.collect { state ->
+                        when (state) {
+                            SyncState.INITIAL_SYNC -> seenInitialSync.set(true)
+                            SyncState.RUNNING -> settled.set(true)
+                            SyncState.STARTED -> if (!seenInitialSync.get()) settled.set(true)
+                            else -> {}
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "notification watcher: sync-state collector ended: ${e.message}")
+                }
+            }.also { notificationWatcherJobs.add(it) }
             try {
                 // roomId.full -> last relevant event id seen so far ("" = none yet).
                 val seen = java.util.concurrent.ConcurrentHashMap<String, String>()
                 // roomId.full -> collector launched (dedup against map re-emissions).
                 val registered = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
                 var watched = 0
+                // Rooms already in the store when the watcher attaches were seen
+                // by an earlier process: unread there means messages arrived while
+                // the app was down, and they MUST notify at registration. Rooms
+                // that appear later are new — those need the settle gate below
+                // (a cold login's first emission can race the wipe and be non-empty).
+                var knownAtStart: Set<String>? = null
                 c.room.getAll().collect { rooms ->
+                    val knownRooms = knownAtStart
+                        ?: rooms.keys.mapTo(java.util.HashSet()) { it.full }.also { knownAtStart = it }
                     for ((roomId, roomFlow) in rooms) {
                         val key = roomId.full
                         if (!registered.add(key)) continue
-                        // No preload here: the collector's first emission
-                        // establishes the baseline (rooms already synced are not
-                        // notified), and later emissions notify for new ones.
                         val job = scope.launch {
                             try {
                                 // The v5 badge feed: room.unreadMessageCount is
@@ -5259,6 +5314,54 @@ object MatrixRepository {
                                             if (unreadCounts[key] != count) {
                                                 unreadCounts[key] = count
                                                 roomListDirty = true
+                                            }
+                                        }
+                                    }
+                                    // First-message ping drop (LP3 feedback 2026-09-02):
+                                    // a room whose newest message is ALREADY in the
+                                    // store when its collector starts — the room was
+                                    // created by that first message (bridge/RCS first
+                                    // contact), or the app was down when it arrived —
+                                    // used to be baselined as "history" below and never
+                                    // notified until a second message came. Notify once
+                                    // for the newest event when the room is genuinely
+                                    // unread: either it predates this process (known —
+                                    // unread = arrived while we were down) or the account
+                                    // has settled past its initial-sync backfill (new
+                                    // post-settle rooms are live arrivals). `seen` is
+                                    // pre-seeded with the notified event so the collector
+                                    // below doesn't notify it a second time. A room with
+                                    // NO relevant event yet (registered empty) has
+                                    // nothing to pre-seed — instead `emptyAtReg` lets the
+                                    // collector's baseline branch below notify its first
+                                    // arriving event (the app was down for the first
+                                    // message in a brand-new room).
+                                    val regRoom = roomFlow.filterNotNull().firstOrNull()
+                                    val regLastId = regRoom?.lastRelevantEventId?.full
+                                    val emptyAtReg = regLastId == null
+                                    if (regRoom != null && regLastId != null &&
+                                        regRoom.membership == Membership.JOIN
+                                    ) {
+                                        seen[key] = regLastId
+                                        if (key in knownRooms || settled.get()) {
+                                            // The user's own m.read receipt (sent when the
+                                            // thread was last opened, [markRead]) is the
+                                            // ground truth for "already seen" — the
+                                            // NotificationService count (getCount) never
+                                            // tracks messages in this app, so a getCount
+                                            // gate stays 0 and eats the first message
+                                            // (verified 2026-09-02). A receipt behind the
+                                            // newest event — or none at all (thread never
+                                            // opened) — means genuinely unread: notify once.
+                                            val ownRead = ownReadReceiptId(c, roomId)
+                                            if (ownRead != regLastId) {
+                                                android.util.Log.d(
+                                                    TAG,
+                                                    "notification watcher: $key registered with unread newest " +
+                                                        "(${if (key in knownRooms) "known" else "new post-settle"}, " +
+                                                        "ownRead=$ownRead) — notifying for first message",
+                                                )
+                                                notifyForEvent(c, roomId, regLastId, regRoom)
                                             }
                                         }
                                     }
@@ -5283,9 +5386,18 @@ object MatrixRepository {
                                         val prev = seen[key]
                                         if (prev == null) {
                                             // Baseline: the first loaded state is
-                                            // already-synced history, never notified.
-                                            seen[key] = lastId
-                                            return@collect
+                                            // already-synced history, never notified —
+                                            // EXCEPT a room that registered empty
+                                            // ([emptyAtReg], see above): once the account
+                                            // has settled past its initial-sync backfill,
+                                            // that first event is a live arrival, not
+                                            // replayed history — fall through to the
+                                            // notify path below (the app was down when a
+                                            // brand-new room's first message arrived).
+                                            if (!(emptyAtReg && settled.get())) {
+                                                seen[key] = lastId
+                                                return@collect
+                                            }
                                         }
                                         if (prev != lastId) {
                                             seen[key] = lastId
@@ -7486,6 +7598,13 @@ object MatrixRepository {
                 // (feedback 2026-09-01: the caption alone lost the video
                 // context).
                 "[Video]" to "text"
+            is RoomMessageEventContent.FileBased.File ->
+                // RCS direct photos arrive as m.file with an image/* mimetype
+                // (feedback 2026-09-01) — render those as image rows so the
+                // media actually fetches; other m.file stays a "[File]" row.
+                if (content.info?.mimeType?.startsWith("image/", ignoreCase = true) == true)
+                    (content.fileName?.takeIf { it.isNotBlank() } ?: "[Photo]") to "image"
+                else "[File]" to "text"
             is RoomMessageEventContent.TextBased -> {
                 // m.notice = bridge system messages ("Turned off disappearing
                 // messages", timer-set notices… — the mautrix bridge sends them
@@ -7589,6 +7708,10 @@ object MatrixRepository {
                         // the room list (feedback round 2026-08-19).
                         content.body.takeIf { it.isNotBlank() && it != content.fileName }
                             ?.take(MAX_PREVIEW_LENGTH) ?: "[Photo]"
+                    // RCS direct photos are m.file + image/* (feedback 2026-09-01).
+                    is RoomMessageEventContent.FileBased.File ->
+                        if (content.info?.mimeType?.startsWith("image/", ignoreCase = true) == true) "[Photo]"
+                        else "[File]"
                     is RoomMessageEventContent.FileBased.Video -> "[Video]"
                     is RoomMessageEventContent.FileBased.Audio -> "[Audio]"
                     else -> "[File]"

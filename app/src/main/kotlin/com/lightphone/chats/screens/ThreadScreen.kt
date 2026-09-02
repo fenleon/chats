@@ -1594,11 +1594,17 @@ private fun ImageMessageContent(
     if (bytes == null || image == null) {
         // Still loading, or the media can't be fetched/decoded (e.g.
         // still-encrypted): fall back to the row text ("[Photo]" or the file
-        // name).
+        // name). A failed/skipped fetch (no bytes) is worth one more tap —
+        // re-run it without leaving the thread (feedback 2026-09-01: RCS
+        // attachments time out). Decode failures (bytes but no bitmap) stay
+        // dead text; re-fetching would not help.
+        val bodyModifier =
+            if (bytes == null) Modifier.lightClickable(onClick = { onEnsureMedia(message.id, allowMobile) })
+            else Modifier
         LightText(
             text = message.body,
             variant = LightTextVariant.Paragraph,
-            modifier = Modifier.padding(top = 1.dp),
+            modifier = bodyModifier.padding(top = 1.dp),
         )
         // The caption still shows under the placeholder — the text row is all
         // the context there is (feedback 2026-09-01).
