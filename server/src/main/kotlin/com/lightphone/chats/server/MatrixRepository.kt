@@ -323,6 +323,11 @@ object MatrixRepository {
          *  copy failed; sending still works, the pending row just can't
          *  play until the echo resolves. */
         val localFile: java.io.File? = null,
+        /** Real event id once the homeserver acks the send (/send 200 — see
+         *  [sendVoiceNote]). Cached because Trixnity removes the outbox row as
+         *  soon as the sync echo processes, so a served pending row could
+         *  otherwise fall back to the "local-…" id → SENDING (2026-09-02). */
+        val eventId: String? = null,
     ) : PendingSend
 
     /**
@@ -2485,6 +2490,7 @@ object MatrixRepository {
                 pendingEchoRow(
                     c, RoomId(roomId), pending.txnId, pending.timestampMs,
                     body = "Voice note", contentType = "audio", durationMs = pending.durationMs,
+                    cachedEventId = pending.eventId,
                 ),
             )
         }
@@ -2858,12 +2864,15 @@ object MatrixRepository {
         body: String,
         contentType: String = "text",
         durationMs: Long? = null,
+        /** Real event id cached on the pending at ack time — the outbox row
+         *  (the other source of the id) is removed once the echo processes. */
+        cachedEventId: String? = null,
     ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message {
         val outbox = withTimeoutOrNull(OUTBOX_READ_TIMEOUT_MS) {
             c.room.getOutbox(matrixRoomId, txnId).first()
         }
         return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
-            id = outbox?.eventId?.full ?: "$LOCAL_PENDING_ID_PREFIX$txnId",
+            id = outbox?.eventId?.full ?: cachedEventId ?: "$LOCAL_PENDING_ID_PREFIX$txnId",
             sender = c.userId.full,
             senderName = "",
             body = body,
@@ -2910,13 +2919,13 @@ object MatrixRepository {
                 // m.audio + org.matrix.msc3245.voice, see [sendVoiceNote]).
                 is RoomMessageEventContent.FileBased.Audio -> if (putPendingIfAbsent(
                         pendingAudioEcho, roomKey, om.transactionId,
-                        PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null),
+                        PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null, eventId = om.eventId?.full),
                     )) rebuilt++
                 is RoomMessageEventContent.Unknown ->
                     if (content.type == RoomMessageEventContent.FileBased.Audio.TYPE &&
                         putPendingIfAbsent(
                             pendingAudioEcho, roomKey, om.transactionId,
-                            PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null),
+                            PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null, eventId = om.eventId?.full),
                         )
                     ) rebuilt++
                 else -> {}
@@ -3198,6 +3207,7 @@ object MatrixRepository {
                 pendingEchoRow(
                     c, matrixRoomId, a.txnId, a.timestampMs,
                     body = "Voice note", contentType = "audio", durationMs = a.durationMs,
+                    cachedEventId = a.eventId,
                 )
             },
         )
@@ -4068,6 +4078,122 @@ object MatrixRepository {
         return true
     }
 
+    // --- Media HTTP self-heal (2026-09-02) ----------------------------------
+    // LP3: the newest voice notes in a room stopped playing — every tap timed
+    // out at MEDIA_BUDGET_MS while /sync (a long-lived request on the SAME
+    // shared engine) kept delivering and host/device curl fetched the same
+    // files in <1s. New requests starved while already-running ones survived:
+    // an in-process wedge in the shared OkHttp engine. Only a process restart
+    // cleared it. These counters + rebuild make the stack self-heal instead.
+
+    /** Consecutive voice-media download timeouts while the network is up. */
+    @Volatile private var consecutiveMediaStalls = 0
+    /** A self-heal is armed/pending — new plays wait for it before fetching. */
+    @Volatile private var mediaStackSick = false
+    @Volatile private var mediaHealInFlight = false
+    @Volatile private var lastMediaHealAtMs = 0L
+
+    /** A voice-media fetch timed out: count it, and heal the HTTP stack once
+     *  the pattern (consecutive timeouts, network up) says it is wedged. */
+    private fun noteMediaFetchTimeout() {
+        if (!networkIsUp()) return
+        val stalls = ++consecutiveMediaStalls
+        if (stalls < MEDIA_STALL_HEAL_THRESHOLD || mediaHealInFlight) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastMediaHealAtMs < MEDIA_STALL_HEAL_MIN_INTERVAL_MS) return
+        lastMediaHealAtMs = now
+        mediaStackSick = true
+        android.util.Log.w(
+            TAG,
+            "media stack wedged: $stalls consecutive download timeouts with the network up — self-healing the HTTP stack",
+        )
+        scope.launch { runCatching { selfHealHttpStack() } }
+    }
+
+    /** A fetch completed (success or fast failure) — the stack is responsive. */
+    private fun noteMediaFetchSuccess() {
+        consecutiveMediaStalls = 0
+    }
+
+    /** Whether a validated default network exists (heal gate — a genuinely
+     *  dead/slow link must not look like an engine wedge). */
+    private fun networkIsUp(): Boolean {
+        val cm = appContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        val network = cm.activeNetwork ?: return false
+        return cm.getNetworkCapabilities(network)
+            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+    }
+
+    /**
+     * In-process restart-equivalent for the HTTP stack: stops the current
+     * client, builds a FRESH OkHttp engine, restores the session from the Room
+     * store (the same path a process boot takes — no fresh auth needed), and
+     * re-arms sync per screen state. Runs only after
+     * [MEDIA_STALL_HEAL_THRESHOLD] consecutive media timeouts with the network
+     * up, so rebuild churn on slow links is bounded by the cooldown. Session
+     * state (room list, e2ee cache, pending sends) is deliberately kept — the
+     * store is untouched, only the client/engine are replaced.
+     */
+    private suspend fun selfHealHttpStack() {
+        val ctx = appContext ?: return
+        if (!mediaHealInFlight) initMutex.withLock {
+            if (mediaHealInFlight) return@withLock
+            val old = client
+            if (old == null) return@withLock
+            mediaHealInFlight = true
+            try {
+                runCatching { old.stopSync() }
+                inProcessSyncJob?.cancel()
+                inProcessSyncJob = null
+                inProcessSyncRunning = false
+                slowSyncJob?.cancel()
+                slowSyncJob = null
+                screenOffJob?.cancel()
+                screenOffJob = null
+                syncMode = SyncMode.ACTIVE
+                PushChannel.stop()
+                // A fresh engine: the old one is the wedged layer, and every
+                // ktor client captures the engine at MatrixClient.create time
+                // (see [clientConfiguration]), so new clients must be built
+                // against the new engine.
+                httpClientEngine = buildHttpClientEngine()
+                val restored = runCatching {
+                    MatrixClient.create(
+                        repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+                        mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
+                        cryptoDriverModule = CryptoDriverModule.libOlm(),
+                        authProviderData = null, // restore from the store
+                        configuration = clientConfiguration("chats"),
+                    ).getOrThrow()
+                }.onFailure { e ->
+                    android.util.Log.w(TAG, "self-heal: session restore failed: $e")
+                }.getOrNull()
+                if (restored == null) {
+                    // Restore failed — keep the old client; it may still serve.
+                    // (The store row is intact, so a later ensureClient / boot
+                    // restore succeeds.) The engine var already points at a
+                    // fresh engine for that next create.
+                    return@withLock
+                }
+                client = restored
+                observeClient(restored)
+                // Close the wedged stack now that its replacement is live
+                // (bounded: closing an engine with stalled in-flight calls
+                // must not hang the heal and hold initMutex).
+                withTimeoutOrNull(10_000L) { runCatching { old.closeSuspending() } }
+                android.util.Log.w(TAG, "self-heal: HTTP stack rebuilt for ${restored.userId.full}")
+                if (syncEnabled) {
+                    PushChannel.start(ctx, restored)
+                    applySyncModeForScreenState()
+                }
+            } finally {
+                mediaHealInFlight = false
+                mediaStackSick = false
+            }
+        }
+    }
+
     // --- Voice notes (Phase 14) ---------------------------------------------
 
     /**
@@ -4079,7 +4205,7 @@ object MatrixRepository {
      * tool runtime forbids media APIs. @return (playing, error).
      */
     suspend fun playVoiceNote(roomId: String, eventId: String): Pair<Boolean, String?> {
-        val c = client ?: return false to "not logged in"
+        var c = client ?: return false to "not logged in"
         // Tap the playing row again → PAUSE (keeps the position; the next tap
         // on the same row resumes from there — feedback 2026-08-27).
         if (playingAudioEventId == eventId) {
@@ -4138,6 +4264,20 @@ object MatrixRepository {
                     )
                 }
             }
+        }
+        // A media-stack self-heal is in flight (consecutive download timeouts
+        // while the network is up — 2026-09-02): wait for it so THIS tap uses
+        // the fresh engine instead of timing out again.
+        if (mediaStackSick) {
+            val deadline = android.os.SystemClock.elapsedRealtime() + MEDIA_HEAL_WAIT_MS
+            while (mediaStackSick && android.os.SystemClock.elapsedRealtime() < deadline) delay(100)
+            if (!mediaStackSick) {
+                android.util.Log.d(TAG, "playVoiceNote: waited out the HTTP self-heal (id=$eventId)")
+            }
+            // The heal replaced the client mid-wait — fetch on the fresh one
+            // (the pre-wait reference belongs to the closed stack).
+            val current = client
+            if (current != null && current !== c) c = current
         }
         val matrixRoomId = RoomId(roomId)
         val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
@@ -4210,6 +4350,10 @@ object MatrixRepository {
                     "playVoiceNote: download timed out for $eventId after ${MEDIA_BUDGET_MS}ms " +
                         "(attempt $attempt/2, encrypted=${file != null}, url=${url ?: "null"})",
                 )
+                // A timeout is the wedge signature (2026-09-02): count it and
+                // self-heal once consecutive stalls + a healthy network say the
+                // shared HTTP engine is stuck (see [noteMediaFetchTimeout]).
+                noteMediaFetchTimeout()
                 continue
             }
             if (result.isFailure) {
@@ -4224,8 +4368,11 @@ object MatrixRepository {
                         "url=${url ?: "null"}, size=${content.info?.size})",
                     result.exceptionOrNull(),
                 )
+                // A fast failure proves the engine answers — not a wedge.
+                noteMediaFetchSuccess()
                 continue
             }
+            noteMediaFetchSuccess()
             download = result
             break
         }
@@ -4569,16 +4716,20 @@ object MatrixRepository {
                     else -> return@withTimeoutOrNull null
                 }
             }
-            if (result == null || result.isFailure) {
-                if (result?.isFailure == true) {
-                    android.util.Log.w(
-                        TAG,
-                        "voice download failed for $eventId (attempt $attempt/2)",
-                        result.exceptionOrNull(),
-                    )
-                }
+            if (result == null) {
+                noteMediaFetchTimeout()
                 continue
             }
+            if (result.isFailure) {
+                noteMediaFetchSuccess()
+                android.util.Log.w(
+                    TAG,
+                    "voice download failed for $eventId (attempt $attempt/2)",
+                    result.exceptionOrNull(),
+                )
+                continue
+            }
+            noteMediaFetchSuccess()
             download = result
             break
         }
@@ -4827,6 +4978,21 @@ object MatrixRepository {
         }.getOrNull()
         roomPending[txnId] = PendingAudioSend(txnId, System.currentTimeMillis(), durationMs, localFile)
         wakeAfterSend(matrixRoomId.full)
+        // Text sends resolve their row the moment the /send 200 ack lands (the
+        // RPC returns the real event id and the composer swaps it in); a voice
+        // send's row is served from the pending map, whose id fell back to
+        // "local-…" (→ SENDING) once Trixnity removed the outbox row at echo
+        // processing — and the active room's page isn't recomputed on the echo,
+        // so the row stuck until a re-entry (2026-09-02). Cache the acked id on
+        // the pending + bump the page: the next poll serves the row with its
+        // real id (~1-2 s after send) instead of SENDING. Holds the RPC up to
+        // [SEND_ACK_WAIT_MS] like [sendMessage] does (the recording activity
+        // shows its "sending" state meanwhile).
+        val ackedEventId = awaitOutboxAck(c, matrixRoomId, txnId)
+        if (ackedEventId != null) {
+            roomPending[txnId]?.let { roomPending[txnId] = it.copy(eventId = ackedEventId) }
+            bumpMessagePageRevision(matrixRoomId.full)
+        }
         return true
     }
 
@@ -6955,6 +7121,26 @@ object MatrixRepository {
             effectiveLastCache[key] = EffectiveLast(serverLastId, serverLastId, serverTs)
             return serverLastId to serverTs
         }
+        // The newest event is still mid-decrypt (content unresolved, not yet a
+        // failure — the megolm key arrived after this pass started): it drops
+        // out of fastFiltered below, so without this branch the firstReal pin
+        // would cache yesterday's message forever and the row would keep the
+        // old timestamp until the room's next message or a restart (LP3
+        // 2026-09-02: Directing showed yesterday while the thread had today's
+        // message). Stamp the new event now — the room bumps to today on the
+        // same dirty pass — and retry after the decrypt window; the re-walk
+        // then pins it permanently once readable, or routes a failed decrypt
+        // to the ghost machinery below.
+        val newestDecryptPending = serverLast != null &&
+            serverLast.content?.getOrNull() == null &&
+            serverLast.event.content is EncryptedMessageEventContent &&
+            serverLast.content?.isFailure != true
+        if (newestDecryptPending && !inFlood) {
+            effectiveLastCache[key] = EffectiveLast(
+                serverLastId, serverLastId, serverTs, retryAtMs = now + GHOST_WALK_RETRY_MS,
+            )
+            return serverLastId to serverTs
+        }
         // The server's newest event renders as nothing — a dropped edit, a
         // bridge status ack / reaction / redaction, or an in-flood ghost. When
         // the fast window already holds a renderable event, resolve it
@@ -6963,7 +7149,10 @@ object MatrixRepository {
         // (feedback 2026-08-17: rooms topped by edits showed "last message
         // Thursday").
         val firstReal = fastFiltered.firstOrNull()
-        if (firstReal != null && firstReal.event.id.full != serverLastId) {
+        // A still-decrypting newest must not pin the older message forever
+        // either (in-flood copies fall through here) — route to the ghost
+        // machinery instead, which preserves the last-good row and retries.
+        if (firstReal != null && firstReal.event.id.full != serverLastId && !newestDecryptPending) {
             val realTs = firstReal.event.originTimestamp
             effectiveLastCache[key] = EffectiveLast(serverLastId, firstReal.event.id.full, realTs)
             return firstReal.event.id.full to realTs
@@ -7267,7 +7456,13 @@ object MatrixRepository {
         response
     }
 
-    private val httpClientEngine = OkHttp.create {
+    @Volatile
+    private var httpClientEngine = buildHttpClientEngine()
+
+    /** A fresh engine — [selfHealHttpStack] swaps the wedged engine for a new
+     *  one (each ktor client captures the engine at MatrixClient.create time,
+     *  so a rebuild only helps clients created after the swap). */
+    private fun buildHttpClientEngine() = OkHttp.create {
         addInterceptor(httpLoggingInterceptor())
         addInterceptor(claimFailuresFixInterceptor)
     }.also { android.util.Log.d(TAG, "HTTP-TRAFFIC: generic engine armed") }
@@ -7941,6 +8136,14 @@ object MatrixRepository {
     /** Re-reads of the event while its content is still decrypting. */
     private const val MEDIA_CONTENT_RETRIES = 4
     private const val MEDIA_CONTENT_RETRY_DELAY_MS = 1_500L
+    /** Consecutive voice-media download timeouts (network up) that mark the
+     *  shared HTTP engine wedged and trigger the in-process self-heal
+     *  (2026-09-02 — see [selfHealHttpStack]). */
+    private const val MEDIA_STALL_HEAL_THRESHOLD = 3
+    /** Cooldown between HTTP-stack self-heals (a slow link must not churn). */
+    private const val MEDIA_STALL_HEAL_MIN_INTERVAL_MS = 300_000L
+    /** How long a play waits for an in-flight self-heal before fetching anyway. */
+    private const val MEDIA_HEAL_WAIT_MS = 6_000L
     /** How many display JPEGs the LRU keeps (each ~100-300 KB). */
     private const val MAX_MEDIA_CACHE_ENTRIES = 24
     /** Voice-note cache bound (each file ~30-200 KB at 32 kbps Opus). */
