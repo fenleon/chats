@@ -402,9 +402,9 @@ object MatrixRepository {
     private var sessionExpired = false
 
     /**
-     * True while the degraded in-process sync loop is running (see
-     * [startSyncLoop]) — lets ChatSyncService skip starting a second loop on
-     * the same client when the foreground-service promotion finally lands.
+     * True while the in-process path owns the sync arm (see [startSyncLoop]) —
+     * lets ChatSyncService skip arming a second loop on the same client when
+     * the foreground-service promotion finally lands.
      */
     @Volatile
     private var inProcessSyncRunning = false
@@ -457,13 +457,15 @@ object MatrixRepository {
     private var screenOffJob: Job? = null
 
     /**
-     * The supervised in-process sync loop (see [startSyncLoop]): owns
-     * [inProcessSyncRunning] and restarts the long-poll when it dies, so a
-     * loop failure right after login never leaves a silent dead window (LP3
-     * 2026-08-29: 176 s of zero /sync — the other device's verification accept
-     * is a to-device event that can only arrive via sync).
+     * The in-process sync arm (see [startSyncLoop]): a short-lived job that
+     * calls [de.connect2x.trixnity.client.MatrixClient.startSync] once. Under
+     * Trixnity v5 that call just arms the client's internal sync loop — the
+     * /sync rounds run inside the client, which retries errors itself — so no
+     * restart supervision lives here; [ChatSyncService]'s state watchdog
+     * covers a wedged loop after the foreground-service promotion. Kept
+     * cancellable so teardown paths can drop a queued arm.
      */
-    private var syncSupervisorJob: Job? = null
+    private var inProcessSyncJob: Job? = null
 
     /** Elapsed-realtime of the last push-wake syncOnce. Read-receipt/unread-
      *  count push bursts collapse against this (see [onPushDelivered]): every
@@ -504,10 +506,6 @@ object MatrixRepository {
      *  ponytail: 15 min is a session value — tighten if the monitor shows
      *  receive latency, loosen if battery still burns. */
     private const val SLOW_SYNC_LAZY_INTERVAL_MS = 900_000L
-
-    /** In-process sync-loop restart backoff (supervision, 2026-08-29). */
-    private const val SYNC_LOOP_RESTART_MIN_MS = 1_000L
-    private const val SYNC_LOOP_RESTART_MAX_MS = 30_000L
 
     /** Foreground-service promotion cadence (2026-08-29: the old 3→60 s
      *  geometric backoff stretched a blocked promotion to ~176 s after login —
@@ -604,11 +602,11 @@ object MatrixRepository {
                 runCatching { c.stopSync() }
                 android.util.Log.d(TAG, "network back after loss — resetting sync loop")
                 if (isScreenInteractive() && syncEnabled) {
-                    // Restart through the supervised loop — a fresh supervisor
-                    // also resets its backoff, so a mid-30s delay doesn't delay
-                    // the resume. A dark screen must NOT start a long-poll and a
-                    // paused sync must stay paused: that branch goes through the
-                    // shared screen → cadence entry point (both gates live in it).
+                    // Re-arm through the shared entry point (the stopSync above
+                    // un-armed the slot, so [startSyncLoop] must re-arm it). A
+                    // dark screen must NOT start a long-poll and a paused sync
+                    // must stay paused: that branch goes through the shared
+                    // screen → cadence entry point (both gates live in it).
                     inProcessSyncRunning = false
                     startSyncLoop(appContext ?: return@launch)
                 } else {
@@ -706,8 +704,8 @@ object MatrixRepository {
         syncMode = SyncMode.ACTIVE
         if (!enabled) {
             runCatching { c?.stopSync() }
-            syncSupervisorJob?.cancel()
-            syncSupervisorJob = null
+            inProcessSyncJob?.cancel()
+            inProcessSyncJob = null
             inProcessSyncRunning = false
             activeRoomRefreshJob?.cancel()
             activeRoomRefreshJob = null
@@ -799,8 +797,8 @@ object MatrixRepository {
         if (isScreenInteractive()) return // screen came back on — enterActiveSync owns sync
         syncMode = SyncMode.SLOW // gate first: the watchdog must not restart the long-poll
         runCatching { c.stopSync() }
-        syncSupervisorJob?.cancel()
-        syncSupervisorJob = null
+        inProcessSyncJob?.cancel()
+        inProcessSyncJob = null
         inProcessSyncRunning = false
         slowSyncJob?.cancel()
         slowSyncJob = startSlowSyncRounds(c)
@@ -1068,39 +1066,31 @@ object MatrixRepository {
      * Starts the Matrix sync loop with a foreground-service fallback. Android
      * blocks `startForegroundService` while the server process boots in the
      * background (mAllowStartForeground=false right after install/update), so
-     * first run the loop in-process — that works as long as the tool is bound/
+     * first arm the loop in-process — that works as long as the tool is bound/
      * foreground — then keep promoting to the foreground service so sync
-     * survives the tool closing. ChatSyncService treats a running in-process
-     * loop as keep-alive-only instead of starting a second loop.
+     * survives the tool closing. ChatSyncService treats an armed in-process
+     * loop as keep-alive-only instead of arming a second loop.
      *
-     * Non-suspend since 2026-08-29: Trixnity's [MatrixClient.startSync] is a
-     * suspend long-poll, so the old inline call blocked its caller (the login
-     * binder dispatch runs on runBlocking) for the loop's whole lifetime — the
-     * FGS promotion only ran after it returned, and a dead loop had no restart
-     * until the service watchdog attached (LP3: 176 s of zero /sync after
-     * login). The supervisor job owns the loop and restarts it with backoff;
-     * the FGS promotion runs at a fixed cadence concurrently.
+     * Arm-once since 2026-09-02: under Trixnity v5, [MatrixClient.startSync]
+     * does NOT run the sync inline — it arms the client's internal sync loop
+     * (the /sync rounds and their error retries happen inside the client) and
+     * returns. The old restart-with-backoff loop was built on v4 semantics
+     * (startSync suspended until the loop died), so on v5 it logged "loop
+     * ended" after every arm and re-armed on a 1→30 s clock, aborting the
+     * in-flight round each time (LP3 2026-09-02: W-line every 30 s while the
+     * rounds ran fine inside Trixnity). A wedged loop is recovered by
+     * [ChatSyncService]'s syncState watchdog once the promotion lands.
      */
     private fun startSyncLoop(context: Context) {
         val c = client ?: return
         if (inProcessSyncRunning) return
-        syncSupervisorJob?.cancel()
+        inProcessSyncJob?.cancel()
         inProcessSyncRunning = true
-        syncSupervisorJob = scope.launch {
-            var restartDelayMs = SYNC_LOOP_RESTART_MIN_MS
-            while (isActive && client === c) {
-                runCatching { c.startSync(Presence.OFFLINE) }
-                    .onFailure { android.util.Log.w(TAG, "in-process sync loop died: ${it.message}") }
-                if (!isActive || client !== c) break
-                android.util.Log.w(
-                    TAG,
-                    "in-process sync loop ended — restarting in ${restartDelayMs / 1000}s",
-                )
-                delay(restartDelayMs)
-                restartDelayMs = (restartDelayMs * 2).coerceAtMost(SYNC_LOOP_RESTART_MAX_MS)
-            }
+        inProcessSyncJob = scope.launch {
+            runCatching { c.startSync(Presence.OFFLINE) }
+                .onFailure { android.util.Log.w(TAG, "in-process sync failed to arm: ${it.message}") }
         }
-        android.util.Log.d(TAG, "in-process sync loop started for ${c.userId.full}")
+        android.util.Log.d(TAG, "in-process sync loop armed for ${c.userId.full}")
         // Foreground-service promotion at a fixed cadence (the old 3→60 s
         // geometric backoff stretched a blocked promotion to ~176 s — a fixed
         // interval converges within one tick of the system allowing it).
@@ -1126,8 +1116,8 @@ object MatrixRepository {
             }
             // The old client's loop is stopped; a stale flag would silently
             // kill the new session's sync (re-login after restore/expiry).
-            syncSupervisorJob?.cancel()
-            syncSupervisorJob = null
+            inProcessSyncJob?.cancel()
+            inProcessSyncJob = null
             inProcessSyncRunning = false
             _connectionState.value = ChatConnectionState.Connecting
 
@@ -1216,8 +1206,8 @@ object MatrixRepository {
                 runCatching { old.stopSync() }
                 client = null
             }
-            syncSupervisorJob?.cancel()
-            syncSupervisorJob = null
+            inProcessSyncJob?.cancel()
+            inProcessSyncJob = null
             inProcessSyncRunning = false
             _connectionState.value = ChatConnectionState.Connecting
 
@@ -1742,8 +1732,8 @@ object MatrixRepository {
             slowSyncJob = null
             screenOffJob?.cancel()
             screenOffJob = null
-            syncSupervisorJob?.cancel()
-            syncSupervisorJob = null
+            inProcessSyncJob?.cancel()
+            inProcessSyncJob = null
             syncMode = SyncMode.ACTIVE
             inProcessSyncRunning = false
             observedClient = null
