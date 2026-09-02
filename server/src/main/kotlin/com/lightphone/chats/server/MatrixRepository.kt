@@ -2327,20 +2327,7 @@ object MatrixRepository {
         // Reactions: m.reaction events in the delta patch their target rows.
         // Same dedup + label shape as the full rebuild's window walk, scoped to
         // the delta (the target must be in the page for the label to land).
-        //  ponytail: dedup is per-delta; a cross-delta re-reaction could double
-        //  a label — harmless, and the next full rebuild cleans it.
-        val reactionsByTarget = HashMap<String, MutableList<String>>()
-        val reactionSeen = HashSet<String>()
-        for (te in delta) {
-            val content = te.content?.getOrNull() ?: (te.event.content as? ReactionEventContent)
-            if (content !is ReactionEventContent) continue
-            val relates = content.relatesTo as? RelatesTo.Annotation ?: continue
-            val targetId = relates.eventId.full
-            val key = relates.key?.takeIf { it.isNotBlank() } ?: continue
-            if (!reactionSeen.add("${te.event.sender.full}|$key")) continue
-            val who = if (te.event.sender == c.userId) "You" else senderNameOf(c, matrixRoomId, te.event.sender)
-            reactionsByTarget.getOrPut(targetId) { mutableListOf() }.add("$who reacted with $key")
-        }
+        val reactionsByTarget = reactionTagsForEvents(c, matrixRoomId, delta)
         val sendStatuses = sendStatusesByEventIdCached(c, matrixRoomId)
         // Receipts (cheap — a receipts-repo read, no chain re-walk beyond the
         // SQL above): the other party's read position, recomputed over the
@@ -2367,11 +2354,16 @@ object MatrixRepository {
             var out = m
             val edit = editByTarget[m.id]
             if (edit != null && m.contentType == "text" && !m.id.startsWith(LOCAL_PENDING_ID_PREFIX)) {
-                out = out.copy(body = stripOwnPrefix(stripReplyQuote(edit.first), ownName), edited = true)
+                out = out.copy(
+                    body = stripOwnPrefix(stripForwardHeader(stripReplyQuote(edit.first)).first, ownName),
+                    edited = true,
+                )
             }
             val added = reactionsByTarget[m.id]
             if (added != null) {
-                val merged = out.reactions + added.filter { it !in out.reactions }
+                // Collapse keeps the merged list at most two lines (a cached
+                // summary can meet fresh delta reactions).
+                val merged = collapseReactionTags(out.reactions + added.filter { it !in out.reactions })
                 if (merged != out.reactions) out = out.copy(reactions = merged)
             }
             if (!out.read && out.id in readEventIds) out = out.copy(read = true)
@@ -3427,20 +3419,16 @@ object MatrixRepository {
     }
 
     /**
-     * Reaction labels per message event id, from the room's recent `m.reaction`
-     * events (newest-first window, like [sendStatusByEventId]). Reactions are
+     * Reaction tags per message event id, from the room's recent `m.reaction`
+     * events (the newest window, like [sendStatusByEventId]). Reactions are
      * never encrypted (per the Matrix spec), so the raw event content reads
      * directly — no decrypt wait. A reaction's `m.relates_to` carries the
-     * target event id + the reaction key (an emoji). Each entry is a display
-     * string — "Name reacted with ❤️" (own reactions read "You reacted with
-     * ❤️") — deduped per (sender, key) so a re-reaction doesn't repeat
-     * (feedback 2026-08-14).
+     * target event id + the reaction key (an emoji).
      */
     private suspend fun reactionLabelsByEvent(
         c: MatrixClient,
         matrixRoomId: RoomId,
     ): Map<String, List<String>> {
-        val result = mutableMapOf<String, MutableList<String>>()
         val config: GetTimelineEventsConfig.() -> Unit = {
             this.maxSize = SEND_STATUS_WINDOW.toLong()
             fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
@@ -3448,19 +3436,74 @@ object MatrixRepository {
         }
         val collected = collectNewestEvents(c, matrixRoomId, config, MESSAGES_BUDGET_MS)
             ?: return emptyMap()
-        val seen = HashSet<String>() // "sender|key", dedupes re-reactions
-        for (te in collected) {
+        return reactionTagsForEvents(c, matrixRoomId, collected)
+    }
+
+    /**
+     * Reaction tags per target message id from a list of timeline events (the
+     * newest window, or the sync delta). Each entry is a display string —
+     * "Name reacted with ❤️" (own reactions read "You reacted with ❤️") —
+     * deduped per (sender, key) so a re-reaction doesn't repeat (feedback
+     * 2026-08-14), ordered chronologically so the first tag is the FIRST
+     * person to react (the name a summary keeps; 2026-09-02). Older pages
+     * report none — reactions sit after their target in the timeline, so the
+     * newest window carries them (minimal Phase 14 scope).
+     */
+    private suspend fun reactionTagsForEvents(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        events: List<TimelineEvent>,
+    ): Map<String, List<String>> {
+        val result = mutableMapOf<String, MutableList<ReactionEntry>>()
+        val seen = HashMap<String, ReactionEntry>() // "target|sender|key" → entry (earliest kept)
+        for (te in events) {
             val content = te.content?.getOrNull() ?: (te.event.content as? ReactionEventContent)
             if (content !is ReactionEventContent) continue
             val relates = content.relatesTo as? RelatesTo.Annotation ?: continue
             val targetId = relates.eventId.full
             val key = relates.key?.takeIf { it.isNotBlank() } ?: continue
             val sender = te.event.sender
-            if (!seen.add("${sender.full}|$key")) continue
+            val dedupeKey = "$targetId|${sender.full}|$key"
+            val existing = seen[dedupeKey]
+            if (existing != null) {
+                // A re-reaction (same person, same emoji, again): keep the
+                // earliest so the chronological order is the real one.
+                if (te.event.originTimestamp < existing.timestampMs) existing.timestampMs = te.event.originTimestamp
+                continue
+            }
             val who = if (sender == c.userId) "You" else senderNameOf(c, matrixRoomId, sender)
-            result.getOrPut(targetId) { mutableListOf() }.add("$who reacted with $key")
+            val entry = ReactionEntry(te.event.originTimestamp, who, key)
+            seen[dedupeKey] = entry
+            result.getOrPut(targetId) { mutableListOf() }.add(entry)
         }
-        return result
+        return result.mapValues { (_, entries) ->
+            entries.sortedBy { it.timestampMs }.map { "${it.who} reacted with ${it.key}" }
+        }
+    }
+
+    /** A reaction as it will display: who reacted, with which key, and when
+     *  (the earliest occurrence survives dedupe). */
+    private class ReactionEntry(var timestampMs: Long, val who: String, val key: String)
+
+    /** Keeps a message's reaction tags ("Name reacted with ❤️") to at most two
+     *  lines: two or fewer stay as-is; more collapse into one compact summary
+     *  — the FIRST (earliest) reactor by name, everyone else folded into "and
+     *  others", the distinct emoji listed once each, space-separated:
+     *  "Sophie and others reacted with ❤️ 😂" (feedback 2026-09-02: the list
+     *  read as one comma-separated item; a plain space keeps each emoji its
+     *  own glyph). One person stacking several emoji isn't a crowd, so it
+     *  keeps the per-reaction lines. Tags never exceed two after this, so the
+     *  tool renders the list unchanged. */
+    private fun collapseReactionTags(tags: List<String>): List<String> {
+        if (tags.size <= 2) return tags
+        val reactions = tags.map { tag ->
+            val at = tag.indexOf(" reacted with ")
+            if (at <= 0) return tags // not our label shape — leave untouched
+            tag.substring(0, at) to tag.substring(at + " reacted with ".length)
+        }
+        if (reactions.map { it.first }.distinct().size < 2) return tags
+        val emojis = reactions.map { it.second }.distinct()
+        return listOf("${reactions.first().first} and others reacted with ${emojis.joinToString(" ")}")
     }
 
     /**
@@ -7808,6 +7851,12 @@ object MatrixRepository {
         // re-import edits target originals we never sync (whatsapp.com bridge
         // rooms), so un-matched edits still render as nothing here.
         if (isReplaceEdit(te)) return null
+        // A WhatsApp forward's "↷ Forwarded" header (stripForwardHeader) is
+        // lifted out of the body; the flag makes the tool render it as a small
+        // chip above the content (2026-09-02). Text rows report it here; media
+        // rows carry it on their caption (a forwarded photo's caption IS the
+        // bare header).
+        var forwarded = false
         val (body, contentType) = when (content) {
             is RoomMessageEventContent.FileBased.Image ->
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "[Photo]") to "image"
@@ -7841,11 +7890,28 @@ object MatrixRepository {
                 // the original when the target is in the page (2026-08-27).
                 // Broadcast channels bake the user's own name into echoed posts
                 // ("FENN: post") — stripped when ownName is set (2026-08-28).
-                val text = stripOwnPrefix(stripReplyQuote(editedBody ?: content.body), ownName)
+                val (stripped, fwd) = stripForwardHeader(stripReplyQuote(editedBody ?: content.body))
+                forwarded = fwd
+                val text = stripOwnPrefix(stripped, ownName)
                 if (text.isBlank()) return null
                 text to if (content is RoomMessageEventContent.TextBased.Notice) "notice" else "text"
             }
             else -> ((previewText(te)?.takeIf { it.isNotBlank() }) ?: return null) to "text"
+        }
+        // The media caption (the m.image / m.video body — most clients put the
+        // caption there, separate from the file name). A caption that equals
+        // the file name is not a caption (feedback round 2026-08-19); neither
+        // is a bare file name — Signal's m.image body IS "image.jpg" with no
+        // caption (feedback 2026-08-27). A forwarded photo's caption is the
+        // bare "↷ Forwarded" header (or the header + a real caption) —
+        // stripped here, and the forwarded flag carries the header to the
+        // tool's chip.
+        val (caption, forwardedByCaption) = when (content) {
+            is RoomMessageEventContent.FileBased.Image ->
+                captionOf(content)?.let { stripForwardHeader(it) } ?: (null to false)
+            is RoomMessageEventContent.FileBased.Video ->
+                captionOf(content)?.let { stripForwardHeader(it) } ?: (null to false)
+            else -> null to false
         }
         val sender = te.event.sender
         return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
@@ -7859,23 +7925,17 @@ object MatrixRepository {
             sendStatus = sendStatus.takeIf { sender == c.userId },
             contentType = contentType,
             read = read,
-            reactions = reactions,
+            // Collapsed here (and at the cached-page merge) so rows never carry
+            // more than two reaction tags (feedback 2026-09-02).
+            reactions = collapseReactionTags(reactions),
             // The voice-note row shows the length + playing progress. Bridged
             // notes often carry no info.duration (Signal — feedback 2026-08-27):
             // fall back to the length measured at prefetch/play time.
             durationMs = (content as? RoomMessageEventContent.FileBased.Audio)?.let { audio ->
                 audio.info?.duration ?: voiceDurationMsByEvent[te.event.id.full]
             },
-            // The media caption (the m.image / m.video body — most clients put
-            // the caption there, separate from the file name). A caption that
-            // equals the file name is not a caption (feedback round
-            // 2026-08-19); neither is a bare file name — Signal's m.image body
-            // IS "image.jpg" with no caption (feedback 2026-08-27).
-            caption = when (content) {
-                is RoomMessageEventContent.FileBased.Image -> captionOf(content)
-                is RoomMessageEventContent.FileBased.Video -> captionOf(content)
-                else -> null
-            },
+            caption = caption?.takeIf { it.isNotBlank() },
+            forwarded = forwarded || forwardedByCaption,
             edited = edited && contentType == "text",
         )
     }
@@ -7923,7 +7983,8 @@ object MatrixRepository {
         if (isReplaceEdit(te)) return null
         if (content != null) {
             return when (content) {
-                is RoomMessageEventContent.TextBased -> stripReplyQuote(content.body).take(MAX_PREVIEW_LENGTH)
+                is RoomMessageEventContent.TextBased ->
+                    stripForwardHeader(stripReplyQuote(content.body)).first.take(MAX_PREVIEW_LENGTH)
                 is RoomMessageEventContent.FileBased -> when (content) {
                     is RoomMessageEventContent.FileBased.Image ->
                         // A caption beats the generic "[Photo]" placeholder in
@@ -7963,6 +8024,22 @@ object MatrixRepository {
         if (!body.startsWith(">")) return body
         val index = body.indexOf("\n\n")
         return if (index != -1) body.substring(index + 2).trimStart() else body
+    }
+
+    /** Lifts a bridge "forwarded" header off a message body (WhatsApp forwards
+     *  arrive as "↷ Forwarded" + a blank line + the content — the bridge's
+     *  text stand-in for WhatsApp's forward chip; 2026-09-02). Returns the
+     *  content ("" when the message is nothing but the header — a forwarded
+     *  photo's caption is just the marker) and whether the header was found.
+     *  The tool renders the header itself as a small chip via [Message.forwarded],
+     *  and previews strip it so the room list shows the content, not the marker. */
+    private fun stripForwardHeader(body: String): Pair<String, Boolean> {
+        val header = "\u21B7 Forwarded" // "↷ Forwarded"
+        if (!body.startsWith(header)) return body to false
+        // The header must be its own first line: "\n\n" + content after it.
+        val rest = body.removePrefix(header)
+        if (rest.isNotEmpty() && !rest.startsWith("\n\n")) return body to false
+        return rest.removePrefix("\n\n").trimStart('\n') to true
     }
 
     /** In broadcast rooms (you + the channel ghost) Beeper echoes your own

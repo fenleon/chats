@@ -31,7 +31,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -1434,6 +1436,32 @@ private fun MessageRow(
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }
+            // A forwarded message carries a small "forwarded" tag — the
+            // bridge's WhatsApp forward marker, lifted out of the body by the
+            // companion and served as this flag. Incoming TEXT rows lead with
+            // the ↷ glyph (Subtitle) left of the body and put the word under
+            // the text, in the same spot as the "edited" tag (below); media
+            // and outgoing rows keep the glyph + word together above the
+            // content. Tight, lowercase, consistent with the other tags
+            // (feedback 2026-09-02: the marker used to sit in the body at
+            // full size with a blank line after it, reading like a separate
+            // message).
+            if (message.forwarded && (message.contentType != "text" || message.isMine)) {
+                Row(
+                    modifier = Modifier.padding(top = 1.dp, bottom = 1.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    LightText(
+                        text = "\u21B7",
+                        variant = LightTextVariant.Subtitle,
+                    )
+                    LightText(
+                        text = "forwarded",
+                        variant = LightTextVariant.Superfine,
+                        modifier = Modifier.padding(start = 0.25f.gridUnitsAsDp()),
+                    )
+                }
+            }
             if (message.contentType == "image") {
                 ImageMessageContent(message, mediaBytes, allowMobile, onEnsureMedia, onOpenImage)
             } else if (message.contentType == "audio") {
@@ -1454,6 +1482,51 @@ private fun MessageRow(
                     // last word always touches the right edge (see
                     // [OutgoingBodyText]).
                     OutgoingBodyText(message.body, bodyMaxWidthPx)
+                } else if (message.forwarded) {
+                    // Forwarded incoming text: the ↷ glyph anchors the left,
+                    // beside the body like the call notices' phone icon. It
+                    // renders at Paragraph — same line box as the body, so
+                    // the row hugs the text — scaled ~2.1x (≈ the Subtitle
+                    // ink size) about the box center, which keeps the arrow
+                    // centered on the body line: Subtitle's far taller line
+                    // box carried the ink low and opened gaps above/below
+                    // (feedback 2026-09-02). The small "forwarded" word sits
+                    // at the message's left edge under both.
+                    Column(modifier = Modifier.padding(top = 1.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            LightText(
+                                text = "\u21B7",
+                                variant = LightTextVariant.Paragraph,
+                                // The ↷ falls back to Noto Sans Symbols, whose
+                                // run sits low in the Paragraph line box — a
+                                // plain center-scale pushed the ink below the
+                                // box into the "forwarded" tag. Pivoting the
+                                // scale ~0.72 down the box keeps the arrow's
+                                // ink centered on the text line; the equal
+                                // padding (a) re-absorbs the scaled ink, which
+                                // is wider than the glyph advance, and (b)
+                                // squares the glyph's footprint (feedback
+                                // 2026-09-02).
+                                modifier = Modifier
+                                    .graphicsLayer {
+                                        scaleX = 2.1f
+                                        scaleY = 2.1f
+                                        transformOrigin = TransformOrigin(0.5f, 0.72f)
+                                    }
+                                    .padding(2.5.dp),
+                            )
+                            LightText(
+                                text = message.body,
+                                variant = LightTextVariant.Paragraph,
+                                modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
+                            )
+                        }
+                        LightText(
+                            text = "forwarded",
+                            variant = LightTextVariant.Superfine,
+                            modifier = Modifier.padding(top = 1.dp),
+                        )
+                    }
                 } else if (message.body.startsWith("Incoming call")) {
                     // Bridged call notices ("Incoming call. Use the WhatsApp
                     // app to answer." — Beeper's bridges can't relay calls, so
