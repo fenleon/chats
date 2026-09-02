@@ -3919,12 +3919,9 @@ object MatrixRepository {
             }
             text(body = body)
         }
-        // Record the optimistic echo server-side and return immediately —
-        // Trixnity's outbox sends in the background (encrypt + ack), so the
-        // composer pops back the moment the message is enqueued instead of
-        // sitting on "Sending…" while the homeserver acks (feedback
-        // 2026-08-14). The echo row survives leaving the thread; the sync
-        // echo (matched by txn id) replaces it in [computeMessagesPage].
+        // Record the optimistic echo server-side — the row survives leaving
+        // the thread, and the sync echo (matched by txn id) replaces it in
+        // [computeMessagesPage].
         val roomPending = pendingTextEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
         roomPending[txnId] = PendingTextSend(txnId, System.currentTimeMillis(), body)
         // Keep the cached/disk newest page — re-opening the thread serves it
@@ -3935,9 +3932,19 @@ object MatrixRepository {
         // Fetch the echo + refresh the panel even in slow-sync mode (screen off).
         wakeAfterSend(matrixRoomId.full)
         android.util.Log.d(TAG, "SendMessage: room=$roomId txn=$txnId body=$body")
+        // Hold the RPC for the homeserver ack (bounded) so the response carries
+        // the real event id — the composer then lands back on the thread with
+        // the row already confirmed instead of showing SENDING until a later
+        // polled page echoes the send (Beeper's SENT_PENDING_SERVER_ECHO
+        // pattern). The wake round above drains the outbox; the /send 200 sets
+        // the outbox row's event id ~1 s later. Ack timeout or a local send
+        // error → null event id, and the optimistic path holds (2026-08-14
+        // behavior: the composer still pops back immediately, and the outbox
+        // keeps delivering the send).
+        val eventId = awaitOutboxAck(c, matrixRoomId, txnId)
         return com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response(
             transactionId = txnId,
-            eventId = null, // not awaited — the sync echo supplies the real id
+            eventId = eventId,
         )
         } catch (e: Exception) {
             // A send that dies before enqueueing used to be invisible: the RPC
@@ -3948,6 +3955,31 @@ object MatrixRepository {
             android.util.Log.e(TAG, "SendMessage FAILED room=$roomId body=$body", e)
             throw e
         }
+    }
+
+    /**
+     * Waits (bounded) for Trixnity's outbox to record the homeserver ack of
+     * [txnId]: the /send 200 sets the outbox row's event id while the sync
+     * echo is still in flight (the outbox drain runs on the wake round from
+     * [wakeAfterSend]). Returns the real event id, or null when the send
+     * failed locally (the outbox row carries a send error) or no ack landed
+     * within [SEND_ACK_WAIT_MS].
+     */
+    private suspend fun awaitOutboxAck(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        txnId: String,
+    ): String? {
+        val deadline = System.currentTimeMillis() + SEND_ACK_WAIT_MS
+        while (System.currentTimeMillis() < deadline) {
+            val outbox = withTimeoutOrNull(OUTBOX_READ_TIMEOUT_MS) {
+                c.room.getOutbox(matrixRoomId, txnId).first()
+            }
+            outbox?.eventId?.full?.let { return it }
+            if (outbox?.sendError != null) return null
+            delay(SEND_ACK_POLL_INTERVAL_MS)
+        }
+        return null
     }
 
     /**
@@ -7700,6 +7732,11 @@ object MatrixRepository {
     private const val QUICK_DECRYPT_WAIT_MS = 100L
     /** Local outbox read for the pending-row state (event id / send error). */
     private const val OUTBOX_READ_TIMEOUT_MS = 500L
+    /** Bounded wait for the homeserver ack of a text send ([awaitOutboxAck]) —
+     *  the /send 200 typically lands ~1 s after enqueue on the wake round. */
+    private const val SEND_ACK_WAIT_MS = 2_000L
+    /** Poll cadence on the outbox row while awaiting the ack. */
+    private const val SEND_ACK_POLL_INTERVAL_MS = 100L
     /** Whole-outbox read for the restart pending reconstruction (one query;
      *  empty outbox → instant). */
     private const val OUTBOX_RECONSTRUCT_BUDGET_MS = 5_000L
