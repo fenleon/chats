@@ -196,6 +196,11 @@ object MatrixRepository {
      *  the crawl runs at most once per 24h, so the in-memory flag alone could
      *  never show after a reboot/install/force-stop. Cleared at login. */
     private const val KEY_RESTORE_COMPLETED = "restore_completed"
+    /** Per-room event id the notification watcher last alerted (prefix + roomId.full),
+     *  persisted so a watcher re-attach — every process start / app launch — does not
+     *  re-alert the same newest event a previous run already dinged (ghost burst
+     *  fix, LP3 2026-09-02). Cleared with the prefs at logout. */
+    private const val KEY_LAST_NOTIFIED_PREFIX = "last_notified_"
     private const val DB_NAME = "matrix_client"
     private const val MEDIA_DIR = "matrix_media"
 
@@ -5398,6 +5403,20 @@ object MatrixRepository {
         return roomId
     }
 
+    /** Last event id the notification watcher alerted for [roomKey], persisted
+     *  across process restarts ([KEY_LAST_NOTIFIED_PREFIX]); null = nothing
+     *  alerted yet (fresh install / new room). */
+    private fun lastNotifiedEventId(roomKey: String): String? =
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.getString(KEY_LAST_NOTIFIED_PREFIX + roomKey, null)
+
+    /** Records that [eventId] was alerted in [roomKey] so a later watcher
+     *  registration (new process) does not re-alert it. */
+    private fun recordNotifiedEvent(roomKey: String, eventId: String) {
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.edit()?.putString(KEY_LAST_NOTIFIED_PREFIX + roomKey, eventId)?.apply()
+    }
+
     /**
      * Watches every joined room's newest relevant event and posts a
      * notification when one arrives from someone else — the sync loop is the
@@ -5518,9 +5537,14 @@ object MatrixRepository {
                                             // gate stays 0 and eats the first message
                                             // (verified 2026-09-02). A receipt behind the
                                             // newest event — or none at all (thread never
-                                            // opened) — means genuinely unread: notify once.
+                                            // opened) — means genuinely unread: notify
+                                            // once — and not again on every launch: an
+                                            // event this watcher already alerted in an
+                                            // earlier process ([recordNotifiedEvent]) is
+                                            // not re-dinged (ghost bursts, LP3 2026-09-02).
                                             val ownRead = ownReadReceiptId(c, roomId)
-                                            if (ownRead != regLastId) {
+                                            val alreadyAlerted = lastNotifiedEventId(key) == regLastId
+                                            if (!alreadyAlerted && ownRead != regLastId) {
                                                 android.util.Log.d(
                                                     TAG,
                                                     "notification watcher: $key registered with unread newest " +
@@ -5722,6 +5746,9 @@ object MatrixRepository {
             direct = room.isDirect,
             unreadCount = unreadCounts[roomId.full]?.toLong() ?: 0L,
         )
+        // Persist "alerted this event" so a later watcher registration (new
+        // process) doesn't re-alert it — the registration-time notify gate.
+        recordNotifiedEvent(roomId.full, eventId)
     }
 
     /**
