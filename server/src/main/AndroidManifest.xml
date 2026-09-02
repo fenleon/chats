@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Restarts the sync service after a reboot (WAKE-COMPARISON.md #1). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Media downloads are gated on the connection type (Settings toggle). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Voice notes are recorded in the server library (RECORD_AUDIO is granted
@@ -106,6 +108,18 @@
             android:name=".ChatSyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Reboot recovery (WAKE-COMPARISON.md #1): a rebooted LP3 has no
+             process, so sync stays dead until the app is opened. Restarts the
+             sync service after first unlock (a protected broadcast — only the
+             system sends BOOT_COMPLETED). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Dev probe (2026-08-21): receives the endpoint LightOS's UP
              distributor issues for the "light-push" instance (see

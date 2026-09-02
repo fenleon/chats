@@ -25,6 +25,13 @@ object ChatNotifier {
     private const val CHANNEL_ID = "chats_messages"
     private const val CHANNEL_NAME = "Messages"
 
+    /** Low-key sync-warning channel (WAKE-COMPARISON.md #3) — no sound, no badge. */
+    private const val PENDING_CHANNEL_ID = "chats_sync_pending"
+    private const val PENDING_CHANNEL_NAME = "Sync warnings"
+
+    /** Fixed id for the sync-pending signal (free: FGS uses 71, rooms start at 1000). */
+    private const val PENDING_NOTIFICATION_ID = 72
+
     /** The tool package hosting the SDK's LightActivity (see its merged manifest). */
     private const val TOOL_PACKAGE = "com.lightphone.chats"
     private const val TOOL_ACTIVITY = "com.thelightphone.sdk.LightActivity"
@@ -46,6 +53,14 @@ object ChatNotifier {
             },
         )
     }
+
+    /** The tool's main activity, used by the message + sync-pending content intents. */
+    private fun toolLaunchIntent(context: Context, roomId: String? = null): Intent =
+        Intent().apply {
+            setComponent(ComponentName(TOOL_PACKAGE, TOOL_ACTIVITY))
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            if (roomId != null) putExtra(EXTRA_NOTIFY_ROOM, roomId)
+        }
 
     /**
      * Shows or replaces the notification for [roomId]'s newest message.
@@ -70,14 +85,10 @@ object ChatNotifier {
         val contentIntent = PendingIntent.getActivity(
             context,
             id,
-            Intent().apply {
-                setComponent(ComponentName(TOOL_PACKAGE, TOOL_ACTIVITY))
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                // The tool reads this once per launch (takeLaunchExtra) so a
-                // notification tap can open the right thread — and only a tap
-                // does: returning from a thread or a list poll never sees it.
-                putExtra(EXTRA_NOTIFY_ROOM, roomId)
-            },
+            // The tool reads this once per launch (takeLaunchExtra) so a
+            // notification tap can open the right thread — and only a tap
+            // does: returning from a thread or a list poll never sees it.
+            toolLaunchIntent(context, roomId),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val builder = Notification.Builder(context, CHANNEL_ID)
@@ -100,6 +111,48 @@ object ChatNotifier {
     /** Removes the notification for a room (thread opened / marked read). */
     fun cancelRoom(context: Context, roomId: String) {
         context.getSystemService(NotificationManager::class.java).cancel(notificationId(roomId))
+    }
+
+    /**
+     * Low-key "messages may be waiting" signal (docs/WAKE-COMPARISON.md #3):
+     * a push-wake sync exhausted its retries, so a message that arrived may
+     * not have been delivered — molly's "may have messages" equivalent.
+     * Cleared on the next successful sync or when the app comes to the
+     * foreground (MatrixRepository.timedSyncOnce / enterActiveSync).
+     */
+    fun notifySyncPending(context: Context) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return
+        manager.createNotificationChannel(
+            NotificationChannel(PENDING_CHANNEL_ID, PENDING_CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Warns when checking for messages failed"
+                setShowBadge(false)
+            },
+        )
+        val contentIntent = PendingIntent.getActivity(
+            context,
+            PENDING_NOTIFICATION_ID,
+            toolLaunchIntent(context),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        manager.notify(
+            PENDING_NOTIFICATION_ID,
+            Notification.Builder(context, PENDING_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.sym_def_app_icon)
+                .setContentTitle("Chats")
+                .setContentText("Checking for messages failed — will retry")
+                .setContentIntent(contentIntent)
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .setVisibility(Notification.VISIBILITY_PRIVATE)
+                .build(),
+        )
+        Log.d(TAG, "sync-pending notification posted")
+    }
+
+    /** Clears the sync-pending signal (next successful sync / foreground). */
+    fun clearSyncPending(context: Context) {
+        context.getSystemService(NotificationManager::class.java).cancel(PENDING_NOTIFICATION_ID)
     }
 
     /** Removes every message notification (logout). */

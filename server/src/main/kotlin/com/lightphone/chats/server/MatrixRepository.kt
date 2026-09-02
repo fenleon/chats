@@ -525,6 +525,16 @@ object MatrixRepository {
      *  window's pending wakes into a single sync, at ~1s latency. */
     private const val PUSH_WAKE_DEBOUNCE_MS = 1_000L
 
+    /** Max syncOnce attempts per push wake (1 + 2 retries, WAKE-COMPARISON.md
+     *  #2): a wake whose sync didn't reach the pushed event retries with
+     *  backoff instead of silently dropping to the 5-min round (Beeper's
+     *  NotCaughtUp retry, in-process — no WorkManager needed while the FGS
+     *  holds the process). */
+    private const val PUSH_WAKE_ATTEMPTS = 3
+
+    /** Backoff base between push-wake retries. */
+    private const val PUSH_WAKE_RETRY_DELAY_MS = 2_000L
+
     /** Min gap between network-triggered sync restarts (flappy-radio guard,
      *  2026-09-01 — see [networkCallback]). */
     private const val NETWORK_RESET_MIN_INTERVAL_MS = 60_000L
@@ -812,7 +822,12 @@ object MatrixRepository {
     private suspend fun timedSyncOnce(c: MatrixClient, reason: String): Result<Unit> {
         val t0 = android.os.SystemClock.elapsedRealtime()
         val result = runCatching { c.syncOnce(Presence.OFFLINE).getOrThrow() }
-            .onSuccess { _connectionState.value = ChatConnectionState.Syncing }
+            .onSuccess {
+                _connectionState.value = ChatConnectionState.Syncing
+                // Any successful sync means the "checking failed" signal (if
+                // any) is stale (WAKE-COMPARISON.md #3).
+                appContext?.let { ChatNotifier.clearSyncPending(it) }
+            }
             .onFailure { _connectionState.value = ChatConnectionState.Offline("sync failed") }
         android.util.Log.d(TAG, "syncOnce took ${android.os.SystemClock.elapsedRealtime() - t0}ms ($reason)")
         return result
@@ -855,6 +870,9 @@ object MatrixRepository {
 
     /** Back to the real-time long-poll (screen on, or any reason sync restarts). */
     private suspend fun enterActiveSync() {
+        // Foreground (screen on): any "checking failed" signal is stale now
+        // (WAKE-COMPARISON.md #3).
+        appContext?.let { ChatNotifier.clearSyncPending(it) }
         screenOffJob?.cancel()
         screenOffJob = null
         slowSyncJob?.cancel()
@@ -893,9 +911,11 @@ object MatrixRepository {
      * note-to-self on Beeper's fork), and an event push right before covers
      * the state anyway. Real event pushes (message arriving) sync once per
      * burst — trailing-edge debounced [PUSH_WAKE_DEBOUNCE_MS] so N messages
-     * cost one syncOnce (~1s latency).
+     * cost one syncOnce (~1s latency). [eventId]/[roomId] come from the push
+     * payload (event_id_only format) and let the wake verify the sync actually
+     * reached the event (WAKE-COMPARISON.md #2).
      */
-    suspend fun onPushDelivered(countsOnly: Boolean = false) {
+    suspend fun onPushDelivered(countsOnly: Boolean = false, eventId: String? = null, roomId: String? = null) {
         val c = client ?: return
         if (syncMode != SyncMode.SLOW) return
         if (countsOnly) {
@@ -904,7 +924,7 @@ object MatrixRepository {
                 android.util.Log.d(TAG, "counts push collapsed (last wake ${(now - lastPushWakeSyncAtMs) / 1000}s ago)")
                 return
             }
-            runPushWake(c)
+            runPushWake(c, eventId, roomId)
             return
         }
         // Real-message push: coalesce bursts. The window's last push wins — the
@@ -913,18 +933,75 @@ object MatrixRepository {
         pushWakeJob = scope.launch {
             delay(PUSH_WAKE_DEBOUNCE_MS)
             if (client !== c || syncMode != SyncMode.SLOW) return@launch
-            runPushWake(c)
+            runPushWake(c, eventId, roomId)
         }
     }
 
-    /** The wake itself: cancel the fallback rounds, run ONE syncOnce, restart
+    /** True when the event is already in the Room store — the store is the
+     *  only consistent truth for "did sync reach this event" (the same tables
+     *  readTimelineChainFromDb walks; single indexed point queries). Message
+     *  events land in TimelineEvent; state events (invites, member/topic
+     *  changes) land in RoomState's JSON `event` column instead — both are
+     *  pushable, so both are checked (2026-09-02: an invite push false-
+     *  negatived on TimelineEvent alone, burning the wake's retries). */
+    private suspend fun isEventStored(c: MatrixClient, roomId: String, eventId: String): Boolean {
+        val db = runCatching {
+            c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class)
+        }.onFailure { e ->
+            android.util.Log.w(TAG, "isEventStored: TrixnityRoomDatabase not in DI", e)
+        }.getOrNull() ?: return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val reader = db.openHelper.readableDatabase
+                val inTimeline = reader.query(
+                    "SELECT count(*) FROM TimelineEvent WHERE roomId = ? AND eventId = ?",
+                    arrayOf<Any>(roomId, eventId),
+                ).use { it.moveToFirst() && it.getInt(0) > 0 }
+                if (inTimeline) return@withContext true
+                reader.query(
+                    "SELECT count(*) FROM RoomState WHERE roomId = ? AND json_extract(event, '$.event_id') = ?",
+                    arrayOf<Any>(roomId, eventId),
+                ).use { it.moveToFirst() && it.getInt(0) > 0 }
+            }.onFailure { e ->
+                android.util.Log.w(TAG, "isEventStored: store query failed", e)
+            }.getOrDefault(false)
+        }
+    }
+
+    /** The wake itself: cancel the fallback rounds, run ONE syncOnce, verify
+     *  it reached the pushed event (bounded retries with backoff), restart
      *  the rounds if the screen is still dark. Shared by counts-only pushes
      *  (immediate) and debounced real-message wakes. */
-    private suspend fun runPushWake(c: MatrixClient) {
+    private suspend fun runPushWake(c: MatrixClient, eventId: String?, roomId: String?) {
+        // Skip-when-useless (WAKE-COMPARISON.md #4): a slow round or an
+        // earlier wake already delivered this event — no sync needed (the
+        // notification watcher posted it when it was stored).
+        if (eventId != null && roomId != null && isEventStored(c, roomId, eventId)) {
+            android.util.Log.d(TAG, "push wake skipped — event already in store")
+            return
+        }
         slowSyncJob?.cancel()
         slowSyncJob = null
-        timedSyncOnce(c, "push")
-            .onFailure { android.util.Log.w(TAG, "push-wake sync failed: ${it.message}") }
+        var caughtUp = false
+        // NOTE: `return@repeat` would NOT break here — repeat's inline lambda
+        // returning just continues the next index (2026-09-02: an invite push
+        // ran all 3 syncs back-to-back with no delays for exactly this reason).
+        // A plain for loop with `break` stops the retries once caught up.
+        for (attempt in 0 until PUSH_WAKE_ATTEMPTS) {
+            timedSyncOnce(c, if (attempt == 0) "push" else "push-retry")
+                .onSuccess {
+                    // Caught up = the sync actually stored the pushed event;
+                    // counts-only wakes (no ids) have nothing to verify.
+                    caughtUp = eventId == null || roomId == null || isEventStored(c, roomId, eventId)
+                }
+                .onFailure { android.util.Log.w(TAG, "push-wake sync failed: ${it.message}") }
+            if (caughtUp) break
+            if (attempt < PUSH_WAKE_ATTEMPTS - 1) delay(PUSH_WAKE_RETRY_DELAY_MS * (attempt + 1))
+        }
+        // Retries exhausted without the event landing — tell the user
+        // something may be waiting (WAKE-COMPARISON.md #3). The fallback
+        // rounds keep retrying, and the next successful sync clears it.
+        if (!caughtUp) appContext?.let { ChatNotifier.notifySyncPending(it) }
         lastPushWakeSyncAtMs = android.os.SystemClock.elapsedRealtime()
         // A push means events landed in the store — end the resolver's
         // screen-off sleep so the next list read is fresh (feedback 2026-08-17).

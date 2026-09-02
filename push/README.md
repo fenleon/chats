@@ -31,11 +31,23 @@ phone does one authenticated, encrypted `/sync` and posts the notification.
    with backoff, `?since=<last-id>` resume so pushes published during a gap are
    replayed). No new dependencies — manual SSE on the OkHttp Trixnity already
    ships.
-3. **Wake + sync** — on a push: one `syncOnce` (`MatrixRepository.onPushDelivered`),
-   which the existing notification watcher turns into the local notification,
-   then idle.
-4. **Fallback** — the screen-off 5-min `syncOnce` rounds stay as a safety net:
-   a silent SSE drop (or Beeper not POSTing) must not mean missed messages.
+3. **Wake + sync (verified, 2026-09-02)** — on a real-message push (debounced
+   1 s, last wins): one `syncOnce` (`MatrixRepository.onPushDelivered` →
+   `runPushWake`), then the wake **verifies the pushed `event_id` landed in
+   the Room store** (`isEventStored` — `TimelineEvent` row, else `RoomState`
+   `json_extract`); the notification watcher posts the local notification.
+   Counts-only pushes collapse to one wake per 5 min. Not caught up → up to 2
+   bounded retries with 2 s/4 s backoff, then a low-key "Checking for messages
+   failed — will retry" notification (cleared on the next successful sync or
+   foreground). A wake whose event a fallback round already delivered skips
+   the sync entirely.
+4. **Fallback** — the screen-off `syncOnce` rounds stay as a safety net: a
+   silent SSE drop (or Beeper not POSTing) must not mean missed messages. The
+   cadence is push-gated (2026-08-31): 15-min lazy while the SSE channel is
+   connected, 5-min when it's down.
+5. **Reboot** — `BootReceiver` re-arms `ChatSyncService` (and with it the SSE
+   subscription) on `BOOT_COMPLETED`; a rebooted LP3 does not stay silent
+   until the tool is opened.
 
 ## Config (dev extras — no default, polling-only when unset)
 
@@ -59,7 +71,8 @@ its Matrix Push Gateway, routing each push by the `pushkey` in the payload.
 
 - **Production: ntfy.sh — DEPLOYED, live-verified (2026-08-17).** The LP3 runs
   the auto-provisioning build; Beeper→ntfy delivery live-proven on the real
-  account; `?since` resume + 5-min fallback rounds cover the gap classes.
+  account; `?since` resume + the push-gated 5/15-min fallback rounds cover the
+  gap classes; push wakes are store-verified with bounded retries (2026-09-02).
 - **UnifiedPush (LightOS distributor) — proven as a probe, NOT the production
   path (2026-08-21).** LightOS serves a per-device UP endpoint
   (`…/api/webhooks/unified_push/deliver/<uuid>`) and delivered a push

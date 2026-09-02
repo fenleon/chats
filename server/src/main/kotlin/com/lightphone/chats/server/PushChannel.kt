@@ -316,6 +316,10 @@ object PushChannel {
             // Beeper counts-only payload (no event/room ids) — still a wake.
             Log.i(TAG, "push received (counts-style, no ids) -> waking one sync")
         }
-        MatrixRepository.onPushDelivered(countsOnly = eventId == null && roomId == null)
+        MatrixRepository.onPushDelivered(
+            countsOnly = eventId == null && roomId == null,
+            eventId = eventId,
+            roomId = roomId,
+        )
     }
 }
