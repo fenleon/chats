@@ -7,20 +7,20 @@
 <p align="center">
   All your Chats, finally, on the Light Phone III.
 </p>
-<a href="https://ko-fi.com/fenleon">
-  <p align="center">
+<p align="center">
+  <a href="https://ko-fi.com/fenleon">
     <picture>
       <img src="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="70">
     </picture>
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="art/buy-me-a-coffee-alpha-white.png">
-      <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="60">
+      <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="70">
     </picture>
     <picture>
       <img src="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="70">
     </picture>
-  </p>
-</a>
+  </a>
+</p>
 
 # Chats
 A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Signal, Telegram, and more into one quiet, text-first interface. Log in with a [Beeper](https://beeper.com) account or a Matrix homeserver. Everything is end-to-end encrypted.
