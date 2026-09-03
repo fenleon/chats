@@ -25,7 +25,7 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 - End-to-end encrypted, with device verification
 
 <p align="center">
-  <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="45%"><br>
+  <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="35%"><br>
 </p>
 
 ## Install
