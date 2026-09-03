@@ -80,9 +80,17 @@ object ChatServiceMethods {
 
                 LightServiceMethod.SendMessage.id -> {
                     val request = LightServiceMethod.SendMessage.decodeRequest(payload!!)
+                    // Send-RPC timing (2026-09-03): the LP3 freeze evidence needs
+                    // the server-side send cost on the log; payload contents stay
+                    // out (privacy).
+                    val t0 = android.os.SystemClock.elapsedRealtime()
                     val response = runBlocking {
                         MatrixRepository.sendMessage(request.roomId, request.body, request.replyToEventId)
                     }
+                    android.util.Log.d(
+                        "ChatServiceMethods",
+                        "dispatch SendMessage took ${android.os.SystemClock.elapsedRealtime() - t0}ms",
+                    )
                     LightResult.Success(LightServiceMethod.SendMessage.encodeResponse(response))
                 }
 

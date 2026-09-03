@@ -106,10 +106,19 @@ object ChatClient {
         roomId: String,
         body: String,
         replyToEventId: String? = null,
-    ): LightServiceMethod.SendMessage.Response? = callRemoteServiceMethod(
-        LightServiceMethod.SendMessage,
-        LightServiceMethod.SendMessage.Request(roomId, body, replyToEventId),
-    ).getOrNull()
+    ): LightServiceMethod.SendMessage.Response? {
+        // Send-RPC timing (2026-09-03), tool-side half of the server dispatch line.
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        return callRemoteServiceMethod(
+            LightServiceMethod.SendMessage,
+            LightServiceMethod.SendMessage.Request(roomId, body, replyToEventId),
+        ).getOrNull().also {
+            android.util.Log.d(
+                "ChatClient",
+                "sendMessage RPC took ${android.os.SystemClock.elapsedRealtime() - t0}ms",
+            )
+        }
+    }
 
     /**
      * Re-sends a locally-failed message: the companion clears the outbox error

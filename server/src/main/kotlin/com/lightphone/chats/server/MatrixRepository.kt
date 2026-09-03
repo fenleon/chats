@@ -3936,11 +3936,16 @@ object MatrixRepository {
      *  run ONE in both modes: the round drains the outbox (the message
      *  reaches the server now) and the follow-up long-poll returns the echo
      *  in ~1-2s — same ~640ms cost as a push-wake round, only on a user
-     *  send. Also wakes the room-list resolver so the panel recomputes the
-     *  row. Skipped when sync is paused by the user.
+     *  send. Also wakes the room-list resolver so the pending-row bump below
+     *  publishes immediately (the echo dirties the list for the real pass).
+     *  Skipped when sync is paused by the user.
      */
     private fun wakeAfterSend(roomId: String) {
-        roomListDirty = true
+        // No roomListDirty here (2026-09-03): a pre-echo dirty pass always ran
+        // on STALE data (the echo hadn't landed), and the echo's per-room sig
+        // collectors in [observeNotifications] dirty the list themselves — so
+        // this cost a second full pass per send on a big account. The resolver
+        // wake below is kept for the pending-row bump's immediate publish.
         wakeRoomList()
         // The in-flight send's optimistic row is injected into SERVED pages —
         // bump the page revision so the thread's gating poll fetches and shows
@@ -6196,6 +6201,20 @@ object MatrixRepository {
 
     private val effectiveLastCache = java.util.concurrent.ConcurrentHashMap<String, EffectiveLast>()
 
+    /** Cached summary-gap head probe (fix 2026-09-03): the raw-chain head read
+     *  in [resolveRoomListEntry] used to run UNCACHED every pass and
+     *  [effectiveLastEvent] then re-walked the same head (51 events) — the
+     *  1→51 double read across the ~85-155 summary-gap rooms dominated the
+     *  775-read send sweep. Keyed by the room's lastEventId, mirroring
+     *  [effectiveLastCache]; only readable heads are cached. */
+    private data class SummaryGapHead(
+        /** The room lastEventId this head was probed for. */
+        val lastEventId: String,
+        val headEvent: TimelineEvent,
+    )
+
+    private val summaryGapHeadCache = java.util.concurrent.ConcurrentHashMap<String, SummaryGapHead>()
+
     private val roomListCache = java.util.concurrent.ConcurrentHashMap<String, RoomListEntry>()
     /** Last-seen room signatures, maintained by [observeNotifications] — a
      *  difference sets [roomListDirty] (the resolver's skip gate, audit 2026-08-14). */
@@ -6691,12 +6710,23 @@ object MatrixRepository {
             // the API view truncates at a gap marker — the Annette-room class,
             // 2026-08-23).
             room.lastEventId?.full?.let { lastId ->
-                val headTs = withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
-                    readTimelineChainFromDb(c, roomId, lastId, 1)?.first?.firstOrNull()?.event?.originTimestamp
-                }
-                if (headTs != null) {
+                // Head probe, cached per room.lastEventId (see [summaryGapHeadCache]).
+                val head = summaryGapHeadCache[key]
+                    ?.takeIf { it.lastEventId == lastId }
+                    ?.headEvent
+                    ?: withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
+                        readTimelineChainFromDb(c, roomId, lastId, 1)?.first?.firstOrNull()
+                    }?.also {
+                        // Don't cache a still-encrypted head: its content may
+                        // resolve on a later pass, and a cached unreadable head
+                        // would fall through to [effectiveLastEvent] forever.
+                        if (it.content?.getOrNull() != null) {
+                            summaryGapHeadCache[key] = SummaryGapHead(lastId, it)
+                        }
+                    }
+                if (head != null) {
                     serverLastId = lastId
-                    serverTs = headTs
+                    serverTs = head.event.originTimestamp
                 }
             }
             // No summary cursor at all (the sync never re-stamped this room —
@@ -6715,7 +6745,25 @@ object MatrixRepository {
                 }
             }
         }
-        val (lastEventId, ts) = effectiveLastEvent(c, roomId, serverLastId, serverTs)
+        // Early pin (fix 2026-09-03): when the summary-gap head is a real,
+        // readable message — the same test [effectiveLastEvent]'s fast pin
+        // applies — write its pin directly and skip the 51-event walk. A
+        // txn-id-free head can't be a flood ghost (see [isFloodGhost]: only
+        // txn-id events density-match), so the flood check the walk does is
+        // moot here. Everything else (mid-decrypt, ghost, parked rooms) falls
+        // through to [effectiveLastEvent] unchanged.
+        val gapHead = serverLastId?.let { id ->
+            summaryGapHeadCache[key]?.takeIf { it.lastEventId == id }?.headEvent
+        }
+        val (lastEventId, ts) = if (gapHead != null && txnIdOf(gapHead) == null &&
+            isRenderableRow(gapHead) && previewText(gapHead)?.isNotBlank() == true &&
+            contentSignature(c, gapHead) != null
+        ) {
+            effectiveLastCache[key] = EffectiveLast(serverLastId!!, serverLastId!!, serverTs)
+            serverLastId!! to serverTs
+        } else {
+            effectiveLastEvent(c, roomId, serverLastId, serverTs)
+        }
         // Own send in flight (echo not yet in the store): the row must bump to
         // the top NOW with the send's preview + time — the panel must not keep
         // the pre-send state while the user's own message is on its way (LP3
