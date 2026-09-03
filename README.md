@@ -53,7 +53,7 @@ The APK is signed with a development key, so it needs the community-ADB sideload
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="art/padlock-line-alpha-white.png">
-  <img src="art/padlock-filled-black-on-white.png" alt="A padlock holding an envelope with a heart on it" width="25%"  style="transform: rotate(10deg);><br>
+  <img src="art/padlock-filled-black-on-white.png" alt="A padlock holding an envelope with a heart on it" width="25%"  style="transform: rotate(90deg);">
   </picture>
 </p>
 
