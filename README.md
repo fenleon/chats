@@ -22,10 +22,11 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 - Notifications; a push channel delivers messages instantly
 - Voice notes and photos
 - Battery-conscious background sync, pausable from Settings
+- End-to-end encrypted, with device verification
 
 <p align="center">
   <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="22%"><br>
-  <strong>End-to-end encrypted</strong>, with emoji device verification so you can confirm who you're really talking to.
+  <strong>End-to-end encrypted</strong>
 </p>
 
 ## Install
