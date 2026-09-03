@@ -4461,12 +4461,18 @@ object MatrixRepository {
     suspend fun unsendReaction(roomId: String, eventId: String, key: String): Boolean {
         val c = client ?: return false
         val matrixRoomId = RoomId(roomId)
-        val config: GetTimelineEventsConfig.() -> Unit = {
-            this.maxSize = SEND_STATUS_WINDOW.toLong()
-            fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
-            decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
-        }
-        val window = collectNewestEvents(c, matrixRoomId, config, MESSAGES_BUDGET_MS) ?: return false
+        // Walk the RAW chain (like [reactionLabelsByEvent] and the page build),
+        // not the handler's getLastTimelineEvents view: that view can serve a
+        // partial subset — a reaction sent from another device (Beeper) wasn't
+        // in it, so the unsend found nothing, the RPC failed and the like
+        // "didn't go" (LP3 feedback 2026-09-03). Reactions are plaintext, so
+        // the fast walk is enough.
+        val start = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()?.lastEventId?.full
+        } ?: return false
+        val window = collectRelevantTimelineEvents(
+            c, matrixRoomId, start, SEND_STATUS_WINDOW, fast = true,
+        ).first
         // Reaction keys are compared VS16-normalized: bridges map native
         // reactions back with inconsistent variation selectors (a WhatsApp ❤
         // may round-trip as U+2764 while we sent U+2764+FE0F), and an exact
