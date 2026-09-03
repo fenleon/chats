@@ -9,8 +9,10 @@ import java.time.format.DateTimeFormatter
 
 /**
  * Relative timestamp for room rows: 24-hour time of day for today ("14:02" —
- * feedback 2026-08-21: the AM/PM label was too big for the rows), "Yest." for
- * the previous day, the short weekday name within the last week (Mon, Tue,
+ * feedback 2026-08-21: the AM/PM label was too big for the rows), "Yest" for
+ * the previous day (feedback 2026-09-03: the period dropped — the label reads
+ * like the weekday names, no punctuation), the short weekday name within
+ * the last week (Mon, Tue,
  * Wed, Thu, Fri, Sat, Sun), "Aug 12" (month abbreviation retained) for
  * anything older — with the month + year ("Aug 2025", no day) when the message
  * predates the current year (feedback 2026-08-30: the day was dropped from
@@ -25,7 +27,7 @@ fun formatRelativeTimestamp(timestampMs: Long): String {
     val date = dateTime.toLocalDate()
     return when {
         date == today -> dateTime.toLocalTime().format(ROW_TIME_FORMAT)
-        date == today.minusDays(1) -> "Yest."
+        date == today.minusDays(1) -> "Yest"
         date.isAfter(today.minusDays(7)) -> SHORT_DAY_NAMES[date.dayOfWeek.value - 1]
         date.year == today.year -> date.format(MONTH_DAY_FORMAT)
         else -> date.format(MONTH_YEAR_FORMAT)

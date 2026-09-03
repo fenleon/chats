@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -35,9 +36,9 @@ import kotlinx.coroutines.flow.StateFlow
  * identifier (same size as the name, second line; 2026-09-01), and the
  * network underneath as the small subtext (WhatsApp / Instagram). No top
  * bar; the bottom bar carries only an X in the middle to dismiss. The
- * identity block stays centered in the upper area; the PIN / MUTE / ARCHIVE
- * toggles stack below it, bottom-anchored just above the bottom bar (LP3
- * feedback 2026-08-28).
+ * identity block sits near the screen's vertical center; the PIN / MUTE /
+ * ARCHIVE toggles sit centred between the network tag and the bottom bar's
+ * X (LP3 feedback 2026-08-28 + 2026-09-03).
  *
  * Data source: the identifier is the contact's real number/username,
  * resolved by the companion from the bridge's contact API when the room
@@ -122,18 +123,18 @@ class ContactScreen(
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                // Identity block centered in the upper area — the toggles live
-                // in their own lower block, so the name stays put (LP3
-                // feedback 2026-08-28: adding buttons had pushed it up). The
-                // 1.12:1 weight ratio puts the toggle group's center at the
-                // midpoint between the X and the name (measured 2026-08-29).
-                Box(
-                    modifier = Modifier
-                        .weight(1.12f)
-                        .fillMaxWidth(),
-                    contentAlignment = Alignment.Center,
+                // Identity block, then the toggles, with three weighted
+                // spacers setting the gaps independently (LP3 feedback
+                // 2026-09-03: the weight-split layout coupled them — moving
+                // the name down pushed the buttons down with it). 21 : 3 : 8
+                // (measured on the 1080x1240 @ 480 grid): both old gaps
+                // halved — name→UNPIN ~86px, ARCHIVE→X ~239px — and the name
+                // block centering near the screen's vertical middle.
+                Spacer(modifier = Modifier.weight(21f))
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         LightText(
                             text = name,
                             variant = LightTextVariant.Heading,
@@ -175,31 +176,24 @@ class ContactScreen(
                             )
                         }
                     }
-                }
+                // Gap: name block → buttons. Equal to the gap below the
+                // buttons, so the toggle block sits centred between the
+                // {network} tag and the X (LP3 feedback 2026-09-03). 21 : 5.5
+                // : 5.5 keeps the same total and the same name-block position
+                // the 2026-09-03 tuning set (21/32 of the free space).
+                Spacer(modifier = Modifier.weight(5.5f))
                 // Toggle block (LP3 feedback 2026-08-28): three full-width
-                // buttons stacked on top of each other, top-aligned in the
-                // lower half so the group sits right under the identity block —
-                // that lands the buttons' center at the midpoint between the
-                // X and the name text ("always centered between the X and the
-                // text above the network subtext"), with a tight 0.25gu gap
-                // between buttons. Identity and toggles both weight 1f, so the
-                // split is stable whatever the button labels or screen size.
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth(),
-                    contentAlignment = Alignment.TopCenter,
+                // buttons stacked with a tight 0.25gu gap.
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(0.25f.gridUnitsAsDp()),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(0.25f.gridUnitsAsDp()),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        ToggleButton(if (isPinned) "UNPIN" else "PIN", onTogglePin)
-                        ToggleButton(if (isMuted) "UNMUTE" else "MUTE", onToggleMute)
-                        ToggleButton(if (isArchived) "UNARCHIVE" else "ARCHIVE", onToggleArchive)
-                    }
+                    ToggleButton(if (isPinned) "UNPIN" else "PIN", onTogglePin)
+                    ToggleButton(if (isMuted) "UNMUTE" else "MUTE", onToggleMute)
+                    ToggleButton(if (isArchived) "UNARCHIVE" else "ARCHIVE", onToggleArchive)
                 }
+                Spacer(modifier = Modifier.weight(5.5f))
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(

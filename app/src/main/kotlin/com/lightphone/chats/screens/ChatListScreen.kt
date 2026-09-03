@@ -2,6 +2,7 @@ package com.lightphone.chats.screens
 
 import android.Manifest
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,10 +20,15 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
@@ -49,8 +55,8 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
+import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import com.thelightphone.sdk.ui.gridUnitsAsDp
-import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -697,12 +703,35 @@ private fun RoomRow(
     onOpen: () -> Unit,
     onLongPress: () -> Unit,
 ) {
+    val currentOnOpen by rememberUpdatedState(onOpen)
+    val currentOnLongPress by rememberUpdatedState(onLongPress)
+    val haptic = LocalHapticFeedback.current
+    val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            // Long-press opens the contact panel (2026-08-29) — the SDK's
-            // lightClickable gained an optional onLongClick for this.
-            .lightClickable(onClick = onOpen, onLongClick = onLongPress)
+            // Long-press opens the contact panel (2026-08-29). Trigger-only
+            // haptics (LP3 feedback 2026-09-03): the buzz fires when the
+            // gesture actually completes — on a genuine tap into the room
+            // (finger-up inside the row; a scroll drag never reaches onTap)
+            // and when the long-press opens the panel — never on finger-down,
+            // so scrolling the list stays silent.
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = {
+                        if (currentHapticsEnabled) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                        currentOnOpen()
+                    },
+                    onLongPress = {
+                        if (currentHapticsEnabled) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                        currentOnLongPress()
+                    },
+                )
+            }
             // Left matches the Phone tool's recents rows (LP3-verified
             // 2026-08-21): 0.5-gu margin, then the unread star's 1-gu slot.
             // The room name lands at 2.75 gu — flush with the bottom-left
@@ -777,9 +806,17 @@ private fun OfflineBanner(text: String) {
 
 @Composable
 private fun StatusText(text: String) {
-    LightText(
-        text = text,
-        variant = LightTextVariant.Copy,
-        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 24.dp),
-    )
+    // Centered like the LP3's own loading state (LP3 feedback 2026-09-03):
+    // the "Loading…" used to sit top-left.
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        LightText(
+            text = text,
+            variant = LightTextVariant.Copy,
+            align = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp()),
+        )
+    }
 }

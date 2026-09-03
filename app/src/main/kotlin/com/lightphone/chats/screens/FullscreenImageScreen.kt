@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -39,6 +40,7 @@ import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -81,6 +83,14 @@ class FullscreenImageScreen(
         val scope = rememberCoroutineScope()
         var saving by remember(bytes) { mutableStateOf(false) }
         var saved by remember(bytes) { mutableStateOf<Boolean?>(null) }
+        // The confirmation auto-dismisses after 2 s — no tap needed (LP3
+        // feedback 2026-09-03).
+        LaunchedEffect(saved) {
+            if (saved != null) {
+                delay(2_000)
+                saved = null
+            }
+        }
 
         LightTheme(colors = themeColors) {
             Box(

@@ -1,11 +1,10 @@
 package com.lightphone.chats.screens
 
 import android.graphics.BitmapFactory
+import android.util.Log
 import android.text.format.DateUtils
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -64,6 +63,7 @@ import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
+import com.thelightphone.sdk.ui.LightFullscreenModal
 import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightText
@@ -532,6 +532,7 @@ class ThreadViewModel(
                 // reflects, then ride the rest on top — the heart (dis)appears
                 // instantly after a toggle instead of waiting on this poll.
                 var fetched = page?.messages.orEmpty()
+                Log.d("ChatsDebug", "loadNewest: page=${page != null} size=${fetched.size} overlays=${reactionOverlays.value.size}")
                 dropReflectedOverlays(fetched)
                 fetched = applyReactionOverlays(fetched)
                 loaded = fetched
@@ -779,6 +780,7 @@ class ThreadViewModel(
      * never react (nothing to like back — restraint).
      */
     fun toggleLike(message: LightServiceMethod.GetMessages.Message) {
+        Log.d("ChatsDebug", "toggleLike: id=${message.id} isMine=${message.isMine} type=${message.contentType} own=${effectiveOwnKeys(message)} haptics gate ok")
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         if (LIKE_KEY in effectiveOwnKeys(message)) removeReaction(message)
         else setReaction(message, LIKE_KEY)
@@ -850,6 +852,7 @@ class ThreadViewModel(
         val updates = own.associateWith { false } + (key to true)
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + updates))
+        Log.d("ChatsDebug", "setReaction: id=${message.id} overlay=$updates")
         loadNewest(quiet = true)
         viewModelScope.launch {
             var ok = true
@@ -857,6 +860,7 @@ class ThreadViewModel(
                 ok = ChatClient.unsendReaction(room.id, message.id, old) && ok
             }
             ok = ChatClient.sendReaction(room.id, message.id, key) && ok
+            Log.d("ChatsDebug", "setReaction RPC: ok=$ok")
             if (!ok) {
                 (own + key).forEach { revertReactionOverlay(message.id, it) }
                 reactionError.value = message.id to "reaction failed"
@@ -957,6 +961,7 @@ class ThreadViewModel(
     ): List<LightServiceMethod.GetMessages.Message> {
         val overlays = reactionOverlays.value
         if (overlays.isEmpty()) return page
+        Log.d("ChatsDebug", "applyReactionOverlays: ${overlays.keys}")
         return page.map { m ->
             val keys = overlays[m.id] ?: return@map m
             var reactions = m.reactions
@@ -1207,6 +1212,16 @@ class ThreadScreen(
         // UNSEND parks its target here for the confirm panel.
         var contextMessage by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
         var unsendConfirm by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
+        // SAVE from the context window (LP3 feedback 2026-09-03, image rows):
+        // the same save + confirm flow as the fullscreen viewer's bottom bar.
+        val contextScope = rememberCoroutineScope()
+        var saveConfirm by remember { mutableStateOf<Boolean?>(null) }
+        // The panel's target resolved against the freshest polled snapshot (so
+        // own-reaction detection never runs on a stale page) — declared here,
+        // before the list, because the in-list dismiss scrim gates on it.
+        val contextTarget = contextMessage?.let { ctx ->
+            messages.lastOrNull { it.id == ctx.id }
+        }?.takeIf { it.contentType != "redacted" }
         val muted by viewModel.muted.collectAsState()
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
@@ -1433,6 +1448,36 @@ class ThreadScreen(
                             }
                         }
                     }
+                    // A tap on the free area between the top bar and the panel
+                    // dismisses it (LP3 feedback 2026-09-03) — an invisible
+                    // scrim over that band only (last child of this Box, drawn
+                    // over the rows): top-padded clear of the top bar (back +
+                    // room name stay tappable) and ending at the panel's top
+                    // edge, so taps on the panel itself never dismiss (LP3
+                    // feedback 2026-09-03 — the panel background doesn't
+                    // consume taps, a fullscreen scrim caught them).
+                    if (contextTarget != null) {
+                        // Tap-away dismiss buzzes like every other panel
+                        // dismissal (LP3 feedback 2026-09-03), gated by the
+                        // same LocalHapticsEnabled the rows read.
+                        val scrimHaptic = LocalHapticFeedback.current
+                        val scrimHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .fillMaxWidth()
+                                .fillMaxHeight(0.5f)
+                                .padding(top = 3f.gridUnitsAsDp())
+                                .pointerInput(Unit) {
+                                    detectTapGestures(onTap = {
+                                        if (scrimHapticsEnabled) {
+                                            scrimHaptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        }
+                                        contextMessage = null
+                                    })
+                                },
+                        )
+                    }
                 }
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
@@ -1469,9 +1514,6 @@ class ThreadScreen(
             // so own-reaction detection never runs on a stale page. Rendered
             // before the volume panel so the volume panel stays on top of
             // everything.
-            val contextTarget = contextMessage?.let { ctx ->
-                messages.lastOrNull { it.id == ctx.id }
-            }?.takeIf { it.contentType != "redacted" }
             ContextWindowOverlay(
                 message = contextTarget,
                 ownReaction = contextTarget?.let(::ownReactionKeys)?.firstOrNull(),
@@ -1480,9 +1522,41 @@ class ThreadScreen(
                 onRemoveReaction = { contextTarget?.let { viewModel.removeReaction(it) } },
                 onEdit = { contextTarget?.let { openComposer(it) } },
                 onUnsend = { contextTarget?.let { unsendConfirm = it } },
+                // SAVE (image rows only — the context window's image addition,
+                // LP3 feedback 2026-09-03): the same server-side save the
+                // fullscreen viewer's SAVE PHOTO runs, confirming with the
+                // same panel (below).
+                onSave = contextTarget
+                    ?.takeIf { it.contentType == "image" }
+                    ?.let { target ->
+                        {
+                            contextScope.launch {
+                                // The panel stays up while the save round-trips
+                                // (LP3 feedback 2026-09-03: it used to vanish
+                                // first, then the confirmation appeared); the
+                                // confirm replaces it, and clearing the target
+                                // then drops the panel behind the modal.
+                                saveConfirm = ChatClient.saveMessageImage(room.id, target.id)
+                                contextMessage = null
+                            }
+                        }
+                    },
                 onDismiss = { contextMessage = null },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
+            }
+            // The save confirmation (LP3 feedback 2026-09-03): the same
+            // fullscreen-panel grammar as the viewer's, auto-dismissing after
+            // 2 s so a tap isn't needed.
+            saveConfirm?.let { ok ->
+                LaunchedEffect(ok) {
+                    delay(2_000)
+                    saveConfirm = null
+                }
+                LightFullscreenModal(
+                    message = if (ok) "Photo saved" else "Couldn't save photo",
+                    onClose = { saveConfirm = null },
+                )
             }
             // Unsend confirmation (Phase C, 2026-09-03): one accidental
             // long-press must not nuke a message — the same fullscreen-panel
@@ -1872,10 +1946,11 @@ private fun MessageRow(
                 // window over the bottom half; Phase C (2026-09-03): OWN text
                 // rows open it too (EDIT / UNSEND), when the
                 // bridge caps still allow either. `combinedClickable`/
-                // `lightClickable` can't do double-tap. Media rows are
-                // excluded — image taps open the viewer and voice-note taps
-                // play (their inner clickables swallow the gestures anyway);
-                // failed / in-flight rows keep their retry tap and don't react.
+                // `lightClickable` can't do double-tap. Media rows carry their
+                // own gestures inside their content composables (image tap =
+                // viewer, voice-note tap = play, long-press = context window
+                // since LP3 feedback 2026-09-03) — the text gate stays text-
+                // only; failed / in-flight rows keep their retry tap.
                 .then(
                     if (!failed && !inFlight && message.contentType == "text" &&
                         (!message.isMine || message.canEdit || message.canUnsend)
@@ -1888,30 +1963,39 @@ private fun MessageRow(
                         // (LP3 feedback 2026-09-03: double-tap unsend "just
                         // sends more hearts").
                         val gestureMessage by rememberUpdatedState(message)
-                        // Haptic on finger-down, the same grammar as
-                        // lightClickable (LightOS vibrates on touch) — the
-                        // raw detectTapGestures block had none, so double-tap
-                        // and long-press felt dead (LP3 feedback 2026-09-03).
-                        // Gated by the same LocalHapticsEnabled the SDK's
-                        // lightClickable reads; the SDK's context-based
-                        // haptic helper is plugin-banned in tool code, so
-                        // this goes through Compose's haptic API instead.
-                        val hapticsEnabled = LocalHapticsEnabled.current
+                        // LP3 feedback 2026-09-03 (the Phone tool's native
+                        // half-panel grammar): NO vibration on finger-down — the
+                        // haptic fires only when the gesture actually triggers,
+                        // the long press that opens the context window and the
+                        // second tap of a like. Gated by the same
+                        // LocalHapticsEnabled the SDK's lightClickable reads;
+                        // the SDK's context-based haptic helper is plugin-banned
+                        // in tool code, so this goes through Compose's haptic
+                        // API instead.
                         val haptic = LocalHapticFeedback.current
+                        val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
                         Modifier
-                            .pointerInput(hapticsEnabled) {
-                                if (!hapticsEnabled) return@pointerInput
-                                awaitEachGesture {
-                                    awaitFirstDown(requireUnconsumed = false)
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                }
-                            }
                             .pointerInput(message.id) {
                                 detectTapGestures(
                                     // The like guards isMine itself (own rows never
                                     // react) — one gesture block serves both sides.
-                                    onDoubleTap = { onToggleLike(gestureMessage) },
-                                    onLongPress = { onOpenContext(gestureMessage) },
+                                    onDoubleTap = {
+                                        if (currentHapticsEnabled) {
+                                            // LongPress-type buzz (the app's
+                                            // standard click feel) — the old
+                                            // TextHandleMove tick was
+                                            // imperceptible on the LP3
+                                            // (LP3 feedback 2026-09-03).
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        }
+                                        onToggleLike(gestureMessage)
+                                    },
+                                    onLongPress = {
+                                        if (currentHapticsEnabled) {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        }
+                                        onOpenContext(gestureMessage)
+                                    },
                                 )
                             }
                     } else {
@@ -1974,8 +2058,15 @@ private fun MessageRow(
                     )
                 }
             }
+            // Media rows open the context window on long-press (LP3 feedback
+            // 2026-09-03) — received rows always (LIKE/REACT [+ SAVE on
+            // images]), own rows only while the bridge still allows an unsend
+            // (canEdit never applies to media; otherwise no panel at all).
+            val contextGesture = if (!message.isMine || message.canUnsend) {
+                { onOpenContext(message) }
+            } else null
             if (message.contentType == "image") {
-                ImageMessageContent(message, mediaBytes, allowMobile, onEnsureMedia, onOpenImage)
+                ImageMessageContent(message, mediaBytes, allowMobile, onEnsureMedia, onOpenImage, contextGesture)
             } else if (message.contentType == "audio") {
                 AudioMessageContent(
                     message = message,
@@ -1987,6 +2078,7 @@ private fun MessageRow(
                     pausedPositionMs = pausedPositionMs,
                     error = voiceError?.takeIf { it.first == message.id }?.second,
                     onTogglePlay = { onPlayVoiceNote(message.id) },
+                    onOpenContext = contextGesture,
                 )
             } else {
                 if (message.isMine) {
@@ -2165,6 +2257,7 @@ private fun ImageMessageContent(
     allowMobile: Boolean,
     onEnsureMedia: (String, Boolean) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
+    onOpenContext: (() -> Unit)?,
 ) {
     // The toggle is part of the key: flipping "Mobile data downloads" (or
     // moving off cellular) re-attempts rows that were skipped as Wi-Fi-only.
@@ -2184,6 +2277,13 @@ private fun ImageMessageContent(
         }
     }
     val image = bitmap
+    // Gesture callbacks stay fresh across recompositions (the text rows'
+    // rememberUpdatedState lesson): the pointerInput keys below never change,
+    // so without this the captured lambdas kept the first-composed snapshot.
+    val currentOnOpenImage by rememberUpdatedState(onOpenImage)
+    val currentOnOpenContext by rememberUpdatedState(onOpenContext)
+    val haptic = LocalHapticFeedback.current
+    val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
     if (bytes == null || image == null) {
         // Still loading, or the media can't be fetched/decoded (e.g.
         // still-encrypted): fall back to the row text ("[Photo]" or the file
@@ -2221,7 +2321,23 @@ private fun ImageMessageContent(
             // side-bars beside portrait shots (feedback 2026-09-01).
             .heightIn(max = MAX_IMAGE_HEIGHT_DP)
             .padding(top = 1.dp)
-            .lightClickable(onClick = { onOpenImage(bytes) }),
+            // Tap opens the viewer; long-press opens the context window (LP3
+            // feedback 2026-09-03) — the old lightClickable tap-only target
+            // can't carry the long-press. The haptic fires on the trigger, not
+            // on finger-down (the Phone tool's half-panel grammar, LP3
+            // feedback 2026-09-03).
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { currentOnOpenImage(bytes) },
+                    // A long-press consumes the gesture — no viewer open.
+                    onLongPress = {
+                        if (currentHapticsEnabled) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                        currentOnOpenContext?.invoke()
+                    },
+                )
+            },
     )
     // Feedback round 2026-08-19: received photos with a caption (the m.image
     // body) show it under the thumbnail, like native messaging apps.
@@ -2251,6 +2367,9 @@ private fun AudioMessageContent(
     pausedPositionMs: Long?,
     error: String?,
     onTogglePlay: () -> Unit,
+    /** Non-null: long-press opens the context window (LP3 feedback
+     *  2026-09-03) — the old lightClickable played on any press length. */
+    onOpenContext: (() -> Unit)?,
 ) {
     // While playing, refresh the interpolated position counter every second:
     // the position polls arrive every few seconds, and the label interpolates
@@ -2284,9 +2403,28 @@ private fun AudioMessageContent(
         durationMs != null -> formatDuration(durationMs)
         else -> message.body
     }
+    val currentOnTogglePlay by rememberUpdatedState(onTogglePlay)
+    val currentOnOpenContext by rememberUpdatedState(onOpenContext)
+    val haptic = LocalHapticFeedback.current
+    val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
     Row(
         modifier = Modifier
-            .lightClickable(onClick = onTogglePlay)
+            // Tap toggles playback; long-press opens the context window (LP3
+            // feedback 2026-09-03) — detectTapGestures consumes the long-press
+            // so it never falls through to a play. The haptic fires on the
+            // trigger, not on finger-down (the Phone tool's half-panel
+            // grammar, LP3 feedback 2026-09-03).
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { currentOnTogglePlay() },
+                    onLongPress = {
+                        if (currentHapticsEnabled) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                        currentOnOpenContext?.invoke()
+                    },
+                )
+            }
             .padding(top = 1.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
