@@ -123,6 +123,23 @@ object ChatClient {
         )
     }
 
+    /**
+     * Sends a reaction (an m.reaction annotation; [key] = the emoji) on a
+     * message (Phase A, 2026-09-03). False when the companion rejected it.
+     */
+    suspend fun sendReaction(roomId: String, eventId: String, key: String): Boolean =
+        callRemoteServiceMethod(
+            LightServiceMethod.SendReaction,
+            LightServiceMethod.SendReaction.Request(roomId, eventId, key),
+        ) is LightResult.Success
+
+    /** Unsends (redacts) the signed-in user's reaction with [key] on [eventId]. */
+    suspend fun unsendReaction(roomId: String, eventId: String, key: String): Boolean =
+        callRemoteServiceMethod(
+            LightServiceMethod.UnsendReaction,
+            LightServiceMethod.UnsendReaction.Request(roomId, eventId, key),
+        ) is LightResult.Success
+
     suspend fun markRead(roomId: String, eventId: String) {
         callRemoteServiceMethod(
             LightServiceMethod.MarkRead,
@@ -240,6 +257,14 @@ object ChatClient {
             LightServiceMethod.GetMessageMedia,
             LightServiceMethod.GetMessageMedia.Request(roomId, eventId, allowMobileData),
         ).getOrNull()?.bytes
+
+    /** Saves an image message to the device's Pictures/Chats album
+     *  (photo viewer save button, 2026-09-03). */
+    suspend fun saveMessageImage(roomId: String, eventId: String): Boolean =
+        callRemoteServiceMethod(
+            LightServiceMethod.SaveMessageImage,
+            LightServiceMethod.SaveMessageImage.Request(roomId, eventId),
+        ).getOrNull()?.ok == true
 
     /**
      * Toggles voice-note playback in the companion: plays [eventId], or stops

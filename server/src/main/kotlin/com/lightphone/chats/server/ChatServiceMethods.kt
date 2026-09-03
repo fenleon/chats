@@ -86,6 +86,22 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.SendMessage.encodeResponse(response))
                 }
 
+                LightServiceMethod.SendReaction.id -> {
+                    val request = LightServiceMethod.SendReaction.decodeRequest(payload!!)
+                    runBlocking {
+                        MatrixRepository.sendReaction(request.roomId, request.eventId, request.key)
+                    }
+                    LightResult.Success(LightServiceMethod.SendReaction.encodeResponse(Unit))
+                }
+
+                LightServiceMethod.UnsendReaction.id -> {
+                    val request = LightServiceMethod.UnsendReaction.decodeRequest(payload!!)
+                    runBlocking {
+                        MatrixRepository.unsendReaction(request.roomId, request.eventId, request.key)
+                    }
+                    LightResult.Success(LightServiceMethod.UnsendReaction.encodeResponse(Unit))
+                }
+
                 LightServiceMethod.RetrySend.id -> {
                     val request = LightServiceMethod.RetrySend.decodeRequest(payload!!)
                     runBlocking {
@@ -233,6 +249,18 @@ object ChatServiceMethods {
                     LightResult.Success(
                         LightServiceMethod.GetMessageMedia.encodeResponse(
                             LightServiceMethod.GetMessageMedia.Response(bytes),
+                        ),
+                    )
+                }
+
+                LightServiceMethod.SaveMessageImage.id -> {
+                    val request = LightServiceMethod.SaveMessageImage.decodeRequest(payload!!)
+                    val ok = runBlocking {
+                        MatrixRepository.saveMessageImage(request.roomId, request.eventId)
+                    }
+                    LightResult.Success(
+                        LightServiceMethod.SaveMessageImage.encodeResponse(
+                            LightServiceMethod.SaveMessageImage.Response(ok),
                         ),
                     )
                 }

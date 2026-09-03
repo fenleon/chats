@@ -9,7 +9,11 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Environment
 import android.os.PowerManager
+import android.provider.MediaStore as AndroidMediaStore
+import android.webkit.MimeTypeMap
+import android.content.ContentValues
 import androidx.room.Room
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
 import com.thelightphone.sdk.shared.LightServiceMethod
@@ -145,6 +149,7 @@ import de.connect2x.trixnity.core.model.events.m.ReactionEventContent
 import de.connect2x.trixnity.core.model.events.m.room.EncryptedFile
 import de.connect2x.trixnity.core.model.events.m.room.EncryptedMessageEventContent
 import de.connect2x.trixnity.core.model.events.m.room.Membership
+import de.connect2x.trixnity.core.model.events.m.room.RedactionEventContent
 import de.connect2x.trixnity.core.model.events.m.room.RoomMessageEventContent
 import de.connect2x.trixnity.core.model.events.m.space.ChildEventContent
 import de.connect2x.trixnity.core.model.events.m.secretstorage.DefaultSecretKeyEventContent
@@ -2297,6 +2302,13 @@ object MatrixRepository {
         // Bails: anything the incremental path can't resolve exactly.
         if (delta.any { it.gap != null }) return null
         if (delta.any { te -> te.content?.getOrNull() == null && te.event.content is EncryptedMessageEventContent }) return null
+        // A redaction REMOVES content the cached page shows (Phase A, 2026-09-03:
+        // an unsent reaction's tag must vanish) — the append-only patch below can
+        // only add reaction tags, so bail to the full rebuild (rare; the rebuild
+        // recomputes tags from the window and the redacted one is gone).
+        if (delta.any { te ->
+                te.content?.getOrNull() is RedactionEventContent || te.event.content is RedactionEventContent
+            }) return null
         // The pending-echo replacement dance (optimistic row → real echo)
         // stays with the full rebuild.
         val pendingTxnIds = buildSet {
@@ -2316,13 +2328,13 @@ object MatrixRepository {
         // Edits: an edit replaces its target — patch body + edited flag. The
         // delta is newer than the whole cached page, so the newest edit wins
         // (first occurrence in newest-first order), like the full rebuild.
-        val editByTarget = HashMap<String, Pair<String, Long>>()
+        val editByTarget = HashMap<String, Pair<RoomMessageEventContent, Long>>()
         for (te in delta) {
             val content = te.content?.getOrNull() as? RoomMessageEventContent ?: continue
             val replace = content.relatesTo as? RelatesTo.Replace ?: continue
-            val newBody = (replace.newContent as? RoomMessageEventContent)?.body
-                ?.takeIf { it.isNotBlank() } ?: continue
-            editByTarget.putIfAbsent(replace.eventId.full, newBody to te.event.originTimestamp)
+            val newContent = (replace.newContent as? RoomMessageEventContent)
+                ?.takeIf { it.body.isNotBlank() } ?: continue
+            editByTarget.putIfAbsent(replace.eventId.full, newContent to te.event.originTimestamp)
         }
         // Reactions: m.reaction events in the delta patch their target rows.
         // Same dedup + label shape as the full rebuild's window walk, scoped to
@@ -2344,7 +2356,8 @@ object MatrixRepository {
                 sendStatuses[te.event.id.full],
                 read = te.event.id.full in readEventIds,
                 reactions = reactionsByTarget[te.event.id.full].orEmpty(),
-                editedBody = edit?.first,
+                editedBody = (edit?.first as? RoomMessageEventContent.TextBased)?.body,
+                editedContent = edit?.first,
                 edited = edit != null,
                 ownName = ownName,
             )?.let { newRows.add(it) }
@@ -2355,9 +2368,25 @@ object MatrixRepository {
             val edit = editByTarget[m.id]
             if (edit != null && m.contentType == "text" && !m.id.startsWith(LOCAL_PENDING_ID_PREFIX)) {
                 out = out.copy(
-                    body = stripOwnPrefix(stripForwardHeader(stripReplyQuote(edit.first)).first, ownName),
+                    body = stripOwnPrefix(stripForwardHeader(stripReplyQuote(edit.first.body)).first, ownName),
                     edited = true,
                 )
+            } else if (edit != null) {
+                // A media edit (gmessages: pending m.notice → m.image) must
+                // REBUILD the row, not body-copy: the row's contentType comes
+                // from the original event, so a body-only patch left a centred
+                // system line wearing the bare file name (2026-09-03). The
+                // reactions/read/status patches below still apply.
+                c.room.getTimelineEvent(matrixRoomId, EventId(m.id)).firstOrNull()?.let { target ->
+                    messageFrom(
+                        c, matrixRoomId, target,
+                        sendStatuses[m.id],
+                        read = m.id in readEventIds,
+                        reactions = m.reactions,
+                        editedContent = edit.first,
+                        ownName = ownName,
+                    )?.let { out = it }
+                }
             }
             val added = reactionsByTarget[m.id]
             if (added != null) {
@@ -3085,13 +3114,13 @@ object MatrixRepository {
         // occurrence of a target is the NEWEST edit — putIfAbsent keeps it.
         // Edits targeting events outside the page can't be applied here (their
         // target isn't in this page build) and stay invisible, as before.
-        val editByTarget = HashMap<String, Pair<String, Long>>()
+        val editByTarget = HashMap<String, Pair<RoomMessageEventContent, Long>>()
         for (te in events) {
             val content = te.content?.getOrNull() as? RoomMessageEventContent ?: continue
             val replace = content.relatesTo as? RelatesTo.Replace ?: continue
-            val newBody = (replace.newContent as? RoomMessageEventContent)?.body
-                ?.takeIf { it.isNotBlank() } ?: continue
-            editByTarget.putIfAbsent(replace.eventId.full, newBody to te.event.originTimestamp)
+            val newContent = (replace.newContent as? RoomMessageEventContent)
+                ?.takeIf { it.body.isNotBlank() } ?: continue
+            editByTarget.putIfAbsent(replace.eventId.full, newContent to te.event.originTimestamp)
         }
         // Auto-download: the newest audio notes of the opened thread start
         // downloading in the background so the first play tap usually hits the
@@ -3141,7 +3170,8 @@ object MatrixRepository {
                 sendStatuses[te.event.id.full],
                 read = te.event.id.full in readEventIds,
                 reactions = reactionsByEvent[te.event.id.full].orEmpty(),
-                editedBody = edit?.first,
+                editedBody = (edit?.first as? RoomMessageEventContent.TextBased)?.body,
+                editedContent = edit?.first,
                 edited = edit != null,
                 ownName = ownName,
             )?.let { result.add(it) }
@@ -4060,6 +4090,56 @@ object MatrixRepository {
             c.room.retrySendMessage(RoomId(roomId), transactionId)
             true
         }.getOrDefault(false)
+    }
+
+    /**
+     * Sends a reaction: an m.reaction annotation on [eventId] (Phase A,
+     * 2026-09-03). Reactions are NOT in [RoomService]'s MessageBuilder DSL —
+     * the raw API call is the path (same shapes verified against Trixnity
+     * 5.8.0). Throws on failure; the dispatch maps it to a tool-side error.
+     */
+    suspend fun sendReaction(roomId: String, eventId: String, key: String) {
+        val c = client ?: error("not logged in")
+        c.api.room.sendMessageEvent(
+            RoomId(roomId),
+            ReactionEventContent(relatesTo = RelatesTo.Annotation(EventId(eventId), key)),
+        ).getOrThrow()
+        // The reaction is a timeline event, so the quiet-room guard doesn't
+        // apply — the next rebuild/incremental picks the tag up; this makes
+        // it visible on the next poll instead of one tick later.
+        refreshMessagePage(roomId)
+    }
+
+    /**
+     * Unsends the signed-in user's reaction with [key] on [eventId]: finds
+     * the reaction event id(s) in the newest timeline window — covers
+     * reactions sent from other clients too — and redacts each (a
+     * re-reaction leaves several; the display dedupe keeps the earliest).
+     * False when none of the user's is in the window (nothing to unsend).
+     */
+    suspend fun unsendReaction(roomId: String, eventId: String, key: String): Boolean {
+        val c = client ?: return false
+        val matrixRoomId = RoomId(roomId)
+        val config: GetTimelineEventsConfig.() -> Unit = {
+            this.maxSize = SEND_STATUS_WINDOW.toLong()
+            fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
+            decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
+        }
+        val window = collectNewestEvents(c, matrixRoomId, config, MESSAGES_BUDGET_MS) ?: return false
+        val ownIds = window.mapNotNull { te ->
+            val content = te.content?.getOrNull() ?: (te.event.content as? ReactionEventContent)
+            if (content !is ReactionEventContent) return@mapNotNull null
+            val relates = content.relatesTo as? RelatesTo.Annotation ?: return@mapNotNull null
+            if (te.event.sender != c.userId) return@mapNotNull null
+            if (relates.eventId.full != eventId || relates.key != key) return@mapNotNull null
+            te.event.id.full
+        }
+        if (ownIds.isEmpty()) return false
+        ownIds.forEach { id ->
+            c.api.room.redactEvent(matrixRoomId, EventId(id)).getOrThrow()
+        }
+        refreshMessagePage(roomId)
+        return true
     }
 
     // --- Photos (Phase 13) --------------------------------------------------
@@ -5131,6 +5211,79 @@ object MatrixRepository {
         val jpeg = compressImage(bytes, DISPLAY_MAX_DIMENSION, DISPLAY_JPEG_QUALITY) ?: return null
         mediaCache[cacheKey] = jpeg
         return jpeg
+    }
+
+    /**
+     * Saves an image message's original bytes to the device's Pictures/Chats
+     * album (photo viewer save button, 2026-09-03). The original is re-fetched
+     * (Trixnity's media cache hits after a view) rather than saving the
+     * viewer's downscaled display JPEG. App-contributed media needs no storage
+     * permission on API 29+.
+     */
+    suspend fun saveMessageImage(roomId: String, eventId: String): Boolean {
+        val c = client ?: return false
+        if (eventId.startsWith(LOCAL_PENDING_ID_PREFIX)) return false
+        val ctx = appContext ?: return false
+        val matrixRoomId = RoomId(roomId)
+        val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+            var event: TimelineEvent? = null
+            repeat(MEDIA_CONTENT_RETRIES) {
+                event = c.room.getTimelineEvent(matrixRoomId, EventId(eventId)).firstOrNull()
+                if (event?.content?.getOrNull() != null) return@withTimeoutOrNull event
+                delay(MEDIA_CONTENT_RETRY_DELAY_MS)
+            }
+            event
+        }
+        val content = when (val raw = te?.content?.getOrNull()) {
+            is RoomMessageEventContent.FileBased.Image -> raw
+            is RoomMessageEventContent.FileBased.File ->
+                if (raw.info?.mimeType?.startsWith("image/", ignoreCase = true) == true) raw else null
+            else -> null
+        } ?: return false
+        val file = content.file?.takeIf { !it.url.isNullOrBlank() }
+        val url = content.url?.takeIf { it.isNotBlank() }
+        if (file == null && url == null) return false
+        val mediaService = c.di.get<MediaService>(MediaService::class)
+        val bytes = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+            val result = when {
+                file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = true)
+                else -> mediaService.getMedia(url!!, maxSize = null, saveToCache = true)
+            }
+            if (result.isFailure) {
+                android.util.Log.w(TAG, "saveMessageImage: fetch failed for $eventId", result.exceptionOrNull())
+            }
+            result.getOrNull()?.toByteArray()
+        }?.takeIf { it.isNotEmpty() } ?: return false
+
+        val mime = content.info?.mimeType ?: "image/jpeg"
+        val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: "jpg"
+        val name = "chats-" +
+            eventId.replace(Regex("[^A-Za-z0-9._-]"), "_") + "-" +
+            System.currentTimeMillis() + "." + ext
+        val values = ContentValues().apply {
+            put(AndroidMediaStore.Images.Media.DISPLAY_NAME, name)
+            put(AndroidMediaStore.Images.Media.MIME_TYPE, mime)
+            put(AndroidMediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Chats")
+            put(AndroidMediaStore.Images.Media.IS_PENDING, 1)
+        }
+        val resolver = ctx.contentResolver
+        val uri = resolver.insert(AndroidMediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: return false
+        try {
+            resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: run {
+                resolver.delete(uri, null, null)
+                return false
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "saveMessageImage: write failed for $eventId", e)
+            runCatching { resolver.delete(uri, null, null) }
+            return false
+        } finally {
+            values.clear()
+            values.put(AndroidMediaStore.Images.Media.IS_PENDING, 0)
+            runCatching { resolver.update(uri, values, null, null) }
+        }
+        return true
     }
 
     /** Whether the active network connection is cellular (mobile data). */
@@ -7841,6 +7994,7 @@ object MatrixRepository {
         read: Boolean = false,
         reactions: List<String> = emptyList(),
         editedBody: String? = null,
+        editedContent: RoomMessageEventContent? = null,
         edited: Boolean = false,
         ownName: String? = null,
     ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message? {
@@ -7849,7 +8003,14 @@ object MatrixRepository {
         // audio event as a playable voice-note row (played via PlayVoiceNote);
         // every other showable event renders as text. Text bodies are the full
         // message — the 80-char preview cap is only for the room list.
-        val content = te.content?.getOrNull()
+        val content = te.content?.getOrNull()?.let { orig ->
+            // A bridge media edit (m.replace) rewrites a pending m.notice into
+            // the real m.image/m.video/m.audio — classify the row from the
+            // edit's new content, or it stays a system line wearing the edited
+            // file name (gmessages, 2026-09-03). Text edits keep the original
+            // classification (their body swap rides on [editedBody]).
+            (editedContent as? RoomMessageEventContent.FileBased) ?: orig
+        }
         // Edit events (m.replace) never become a row — they REPLACE their
         // target, and the target row is rebuilt with the edited body + the
         // edited flag by [computeMessagesPage] (feedback 2026-08-27). Beeper's
@@ -7864,7 +8025,13 @@ object MatrixRepository {
         var forwarded = false
         val (body, contentType) = when (content) {
             is RoomMessageEventContent.FileBased.Image ->
-                (content.fileName?.takeIf { it.isNotBlank() } ?: "[Photo]") to "image"
+                // The body is the row's fallback label, not the file name — a
+                // bare "IMG_0312.JPG" renders like a message (gmessages,
+                // 2026-09-03). Rows with no media uri at all can never fetch
+                // ("[Photo — unavailable]"); the rest get "[Photo]" when their
+                // bytes are missing.
+                (if (content.url.isNullOrBlank() && content.file?.url.isNullOrBlank())
+                    "[Photo — unavailable]" else "[Photo]") to "image"
             is RoomMessageEventContent.FileBased.Audio ->
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note") to "audio"
             is RoomMessageEventContent.FileBased.Video ->
@@ -7879,7 +8046,8 @@ object MatrixRepository {
                 // (feedback 2026-09-01) — render those as image rows so the
                 // media actually fetches; other m.file stays a "[File]" row.
                 if (content.info?.mimeType?.startsWith("image/", ignoreCase = true) == true)
-                    (content.fileName?.takeIf { it.isNotBlank() } ?: "[Photo]") to "image"
+                    (if (content.url.isNullOrBlank() && content.file?.url.isNullOrBlank())
+                        "[Photo — unavailable]" else "[Photo]") to "image"
                 else "[File]" to "text"
             is RoomMessageEventContent.TextBased -> {
                 // m.notice = bridge system messages ("Turned off disappearing

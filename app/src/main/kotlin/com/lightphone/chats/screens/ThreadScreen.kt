@@ -1057,7 +1057,9 @@ class ThreadScreen(
                                             onRetrySend = viewModel::retrySend,
                                             onResendAsNew = viewModel::resendAsNew,
                                             onOpenImage = { bytes ->
-                                                navigateTo(screenFactory = { FullscreenImageScreen(it, row.message.id, bytes) })
+                                                navigateTo(screenFactory = {
+                                                    FullscreenImageScreen(it, room.id, row.message.id, bytes)
+                                                })
                                             },
                                         )
                                     }
