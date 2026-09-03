@@ -27,7 +27,8 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 
 <p align="center">
   <picture>
-  <img src="art/bubbles-filled-alpha-white.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="65%">
+    <source media="(prefers-color-scheme: dark)" srcset="art/bubbles-line-alpha-white.png">
+    <img src="art/bubbles-line-alpha-black.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="65%">
   </picture>
 </p>
 
@@ -51,7 +52,8 @@ The APK is signed with a development key, so it needs the community-ADB sideload
 
 <p align="center">
   <picture>
-  <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="35%"><br>
+    <source media="(prefers-color-scheme: dark)" srcset="art/padlock-line-alpha-white.png">
+  <img src="art/padlock-filled-black-on-white.png" alt="A padlock holding an envelope with a heart on it" width="35%"><br>
   </picture>
 </p>
 
