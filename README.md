@@ -17,8 +17,8 @@ Everything is end-to-end encrypted.
 
 ## Features
 
-- **Networks** — WhatsApp, Signal, Telegram, Messenger, Google Messages, Instagram DMs and more, through your Beeper account
-- 1:1 and group chats — archive, pin, mute, search, reactions, delivery status
+- Connect to all your **Networks**, including WhatsApp, Signal, Telegram, Messenger, Google Messages, Instagram DMs and more, through your Beeper account
+- 1:1 and group chats, with archive, pin, mute, search, reactions, delivery status support
 - End-to-end encryption with emoji device verification
 - Notifications; a push channel delivers messages instantly
 - Voice notes and photos
