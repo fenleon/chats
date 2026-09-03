@@ -5,7 +5,7 @@
   </picture>
 </p>
 <p align="center">
-  All your Chats, finally, on the Light Phone III.
+  All your Chats, finally, on the [Light Phone III](https://www.thelightphone.com/).
 </p>
 
 # Chats
