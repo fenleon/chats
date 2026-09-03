@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The LP3's wide thin dismiss chevron (com.lightos res/drawable/down_lp3,
+     white-filled) — the context window's bottom-center dismiss control. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="32.0dp"
+    android:height="19.0dp"
+    android:viewportWidth="32.0"
+    android:viewportHeight="19.0">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M0,3.026L11.831,14.857L15.714,18.74L19.597,14.857L31.428,3.026L27.999,-0L15.714,12.404L3.285,-0L0,3.026Z"
+        android:fillType="nonZero" />
+</vector>

@@ -155,6 +155,7 @@ import de.connect2x.trixnity.core.model.events.m.space.ChildEventContent
 import de.connect2x.trixnity.core.model.events.m.secretstorage.DefaultSecretKeyEventContent
 import de.connect2x.trixnity.core.model.events.m.secretstorage.SecretKeyEventContent
 import de.connect2x.trixnity.core.model.events.ClientEvent
+import de.connect2x.trixnity.core.model.events.RedactedEventContent
 import de.connect2x.trixnity.core.model.events.UnknownEventContent
 import de.connect2x.trixnity.core.subscribeEventList
 import de.connect2x.trixnity.core.unsubscribeOnCompletion
@@ -3165,11 +3166,24 @@ object MatrixRepository {
             pendingTextEcho[roomId]?.keys?.let { addAll(it) }
             pendingImageEcho[roomId]?.keys?.let { addAll(it) }
         }
+        // The room's bridge caps, fetched lazily on the first own row (see the
+        // row loop below).
+        var features: RoomFeatures? = null
         for (i in startIndex until events.size) {
             if (result.size >= limit) break
             val te = events[i]
             val txnId = txnIdOf(te)
             if (txnId != null && txnId in pendingTxnIds && te.content?.getOrNull() == null) continue
+            // Tombstone (Phase C, 2026-09-03): a redacted MESSAGE renders as a
+            // quiet "Message unsent" row instead of silently vanishing (the
+            // message type only — redacted reactions are timeline noise, not
+            // rows). The room-list preview machinery ([effectiveLastEvent])
+            // keeps skipping these like any other non-renderable event.
+            val resolvedContent = te.content?.getOrNull()
+            if (resolvedContent is RedactedEventContent && resolvedContent.eventType == "m.room.message") {
+                result.add(redactedRow(c, matrixRoomId, te))
+                continue
+            }
             val edit = editByTarget[te.event.id.full]
             messageFrom(
                 c,
@@ -3182,7 +3196,26 @@ object MatrixRepository {
                 editedContent = edit?.first,
                 edited = edit != null,
                 ownName = ownName,
-            )?.let { result.add(it) }
+            )?.let { row ->
+                // Bridge caps (Phase C, 2026-09-03): stamp canEdit/canUnsend on
+                // OWN rows only — the fetch fires on the first own row, so a
+                // received-only thread never pays the state GET.
+                if (!row.isMine) {
+                    result.add(row)
+                } else {
+                    if (features == null) features = roomFeatures(c, matrixRoomId)
+                    val f = features!!
+                    val ageMs = System.currentTimeMillis() - row.timestampMs
+                    result.add(
+                        row.copy(
+                            canEdit = f.editSupported && row.contentType == "text" &&
+                                (f.editMaxAgeMs == null || ageMs < f.editMaxAgeMs),
+                            canUnsend = f.deleteSupported &&
+                                (f.deleteMaxAgeMs == null || ageMs < f.deleteMaxAgeMs),
+                        ),
+                    )
+                }
+            }
         }
         // Optimistic rows for sends whose sync echo hasn't landed (voice notes
         // + text share the resolve/replace dance, feedback 2026-08-13/14): a
@@ -3294,6 +3327,77 @@ object MatrixRepository {
         } == true
         val undecryptable = roomEncrypted && beforeEventId == null && events.isNotEmpty() && oldestFirst.isEmpty()
         return MessagesPage(messages = oldestFirst, hasMore = hasMore, encrypted = undecryptable)
+    }
+
+    /** Type of Beeper's per-room bridge-capability state event (Phase C,
+     *  2026-09-03): `edit`/`delete` support levels + `edit_max_age` /
+     *  `delete_max_age` windows the bridge enforces (e.g. WhatsApp: edit 15
+     *  min, unsend 2 days). The page build reads it to offer/hide the tool's
+     *  EDIT/UNSEND actions on own rows. */
+    private const val BEEPER_ROOM_FEATURES_EVENT_TYPE = "com.beeper.room_features"
+
+    /**
+     * A room's bridge capabilities (the [BEEPER_ROOM_FEATURES_EVENT_TYPE]
+     * content, verified against mautrix's connector capabilities): the
+     * support levels are ints (-2 rejected … 2 fully supported) and the ages
+     * are JSON **seconds**. Field present ⇒ supported iff ≥ 1; field absent
+     * ⇒ supported (Telegram-style bridges leave it out — wrongly hiding the
+     * action is worse than a tap-time error); age present and > 0 ⇒ window,
+     * else no limit.
+     */
+    private data class RoomFeatures(
+        val editSupported: Boolean,
+        val editMaxAgeMs: Long?,
+        val deleteSupported: Boolean,
+        val deleteMaxAgeMs: Long?,
+    )
+
+    /** Ungated room — no [BEEPER_ROOM_FEATURES_EVENT_TYPE] state event (native
+     *  Matrix rooms, caps-less bridges): both actions always offered. */
+    private val UNGATED_ROOM_FEATURES = RoomFeatures(true, null, true, null)
+
+    /** Room → bridge caps, fetched at most once per room per process (negative
+     *  results cached too, so a caps-less room never refetches — the caps
+     *  don't change within a session, and the full-state GET is not free). */
+    private val roomFeaturesCache = java.util.concurrent.ConcurrentHashMap<String, RoomFeatures>()
+
+    /**
+     * The room's bridge caps (Phase C, 2026-09-03). The state event's
+     * state_key is the bridge-info key (NOT ""), so a targeted
+     * getStateEventContent can't hit it — a full-state GET filtered by type,
+     * deserializing to [UnknownEventContent] with the raw JSON. Any failure
+     * reads as ungated.
+     */
+    private suspend fun roomFeatures(c: MatrixClient, matrixRoomId: RoomId): RoomFeatures =
+        roomFeaturesCache[matrixRoomId.full] ?: run {
+            val features = runCatching {
+                c.api.room.getState(matrixRoomId).getOrNull()
+                    ?.firstOrNull {
+                        (it.content as? UnknownEventContent)?.eventType ==
+                            BEEPER_ROOM_FEATURES_EVENT_TYPE
+                    }
+                    ?.let { parseRoomFeatures(it.content as UnknownEventContent) }
+            }.getOrNull() ?: UNGATED_ROOM_FEATURES
+            roomFeaturesCache[matrixRoomId.full] = features
+            features
+        }
+
+    /** Lenient [RoomFeatures] parse — unknown keys/malformed numbers read as
+     *  "absent" (supported / no window), matching the fail-open rule. */
+    private fun parseRoomFeatures(content: UnknownEventContent): RoomFeatures {
+        fun supportOf(key: String): Boolean? =
+            (content.raw[key] as? JsonPrimitive)?.contentOrNull?.toIntOrNull()?.let { it >= 1 }
+
+        fun ageMsOf(key: String): Long? =
+            (content.raw[key] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
+                ?.takeIf { it > 0 }?.times(1000)
+
+        return RoomFeatures(
+            editSupported = supportOf("edit") ?: true,
+            editMaxAgeMs = ageMsOf("edit_max_age"),
+            deleteSupported = supportOf("delete") ?: true,
+            deleteMaxAgeMs = ageMsOf("delete_max_age"),
+        )
     }
 
     /** Type of Beeper's per-message delivery-state events (unencrypted, posted
@@ -4148,6 +4252,44 @@ object MatrixRepository {
         }
         refreshMessagePage(roomId)
         return true
+    }
+
+    /**
+     * Edits an own text message (Phase C, 2026-09-03): an m.replace edit —
+     * the raw API call, same path [sendReaction] proves works E2EE. The outer
+     * body carries the spec's "* " fallback prefix (what older clients
+     * render); the clean text rides in m.new_content (what the page build
+     * serves). Throws on failure; the dispatch maps it to a tool-side error.
+     */
+    suspend fun editMessage(roomId: String, eventId: String, newBody: String) {
+        if (newBody.isBlank()) error("empty edit body")
+        val c = client ?: error("not logged in")
+        c.api.room.sendMessageEvent(
+            RoomId(roomId),
+            RoomMessageEventContent.TextBased.Text(
+                body = "* $newBody",
+                relatesTo = RelatesTo.Replace(
+                    EventId(eventId),
+                    RoomMessageEventContent.TextBased.Text(body = newBody),
+                ),
+            ),
+        ).getOrThrow()
+        // The edit is a timeline event — same reasoning as [sendReaction]:
+        // this makes it visible on the next poll instead of one tick later.
+        refreshMessagePage(roomId)
+    }
+
+    /**
+     * Unsends an own message for everyone (Phase C, 2026-09-03): a plain
+     * Matrix redaction — the identical call [unsendReaction] uses, pointed at
+     * the message event instead of a reaction. The delta page patch bails to
+     * the full rebuild on redactions, so the tombstone lands on the next
+     * poll. Throws on failure; the dispatch maps it to a tool-side error.
+     */
+    suspend fun unsendMessage(roomId: String, eventId: String) {
+        val c = client ?: error("not logged in")
+        c.api.room.redactEvent(RoomId(roomId), EventId(eventId)).getOrThrow()
+        refreshMessagePage(roomId)
     }
 
     // --- Photos (Phase 13) --------------------------------------------------
@@ -7992,6 +8134,29 @@ object MatrixRepository {
         val content = te.content?.getOrNull()
         return content is RoomMessageEventContent ||
             (content == null && te.event.content is EncryptedMessageEventContent)
+    }
+
+    /**
+     * The "Message unsent" tombstone row for a redacted message event (Phase
+     * C, 2026-09-03): id/sender/name/time preserved so the row stays in its
+     * conversation slot; the content replaced by the quiet placeholder.
+     * Reactions/status/read never apply to a redacted event.
+     */
+    private suspend fun redactedRow(
+        c: MatrixClient,
+        roomId: RoomId,
+        te: TimelineEvent,
+    ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message {
+        val sender = te.event.sender
+        return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+            id = te.event.id.full,
+            sender = sender.full,
+            senderName = senderNameOf(c, roomId, sender),
+            body = "Message unsent",
+            timestampMs = te.event.originTimestamp,
+            isMine = sender == c.userId,
+            contentType = "redacted",
+        )
     }
 
     private suspend fun messageFrom(

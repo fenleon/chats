@@ -102,6 +102,22 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.UnsendReaction.encodeResponse(Unit))
                 }
 
+                LightServiceMethod.EditMessage.id -> {
+                    val request = LightServiceMethod.EditMessage.decodeRequest(payload!!)
+                    runBlocking {
+                        MatrixRepository.editMessage(request.roomId, request.eventId, request.newBody)
+                    }
+                    LightResult.Success(LightServiceMethod.EditMessage.encodeResponse(Unit))
+                }
+
+                LightServiceMethod.UnsendMessage.id -> {
+                    val request = LightServiceMethod.UnsendMessage.decodeRequest(payload!!)
+                    runBlocking {
+                        MatrixRepository.unsendMessage(request.roomId, request.eventId)
+                    }
+                    LightResult.Success(LightServiceMethod.UnsendMessage.encodeResponse(Unit))
+                }
+
                 LightServiceMethod.RetrySend.id -> {
                     val request = LightServiceMethod.RetrySend.decodeRequest(payload!!)
                     runBlocking {

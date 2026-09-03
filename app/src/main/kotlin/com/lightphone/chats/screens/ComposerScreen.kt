@@ -20,6 +20,7 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
+import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightTextInputEditor
@@ -52,6 +53,10 @@ data class ComposerResult(
 
 class ComposerViewModel(
     private val roomId: String,
+    /** When set (Phase C, 2026-09-03), the composer EDITS this message:
+     *  SEND routes to [ChatClient.editMessage] and pops back with the edit
+     *  result instead of sending a new message. */
+    private val editTarget: LightServiceMethod.GetMessages.Message? = null,
 ) : LightViewModel<ComposerResult>() {
 
     val busy = MutableStateFlow(false)
@@ -60,31 +65,46 @@ class ComposerViewModel(
         super.onScreenShow(screen)
         // The composer is the only place the tool types; announce it for the
         // whole time the screen is up, until the message is sent or dismissed.
-        viewModelScope.launch { ChatClient.setTyping(roomId, true) }
+        // An edit is not typing — no indicator for the contact.
+        if (editTarget == null) {
+            viewModelScope.launch { ChatClient.setTyping(roomId, true) }
+        }
     }
 
     override fun onScreenHide(screen: SimpleLightScreen<ComposerResult>) {
         super.onScreenHide(screen)
-        viewModelScope.launch { ChatClient.setTyping(roomId, false) }
+        if (editTarget == null) {
+            viewModelScope.launch { ChatClient.setTyping(roomId, false) }
+        }
     }
 
-    /** Sends the draft; pops back with a [ComposerResult] on success, stays on
-     *  failure so the text survives for a retry. */
+    /** Sends the draft (or applies the edit); pops back with a
+     *  [ComposerResult] on success, stays on failure so the text survives for
+     *  a retry. */
     fun send(text: CharSequence, screen: SimpleLightScreen<ComposerResult>) {
         val body = text.toString().trim()
         if (body.isEmpty() || busy.value) return
         viewModelScope.launch {
             busy.value = true
             try {
-                val response = ChatClient.sendMessage(roomId, body)
-                if (response != null) {
-                    screen.goBack(
-                        ComposerResult(
-                            body = body,
-                            id = response.eventId ?: "local-${response.transactionId}",
-                            timestampMs = System.currentTimeMillis(),
-                        ),
-                    )
+                if (editTarget != null) {
+                    val ok = ChatClient.editMessage(roomId, editTarget.id, body)
+                    if (ok) {
+                        // Same event id — the thread's optimistic edit overlay
+                        // keys off it.
+                        screen.goBack(ComposerResult(body, editTarget.id, editTarget.timestampMs))
+                    }
+                } else {
+                    val response = ChatClient.sendMessage(roomId, body)
+                    if (response != null) {
+                        screen.goBack(
+                            ComposerResult(
+                                body = body,
+                                id = response.eventId ?: "local-${response.transactionId}",
+                                timestampMs = System.currentTimeMillis(),
+                            ),
+                        )
+                    }
                 }
             } finally {
                 // A failed/exception RPC must not leave the busy flag set —
@@ -101,12 +121,15 @@ class ComposerScreen(
     sealedActivity: SealedLightActivity,
     private val roomId: String,
     private val roomName: String,
+    /** When set, the composer prefills this message's body and SEND edits it
+     *  (Phase C, 2026-09-03, opened from the thread's context window). */
+    private val editTarget: LightServiceMethod.GetMessages.Message? = null,
 ) : LightScreen<ComposerResult, ComposerViewModel>(sealedActivity) {
 
     override val viewModelClass: Class<ComposerViewModel>
         get() = ComposerViewModel::class.java
 
-    override fun createViewModel(): ComposerViewModel = ComposerViewModel(roomId)
+    override fun createViewModel(): ComposerViewModel = ComposerViewModel(roomId, editTarget)
 
     @Composable
     override fun Content() {
@@ -124,9 +147,12 @@ class ComposerScreen(
         }
         // Restore the room's unsent draft (feedback 2026-08-22); the composer
         // saves every change back to [composerDrafts] so leaving mid-draft
-        // keeps the text until it's sent or cleared.
-        val textState = rememberTextFieldState(composerDrafts[roomId] ?: "")
+        // keeps the text until it's sent or cleared. An edit (Phase C)
+        // prefills the row's body instead and never touches the draft — a
+        // cancelled edit must not leak into the next normal composer.
+        val textState = rememberTextFieldState(editTarget?.body ?: composerDrafts[roomId] ?: "")
         LaunchedEffect(textState.text) {
+            if (editTarget != null) return@LaunchedEffect
             val text = textState.text.toString()
             if (text.isEmpty()) composerDrafts.remove(roomId) else composerDrafts[roomId] = text
         }
@@ -134,7 +160,9 @@ class ComposerScreen(
         LightTheme(colors = themeColors) {
             Box(modifier = Modifier.fillMaxSize()) {
                 LightTextInputEditor(
-                    title = roomName,
+                    // An edit announces itself in the title slot (the room
+                    // name's place); back (below) cancels it.
+                    title = if (editTarget != null) "EDITING" else roomName,
                     state = textState,
                     keyboardOptionsFlow = keyboardOptionsFlow,
                     onSubmit = { viewModel.send(it, this@ComposerScreen) },

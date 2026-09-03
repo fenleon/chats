@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import android.text.format.DateUtils
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -34,6 +35,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -316,6 +318,31 @@ class ThreadViewModel(
     val voiceError = MutableStateFlow<Pair<String, String>?>(null)
 
     /**
+     * Phase B (2026-09-03) reactions. Per-event overlay over the served
+     * reaction tags — reaction key → true = own reaction added, false =
+     * suppressed — so the tag appears/disappears instantly instead of waiting
+     * on the 3 s poll. Entries drop once a served page reflects the action; a
+     * failed RPC reverts (removed) and surfaces [reactionError], the
+     * voice-error pattern. The overlay dies with the ViewModel (the thread).
+     */
+    private val reactionOverlays = MutableStateFlow<Map<String, Map<String, Boolean>>>(emptyMap())
+
+    /** (eventId, message) of a failed reaction toggle — cleared after a few seconds. */
+    val reactionError = MutableStateFlow<Pair<String, String>?>(null)
+
+    /**
+     * Phase C (2026-09-03) message overlays, same pattern as the reaction
+     * overlays: per-event optimistic edits (eventId → new body) and unsends
+     * (eventId set → tombstone), applied after the page maps in so the row
+     * reacts instantly instead of waiting on the 3 s poll. Entries drop once
+     * a served page reflects the action; unsend failures revert and surface
+     * [reactionError] (edit failures keep the composer open instead — the
+     * text survives for a retry).
+     */
+    private val editOverlays = MutableStateFlow<Map<String, String>>(emptyMap())
+    private val unsentOverlays = MutableStateFlow<Set<String>>(emptySet())
+
+    /**
      * In-app volume panel state (null = hidden), the shared LightOS replica
      * (feedback 2026-08-30): while a voice note is playing/paused the volume
      * rocker shows this panel instead of LightOS's (which is ringer-only for
@@ -491,10 +518,16 @@ class ThreadViewModel(
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
             if (!quiet) loading.value = true
-            val loaded: List<LightServiceMethod.GetMessages.Message>
+            var loaded: List<LightServiceMethod.GetMessages.Message>
             try {
                 val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
-                loaded = page?.messages.orEmpty()
+                // Reaction overlay (Phase A): drop entries the served page now
+                // reflects, then ride the rest on top — the heart (dis)appears
+                // instantly after a toggle instead of waiting on this poll.
+                var fetched = page?.messages.orEmpty()
+                dropReflectedOverlays(fetched)
+                fetched = applyReactionOverlays(fetched)
+                loaded = fetched
                 roomEncrypted.value = page?.encrypted ?: false
                 playingEventId.value = page?.audioPlayingEventId
                 if (page?.audioPositionMs != null) {
@@ -507,7 +540,11 @@ class ThreadViewModel(
                 // full replace every poll shrank the list back to the newest page
                 // and yanked the scroll down (and made top rows flicker in/out).
                 if (loaded.isNotEmpty() || messages.value.isEmpty()) {
-                    messages.value = mergeWithPending(mergeNewestPage(loaded, messages.value))
+                    // Message overlays (edits/unsends) ride on AFTER the merge,
+                    // so rows in older paged history get them too.
+                    messages.value = applyMessageOverlays(
+                        mergeWithPending(mergeNewestPage(loaded, messages.value)),
+                    )
                     hasMore.value = page?.hasMore ?: false
                 }
             } finally {
@@ -729,6 +766,228 @@ class ThreadViewModel(
     }
 
     /**
+     * Double-tap like (Phase A, 2026-09-03): toggles the signed-in user's ❤️
+     * on a RECEIVED message. Own rows never react (nothing to like back —
+     * restraint).
+     */
+    fun toggleLike(message: LightServiceMethod.GetMessages.Message) {
+        toggleReaction(message, LIKE_KEY)
+    }
+
+    /**
+     * Toggles the signed-in user's [key] reaction on a RECEIVED message
+     * (Phase B, 2026-09-03 — the context window's emoji grid): send when
+     * absent, unsend when present. The optimistic overlay flips the tag
+     * immediately (the 3 s poll is too slow); a failed RPC reverts it and
+     * shows the quiet row error (the voice-note error pattern). Own rows
+     * never react.
+     */
+    fun toggleReaction(message: LightServiceMethod.GetMessages.Message, key: String) {
+        if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
+        val adding = OWN_REACTION_TAG_PREFIX + key !in message.reactions
+        reactionOverlays.value = reactionOverlays.value +
+            (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + (key to adding)))
+        viewModelScope.launch {
+            val ok = if (adding) {
+                ChatClient.sendReaction(room.id, message.id, key)
+            } else {
+                ChatClient.unsendReaction(room.id, message.id, key)
+            }
+            if (!ok) {
+                revertReactionOverlay(message.id, key)
+                reactionError.value = message.id to "reaction failed"
+                delay(VOICE_ERROR_DISMISS_MS)
+                if (reactionError.value?.first == message.id) reactionError.value = null
+            }
+        }
+    }
+
+    /** Rolls back one key's optimistic overlay entry after a failed RPC. */
+    private fun revertReactionOverlay(eventId: String, key: String) {
+        val keys = reactionOverlays.value[eventId] ?: return
+        val remaining = keys - key
+        reactionOverlays.value =
+            if (remaining.isEmpty()) reactionOverlays.value - eventId
+            else reactionOverlays.value + (eventId to remaining)
+    }
+
+    /**
+     * Sets the signed-in user's sole reaction on a RECEIVED message to [key]
+     * (Phase B, 2026-09-03 — the context window's LIKE MESSAGE / REACT /
+     * EDIT REACTION rows, one own reaction at a time, replace semantics):
+     * unsends any existing own reaction(s) and sends [key]. Optimistic
+     * overlay for both directions; a failed RPC rolls every touched key back
+     * and surfaces the quiet row error. When the failure lands between the
+     * unsend and the send, the reaction is lost server-side — the error tag
+     * says so implicitly and the user can re-react.
+     */
+    fun setReaction(message: LightServiceMethod.GetMessages.Message, key: String) {
+        if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
+        val own = ownReactionKeys(message)
+        if (own == listOf(key)) return // already this exact reaction
+        val updates = own.associateWith { false } + (key to true)
+        reactionOverlays.value = reactionOverlays.value +
+            (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + updates))
+        viewModelScope.launch {
+            var ok = true
+            for (old in own) {
+                ok = ChatClient.unsendReaction(room.id, message.id, old) && ok
+            }
+            ok = ChatClient.sendReaction(room.id, message.id, key) && ok
+            if (!ok) {
+                (own + key).forEach { revertReactionOverlay(message.id, it) }
+                reactionError.value = message.id to "reaction failed"
+                delay(VOICE_ERROR_DISMISS_MS)
+                if (reactionError.value?.first == message.id) reactionError.value = null
+            }
+        }
+    }
+
+    /**
+     * Unsends the user's own reaction(s) on a RECEIVED message (the context
+     * window's REMOVE REACTION row). Optimistic overlay, revert + quiet row
+     * error on failure — the [toggleReaction] pattern.
+     */
+    fun removeReaction(message: LightServiceMethod.GetMessages.Message) {
+        if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
+        val own = ownReactionKeys(message)
+        if (own.isEmpty()) return
+        reactionOverlays.value = reactionOverlays.value +
+            (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + own.associateWith { false }))
+        viewModelScope.launch {
+            var ok = true
+            for (old in own) {
+                ok = ChatClient.unsendReaction(room.id, message.id, old) && ok
+            }
+            if (!ok) {
+                own.forEach { revertReactionOverlay(message.id, it) }
+                reactionError.value = message.id to "reaction failed"
+                delay(VOICE_ERROR_DISMISS_MS)
+                if (reactionError.value?.first == message.id) reactionError.value = null
+            }
+        }
+    }
+
+    /**
+     * Applies a completed edit optimistically (Phase C, 2026-09-03): the row
+     * shows the new body at once, the "edited" tag arrives with the echo. The
+     * overlay drops when a served page carries the edited body
+     * ([dropReflectedOverlays]). An edit RPC that fails never reaches here —
+     * the composer stays open with the text, which IS the revert.
+     */
+    fun applyEditEcho(eventId: String, body: String) {
+        if (body.isBlank() || eventId.startsWith(LOCAL_ROW_PREFIX)) return
+        editOverlays.value = editOverlays.value + (eventId to body)
+    }
+
+    /**
+     * Unsends an own message (Phase C, 2026-09-03 — the context window's
+     * UNSEND MESSAGE row, behind the confirm panel): the row becomes the
+     * tombstone instantly via the overlay; a failed RPC reverts it and
+     * surfaces the quiet row error (the reaction pattern). The overlay drops
+     * once a served page shows the row redacted.
+     */
+    fun unsendMessage(message: LightServiceMethod.GetMessages.Message) {
+        if (!message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
+        unsentOverlays.value = unsentOverlays.value + message.id
+        // An unsend supersedes any pending edit overlay on the same row.
+        editOverlays.value = editOverlays.value - message.id
+        loadNewest(quiet = true)
+        viewModelScope.launch {
+            val ok = ChatClient.unsendMessage(room.id, message.id)
+            if (!ok) {
+                unsentOverlays.value = unsentOverlays.value - message.id
+                reactionError.value = message.id to "unsend failed"
+                delay(VOICE_ERROR_DISMISS_MS)
+                if (reactionError.value?.first == message.id) reactionError.value = null
+            }
+        }
+    }
+
+    /**
+     * Applies the reaction overlay to a fetched newest page (after the fetch,
+     * before the merge — the overlay holds until the served page reflects the
+     * action, which [dropReflectedOverlays] handles first).
+     */
+    private fun applyReactionOverlays(
+        page: List<LightServiceMethod.GetMessages.Message>,
+    ): List<LightServiceMethod.GetMessages.Message> {
+        val overlays = reactionOverlays.value
+        if (overlays.isEmpty()) return page
+        return page.map { m ->
+            val keys = overlays[m.id] ?: return@map m
+            var reactions = m.reactions
+            keys.forEach { (key, added) ->
+                val tag = OWN_REACTION_TAG_PREFIX + key
+                reactions = if (added) {
+                    if (tag in reactions) reactions else reactions + tag
+                } else {
+                    reactions - tag
+                }
+            }
+            if (reactions != m.reactions) m.copy(reactions = reactions) else m
+        }
+    }
+
+    /**
+     * Applies the Phase C message overlays (after the merge, so rows in older
+     * paged history get them too): an edit's overlay swaps the row's body;
+     * an unsend's overlay turns the row into the "redacted" tombstone —
+     * keeping the row visible until the served rebuild replaces it, which
+     * also holds the context panel's target stable.
+     */
+    private fun applyMessageOverlays(
+        page: List<LightServiceMethod.GetMessages.Message>,
+    ): List<LightServiceMethod.GetMessages.Message> {
+        val edits = editOverlays.value
+        val unsent = unsentOverlays.value
+        if (edits.isEmpty() && unsent.isEmpty()) return page
+        return page.map { m ->
+            var row = m
+            edits[row.id]?.let { body -> row = row.copy(body = body) }
+            if (row.id in unsent) {
+                row = row.copy(
+                    contentType = "redacted",
+                    body = "Message unsent",
+                    reactions = emptyList(),
+                    sendStatus = null,
+                    read = false,
+                    caption = null,
+                    durationMs = null,
+                    forwarded = false,
+                    edited = false,
+                )
+            }
+            row
+        }
+    }
+
+    /** Drops overlay entries a fetched page now reflects (the poll caught up
+     *  with the RPC; the overlay only bridges the gap). Covers the reaction,
+     *  edit, and unsend overlays (Phase A/C). */
+    private fun dropReflectedOverlays(
+        page: List<LightServiceMethod.GetMessages.Message>,
+    ) {
+        reactionOverlays.value = reactionOverlays.value.mapNotNull { (eventId, keys) ->
+            val served = page.firstOrNull { it.id == eventId } ?: return@mapNotNull eventId to keys
+            val remaining = keys.filterNot { (key, added) ->
+                val tag = OWN_REACTION_TAG_PREFIX + key
+                if (added) tag in served.reactions else tag !in served.reactions
+            }
+            if (remaining.isEmpty()) null else eventId to remaining
+        }.toMap()
+        // Edits: the served row now carries the overlaid body (or was unsent —
+        // a redacted row never matches a body).
+        editOverlays.value = editOverlays.value.filterNot { (eventId, body) ->
+            page.any { it.id == eventId && (it.body == body || it.contentType == "redacted") }
+        }
+        // Unsends: the served row is the tombstone (same id).
+        unsentOverlays.value = unsentOverlays.value.filterNot { eventId ->
+            page.any { it.id == eventId && it.contentType == "redacted" }
+        }.toSet()
+    }
+
+    /**
      * Re-sends a bridge-reported delivery failure as a NEW message (tap on a
      * "not delivered. tap to resend" row, 2026-08-23): the event already left
      * the device, so there's no txn to retry — the same body goes out through
@@ -836,6 +1095,27 @@ private const val OLDER_LOAD_THRESHOLD = 3
 /** Optimistic rows (not yet echoed by sync) carry this id prefix. */
 private const val LOCAL_ROW_PREFIX = "local-"
 
+/** The double-tap like: the reaction key (Phase A, 2026-09-03). */
+private const val LIKE_KEY = "❤️"
+
+/**
+ * How the server tags the user's own reactions — the overlay strings must
+ * match the served format exactly ("You reacted with $key").
+ */
+private const val OWN_REACTION_TAG_PREFIX = "You reacted with "
+
+/**
+ * The signed-in user's own reaction keys on [message], read from the served
+ * tags (which already carry the optimistic overlay). Ceiling: the server's
+ * collapseReactionTags can fold the own tag into an "X and others reacted
+ * with …" merge, where this misses it — the same ceiling as the Phase A
+ * toggle.
+ */
+private fun ownReactionKeys(message: LightServiceMethod.GetMessages.Message): List<String> =
+    message.reactions
+        .filter { it.startsWith(OWN_REACTION_TAG_PREFIX) }
+        .map { it.removePrefix(OWN_REACTION_TAG_PREFIX) }
+
 /**
  * Max tap-to-resend attempts per message chain (2026-08-23): each resend is a
  * NEW message, so past this the row shows a static "failed to deliver" instead
@@ -876,6 +1156,12 @@ class ThreadScreen(
         val pausedEventId by viewModel.pausedEventId.collectAsState()
         val pausedPositionMs by viewModel.pausedPositionMs.collectAsState()
         val voiceError by viewModel.voiceError.collectAsState()
+        val reactionError by viewModel.reactionError.collectAsState()
+        // Context window (Phase B, 2026-09-03): the long-pressed message
+        // (null = the panel is hidden). Phase C adds the own-message path:
+        // UNSEND MESSAGE parks its target here for the confirm panel.
+        var contextMessage by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
+        var unsendConfirm by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
         val muted by viewModel.muted.collectAsState()
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
@@ -1052,10 +1338,13 @@ class ThreadScreen(
                                             paused = row.message.id == pausedEventId,
                                             pausedPositionMs = pausedPositionMs,
                                             voiceError = voiceError,
+                                            reactionError = reactionError,
                                             onEnsureMedia = viewModel::ensureMedia,
                                             onPlayVoiceNote = viewModel::playVoiceNote,
                                             onRetrySend = viewModel::retrySend,
                                             onResendAsNew = viewModel::resendAsNew,
+                                            onToggleLike = viewModel::toggleLike,
+                                            onOpenContext = { contextMessage = it },
                                             onOpenImage = { bytes ->
                                                 navigateTo(screenFactory = {
                                                     FullscreenImageScreen(it, room.id, row.message.id, bytes)
@@ -1127,6 +1416,40 @@ class ThreadScreen(
                     ),
                 )
             }
+            // Context window (Phase B, 2026-09-03): the long-pressed message's
+            // panel over the bottom half — received rows get LIKE MESSAGE /
+            // REACT (+ EDIT/REMOVE REACTION once a reaction exists); own rows
+            // get EDIT MESSAGE / UNSEND MESSAGE (Phase C, gated per row by
+            // the bridge caps). Actions act on the freshest polled snapshot
+            // so own-reaction detection never runs on a stale page. Rendered
+            // before the volume panel so the volume panel stays on top of
+            // everything.
+            val contextTarget = contextMessage?.let { ctx ->
+                messages.lastOrNull { it.id == ctx.id }
+            }?.takeIf { it.contentType != "redacted" }
+            ContextWindowOverlay(
+                message = contextTarget,
+                ownReaction = contextTarget?.let(::ownReactionKeys)?.firstOrNull(),
+                onLike = { contextTarget?.let { viewModel.setReaction(it, LIKE_KEY) } },
+                onReact = { key -> contextTarget?.let { viewModel.setReaction(it, key) } },
+                onRemoveReaction = { contextTarget?.let { viewModel.removeReaction(it) } },
+                onEdit = { contextTarget?.let { openComposer(it) } },
+                onUnsend = { contextTarget?.let { unsendConfirm = it } },
+                onDismiss = { contextMessage = null },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
+            }
+            // Unsend confirmation (Phase C, 2026-09-03): one accidental
+            // long-press must not nuke a message — the same fullscreen-panel
+            // grammar as the photo viewer's save confirm.
+            unsendConfirm?.let { target ->
+                UnsendConfirmPanel(
+                    onConfirm = {
+                        viewModel.unsendMessage(target)
+                        unsendConfirm = null
+                    },
+                    onDismiss = { unsendConfirm = null },
+                )
             }
             // The in-app volume panel replica (feedback 2026-08-30): the volume
             // rocker shows it over the thread while a voice note plays/pauses.
@@ -1171,24 +1494,31 @@ class ThreadScreen(
         }
     }
 
-    private fun openComposer() {
-        navigateTo(screenFactory = { ComposerScreen(it, room.id, room.name) }) { result ->
+    private fun openComposer(edit: LightServiceMethod.GetMessages.Message? = null) {
+        navigateTo(screenFactory = { ComposerScreen(it, room.id, room.name, edit) }) { result ->
             if (result != null) {
-                // The message went out — drop the restored draft so the next
-                // open starts clean (feedback 2026-08-22).
-                composerDrafts.remove(room.id)
-                // Show the sent message immediately (optimistic echo); the
-                // poll replaces the row with the real event once sync lands.
-                viewModel.addOptimistic(
-                    LightServiceMethod.GetMessages.Message(
-                        id = result.id,
-                        sender = "",
-                        senderName = "",
-                        body = result.body,
-                        timestampMs = result.timestampMs,
-                        isMine = true,
-                    ),
-                )
+                if (edit == null) {
+                    // The message went out — drop the restored draft so the
+                    // next open starts clean (feedback 2026-08-22).
+                    composerDrafts.remove(room.id)
+                    // Show the sent message immediately (optimistic echo); the
+                    // poll replaces the row with the real event once sync lands.
+                    viewModel.addOptimistic(
+                        LightServiceMethod.GetMessages.Message(
+                            id = result.id,
+                            sender = "",
+                            senderName = "",
+                            body = result.body,
+                            timestampMs = result.timestampMs,
+                            isMine = true,
+                        ),
+                    )
+                } else {
+                    // Phase C edit: the row shows the new body instantly via
+                    // the overlay; the poll's served page drops it once the
+                    // edit echo lands.
+                    viewModel.applyEditEcho(result.id, result.body)
+                }
                 viewModel.loadNewest(quiet = true)
             }
         }
@@ -1227,6 +1557,52 @@ private const val DECRYPTION_NOTICE =
  *  are pending from the account's other devices. */
 private const val DECRYPTION_NOTICE_KEYS_PENDING =
     "Encrypted — history can't be read yet, keys from your other devices are pending (Settings → Account → Verify Device)"
+
+/**
+ * The unsend confirmation (Phase C, 2026-09-03): the same fullscreen-panel
+ * grammar as the photo viewer's save confirm ([LightFullscreenModal]) —
+ * message centered on the plain background, action in the bottom bar — with
+ * the destructive action and the cancel side by side.
+ */
+@Composable
+private fun UnsendConfirmPanel(
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(LightThemeTokens.colors.background),
+    ) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(horizontal = 2f.gridUnitsAsDp()),
+            contentAlignment = Alignment.Center,
+        ) {
+            LightText(
+                text = "Unsend this message?",
+                variant = LightTextVariant.Copy,
+                align = TextAlign.Center,
+            )
+        }
+        LightBottomBar(
+            modifier = Modifier.navigationBarsPadding(),
+            items = listOf(
+                LightBarButton.Text(
+                    text = "UNSEND",
+                    onClick = onConfirm,
+                ),
+                LightBarButton.LightIcon(
+                    icon = LightIcons.CLOSE,
+                    onClick = onDismiss,
+                    contentDescription = "Cancel",
+                ),
+            ),
+        )
+    }
+}
 
 @Composable
 private fun DecryptionNotice(text: String) {
@@ -1345,10 +1721,13 @@ private fun MessageRow(
     paused: Boolean,
     pausedPositionMs: Long?,
     voiceError: Pair<String, String>?,
+    reactionError: Pair<String, String>?,
     onEnsureMedia: (String, Boolean) -> Unit,
     onPlayVoiceNote: (String) -> Unit,
     onRetrySend: (LightServiceMethod.GetMessages.Message) -> Unit,
     onResendAsNew: (LightServiceMethod.GetMessages.Message) -> Unit,
+    onToggleLike: (LightServiceMethod.GetMessages.Message) -> Unit,
+    onOpenContext: (LightServiceMethod.GetMessages.Message) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
 ) {
     // Phase 13: a buffer keeps message text off the far screen edge. Outgoing
@@ -1376,6 +1755,18 @@ private fun MessageRow(
         // like the timestamps/labels: hierarchy from size, not dimming
         // (feedback 2026-08-22: "no grey in the chats tool").
         if (message.contentType == "notice") {
+            LightText(
+                text = message.body,
+                variant = LightTextVariant.Superfine,
+                align = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            return@BoxWithConstraints
+        }
+        // Tombstones (Phase C, 2026-09-03): the message was unsent (redacted)
+        // — a quiet centered placeholder line, like the system rows above. No
+        // reactions/status/gestures: the event is gone for everyone.
+        if (message.contentType == "redacted") {
             LightText(
                 text = message.body,
                 variant = LightTextVariant.Superfine,
@@ -1421,6 +1812,31 @@ private fun MessageRow(
                         retryable -> Modifier.lightClickable(onClick = { onRetrySend(message) })
                         retryableNew && !resendExhausted -> Modifier.lightClickable(onClick = { onResendAsNew(message) })
                         else -> Modifier
+                    },
+                )
+                // Phase A (2026-09-03): double-tap a received TEXT row to like/
+                // unlike it; Phase B (2026-09-03): long-press opens the context
+                // window over the bottom half; Phase C (2026-09-03): OWN text
+                // rows open it too (EDIT MESSAGE / UNSEND MESSAGE), when the
+                // bridge caps still allow either. `combinedClickable`/
+                // `lightClickable` can't do double-tap. Media rows are
+                // excluded — image taps open the viewer and voice-note taps
+                // play (their inner clickables swallow the gestures anyway);
+                // failed / in-flight rows keep their retry tap and don't react.
+                .then(
+                    if (!failed && !inFlight && message.contentType == "text" &&
+                        (!message.isMine || message.canEdit || message.canUnsend)
+                    ) {
+                        Modifier.pointerInput(message.id) {
+                            detectTapGestures(
+                                // The like guards isMine itself (own rows never
+                                // react) — one gesture block serves both sides.
+                                onDoubleTap = { onToggleLike(message) },
+                                onLongPress = { onOpenContext(message) },
+                            )
+                        }
+                    } else {
+                        Modifier
                     },
                 ),
             horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start,
@@ -1602,6 +2018,16 @@ private fun MessageRow(
                     variant = LightTextVariant.Superfine,
                     // Solid white like the timestamps/delivery labels
                     // (feedback 2026-08-21).
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
+            // Phase A: a reaction toggle that failed server-side reverted the
+            // optimistic tag — the quiet row error says so (same grammar as the
+            // voice-note error, feedback 2026-08-19).
+            reactionError?.takeIf { it.first == message.id }?.let { error ->
+                LightText(
+                    text = error.second,
+                    variant = LightTextVariant.Superfine,
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }

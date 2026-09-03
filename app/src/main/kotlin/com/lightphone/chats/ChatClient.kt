@@ -140,6 +140,24 @@ object ChatClient {
             LightServiceMethod.UnsendReaction.Request(roomId, eventId, key),
         ) is LightResult.Success
 
+    /**
+     * Edits an own text message (Phase C, 2026-09-03). False when the
+     * companion rejected it (e.g. the edit is blank).
+     */
+    suspend fun editMessage(roomId: String, eventId: String, newBody: String): Boolean =
+        callRemoteServiceMethod(
+            LightServiceMethod.EditMessage,
+            LightServiceMethod.EditMessage.Request(roomId, eventId, newBody),
+        ) is LightResult.Success
+
+    /** Unsends (redacts) an own message — removed for everyone the bridge can
+     *  reach (Phase C, 2026-09-03). False when the companion rejected it. */
+    suspend fun unsendMessage(roomId: String, eventId: String): Boolean =
+        callRemoteServiceMethod(
+            LightServiceMethod.UnsendMessage,
+            LightServiceMethod.UnsendMessage.Request(roomId, eventId),
+        ) is LightResult.Success
+
     suspend fun markRead(roomId: String, eventId: String) {
         callRemoteServiceMethod(
             LightServiceMethod.MarkRead,
