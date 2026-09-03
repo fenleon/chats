@@ -2557,10 +2557,17 @@ object MatrixRepository {
     /**
      * Content signature for dedup: sender + message kind + body/url + file
      * name. Null when the content isn't readable yet (still-encrypted) — such
-     * events can't be deduped and fall through to the flood rule.
+     * events can't be deduped and fall through to the flood rule. Also null
+     * for m.replace edit events: they never render as rows, so they're not
+     * re-import-copy candidates — and their media url lives in
+     * m.new_content, leaving the top-level url/fileName null, which made
+     * every same-sender media edit collapse into one signature and dedupe
+     * kept only the newest (gmessages 2026-09-03: older photo edits dropped,
+     * their "Waiting for attachment …" notices never became photos).
      */
     private fun contentSignature(c: MatrixClient, te: TimelineEvent): String? {
         val content = te.content?.getOrNull() ?: return null
+        if ((content as? RoomMessageEventContent)?.relatesTo is RelatesTo.Replace) return null
         val sender = te.event.sender.full
         return when (content) {
             is RoomMessageEventContent.TextBased -> "$sender|text|${content.body}"
@@ -3118,9 +3125,10 @@ object MatrixRepository {
         for (te in events) {
             val content = te.content?.getOrNull() as? RoomMessageEventContent ?: continue
             val replace = content.relatesTo as? RelatesTo.Replace ?: continue
-            val newContent = (replace.newContent as? RoomMessageEventContent)
+            val newContent = replace.newContent
+            val nc = (newContent as? RoomMessageEventContent)
                 ?.takeIf { it.body.isNotBlank() } ?: continue
-            editByTarget.putIfAbsent(replace.eventId.full, newContent to te.event.originTimestamp)
+            editByTarget.putIfAbsent(replace.eventId.full, nc to te.event.originTimestamp)
         }
         // Auto-download: the newest audio notes of the opened thread start
         // downloading in the background so the first play tap usually hits the
