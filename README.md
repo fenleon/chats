@@ -40,12 +40,6 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 - Battery-conscious background sync, pausable from Settings
 - End-to-end encrypted, with device verification
 
-<p align="center">
-  <picture>
-  <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="35%"><br>
-  </picture>
-</p>
-
 ## Install
 
 The APK is signed with a development key, so it needs the community-ADB sideload route and the most permissive external-tools tier on the phone:
@@ -57,8 +51,7 @@ The APK is signed with a development key, so it needs the community-ADB sideload
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="art/so-many-chats-alpha-white.png">
-    <img src="art/so-many-chats-alpha-black.png" alt="So many chats" width="35%">
+  <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="35%"><br>
   </picture>
 </p>
 
@@ -81,4 +74,9 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
 
 Chats is an independent, unofficial open-source project, not affiliated with or endorsed by The Light Phone, Inc., or Beeper. The Matrix protocol engine is [Trixnity](https://github.com/benkuly/trixnity) (Apache-2.0). Licensed under the [MIT License](LICENSE).
 
-
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="art/so-many-chats-alpha-white.png">
+    <img src="art/so-many-chats-alpha-black.png" alt="So many chats" width="35%">
+  </picture>
+</p>
