@@ -28,9 +28,10 @@ Everything is end-to-end encrypted.
 
 The APK is signed with a development key, so it needs the community-ADB sideload route and the most permissive external-tools tier on the phone:
 
-1. Enable USB debugging (Settings → Developer options) and install the APK: `adb install -r app-release.apk`
-2. Set Developer options → External tools → **All tools**
-3. Open Chats from the toolbox and log in with your Beeper account from Settings
+1. Download the latest APK from [Releases](https://github.com/fenleon/chats/releases/latest)
+2. Enable USB debugging (Settings → Developer options) and install it: `adb install -r app-release.apk`
+3. Set Developer options → External tools → **All tools**
+4. Open Chats from the toolbox and log in with your Beeper account from Settings
 
 ## Build
 
