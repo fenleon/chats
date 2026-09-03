@@ -56,3 +56,10 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
 ## Legal
 
 Chats is an independent, unofficial open-source project, not affiliated with or endorsed by The Light Phone, Inc., or Beeper. The Matrix protocol engine is [Trixnity](https://github.com/benkuly/trixnity) (Apache-2.0). Licensed under the [MIT License](LICENSE).
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="art/so-many-chats-alpha-white.png">
+    <img src="art/so-many-chats-alpha-black.png" alt="So many chats" width="35%">
+  </picture>
+</p>
