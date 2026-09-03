@@ -1942,6 +1942,44 @@ object MatrixRepository {
      *  nothing new arrived — the refresh skips the rebuild (one cheap read). */
     private val lastRefreshedEventId = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    /**
+     * Event ids this client unsend-redacted, persisted so a redacted ENCRYPTED
+     * event can be recognized as a former message in the tombstone branch of
+     * [computeMessagesPage]: Trixnity stores a redacted m.room.encrypted event
+     * as RedactedEventContent("m.room.encrypted") whatever it was (message,
+     * reaction, edit — the original type lived in the Megolm ciphertext the
+     * redaction dropped), so the plain eventType check misses it and the
+     * "[Message unsent]" row silently vanishes on the next page build (LP3
+     * feedback 2026-09-03: the unsent row vanished from the hannah room).
+     * Trusting the bare m.room.encrypted type instead is NOT an option — the
+     * bridge's key-rotation redactions (megolm self-heal, 2026-08-23) and
+     * un-react redactions would paint fake tombstones — so only redactions we
+     * ourselves issued as message redactions get the marker. Plaintext rooms
+     * keep matching on eventType alone (the type survives there).
+     */
+    private val unsentMessageIds: MutableSet<String> by lazy {
+        val set = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        runCatching {
+            unsentMessageFile()?.readText()?.lineSequence()?.filter { it.isNotBlank() }?.forEach { set.add(it) }
+        }
+        set
+    }
+
+    /** One event id per line (ids are opaque; no secrets in here). */
+    private fun unsentMessageFile(): java.io.File? =
+        appContext?.let { java.io.File(it.filesDir, "unsent_messages.txt") }
+
+    /** Records a message redaction so every later page build renders its
+     *  tombstone. Capped — a marker only matters while the redacted event sits
+     *  in a page window. */
+    private fun rememberUnsentMessage(eventId: String) {
+        val set = unsentMessageIds
+        if (!set.add(eventId)) return
+        runCatching {
+            unsentMessageFile()?.writeText(set.take(UNSENT_MARKER_MAX).joinToString("\n"))
+        }
+    }
+
     /** Room → elapsed-realtime timestamp until which the futile key-backup
      *  restore is suppressed (battery 2026-08-15: pre-verification history
      *  never gets its sessions back, yet every page build retried it). */
@@ -1952,6 +1990,12 @@ object MatrixRepository {
         val until = decryptRestoreCooldown[matrixRoomId.full] ?: return false
         return android.os.SystemClock.elapsedRealtime() < until
     }
+
+    /** Room → elapsed-realtime until which the quiet-room guard skips the
+     *  API-resolve attempts for still-unresolved reactions (battery: a key
+     *  that never arrives must not turn the 3 s guard into a decrypt loop —
+     *  see [patchReactionTags]). */
+    private val reactionResolveRetryAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /** Parks a room whose key-backup restore found nothing to load: every retry
      *  path (preview, ghost walk, page build, daily crawl) stops re-attempting
@@ -2190,12 +2234,16 @@ object MatrixRepository {
                     // Read receipts are ephemeral — they never move the room's
                     // last TIMELINE event, so this quiet-room guard would freeze
                     // the "seen" tag on a room the other party read without
-                    // replying (feedback 2026-08-30). Patch the cached page's
-                    // read flags cheaply (one bounded chain read + receipts-repo
-                    // read) instead of a full rebuild; null = nothing changed,
-                    // so the cache/disk stay untouched.
+                    // replying (feedback 2026-08-30). Reaction tags are the same
+                    // class of quiet event (LP3 feedback 2026-09-03: an
+                    // encrypted m.reaction whose content the cached build never
+                    // resolved stayed tag-less until another event landed).
+                    // Patch the cached page cheaply (one bounded chain walk +
+                    // a backoff-gated resolve for the unresolved ones) instead
+                    // of a full rebuild; null = nothing changed, so the cache
+                    // and disk stay untouched.
                     runCatching {
-                        patchReadReceipts(c, roomId, cached)?.let { updated ->
+                        patchQuietPage(c, roomId, cached)?.let { updated ->
                             messagePageCache[roomId] = MessagePageEntry(
                                 updated, cached.limit, android.os.SystemClock.elapsedRealtime(),
                             )
@@ -2269,6 +2317,94 @@ object MatrixRepository {
             if (!m.read && m.id in readEventIds) {
                 changed = true
                 m.copy(read = true)
+            } else m
+        }
+        if (!changed) return null
+        return MessagesPage(patched, cached.page.hasMore, cached.page.encrypted)
+    }
+
+    /**
+     * Quiet-room guard patch: recomputes the cached page's parts that don't
+     * move the room's last event id — read receipts (sync ephemeral, feedback
+     * 2026-08-30) and reaction tags (see [patchReactionTags]). null when
+     * neither changed, so the caller keeps the cache and disk as-is.
+     */
+    private suspend fun patchQuietPage(
+        c: MatrixClient,
+        roomId: String,
+        cached: MessagePageEntry,
+    ): MessagesPage? {
+        val receiptPatched = runCatching { patchReadReceipts(c, roomId, cached) }.getOrNull()
+        val tagPatched = runCatching {
+            patchReactionTags(
+                c, roomId,
+                receiptPatched?.let { MessagePageEntry(it, cached.limit, cached.refreshedAtMs) } ?: cached,
+            )
+        }.getOrNull()
+        return tagPatched ?: receiptPatched
+    }
+
+    /**
+     * Recomputes a cached newest page's reaction tags ("Name reacted with ❤️")
+     * over the cached chain window — the same newest-page-only scope the full
+     * rebuild tags from, so the patch stays consistent with what the page
+     * holds. The reason this exists: an encrypted m.reaction (bridge reactions
+     * land as Megolm) reaches the store with its content unresolved, the
+     * rebuild that ran on its arrival gave up on the decrypt and stamped
+     * lastRefreshedEventId, and every later quiet tick then skipped it — the
+     * tag only appeared when another event forced a rebuild (LP3 feedback
+     * 2026-09-03: the hannah room's reactions showed late or never). Events
+     * still unresolved are re-read through the API — that re-read triggers the
+     * decrypt (the mechanism [resolvePendingEcho] relies on) — at most
+     * [REACTION_RESOLVE_MAX] per pass with a per-room backoff after a dry pass,
+     * so a key that never arrives can't turn the 3 s guard into a decrypt loop
+     * (battery). null when nothing changed.
+     */
+    private suspend fun patchReactionTags(
+        c: MatrixClient,
+        roomId: String,
+        cached: MessagePageEntry,
+    ): MessagesPage? {
+        val prevId = lastRefreshedEventId[roomId] ?: return null
+        val matrixRoomId = RoomId(roomId)
+        // Quiet means nothing NEW arrived since the last refresh — the missed
+        // reaction already sits inside the cached window, so this bounded store
+        // walk covers it (the same walk [patchReadReceipts] does for receipts).
+        val chain = readTimelineChainFromDb(c, matrixRoomId, prevId, cached.limit + 1)?.first.orEmpty()
+        if (chain.isEmpty()) return null
+        val unresolved = chain.filter {
+            it.content?.getOrNull() == null && it.event.content is EncryptedMessageEventContent
+        }
+        val resolved = mutableListOf<TimelineEvent>()
+        if (unresolved.isNotEmpty()) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now >= (reactionResolveRetryAt[roomId] ?: 0L)) {
+                val config: GetTimelineEventConfig.() -> Unit = {
+                    fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                    decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                }
+                for (te in unresolved.take(REACTION_RESOLVE_MAX)) {
+                    withTimeoutOrNull(DECRYPT_WAIT_MS) {
+                        c.room.getTimelineEvent(matrixRoomId, te.event.id, config)
+                            .filterNotNull().firstOrNull { it.content?.getOrNull() != null }
+                    }?.let { resolved.add(it) }
+                }
+                // A dry pass backs the resolve attempts off — the walk below
+                // still picks the tag up the moment sync lands the key and the
+                // store row resolves on its own.
+                if (resolved.isEmpty()) reactionResolveRetryAt[roomId] = now + REACTION_RESOLVE_RETRY_MS
+                else reactionResolveRetryAt.remove(roomId)
+            }
+        }
+        val tags = reactionTagsForEvents(c, matrixRoomId, chain + resolved)
+        if (tags.isEmpty()) return null
+        var changed = false
+        val patched = cached.page.messages.map { m ->
+            val fresh = tags[m.id] ?: return@map m
+            val collapsed = collapseReactionTags(fresh)
+            if (collapsed != m.reactions) {
+                changed = true
+                m.copy(reactions = collapsed)
             } else m
         }
         if (!changed) return null
@@ -3155,10 +3291,22 @@ object MatrixRepository {
         // newest events; an older page's messages are always "read" in practice
         // but re-resolving each receipt per page isn't worth it).
         val readEventIds = if (beforeEventId == null && !fast) readReceiptsByEvent(c, matrixRoomId, events) else emptySet()
-        // Reactions, same newest-page scope: m.reaction events sit after their
-        // target in the timeline, so the newest window carries the reactions
-        // that matter. Older pages report none (minimal Phase 14 scope).
-        val reactionsByEvent = if (beforeEventId == null && !fast) reactionLabelsByEvent(c, matrixRoomId) else emptyMap()
+        // Reactions on EVERY page path (LP3 2026-09-03): m.reaction sits after
+        // its target, so a walk from the room head covers the in-window
+        // messages of fast cold-open pages and scrolled-back older pages alike
+        // — both served no tags before (the Sophie 9:12 likes, the Hannah
+        // reactions). Plaintext walk, no decrypt wait; [reactionCache] keeps
+        // repeated builds (older-page scrolls) off the raw chain. Ceiling:
+        // messages deeper than SEND_STATUS_WINDOW events from the head show
+        // no reactions — a deeper per-scroll walk would tax every pagination.
+        // Full builds recompute UNCACHED (as before): they must see fresh
+        // state the moment a sync lands — a reaction removed on another
+        // device redacts the tag immediately, not one TTL later.
+        val reactionsByEvent = if (beforeEventId == null && !fast) {
+            reactionLabelsByEvent(c, matrixRoomId)
+        } else {
+            reactionLabelsByEventCached(c, matrixRoomId)
+        }
         // A just-sent message's echo can sit in the timeline before its
         // decryption lands; the optimistic rows below represent it, so skip
         // the undecrypted "[Encrypted]" placeholder — a message the user just
@@ -3181,9 +3329,22 @@ object MatrixRepository {
             // quiet "Message unsent" row instead of silently vanishing (the
             // message type only — redacted reactions are timeline noise, not
             // rows). The room-list preview machinery ([effectiveLastEvent])
-            // keeps skipping these like any other non-renderable event.
+            // keeps skipping these like any other non-renderable event. In an
+            // e2ee room the original type is unrecoverable — Trixnity stores
+            // any redacted encrypted event as RedactedEventContent
+            // ("m.room.encrypted"), whatever it was — so a redacted message
+            // only identifies via our own unsend marker ([unsentMessageIds]);
+            // trusting the bare encrypted type would paint tombstones over the
+            // bridge's key-rotation redactions (LP3 feedback 2026-09-03: the
+            // unsent row vanished from the hannah room's thread).
             val resolvedContent = te.content?.getOrNull()
-            if (resolvedContent is RedactedEventContent && resolvedContent.eventType == "m.room.message") {
+            if (resolvedContent is RedactedEventContent &&
+                (
+                    resolvedContent.eventType == "m.room.message" ||
+                        resolvedContent.eventType == "m.room.encrypted" &&
+                        te.event.id.full in unsentMessageIds
+                    )
+            ) {
                 result.add(redactedRow(c, matrixRoomId, te))
                 continue
             }
@@ -3489,6 +3650,12 @@ object MatrixRepository {
      *  page build (fast warm, pagination, refresh) reads one map instead of
      *  re-walking the room's status window per call (2026-08-23). */
     private val sendStatusCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Map<String, String>>>()
+    /** Per-room reaction-tag maps behind the same TTL ([SEND_STATUS_CACHE_TTL_MS])
+     *  as [sendStatusCache] — every page path now carries reactions (LP3
+     *  2026-09-03), and each build would otherwise re-walk the raw chain.
+     *  Invalidated in [sendReaction]/[unsendReaction] so a toggle never reads
+     *  its own stale map. */
+    private val reactionCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Map<String, List<String>>>>()
 
     /** [sendStatusByEventId] with a per-room TTL cache — statuses must reach
      *  messages on ANY page (the FAIL marker disappearing once a message
@@ -3574,14 +3741,39 @@ object MatrixRepository {
         c: MatrixClient,
         matrixRoomId: RoomId,
     ): Map<String, List<String>> {
-        val config: GetTimelineEventsConfig.() -> Unit = {
-            this.maxSize = SEND_STATUS_WINDOW.toLong()
-            fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
-            decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
-        }
-        val collected = collectNewestEvents(c, matrixRoomId, config, MESSAGES_BUDGET_MS)
-            ?: return emptyMap()
+        // Walk the RAW chain (like [sendStatusByEventId] and the page build),
+        // not the handler's getLastTimelineEvents view: that view can miss
+        // events after a chain gap — the Sophie room's existing reaction
+        // never reached the served page's reactions map (LP3 2026-09-03; the
+        // page build abandoned that API for the same reason). Reactions are
+        // never encrypted, so the fast walk is enough.
+        val start = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()?.lastEventId?.full
+        } ?: return emptyMap()
+        val collected = collectRelevantTimelineEvents(c, matrixRoomId, start, SEND_STATUS_WINDOW, fast = true).first
         return reactionTagsForEvents(c, matrixRoomId, collected)
+    }
+
+    /**
+     * [reactionLabelsByEvent] behind the same per-room TTL as the send
+     * statuses. Serves every page path — the fast cold-open page and
+     * scrolled-back older pages included, which both served no tags before
+     * (LP3 2026-09-03: the Sophie 9:12 likes were invisible on the fast page,
+     * and the fast 6-row page is what gets persisted, so a quiet room kept
+     * its tag-less page until a background rebuild landed).
+     */
+    private suspend fun reactionLabelsByEventCached(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+    ): Map<String, List<String>> {
+        val key = matrixRoomId.full
+        val now = android.os.SystemClock.elapsedRealtime()
+        reactionCache[key]?.let { (fetchedAt, map) ->
+            if (now - fetchedAt < SEND_STATUS_CACHE_TTL_MS) return map
+        }
+        val map = reactionLabelsByEvent(c, matrixRoomId)
+        reactionCache[key] = now to map
+        return map
     }
 
     /**
@@ -3592,8 +3784,9 @@ object MatrixRepository {
      * semantics — LP3 feedback 2026-09-03: fire then heart showed both), the
      * person's newest reaction kept, ordered chronologically so the first tag
      * is the FIRST person to react (the name a summary keeps; 2026-09-02).
-     * Older pages report none — reactions sit after their target in the
-     * timeline, so the newest window carries them (minimal Phase 14 scope).
+     * The tag map comes from a bounded walk off the room head
+     * ([reactionLabelsByEventCached], SEND_STATUS_WINDOW events), so messages
+     * deeper than that window report none even on older pages.
      */
     private suspend fun reactionTagsForEvents(
         c: MatrixClient,
@@ -4252,7 +4445,9 @@ object MatrixRepository {
         ).getOrThrow()
         // The reaction is a timeline event, so the quiet-room guard doesn't
         // apply — the next rebuild/incremental picks the tag up; this makes
-        // it visible on the next poll instead of one tick later.
+        // it visible on the next poll instead of one tick later. The page
+        // cache must drop too, or the reload re-reads its own stale map.
+        reactionCache.remove(roomId)
         refreshMessagePage(roomId)
     }
 
@@ -4295,6 +4490,7 @@ object MatrixRepository {
         ownIds.forEach { id ->
             c.api.room.redactEvent(matrixRoomId, EventId(id)).getOrThrow()
         }
+        reactionCache.remove(roomId)
         refreshMessagePage(roomId)
         return true
     }
@@ -4333,6 +4529,11 @@ object MatrixRepository {
      */
     suspend fun unsendMessage(roomId: String, eventId: String) {
         val c = client ?: error("not logged in")
+        // The marker goes down BEFORE the redaction call: the page rebuild this
+        // triggers can beat the redaction's sync echo into the store, and the
+        // tombstone must survive both orderings (e2ee rooms can't recognize a
+        // redacted message by type — see [unsentMessageIds]).
+        rememberUnsentMessage(eventId)
         c.api.room.redactEvent(RoomId(roomId), EventId(eventId)).getOrThrow()
         refreshMessagePage(roomId)
     }
@@ -6075,11 +6276,22 @@ object MatrixRepository {
         // the unread badge and the room list stay (muted), or the room is
         // hidden from the list entirely and reachable only via search
         // (archived). Checked before the decrypt wait so a muted room costs
-        // nothing per message. Cache miss (flags not yet built) = notify, same
-        // as before the flags cache existed.
+        // nothing per message.
         val flags = roomFlagsCache[roomId.full]
         if (flags?.muted == true || flags?.archived == true) {
             android.util.Log.d(TAG, "notifyForEvent: skipping ${if (flags.archived == true) "archived" else "muted"} room $roomId")
+            return
+        }
+        // Cold-process miss (the whole-cache build waits on the room-list
+        // resolver): mute must not wait — the install-restart notified a
+        // MUTED room in this window (LP3 feedback 2026-09-03, the muted
+        // Crocs squad re-notified right after an APK update). The miss path
+        // reads the push rules directly — one account-data store read, and
+        // it warms nothing (the resolver rebuild supersedes it). Archived
+        // still falls through to notify here: resolving it costs a network
+        // GET per event, and an archived room's unread event is rare.
+        if (flags == null && isRoomMutedByPushRule(c, roomId.full)) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping muted (cold-cache read) room $roomId")
             return
         }
         // Wait briefly for decryption so the preview shows the real text (the
@@ -7042,6 +7254,20 @@ object MatrixRepository {
         wakeRoomList()
     }
 
+    /** The room's mute flag straight from the synced global ROOM push rules:
+     *  a `dont_notify` rule with the room id (dont_notify has no PushAction
+     *  constant — compare by name; raw equality is JsonElement-sensitive).
+     *  One account-data store read — used per-room by the cache build and
+     *  directly by the notify gate's cold-cache miss path. */
+    private suspend fun isRoomMutedByPushRule(c: MatrixClient, roomId: String): Boolean = try {
+        c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
+            .get(PushRulesEventContent::class).first()?.content?.global?.room
+            .orEmpty()
+            .any { it.ruleId == roomId && it.actions.any { action -> action.name == "dont_notify" } }
+    } catch (_: Exception) {
+        false // unreadable rules: behave like before (no mute known)
+    }
+
     /**
      * Pinned/archived/muted per room, from synced state: the room's m.favourite
      * tag (pinned), Beeper's `com.beeper.inbox.done` account data
@@ -7071,10 +7297,6 @@ object MatrixRepository {
         // the LP3 served exactly 1 pinned room though the store held 3
         // (2026-08-29: Sophie pinned, Anni + Note to self dropped).
         val result = roomFlagsCache.toMutableMap()
-        val pushRules = try {
-            c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
-                .get(PushRulesEventContent::class).first()?.content?.global?.room.orEmpty()
-        } catch (_: Exception) { emptyList() }
         for ((roomId, _) in rooms) {
             val key = roomId.full
             withTimeoutOrNull(ROOM_FLAGS_ROOM_BUDGET_MS) {
@@ -7094,9 +7316,7 @@ object MatrixRepository {
                 result[key] = RoomFlags(
                     pinned = tags?.tags?.containsKey(TagEventContent.TagName.Favourite) == true,
                     archived = archived,
-                    // dont_notify has no PushAction constant — compare by name
-                    // (raw equality is JsonElement-sensitive).
-                    muted = pushRules.any { it.ruleId == key && it.actions.any { action -> action.name == "dont_notify" } },
+                    muted = isRoomMutedByPushRule(c, key),
                 )
                 // Our optimistic write now matches the server — drop the
                 // overlay entry (confirmed). Not-yet-echoed writes stay.
@@ -8576,6 +8796,13 @@ object MatrixRepository {
     private const val DECRYPT_WAIT_MS = 3_000L
     /** Peek budget for events after the first one failed to decrypt. */
     private const val QUICK_DECRYPT_WAIT_MS = 100L
+    /** Quiet-guard reaction patch (see [patchReactionTags]): unresolved events
+     *  API-resolved per pass, and the backoff after a pass that resolved none. */
+    private const val REACTION_RESOLVE_MAX = 2
+    private const val REACTION_RESOLVE_RETRY_MS = 30_000L
+    /** Marker store cap (see [unsentMessageIds]) — a marker only matters while
+     *  the redacted event sits in a page window. */
+    private const val UNSENT_MARKER_MAX = 256
     /** Local outbox read for the pending-row state (event id / send error). */
     private const val OUTBOX_READ_TIMEOUT_MS = 500L
     /** Bounded wait for the homeserver ack of a text send ([awaitOutboxAck]) —
