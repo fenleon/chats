@@ -162,7 +162,7 @@ class ComposerScreen(
                 LightTextInputEditor(
                     // An edit announces itself in the title slot (the room
                     // name's place); back (below) cancels it.
-                    title = if (editTarget != null) "EDITING" else roomName,
+                    title = if (editTarget != null) "Editing Message" else roomName,
                     state = textState,
                     keyboardOptionsFlow = keyboardOptionsFlow,
                     onSubmit = { viewModel.send(it, this@ComposerScreen) },

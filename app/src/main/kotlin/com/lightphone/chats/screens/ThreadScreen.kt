@@ -4,6 +4,8 @@ import android.graphics.BitmapFactory
 import android.text.format.DateUtils
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -27,6 +29,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -35,12 +38,15 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
@@ -67,6 +73,7 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
+import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import com.thelightphone.sdk.ui.scaledForScreenHeight
@@ -766,12 +773,15 @@ class ThreadViewModel(
     }
 
     /**
-     * Double-tap like (Phase A, 2026-09-03): toggles the signed-in user's ❤️
-     * on a RECEIVED message. Own rows never react (nothing to like back —
-     * restraint).
+     * Double-tap like (Phase A, 2026-09-03): Beeper semantics — double-tap
+     * REPLACES the user's current reaction with the ❤️ (not add alongside,
+     * LP3 feedback 2026-09-03); a second double-tap removes it. Own rows
+     * never react (nothing to like back — restraint).
      */
     fun toggleLike(message: LightServiceMethod.GetMessages.Message) {
-        toggleReaction(message, LIKE_KEY)
+        if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
+        if (LIKE_KEY in effectiveOwnKeys(message)) removeReaction(message)
+        else setReaction(message, LIKE_KEY)
     }
 
     /**
@@ -784,9 +794,21 @@ class ThreadViewModel(
      */
     fun toggleReaction(message: LightServiceMethod.GetMessages.Message, key: String) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
-        val adding = OWN_REACTION_TAG_PREFIX + key !in message.reactions
+        // The toggle must see its own optimistic overlay: a quick re-tap before
+        // the poll catches up reads the overlay's target state, not the stale
+        // served page (LP3 feedback 2026-09-03: re-tapping kept SENDING hearts).
+        val overlayKeys = reactionOverlays.value[message.id]
+        val ownPresent = if (overlayKeys != null && key in overlayKeys) {
+            overlayKeys.getValue(key)
+        } else {
+            OWN_REACTION_TAG_PREFIX + key in message.reactions
+        }
+        val adding = !ownPresent
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + (key to adding)))
+        // Re-fetch with the overlay applied — the tag flips this frame, not on
+        // the next poll tick.
+        loadNewest(quiet = true)
         viewModelScope.launch {
             val ok = if (adding) {
                 ChatClient.sendReaction(room.id, message.id, key)
@@ -823,11 +845,12 @@ class ThreadViewModel(
      */
     fun setReaction(message: LightServiceMethod.GetMessages.Message, key: String) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
-        val own = ownReactionKeys(message)
+        val own = effectiveOwnKeys(message)
         if (own == listOf(key)) return // already this exact reaction
         val updates = own.associateWith { false } + (key to true)
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + updates))
+        loadNewest(quiet = true)
         viewModelScope.launch {
             var ok = true
             for (old in own) {
@@ -850,10 +873,11 @@ class ThreadViewModel(
      */
     fun removeReaction(message: LightServiceMethod.GetMessages.Message) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
-        val own = ownReactionKeys(message)
+        val own = effectiveOwnKeys(message)
         if (own.isEmpty()) return
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + own.associateWith { false }))
+        loadNewest(quiet = true)
         viewModelScope.launch {
             var ok = true
             for (old in own) {
@@ -866,6 +890,25 @@ class ThreadViewModel(
                 if (reactionError.value?.first == message.id) reactionError.value = null
             }
         }
+    }
+
+    /**
+     * The user's current reaction keys on [message]: the served tags plus the
+     * optimistic overlay — a reaction just tapped (or just removed) that the
+     * poll hasn't reflected yet still counts, so a second toggle acts on the
+     * real state instead of the stale page (the [toggleReaction] overlay read,
+     * generalized for the replace semantics of [toggleLike]/[setReaction]).
+     */
+    private fun effectiveOwnKeys(message: LightServiceMethod.GetMessages.Message): List<String> {
+        val keys = ownReactionKeys(message).toMutableList()
+        reactionOverlays.value[message.id]?.forEach { (key, added) ->
+            if (added) {
+                if (key !in keys) keys.add(key)
+            } else {
+                keys.remove(key)
+            }
+        }
+        return keys
     }
 
     /**
@@ -944,11 +987,13 @@ class ThreadViewModel(
         if (edits.isEmpty() && unsent.isEmpty()) return page
         return page.map { m ->
             var row = m
-            edits[row.id]?.let { body -> row = row.copy(body = body) }
+            // The edit overlay also stamps the "edited" tag — the body swap
+            // alone made the tag wait for the echo (LP3 feedback 2026-09-03).
+            edits[row.id]?.let { body -> row = row.copy(body = body, edited = true) }
             if (row.id in unsent) {
                 row = row.copy(
                     contentType = "redacted",
-                    body = "Message unsent",
+                    body = "[Message unsent]",
                     reactions = emptyList(),
                     sendStatus = null,
                     read = false,
@@ -1444,6 +1489,7 @@ class ThreadScreen(
             // grammar as the photo viewer's save confirm.
             unsendConfirm?.let { target ->
                 UnsendConfirmPanel(
+                    target = target,
                     onConfirm = {
                         viewModel.unsendMessage(target)
                         unsendConfirm = null
@@ -1559,13 +1605,14 @@ private const val DECRYPTION_NOTICE_KEYS_PENDING =
     "Encrypted — history can't be read yet, keys from your other devices are pending (Settings → Account → Verify Device)"
 
 /**
- * The unsend confirmation (Phase C, 2026-09-03): the same fullscreen-panel
- * grammar as the photo viewer's save confirm ([LightFullscreenModal]) —
- * message centered on the plain background, action in the bottom bar — with
- * the destructive action and the cancel side by side.
+ * The unsend confirmation (Phase C, 2026-09-03). LP3 feedback 2026-09-03: the
+ * question reads big, the message previews under it (3 lines, ellipsized), the
+ * destructive action sits alone in the bottom bar, and back (<, top left)
+ * cancels — the composer's navigation grammar, not a modal.
  */
 @Composable
 private fun UnsendConfirmPanel(
+    target: LightServiceMethod.GetMessages.Message,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1574,6 +1621,13 @@ private fun UnsendConfirmPanel(
             .fillMaxSize()
             .background(LightThemeTokens.colors.background),
     ) {
+        LightTopBar(
+            leftButton = LightBarButton.LightIcon(
+                icon = LightIcons.BACK,
+                onClick = onDismiss,
+                contentDescription = "Back",
+            ),
+        )
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -1581,23 +1635,28 @@ private fun UnsendConfirmPanel(
                 .padding(horizontal = 2f.gridUnitsAsDp()),
             contentAlignment = Alignment.Center,
         ) {
-            LightText(
-                text = "Unsend this message?",
-                variant = LightTextVariant.Copy,
-                align = TextAlign.Center,
-            )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                LightText(
+                    text = "Are you sure you want to unsend this message?",
+                    variant = LightTextVariant.Subheading,
+                    align = TextAlign.Center,
+                )
+                LightText(
+                    text = target.body.ifBlank { "[Message]" },
+                    variant = LightTextVariant.Paragraph,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    align = TextAlign.Center,
+                    modifier = Modifier.padding(top = 1f.gridUnitsAsDp()),
+                )
+            }
         }
         LightBottomBar(
             modifier = Modifier.navigationBarsPadding(),
             items = listOf(
                 LightBarButton.Text(
-                    text = "UNSEND",
+                    text = "CONFIRM",
                     onClick = onConfirm,
-                ),
-                LightBarButton.LightIcon(
-                    icon = LightIcons.CLOSE,
-                    onClick = onDismiss,
-                    contentDescription = "Cancel",
                 ),
             ),
         )
@@ -1763,18 +1822,12 @@ private fun MessageRow(
             )
             return@BoxWithConstraints
         }
-        // Tombstones (Phase C, 2026-09-03): the message was unsent (redacted)
-        // — a quiet centered placeholder line, like the system rows above. No
-        // reactions/status/gestures: the event is gone for everyone.
-        if (message.contentType == "redacted") {
-            LightText(
-                text = message.body,
-                variant = LightTextVariant.Superfine,
-                align = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            return@BoxWithConstraints
-        }
+        // Tombstones (Phase C, 2026-09-03): the message was unsent (redacted).
+        // Rendered like a normal text row — same size and sender alignment,
+        // "[Message unsent]" body, no reactions/status/gestures (the event is
+        // gone for everyone). The old centered Superfine placeholder read as
+        // transient and out of place (LP3 feedback 2026-09-03). The gesture
+        // gate below requires contentType == "text", so tombstones stay inert.
         // The outgoing body's column cap (0.875 × the row content width):
         // outgoing text is measured against it so the block never spans the
         // full row (feedback 2026-08-17); the block width itself comes from
@@ -1827,14 +1880,40 @@ private fun MessageRow(
                     if (!failed && !inFlight && message.contentType == "text" &&
                         (!message.isMine || message.canEdit || message.canUnsend)
                     ) {
-                        Modifier.pointerInput(message.id) {
-                            detectTapGestures(
-                                // The like guards isMine itself (own rows never
-                                // react) — one gesture block serves both sides.
-                                onDoubleTap = { onToggleLike(message) },
-                                onLongPress = { onOpenContext(message) },
-                            )
-                        }
+                        // pointerInput's block survives recomposition when the
+                        // key (the stable event id) doesn't change — without
+                        // rememberUpdatedState the callbacks captured the
+                        // first-composed row snapshot, so a toggle computed
+                        // against stale reactions re-SENT the like every time
+                        // (LP3 feedback 2026-09-03: double-tap unsend "just
+                        // sends more hearts").
+                        val gestureMessage by rememberUpdatedState(message)
+                        // Haptic on finger-down, the same grammar as
+                        // lightClickable (LightOS vibrates on touch) — the
+                        // raw detectTapGestures block had none, so double-tap
+                        // and long-press felt dead (LP3 feedback 2026-09-03).
+                        // Gated by the same LocalHapticsEnabled the SDK's
+                        // lightClickable reads; the SDK's context-based
+                        // haptic helper is plugin-banned in tool code, so
+                        // this goes through Compose's haptic API instead.
+                        val hapticsEnabled = LocalHapticsEnabled.current
+                        val haptic = LocalHapticFeedback.current
+                        Modifier
+                            .pointerInput(hapticsEnabled) {
+                                if (!hapticsEnabled) return@pointerInput
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false)
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                }
+                            }
+                            .pointerInput(message.id) {
+                                detectTapGestures(
+                                    // The like guards isMine itself (own rows never
+                                    // react) — one gesture block serves both sides.
+                                    onDoubleTap = { onToggleLike(gestureMessage) },
+                                    onLongPress = { onOpenContext(gestureMessage) },
+                                )
+                            }
                     } else {
                         Modifier
                     },

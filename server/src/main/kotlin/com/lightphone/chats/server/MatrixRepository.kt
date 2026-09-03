@@ -2391,9 +2391,12 @@ object MatrixRepository {
             }
             val added = reactionsByTarget[m.id]
             if (added != null) {
-                // Collapse keeps the merged list at most two lines (a cached
-                // summary can meet fresh delta reactions).
-                val merged = collapseReactionTags(out.reactions + added.filter { it !in out.reactions })
+                // A delta reaction replaces the same sender's cached tag (the
+                // incremental patch sees only the delta — the replaced
+                // reaction's tag still sits in the cached page; LP3 feedback
+                // 2026-09-03: fire→heart showed both until re-entry). Collapse
+                // keeps the merged list at most two lines.
+                val merged = collapseReactionTags(mergeReactionTags(out.reactions, added))
                 if (merged != out.reactions) out = out.copy(reactions = merged)
             }
             if (!out.read && out.id in readEventIds) out = out.copy(read = true)
@@ -3585,11 +3588,12 @@ object MatrixRepository {
      * Reaction tags per target message id from a list of timeline events (the
      * newest window, or the sync delta). Each entry is a display string —
      * "Name reacted with ❤️" (own reactions read "You reacted with ❤️") —
-     * deduped per (sender, key) so a re-reaction doesn't repeat (feedback
-     * 2026-08-14), ordered chronologically so the first tag is the FIRST
-     * person to react (the name a summary keeps; 2026-09-02). Older pages
-     * report none — reactions sit after their target in the timeline, so the
-     * newest window carries them (minimal Phase 14 scope).
+     * deduped per SENDER (one reaction per person per message, Beeper
+     * semantics — LP3 feedback 2026-09-03: fire then heart showed both), the
+     * person's newest reaction kept, ordered chronologically so the first tag
+     * is the FIRST person to react (the name a summary keeps; 2026-09-02).
+     * Older pages report none — reactions sit after their target in the
+     * timeline, so the newest window carries them (minimal Phase 14 scope).
      */
     private suspend fun reactionTagsForEvents(
         c: MatrixClient,
@@ -3597,7 +3601,7 @@ object MatrixRepository {
         events: List<TimelineEvent>,
     ): Map<String, List<String>> {
         val result = mutableMapOf<String, MutableList<ReactionEntry>>()
-        val seen = HashMap<String, ReactionEntry>() // "target|sender|key" → entry (earliest kept)
+        val seen = HashMap<String, ReactionEntry>() // "target|sender" → entry (latest kept)
         for (te in events) {
             val content = te.content?.getOrNull() ?: (te.event.content as? ReactionEventContent)
             if (content !is ReactionEventContent) continue
@@ -3605,12 +3609,15 @@ object MatrixRepository {
             val targetId = relates.eventId.full
             val key = relates.key?.takeIf { it.isNotBlank() } ?: continue
             val sender = te.event.sender
-            val dedupeKey = "$targetId|${sender.full}|$key"
+            val dedupeKey = "$targetId|${sender.full}"
             val existing = seen[dedupeKey]
             if (existing != null) {
-                // A re-reaction (same person, same emoji, again): keep the
-                // earliest so the chronological order is the real one.
-                if (te.event.originTimestamp < existing.timestampMs) existing.timestampMs = te.event.originTimestamp
+                // A person's newer reaction replaces their older one — the
+                // display shows the reaction they currently hold.
+                if (te.event.originTimestamp >= existing.timestampMs) {
+                    existing.timestampMs = te.event.originTimestamp
+                    existing.key = key
+                }
                 continue
             }
             val who = if (sender == c.userId) "You" else senderNameOf(c, matrixRoomId, sender)
@@ -3624,8 +3631,8 @@ object MatrixRepository {
     }
 
     /** A reaction as it will display: who reacted, with which key, and when
-     *  (the earliest occurrence survives dedupe). */
-    private class ReactionEntry(var timestampMs: Long, val who: String, val key: String)
+     *  (the person's latest reaction survives dedupe). */
+    private class ReactionEntry(var timestampMs: Long, val who: String, var key: String)
 
     /** Keeps a message's reaction tags ("Name reacted with ❤️") to at most two
      *  lines: two or fewer stay as-is; more collapse into one compact summary
@@ -3646,6 +3653,28 @@ object MatrixRepository {
         if (reactions.map { it.first }.distinct().size < 2) return tags
         val emojis = reactions.map { it.second }.distinct()
         return listOf("${reactions.first().first} and others reacted with ${emojis.joinToString(" ")}")
+    }
+
+    /**
+     * Merges cached + delta reaction tags per reactor: the delta's tag for a
+     * reactor replaces their cached one. [reactionTagsForEvents] dedupes per
+     * sender within one event window, but the incremental patch only sees the
+     * delta — the replaced reaction's tag still sits in the cached page (LP3
+     * feedback 2026-09-03: fire→heart showed both until re-entry). The tag
+     * label's shape ("Who reacted with …") carries the reactor name; a
+     * collapsed "X and others" cached line only matches on its exact prefix,
+     * the same ceiling [ownReactionKeys] on the tool side lives with.
+     */
+    private fun mergeReactionTags(cached: List<String>, added: List<String>): List<String> {
+        if (added.isEmpty()) return cached
+        val replaced = added.mapNotNull { tag ->
+            val at = tag.indexOf(" reacted with ")
+            if (at <= 0) null else tag.substring(0, at)
+        }.toSet()
+        return cached.filterNot { tag ->
+            val at = tag.indexOf(" reacted with ")
+            at > 0 && tag.substring(0, at) in replaced
+        } + added
     }
 
     /**
@@ -4238,12 +4267,23 @@ object MatrixRepository {
             decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
         }
         val window = collectNewestEvents(c, matrixRoomId, config, MESSAGES_BUDGET_MS) ?: return false
+        // Reaction keys are compared VS16-normalized: bridges map native
+        // reactions back with inconsistent variation selectors (a WhatsApp ❤
+        // may round-trip as U+2764 while we sent U+2764+FE0F), and an exact
+        // match then finds nothing to unsend (LP3 feedback 2026-09-03:
+        // "remove reaction seems to work sometimes").
+        fun normalizeKey(k: String) = k.replace("\uFE0F", "")
+        val wantKey = normalizeKey(key)
         val ownIds = window.mapNotNull { te ->
             val content = te.content?.getOrNull() ?: (te.event.content as? ReactionEventContent)
             if (content !is ReactionEventContent) return@mapNotNull null
             val relates = content.relatesTo as? RelatesTo.Annotation ?: return@mapNotNull null
             if (te.event.sender != c.userId) return@mapNotNull null
-            if (relates.eventId.full != eventId || relates.key != key) return@mapNotNull null
+            if (relates.eventId.full != eventId ||
+                normalizeKey(relates.key ?: return@mapNotNull null) != wantKey
+            ) {
+                return@mapNotNull null
+            }
             te.event.id.full
         }
         if (ownIds.isEmpty()) return false
@@ -8137,10 +8177,10 @@ object MatrixRepository {
     }
 
     /**
-     * The "Message unsent" tombstone row for a redacted message event (Phase
+     * The "[Message unsent]" tombstone row for a redacted message event (Phase
      * C, 2026-09-03): id/sender/name/time preserved so the row stays in its
-     * conversation slot; the content replaced by the quiet placeholder.
-     * Reactions/status/read never apply to a redacted event.
+     * conversation slot, rendered like a normal text row (LP3 feedback
+     * 2026-09-03). Reactions/status/read never apply to a redacted event.
      */
     private suspend fun redactedRow(
         c: MatrixClient,
@@ -8152,7 +8192,7 @@ object MatrixRepository {
             id = te.event.id.full,
             sender = sender.full,
             senderName = senderNameOf(c, roomId, sender),
-            body = "Message unsent",
+            body = "[Message unsent]",
             timestampMs = te.event.originTimestamp,
             isMine = sender == c.userId,
             contentType = "redacted",

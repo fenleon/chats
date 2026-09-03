@@ -2,10 +2,12 @@ package com.lightphone.chats.screens
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -27,7 +29,6 @@ import com.lightphone.chats.R
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
-import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 
 /** What the context window is showing for the long-pressed message. */
@@ -94,36 +95,51 @@ fun ContextWindowOverlay(
             .background(Color.Black),
     ) {
         when (level) {
-            ContextLevel.Actions -> Column(modifier = Modifier.fillMaxWidth()) {
-                when {
+            // LP3 feedback 2026-09-03: the action rows read like bottom-bar
+            // text buttons — the [LightTextVariant.Button] label, centered in
+            // the row, rows sharing the panel height (centered vertically),
+            // instead of the left-aligned Heading list rows.
+            ContextLevel.Actions -> {
+                val rows: List<Pair<String, () -> Unit>> = when {
                     // Own message: the message controls, each only while the
                     // row still allows it (bridge caps / window).
-                    message.isMine -> {
-                        if (message.canEdit) {
-                            ContextActionRow(label = "EDIT MESSAGE") {
-                                onEdit()
-                                onDismiss()
-                            }
-                        }
-                        if (message.canUnsend) {
-                            ContextActionRow(label = "UNSEND MESSAGE") {
-                                onUnsend()
-                                onDismiss()
-                            }
-                        }
+                    message.isMine -> buildList {
+                        if (message.canEdit) add("EDIT MESSAGE" to { onEdit(); onDismiss() })
+                        if (message.canUnsend) add("UNSEND MESSAGE" to { onUnsend(); onDismiss() })
                     }
-                    ownReaction == null -> {
-                        ContextActionRow(label = "LIKE MESSAGE") {
-                            onLike()
-                            onDismiss()
-                        }
-                        ContextActionRow(label = "REACT") { level = ContextLevel.Reactions }
-                    }
-                    else -> {
-                        ContextActionRow(label = "EDIT REACTION") { level = ContextLevel.Reactions }
-                        ContextActionRow(label = "REMOVE REACTION") {
-                            onRemoveReaction()
-                            onDismiss()
+                    ownReaction == null -> listOf(
+                        "LIKE" to { onLike(); onDismiss() },
+                        "REACT" to { level = ContextLevel.Reactions },
+                    )
+                    else -> listOf(
+                        "EDIT REACTION" to { level = ContextLevel.Reactions },
+                        "REMOVE REACTION" to { onRemoveReaction(); onDismiss() },
+                    )
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        // The chevron zone stays clear so a row's tap target
+                        // never sits under it.
+                        .padding(bottom = ChevronZone),
+                    // Bottom-bar-height rows, grouped at the panel's center —
+                    // full-height weight(1f) rows sat too far apart (LP3
+                    // feedback 2026-09-03).
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    rows.forEach { (label, action) ->
+                        Box(
+                            modifier = Modifier
+                                .height(44.dp)
+                                .fillMaxWidth()
+                                .lightClickable(onClick = action),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            LightText(
+                                text = label,
+                                variant = LightTextVariant.Button,
+                                maxLines = 1,
+                            )
                         }
                     }
                 }
@@ -156,8 +172,7 @@ fun ContextWindowOverlay(
         Box(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 13.dp)
-                .size(48.dp)
+                .size(48.dp, 38.dp)
                 .lightClickable(onClick = onDismiss),
             contentAlignment = Alignment.Center,
         ) {
@@ -171,22 +186,13 @@ fun ContextWindowOverlay(
     }
 }
 
-/** One full-width action row of the panel (the Phone tool's list-row look:
- *  Heading label, 2-gu left margin). */
-@Composable
-private fun ContextActionRow(label: String, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .lightClickable(onClick = onClick)
-            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 12.dp),
-    ) {
-        LightText(text = label, variant = LightTextVariant.Heading)
-    }
-}
-
 // Geometry measured from the LP3 emoji panel (1080x1240 @ 480 dpi → px / 3).
 /** Emoji cell height — row centers sit ~140 px (46.7 dp) apart. */
 private val EmojiCell = 46.dp
-/** The native panel's emoji glyphs render ~95 px ≈ 32 dp tall. */
-private val EmojiFontSize = 32.sp
+/** The LP3 panel's glyphs at ~32 dp were too big in practice (LP3 feedback
+ *  2026-09-03) — one size down. */
+private val EmojiFontSize = 24.sp
+/** The chevron's tap zone at the panel's bottom edge; action rows keep clear
+ *  of it. The chevron itself touches the bottom edge (LP3 feedback
+ *  2026-09-03) — no float above it. */
+private val ChevronZone = 38.dp
