@@ -147,7 +147,7 @@ class FullscreenImageScreen(
                 )
                 saved?.let { ok ->
                     LightFullscreenModal(
-                        message = if (ok) "Photo saved." else "Couldn't save photo.",
+                        message = if (ok) "Photo saved" else "Couldn't save photo",
                         onClose = { saved = null },
                     )
                 }
