@@ -1,6 +1,6 @@
 # Chats
 
-*WhatsApp, Signal, Telegram, Instagram DMs, and your other chats on your Light Phone III.*
+*WhatsApp, Signal, Telegram, and your other chats on your Light Phone III.*
 
 Chats is a messaging tool for the Light Phone III. Log in with a [Beeper](https://beeper.com) account and your existing conversations arrive in a quiet, text-first interface. It also speaks plain Matrix, so any Matrix homeserver works as well.
 
@@ -17,7 +17,7 @@ Everything is end-to-end encrypted.
 
 ## Features
 
-- **Networks** — WhatsApp, Signal, Telegram, and Instagram DMs through your Beeper account
+- **Networks** — WhatsApp, Signal, Telegram, Messenger, Google Messages, Instagram DMs and more, through your Beeper account
 - 1:1 and group chats — archive, pin, mute, search, reactions, delivery status
 - End-to-end encryption with emoji device verification
 - Notifications; a push channel delivers messages instantly
@@ -43,7 +43,7 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
 
 ## Limitations
 
-- Bridged networks (WhatsApp, Instagram, ...) arrive through Beeper — an unofficial path, not an official Meta client.
+- Bridged networks (WhatsApp, Instagram, ...) arrive through Beeper, an unofficial path, not an official Meta client.
 - Requires the **All tools** external-tools tier on a real Light Phone III (dev-signed APKs are treated as unknown by LightOS).
 - Without a configured push endpoint, new messages arrive at the next scheduled sync round.
 
