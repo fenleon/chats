@@ -75,6 +75,21 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
 - Requires the **All tools** external-tools tier on a real Light Phone III (dev-signed APKs are treated as unknown by LightOS).
 - Without a configured push endpoint, new messages arrive at the next scheduled sync round.
 
+<a href="https://ko-fi.com/fenleon">
+  <p align="center">
+    <picture>
+      <img src="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="60">
+    </picture>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="art/buy-me-a-coffee-alpha-white.png">
+      <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="60">
+    </picture>
+    <picture>
+      <img src="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="60">
+    </picture>
+  </p>
+</a>
+
 ## Legal
 
 Chats is an independent, unofficial open-source project, not affiliated with or endorsed by The Light Phone, Inc., or Beeper. The Matrix protocol engine is [Trixnity](https://github.com/benkuly/trixnity) (Apache-2.0). Licensed under the [MIT License](LICENSE).
