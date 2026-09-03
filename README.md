@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="art/wordmark-alpha-white.png">
-    <img src="art/wordmark-alpha-black.png" alt="Chats" width="60%">
+    <img src="art/wordmark-alpha-black.png" alt="Chats" width="50%">
   </picture>
 </p>
 <p align="center">
@@ -12,7 +12,7 @@
 A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Signal, Telegram, and more into one quiet, text-first interface. Log in with a [Beeper](https://beeper.com) account or a Matrix homeserver. Everything is end-to-end encrypted.
 
 <p align="center">
-  <img src="art/bubbles-filled-alpha-white.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="55%">
+  <img src="art/bubbles-filled-alpha-white.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="45%">
 </p>
 
 ## Features
