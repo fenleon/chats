@@ -28,7 +28,7 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="art/bubbles-line-alpha-white.png">
-    <img src="art/bubbles-line-alpha-black.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="65%">
+    <img src="art/bubbles-line-alpha-black.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="55%">
   </picture>
 </p>
 
@@ -53,7 +53,7 @@ The APK is signed with a development key, so it needs the community-ADB sideload
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="art/padlock-line-alpha-white.png">
-  <img src="art/padlock-filled-black-on-white.png" alt="A padlock holding an envelope with a heart on it" width="25%">
+  <img src="art/padlock-filled-black-on-white.png" alt="A padlock holding an envelope with a heart on it" width="20%">
   </picture>
 </p>
 
@@ -79,6 +79,6 @@ Chats is an independent, unofficial open-source project, not affiliated with or 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="art/so-many-chats-alpha-white.png">
-    <img src="art/so-many-chats-alpha-black.png" alt="So many chats" width="35%">
+    <img src="art/so-many-chats-alpha-black.png" alt="So many chats" width="30%">
   </picture>
 </p>
