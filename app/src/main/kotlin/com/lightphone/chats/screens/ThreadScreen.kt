@@ -930,11 +930,26 @@ class ThreadScreen(
         // undecryptable). Say so instead of lying about being empty.
         val needsDecryptionNotice = roomEncrypted && messages.isEmpty()
 
-        // The newest message in the thread: the only one that carries the
-        // "seen" tag (older messages show a marker only when a send failed).
-        // The list is oldest-first, so the last item is the newest.
-        // Read status only makes sense in a 1:1 — groups get no tag at all.
-        val latestMessageId = remember(messages) { messages.lastOrNull()?.id }
+        // The newest outgoing message the other party actually read (m.read
+        // receipt or Beeper READ status): the one row that carries the "seen"
+        // tag. The list is oldest-first, so the last match is the newest.
+        // Not "the newest message" (2026-09-03): with 3 sent and 2 read, a
+        // "seen" under the 3rd lied — the tag sits under the 2nd and stays
+        // there while the read position doesn't move. The tag only earns its
+        // place when it adds information (2026-09-03 feedback): it is dropped
+        // when the contact's reply is the thread's newest AND our newest send
+        // is read — the reply itself already says "read everything". So: no
+        // reply yet → tag under the newest read send; reply but the read
+        // position is behind our newest send → tag marks how far they got.
+        // No read evidence → no tag; groups get no tag at all (the isDirect
+        // gate at the call site).
+        val seenMessageId = remember(messages) {
+            val newestRead = messages.lastOrNull { it.isMine && (it.read || it.sendStatus == "READ") }
+            val newestMine = messages.lastOrNull { it.isMine }
+            if (newestRead != null && newestRead.id == newestMine?.id &&
+                messages.lastOrNull()?.isMine == false
+            ) null else newestRead?.id
+        }
 
         // Infinite scroll + scroll-bar metrics, polled rather than
         // snapshotFlow-driven: in this Compose version reads of
@@ -1027,7 +1042,7 @@ class ThreadScreen(
                                             showSender = !room.isDirect && row.showTime,
                                             showTime = row.showTime,
                                             showReadStatus = showReadStatus,
-                                            showDeliveryTag = row.message.id == latestMessageId && room.isDirect,
+                                            showSeenTag = row.message.id == seenMessageId && room.isDirect,
                                             mediaBytes = mediaBytes,
                                             allowMobile = downloadOverMobile,
                                             playing = row.message.id == playingEventId,
@@ -1318,7 +1333,7 @@ private fun MessageRow(
     showSender: Boolean,
     showTime: Boolean,
     showReadStatus: Boolean,
-    showDeliveryTag: Boolean,
+    showSeenTag: Boolean,
     mediaBytes: Map<String, ByteArray>,
     allowMobile: Boolean,
     playing: Boolean,
@@ -1611,26 +1626,24 @@ private fun MessageRow(
                     // 2026-08-21).
                     modifier = Modifier.padding(top = 1.dp),
                 )
-            } else if (message.isMine && showReadStatus && showDeliveryTag) {
-                // Phase 13: the read-status marker (off via Settings → Show
-                // read status) — only on the newest message of a 1:1 thread,
-                // so past messages and group chats stay quiet. Only "seen"
-                // gets a tag, and only when it's actually known (feedback
-                // 2026-08-17): it needs the other party's m.read receipt (or
-                // a Beeper READ status). The "delivered" tag was dropped
-                // (2026-08-30) — SENDING stopping already implies delivery,
-                // and a fresh send showed "delivered" before any delivery
-                // evidence existed. A message with no status event yet (still
-                // in flight, or no bridge report) gets no tag.
-                val tag = if (message.read || message.sendStatus == "READ") "seen" else null
-                if (tag != null) {
-                    LightText(
-                        text = tag,
-                        variant = LightTextVariant.Superfine,
-                        // Solid white like the timestamps (feedback 2026-08-21).
-                        modifier = Modifier.padding(top = 1.dp),
-                    )
-                }
+            } else if (message.isMine && showReadStatus && showSeenTag) {
+                // Phase 13, reshaped 2026-09-03: the read-status marker (off via
+                // Settings → Show read status) sits under the newest outgoing
+                // message the other party actually read — [seenMessageId] picks
+                // the row, so mid-thread placement is expected when the newest
+                // message is unread (or the thread's newest is the contact's
+                // reply). Only "seen" gets a tag, and only when it's actually
+                // known (feedback 2026-08-17): it needs the other party's
+                // m.read receipt (or a Beeper READ status). The "delivered" tag
+                // was dropped (2026-08-30) — SENDING stopping already implies
+                // delivery, and a fresh send showed "delivered" before any
+                // delivery evidence existed. No read evidence anywhere → no tag.
+                LightText(
+                    text = "seen",
+                    variant = LightTextVariant.Superfine,
+                    // Solid white like the timestamps (feedback 2026-08-21).
+                    modifier = Modifier.padding(top = 1.dp),
+                )
             }
         }
     }

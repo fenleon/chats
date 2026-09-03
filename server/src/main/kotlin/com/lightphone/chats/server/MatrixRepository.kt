@@ -5167,41 +5167,46 @@ object MatrixRepository {
     suspend fun markRead(roomId: String, eventId: String) {
         val c = client ?: return
         val matrixRoomId = RoomId(roomId)
-        // The tool's id can be stale (a page served from cache), so the marker
-        // used to cover an OLD event and the unread count never cleared. Bump
-        // it to the store's current newest event — the read marker then covers
-        // every unread message and the echo drops the badge (2026-08-23).
-        val newest = withTimeoutOrNull(ROOM_BUDGET_MS) {
-            // The last-timeline-event stream emits the inner event flow
-            // (non-null), whose events are nullable — mirror the
-            // collectNewestEvents pattern for the inner unwrap.
-            c.room.getLastTimelineEvent(matrixRoomId).first()
-                ?.filterNotNull()?.firstOrNull()
+        // Mark at the event the tool asked for — the newest message it actually
+        // rendered. The old behavior bumped the marker to the store's current
+        // head so the badge always cleared, but the head can hold a message
+        // that arrived between the page fetch and this call (or while the
+        // thread sat open before the poll rendered it): the receiver never saw
+        // it, yet their receipt covered it and the sender's "seen" tag landed
+        // on it (2026-09-03: "sent 3, they read 2, seen on the 3rd"). A
+        // behind-the-head marker leaves the room honestly unread — the
+        // thread's quiet poll re-marks at the real newest once the page (and
+        // the user's screen) catch up. Only a marker that IS the room's head
+        // message keeps the optimistic badge clear below.
+        val room = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()
         }
-        val newestId = newest?.event?.id?.full ?: eventId
-        val newestTs = newest?.event?.originTimestamp ?: 0L
+        val atHead = eventId == room?.lastRelevantEventId?.full
         c.api.room.setReadMarkers(
             roomId = matrixRoomId,
-            fullyRead = EventId(newestId),
-            read = EventId(newestId),
+            fullyRead = EventId(eventId),
+            read = EventId(eventId),
         )
         // Opening the thread makes the room's notification moot.
         appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
-        // Optimistically clear the room's unread in the served list — the
-        // notification count only drops after the read-marker echo
-        // round-trips through sync (a full tick on a big account), which used
-        // to leave the badge up long after the thread was opened. The
-        // resolver keeps serving 0 until the echo confirms or a newer event
-        // arrives ([servedUnread]).
-        pendingReadClear[roomId] = newestId to newestTs
-        roomListCache[roomId]?.let { entry ->
-            if (entry.room.unreadCount > 0) {
-                val cleared = entry.copy(room = entry.room.copy(unreadCount = 0))
-                roomListCache[roomId] = cleared
-                _roomList.value = _roomList.value.map { if (it.id == roomId) cleared.room else it }
+        if (atHead) {
+            // Optimistically clear the room's unread in the served list — the
+            // notification count only drops after the read-marker echo
+            // round-trips through sync (a full tick on a big account), which
+            // used to leave the badge up long after the thread was opened. The
+            // resolver keeps serving 0 until the echo confirms or a newer
+            // event arrives ([servedUnread]).
+            pendingReadClear[roomId] = eventId to
+                (room?.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L)
+            roomListCache[roomId]?.let { entry ->
+                if (entry.room.unreadCount > 0) {
+                    val cleared = entry.copy(room = entry.room.copy(unreadCount = 0))
+                    roomListCache[roomId] = cleared
+                    _roomList.value = _roomList.value.map { if (it.id == roomId) cleared.room else it }
+                }
             }
+            roomListDirty = true
         }
-        roomListDirty = true
     }
 
     suspend fun setTyping(roomId: String, active: Boolean) {
