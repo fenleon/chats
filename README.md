@@ -1,4 +1,9 @@
-# Chats
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="art/wordmark-alpha-white.png">
+    <img src="art/wordmark-alpha-black.png" alt="Chats" width="60%">
+  </picture>
+</p>
 
 *WhatsApp, Signal, Telegram, and your other chats on your Light Phone III.*
 
@@ -7,22 +12,21 @@ Chats is a messaging tool for the Light Phone III. Log in with a [Beeper](https:
 Everything is end-to-end encrypted.
 
 <p align="center">
-  <img src="screenshots/list.png" width="32%" alt="Chat list" />
-  <img src="screenshots/thread.png" width="32%" alt="1:1 thread" />
-  <img src="screenshots/group.png" width="32%" alt="Group thread" />
-  <img src="screenshots/search.png" width="32%" alt="Search" />
-  <img src="screenshots/networks.png" width="32%" alt="Networks" />
-  <img src="screenshots/settings.png" width="32%" alt="Settings" />
+  <img src="art/bubbles-filled-alpha-white.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="55%">
 </p>
 
 ## Features
 
 - Connect to all your **Networks**, including WhatsApp, Signal, Telegram, Messenger, Google Messages, Instagram DMs and more, through your Beeper account
 - 1:1 and group chats, with archive, pin, mute, search, reactions, delivery status support
-- End-to-end encryption with emoji device verification
 - Notifications; a push channel delivers messages instantly
 - Voice notes and photos
 - Battery-conscious background sync, pausable from Settings
+
+<p align="center">
+  <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="22%"><br>
+  <strong>End-to-end encrypted</strong>, with emoji device verification so you can confirm who you're really talking to.
+</p>
 
 ## Install
 
