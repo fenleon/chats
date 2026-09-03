@@ -8,12 +8,12 @@
   All your Chats, finally, on the Light Phone III.
 </p>
 <p align="center">
-    <img srcset="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="60"></img>
+    <img src="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="60"></img>
     <picture>
     <source media="(prefers-color-scheme: dark)" srcset="buy-me-a-coffee-alpha-white.png">
     <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="60">
   </picture>
-    <img srcset="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="60"></img>
+    <img src="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="60"></img>
 </p>
 
 # Chats
