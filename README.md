@@ -7,18 +7,20 @@
 <p align="center">
   All your Chats, finally, on the Light Phone III.
 </p>
-<p align="center">
+<a href="https://ko-fi.com/fenleon">
+  <p align="center">
     <picture>
-    <img src="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="60"></img>
+      <img src="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="70">
     </picture>
     <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="buy-me-a-coffee-alpha-white.png">
-    <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="60">
-  </picture>
-    <picture>
-    <img src="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="60"></img>
+      <source media="(prefers-color-scheme: dark)" srcset="art/buy-me-a-coffee-alpha-white.png">
+      <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="60">
     </picture>
-</p>
+    <picture>
+      <img src="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="70">
+    </picture>
+  </p>
+</a>
 
 # Chats
 A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Signal, Telegram, and more into one quiet, text-first interface. Log in with a [Beeper](https://beeper.com) account or a Matrix homeserver. Everything is end-to-end encrypted.
@@ -74,21 +76,6 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
 - Bridged networks (WhatsApp, Instagram, ...) arrive through Beeper, an unofficial path, not an official Meta client.
 - Requires the **All tools** external-tools tier on a real Light Phone III (dev-signed APKs are treated as unknown by LightOS).
 - Without a configured push endpoint, new messages arrive at the next scheduled sync round.
-
-<a href="https://ko-fi.com/fenleon">
-  <p align="center">
-    <picture>
-      <img src="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="60">
-    </picture>
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="art/buy-me-a-coffee-alpha-white.png">
-      <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="60">
-    </picture>
-    <picture>
-      <img src="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="60">
-    </picture>
-  </p>
-</a>
 
 ## Legal
 
