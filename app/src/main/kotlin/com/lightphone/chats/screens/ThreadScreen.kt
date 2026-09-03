@@ -925,7 +925,7 @@ class ThreadViewModel(
 
     /**
      * Unsends an own message (Phase C, 2026-09-03 — the context window's
-     * UNSEND MESSAGE row, behind the confirm panel): the row becomes the
+     * UNSEND row, behind the confirm panel): the row becomes the
      * tombstone instantly via the overlay; a failed RPC reverts it and
      * surfaces the quiet row error (the reaction pattern). The overlay drops
      * once a served page shows the row redacted.
@@ -1204,7 +1204,7 @@ class ThreadScreen(
         val reactionError by viewModel.reactionError.collectAsState()
         // Context window (Phase B, 2026-09-03): the long-pressed message
         // (null = the panel is hidden). Phase C adds the own-message path:
-        // UNSEND MESSAGE parks its target here for the confirm panel.
+        // UNSEND parks its target here for the confirm panel.
         var contextMessage by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
         var unsendConfirm by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
         val muted by viewModel.muted.collectAsState()
@@ -1464,7 +1464,7 @@ class ThreadScreen(
             // Context window (Phase B, 2026-09-03): the long-pressed message's
             // panel over the bottom half — received rows get LIKE MESSAGE /
             // REACT (+ EDIT/REMOVE REACTION once a reaction exists); own rows
-            // get EDIT MESSAGE / UNSEND MESSAGE (Phase C, gated per row by
+            // get EDIT / UNSEND (Phase C, gated per row by
             // the bridge caps). Actions act on the freshest polled snapshot
             // so own-reaction detection never runs on a stale page. Rendered
             // before the volume panel so the volume panel stays on top of
@@ -1870,7 +1870,7 @@ private fun MessageRow(
                 // Phase A (2026-09-03): double-tap a received TEXT row to like/
                 // unlike it; Phase B (2026-09-03): long-press opens the context
                 // window over the bottom half; Phase C (2026-09-03): OWN text
-                // rows open it too (EDIT MESSAGE / UNSEND MESSAGE), when the
+                // rows open it too (EDIT / UNSEND), when the
                 // bridge caps still allow either. `combinedClickable`/
                 // `lightClickable` can't do double-tap. Media rows are
                 // excluded — image taps open the viewer and voice-note taps

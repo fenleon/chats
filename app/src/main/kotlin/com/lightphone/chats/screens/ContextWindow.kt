@@ -62,8 +62,8 @@ private val REACTION_ROWS = listOf(
  *
  * One own reaction at a time (replace semantics) on a RECEIVED message: no
  * own reaction shows LIKE MESSAGE + REACT; an existing one shows EDIT
- * REACTION + REMOVE REACTION. Own messages (Phase C, 2026-09-03) show EDIT
- * MESSAGE / UNSEND MESSAGE instead — each only when the row still allows it
+ * REACTION + REMOVE REACTION. Own messages (Phase C, 2026-09-03) show
+ * EDIT / UNSEND instead — each only when the row still allows it
  * ([LightServiceMethod.GetMessages.Message.canEdit] / `canUnsend`, the
  * bridge's capability gate).
  *
@@ -104,8 +104,8 @@ fun ContextWindowOverlay(
                     // Own message: the message controls, each only while the
                     // row still allows it (bridge caps / window).
                     message.isMine -> buildList {
-                        if (message.canEdit) add("EDIT MESSAGE" to { onEdit(); onDismiss() })
-                        if (message.canUnsend) add("UNSEND MESSAGE" to { onUnsend(); onDismiss() })
+                        if (message.canEdit) add("EDIT" to { onEdit(); onDismiss() })
+                        if (message.canUnsend) add("UNSEND" to { onUnsend(); onDismiss() })
                     }
                     ownReaction == null -> listOf(
                         "LIKE" to { onLike(); onDismiss() },
