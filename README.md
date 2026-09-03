@@ -50,4 +50,4 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
 
 ## Legal
 
-Chats is an independent, unofficial open-source project, not affiliated with or endorsed by The Light Phone, Inc., Beeper, or Meta. The Matrix protocol engine is [Trixnity](https://github.com/benkuly/trixnity) (Apache-2.0). Licensed under the [MIT License](LICENSE).
+Chats is an independent, unofficial open-source project, not affiliated with or endorsed by The Light Phone, Inc., or Beeper. The Matrix protocol engine is [Trixnity](https://github.com/benkuly/trixnity) (Apache-2.0). Licensed under the [MIT License](LICENSE).
