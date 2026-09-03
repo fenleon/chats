@@ -8,19 +8,25 @@
   All your Chats, finally, on the Light Phone III.
 </p>
 <p align="center">
+    <picture>
     <img src="art/coffee-hand-filled-alpha-white.png" alt="Hand holding Coffee" height="60"></img>
+    </picture>
     <picture>
     <source media="(prefers-color-scheme: dark)" srcset="buy-me-a-coffee-alpha-white.png">
     <img src="art/buy-me-a-coffee-alpha-black.png" alt="Buy Me A Coffee" height="60">
   </picture>
+    <picture>
     <img src="art/ok-hand-filled-alpha-white.png" alt="OK Hand" height="60"></img>
+    </picture>
 </p>
 
 # Chats
 A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Signal, Telegram, and more into one quiet, text-first interface. Log in with a [Beeper](https://beeper.com) account or a Matrix homeserver. Everything is end-to-end encrypted.
 
 <p align="center">
+  <picture>
   <img src="art/bubbles-filled-alpha-white.png" alt="Telegram, WhatsApp, and Signal speech bubbles" width="65%">
+  </picture>
 </p>
 
 ## Features
@@ -33,7 +39,9 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 - End-to-end encrypted, with device verification
 
 <p align="center">
+  <picture>
   <img src="art/padlock-filled-alpha-white.png" alt="A padlock holding an envelope with a heart on it" width="35%"><br>
+  </picture>
 </p>
 
 ## Install
