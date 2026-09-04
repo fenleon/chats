@@ -130,6 +130,7 @@ import de.connect2x.trixnity.client.verification.ActiveDeviceVerification
 import de.connect2x.trixnity.client.verification.ActiveSasVerificationMethod
 import de.connect2x.trixnity.client.verification.ActiveSasVerificationState
 import de.connect2x.trixnity.client.verification.ActiveVerificationState
+import de.connect2x.trixnity.core.model.events.m.key.verification.VerificationCancelEventContent
 import de.connect2x.trixnity.clientserverapi.client.SyncState
 import de.connect2x.trixnity.clientserverapi.client.classicLogin
 import de.connect2x.trixnity.clientserverapi.model.authentication.IdentifierType
@@ -6215,6 +6216,9 @@ object MatrixRepository {
                                         if (roomSigSeen[key] != sig) {
                                             roomSigSeen[key] = sig
                                             markRoomListDirty()
+                                            // Phase 2.1: the row publishes NOW (see
+                                            // [publishRoomRowNow]) — not one pass late.
+                                            publishRoomRowNow(c, roomId, updated)
                                         }
                                         val lastId = updated.lastRelevantEventId?.full ?: return@collect
                                         if (updated.membership != Membership.JOIN) return@collect
@@ -6545,6 +6549,71 @@ object MatrixRepository {
     private fun markRoomListDirty() {
         if (roomListDirtyAt == 0L) roomListDirtyAt = android.os.SystemClock.elapsedRealtime()
         roomListDirty = true
+    }
+
+    /** Rooms with a single-room publish in flight (see [publishRoomRowNow]) —
+     *  bursts collapse; the full pass (already dirtied) covers any dropped tail. */
+    private val singleRoomPublishInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Phase 2.1 (SYNC-PERF-SPEC 2026-09-04): resolve and publish ONE room's row
+     * immediately when its notification-watcher collector sees a change, instead
+     * of waiting for the next budgeted resolver pass — the dominant measured
+     * tail (Phase 0 LP3 table: store→publish median 8.6 s, 8/12 > 5 s). Uses the
+     * same bounded per-room reads the pass does; the full pass still runs
+     * ([markRoomListDirty] fired) for reordering + crawl work. Skipped during
+     * the initial crawl — the back-to-back startup passes already publish, and
+     * one single-room resolve per room there would double the crawl's work.
+     */
+    private fun publishRoomRowNow(c: MatrixClient, roomId: RoomId, room: MatrixRoom) {
+        if (!initialRoomCrawlDone) return
+        val key = roomId.full
+        if (!singleRoomPublishInFlight.add(key)) return
+        scope.launch {
+            try {
+                runCatching {
+                    resolveRoomListEntry(
+                        c, roomId, room, HashMap(),
+                        resolvePreview = true,
+                        verified = isDeviceVerified(c),
+                        // The network maps are TTL caches built by the pass over the
+                        // FULL room map — never call networkByRoom with a single-room
+                        // map here (it would overwrite the cache). Steady state the
+                        // cache is warm; before it is, the row keeps its previous
+                        // (disk-preloaded) label until the next pass.
+                        networks = singleValueMap(key, networkByRoomCache[key] ?: roomListCache[key]?.room?.network),
+                        communities = singleValueMap(key, communityByRoomCache[key] ?: roomListCache[key]?.room?.community),
+                        flags = mapOf(key to singleRoomFlags(c, key)),
+                    )
+                    publishRoomList()
+                }.onFailure {
+                    android.util.Log.w(TAG, "single-room publish failed for $key: ${it.message}")
+                }
+            } finally {
+                singleRoomPublishInFlight.remove(key)
+            }
+        }
+    }
+
+    private fun singleValueMap(key: String, value: String?): Map<String, String> =
+        if (value == null) emptyMap() else mapOf(key to value)
+
+    /** One room's flags, read straight from the store ([roomFlagsByRoom]'s
+     *  per-room body). Deliberately not [roomFlagsByRoom]: a call here must not
+     *  consume the shared invalidation set or re-stamp the build TTL — that
+     *  would race the resolver's own rebuild of the OTHER invalidated rooms. */
+    private suspend fun singleRoomFlags(c: MatrixClient, key: String): RoomFlags {
+        val read = withTimeoutOrNull(ROOM_FLAGS_ROOM_BUDGET_MS) {
+            val tags = c.room.getAccountData(RoomId(key), TagEventContent::class, "").first()
+            val inboxDone = c.room.getAccountData(RoomId(key), BeeperInboxDoneContent::class, "").firstOrNull()
+            val archivedClaim = inboxDone?.atOrder != null || inboxDone?.atTs != null || inboxDone?.updatedTs != null
+            RoomFlags(
+                pinned = tags?.tags?.containsKey(TagEventContent.TagName.Favourite) == true,
+                archived = if (archivedClaim) isRoomArchivedOnServer(c, key) ?: true else false,
+                muted = isRoomMutedByPushRule(c, key),
+            )
+        } ?: roomFlagsCache[key] ?: RoomFlags()
+        return roomFlagsOverlay[key] ?: read
     }
 
     /** Last full room map the resolver collected — the flags-only fast path
@@ -7978,6 +8047,8 @@ object MatrixRepository {
                 }
                 if (walked != null) {
                     val real = filterGhosts(c, walked).filter { isRenderableRow(it) }.firstOrNull()
+                    val kept = effectiveLastCache[key]
+                    val healed = real != null && kept?.effectiveEventId != real.event.id.full
                     effectiveLastCache[key] = EffectiveLast(
                         serverLastId,
                         real?.event?.id?.full,
@@ -7987,6 +8058,18 @@ object MatrixRepository {
                         TAG,
                         "ghostResolve: $key server last $serverLastId → real last ${real?.event?.id?.full ?: "none"}",
                     )
+                    // Phase 2.1 heal (SYNC-PERF-SPEC): the walk resolves what the
+                    // resolve path couldn't read yet — the room-state flow fires
+                    // before the timeline event is queryable in the store, and the
+                    // row parks on last-known-good. Without this wake the healed
+                    // values sit unpublished until the next event or a retry came
+                    // due (probe: row stuck 10 min behind a message the walk had
+                    // resolved 0.8 s after it landed). One dirty pass re-resolves
+                    // from the now-warm cache (cheap) and publishes.
+                    if (healed) {
+                        markRoomListDirty()
+                        wakeRoomList()
+                    }
                 } else {
                     // Timed out: the walk can't complete within budget (large or
                     // undecryptable rooms). Back off hard instead of retrying

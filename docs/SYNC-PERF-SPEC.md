@@ -72,8 +72,9 @@ Ceiling note (`ponytail:`): if ingest is still > 5 s after 1–3, the next step 
 ### Phase 2 — Shrink the tail after the store (target: store→UI < 5 s)
 
 1. **Publish dirty rooms incrementally.** `publishRoomList()` runs only at pass end after a ≤12 s budgeted crawl. Publish the single dirty room's row immediately when its collector fires (`observeNotifications` already sets `roomListDirty` there), and keep the full pass for reordering/crawl work. This is the root-cause fix for "row appears one pass late".
+   **Found during implementation (2026-09-04):** the room-state collector fires BEFORE the timeline event is queryable in the store (`readTimelineChainFromDb … → 0 events` every round), so the row parks on last-known-good and the background ghost walk heals `effectiveLastCache` ~0.8 s later — but nothing re-published after the heal. Fix: `enqueueGhostResolve`'s success path marks dirty + wakes the resolver when it found a NEW real event, so the healed row publishes within ~20 ms of the heal.
 2. **Tighten the tool poll ticks** — the revision check is one tiny binder read; list 5 s → 2 s, thread 3 s → 1.5 s while screen-on. Cheap; no flow plumbing needed (tool-side receivers risk plugin-scan bans — not worth it for ≤2 s).
-3. **Persist the room-list cache.** Cold process start re-crawls previews (memory-only `roomListCache` — "looks like fresh install every restart", WORKLOG 09-03). Disk-cache the published list (JSON in `lightContext.filesDir`, allowed pattern) → instant cold open.
+3. **Persist the room-list cache.** ~~Cold process start re-crawls previews~~ **Already shipped** (Phase 12-14.5, `saveRoomListToDisk`/`preloadRoomListFromDisk` — the "memory-only" premise was stale; re-verified on emulator 2026-09-04: cold start logs "preloaded 12 rooms from disk cache").
 
 ### Phase 3 — Battery: keep what's proven, measure the rest
 

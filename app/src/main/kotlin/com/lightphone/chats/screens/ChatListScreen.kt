@@ -379,7 +379,10 @@ class ChatListViewModel : LightViewModel<Unit>() {
         // which can take several seconds after a fresh boot/reinstall.
         const val REFRESH_RETRIES = 10
         const val REFRESH_RETRY_DELAY_MS = 1_000L
-        const val POLL_INTERVAL_MS = 5_000L
+        // Phase 2 (SYNC-PERF-SPEC 2026-09-04): 5 s → 2 s — the poll is a cheap
+        // revision binder read when nothing moved; only the changed revision
+        // fetches the full payload.
+        const val POLL_INTERVAL_MS = 2_000L
         const val INITIAL_VISIBLE_COUNT = 20
         const val REVEAL_STEP = 20
     }

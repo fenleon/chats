@@ -1140,8 +1140,9 @@ class ThreadViewModel(
         const val PAGE_SIZE = 20
         /** Older-page size: 6 ≈ one screenful per scroll-up load (2026-08-23). */
         const val OLDER_PAGE_SIZE = 6
-        /** Poll cadence while the thread is on screen (feedback pass). */
-        const val THREAD_POLL_MS = 3_000L
+        /** Poll cadence while the thread is on screen (feedback pass). Phase 2
+         *  (SYNC-PERF-SPEC 2026-09-04): 3 s → 1.5 s — revision-gated cheap read. */
+        const val THREAD_POLL_MS = 1_500L
         /** Contact-panel flag poll (pin/mute/archive from other devices). */
         const val FLAG_SYNC_MS = 3_000L
         /** How close (ms) a real echo's timestamp must be to a "local-…" row. */

@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -46,9 +45,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
-/** Cancelled/failed panels dismiss themselves back to the main panel. */
-private const val CANCELLED_AUTO_DISMISS_MS = 4_000L
-
 /** Shown between Continue and the other device accepting (or while waiting). */
 private const val WAITING_TEXT = "Waiting for your other device to accept..."
 
@@ -60,8 +56,8 @@ private const val WAITING_TEXT = "Waiting for your other device to accept..."
  *
  * The flow renders as full-screen panels (feedback 2026-08-19): a local
  * confirmation panel before the request is sent, then the server's states —
- * waiting / accept / compare / cancelled — each with the X-cancel affordance
- * in the bottom bar.
+ * waiting / accept / compare / terminal (cancelled / error) — each with the
+ * X-cancel affordance in the bottom bar.
  */
 class VerificationViewModel : LightViewModel<Unit>() {
 
@@ -149,6 +145,16 @@ class VerificationViewModel : LightViewModel<Unit>() {
         }
     }
 
+    /** Fresh verification after a cancelled/failed attempt: reset the
+     *  server-side state machine, then start over. */
+    fun tryAgain() {
+        if (busy.value) return
+        viewModelScope.launch {
+            ChatClient.verifyAction("reset")
+            start()
+        }
+    }
+
     fun act(action: String) {
         if (busy.value) return
         viewModelScope.launch {
@@ -196,15 +202,6 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
-                // Cancelled/failed panels dismiss themselves back to the main
-                // panel after a few seconds (feedback 2026-08-19).
-                LaunchedEffect(state?.state) {
-                    if (state?.state == "cancelled" || state?.state == "error") {
-                        delay(CANCELLED_AUTO_DISMISS_MS)
-                        viewModel.act("reset")
-                    }
-                }
-
                 // Done: a bare overlay — no top bar, no back, just the centered
                 // confirmation and DONE (feedback 2026-08-19).
                 val verified = e2ee?.verified == true || state?.state == "done"
@@ -258,7 +255,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                         )
                     },
                     center = LightTopBarCenter.Text(
-                        if (state?.state == "compare" && !confirmOpen) "Check your other device" else "Verify Device",
+                        if (state?.state == "compare" && !confirmOpen) "Compare the emoji" else "Verify Device",
                     ),
                 )
 
@@ -289,8 +286,28 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                                 onMatch = { viewModel.act("match") },
                                 onNoMatch = { viewModel.act("no_match") },
                             )
-                            "cancelled" -> CenteredPanel("Verification was cancelled or failed.")
-                            "error" -> CenteredPanel(state?.detail ?: "Verification failed.")
+                            "cancelled" -> TerminalPanel(
+                                message = "Verification was cancelled or failed.",
+                                onTryAgain = viewModel::tryAgain,
+                                onUseRecoveryKey = { openRecoveryEditor() },
+                            )
+                            "error" -> {
+                                val detail = state?.detail
+                                val timedOut = detail != null && (
+                                    detail.contains("timeout", ignoreCase = true) ||
+                                        detail.contains("timed out", ignoreCase = true)
+                                    )
+                                TerminalPanel(
+                                    message = if (timedOut) {
+                                        "Verification timed out. Try your recovery key."
+                                    } else {
+                                        detail ?: "Verification failed."
+                                    },
+                                    detail = if (timedOut) detail else null,
+                                    onTryAgain = viewModel::tryAgain,
+                                    onUseRecoveryKey = { openRecoveryEditor() },
+                                )
+                            }
                             else -> CenteredPanel("Checking…")
                         }
                     }
@@ -433,7 +450,7 @@ private fun MainPanel(
     }
 }
 
-/** A black centered-text panel (the confirm/waiting/accept/cancelled states). */
+/** A black centered-text panel (the confirm/waiting/accept states). */
 @Composable
 private fun CenteredPanel(text: String) {
     Box(
@@ -446,6 +463,45 @@ private fun CenteredPanel(text: String) {
             align = TextAlign.Center,
             modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
         )
+    }
+}
+
+/** Terminal panel for cancelled/failed verification: the reason centred, with
+ *  the two ways forward (recovery key, or start over) as stacked buttons. */
+@Composable
+private fun TerminalPanel(
+    message: String,
+    detail: String? = null,
+    onTryAgain: () -> Unit,
+    onUseRecoveryKey: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                LightText(
+                    text = message,
+                    variant = LightTextVariant.Copy,
+                    align = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                )
+                detail?.let {
+                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                    LightText(
+                        text = it,
+                        variant = LightTextVariant.Detail,
+                        align = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                    )
+                }
+            }
+        }
+        PanelActionButton("USE RECOVERY KEY", onClick = onUseRecoveryKey)
+        PanelActionButton("TRY AGAIN", onClick = onTryAgain)
     }
 }
 
@@ -516,7 +572,7 @@ private fun ComparePanel(
                 }
                 Spacer(Modifier.height(1f.gridUnitsAsDp()))
                 LightText(
-                    text = "Confirm the Emojis match the ones shown on your other device",
+                    text = "Both devices show the same emojis. Tap MATCH below to confirm.",
                     variant = LightTextVariant.Copy,
                     align = TextAlign.Center,
                     modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
