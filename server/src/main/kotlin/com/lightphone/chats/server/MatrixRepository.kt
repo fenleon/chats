@@ -110,6 +110,7 @@ import de.connect2x.trixnity.client.room.GetTimelineEventsConfig
 import de.connect2x.trixnity.client.room.TimelineEventHandler
 import de.connect2x.trixnity.client.room.message.image
 import de.connect2x.trixnity.client.room.message.reply
+import de.connect2x.trixnity.client.room.message.replace
 import de.connect2x.trixnity.client.room.message.text
 import de.connect2x.trixnity.client.serverDiscovery
 import de.connect2x.trixnity.client.store.GlobalAccountDataStore
@@ -1432,7 +1433,7 @@ object MatrixRepository {
         if (outcome.isSuccess) {
             android.util.Log.d(TAG, "recoverWithKey: recovery-key verification succeeded")
             e2eeStateCache = null // now verified — recompute on next read
-            roomListDirty = true // verification changes unread suppression — refresh the list
+            markRoomListDirty() // verification changes unread suppression — refresh the list
         }
         return outcome
     }
@@ -1623,7 +1624,7 @@ object MatrixRepository {
                         restoreMegolmSessions()
                     }
                 }
-                roomListDirty = true // newly verified device → unread counts recompute
+                markRoomListDirty() // newly verified device → unread counts recompute
                 VerificationUi.Done
             }
             else -> {
@@ -1858,6 +1859,16 @@ object MatrixRepository {
     /** Newest activity first — a pure read of the background-refreshed cache. */
     suspend fun getRooms(): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
         if (client == null) return emptyList()
+        // Phase-0 latency timer (SYNC-PERF-SPEC.md): how long after the revision
+        // bump the tool's fetch arrives — includes the poll-tick wait + binder
+        // transit (the server knows both endpoints, so this needs no tool-side flag).
+        if (debugLogging() && roomListPublishedAt > 0) {
+            android.util.Log.d(
+                TAG,
+                "revision→RPC: fetch ${android.os.SystemClock.elapsedRealtime() - roomListPublishedAt}ms " +
+                    "after revision $roomListRevision",
+            )
+        }
         // The resolver seeds the cache promptly at attach and refreshes it in
         // the background; a binder call never triggers a 1284-room resolution
         // burst. On a cold process the first calls may return empty until the
@@ -3107,7 +3118,7 @@ object MatrixRepository {
         if (rebuilt > 0) {
             // The resurrected sends' rooms bump to the top with the pending
             // preview, like [wakeAfterSend] does for a live send.
-            roomListDirty = true
+            markRoomListDirty()
             wakeRoomList()
             android.util.Log.d(TAG, "outbox: rebuilt $rebuilt pending echo rows after restart")
         }
@@ -4512,25 +4523,29 @@ object MatrixRepository {
 
     /**
      * Edits an own text message (Phase C, 2026-09-03): an m.replace edit —
-     * sent through the SAME encrypted outbox DSL as [sendMessage]. The raw
-     * plaintext API this used before is rejected by Beeper's homeserver in
-     * bridged rooms ("cloud bridges aren't allowed to send unencrypted
-     * messages", LP3 2026-09-04 — the composer just sat on "sending" forever).
-     * The outer body carries the spec's "* " fallback prefix (what older
-     * clients render); the clean text rides in m.new_content (what the page
-     * build serves). Throws on failure; the dispatch maps it to a tool-side
-     * error, which the composer now displays.
+     * sent through the SAME encrypted outbox DSL as [sendMessage], via the
+     * canonical [replace] + [text] builders. The raw plaintext API this used
+     * before is rejected by Beeper's homeserver in bridged rooms ("cloud
+     * bridges aren't allowed to send unencrypted messages", LP3 2026-09-04).
+     * [text] routes through [roomMessageBuilder], the ONLY DSL path that
+     * actually attaches the relation: a bare `content(Text(...))` +
+     * `relatesTo = ...` silently DROPS the relation (the `content` lambda
+     * ignores the builder's ContentBuilderInfo), producing a relation-less
+     * "* <text>" message — the bridge then posts it to Instagram as a NEW
+     * message and the original never edits (LP3 2026-09-04, FEN★RGY room).
+     * [text] composes the spec's "* " fallback body plus
+     * RelatesTo.Replace(eventId, m.new_content) itself; the Megolm encryptor
+     * then hoists rel_type/event_id outside the ciphertext so the bridge can
+     * aggregate without decrypting. Throws on failure; the dispatch maps it
+     * to a tool-side error, which the composer now displays.
      */
     suspend fun editMessage(roomId: String, eventId: String, newBody: String) {
         if (newBody.isBlank()) error("empty edit body")
         val c = client ?: error("not logged in")
         val matrixRoomId = RoomId(roomId)
         val txnId = c.room.sendMessage(matrixRoomId) {
-            content(RoomMessageEventContent.TextBased.Text(body = "* $newBody"))
-            relatesTo = RelatesTo.Replace(
-                EventId(eventId),
-                RoomMessageEventContent.TextBased.Text(body = newBody),
-            )
+            replace(EventId(eventId))
+            text(newBody)
         }
         // Hold for the homeserver ack (bounded, like sendMessage) so a 403 or
         // outbox failure surfaces as an error instead of a silent stall. The
@@ -5787,7 +5802,7 @@ object MatrixRepository {
                     _roomList.value = _roomList.value.map { if (it.id == roomId) cleared.room else it }
                 }
             }
-            roomListDirty = true
+            markRoomListDirty()
         }
     }
 
@@ -5966,7 +5981,7 @@ object MatrixRepository {
         roomFlagsCache = roomFlagsCache + (roomId to updated)
         roomFlagsOverlay = roomFlagsOverlay + (roomId to updated)
         flagsOnlyWake = true
-        roomListDirty = true
+        markRoomListDirty()
         wakeRoomList()
     }
 
@@ -6128,7 +6143,7 @@ object MatrixRepository {
                                         c.notification.getCount(roomId).collect { count ->
                                             if (unreadCounts[key] != count) {
                                                 unreadCounts[key] = count
-                                                roomListDirty = true
+                                                markRoomListDirty()
                                             }
                                         }
                                     }
@@ -6199,7 +6214,7 @@ object MatrixRepository {
                                         )
                                         if (roomSigSeen[key] != sig) {
                                             roomSigSeen[key] = sig
-                                            roomListDirty = true
+                                            markRoomListDirty()
                                         }
                                         val lastId = updated.lastRelevantEventId?.full ?: return@collect
                                         if (updated.membership != Membership.JOIN) return@collect
@@ -6514,6 +6529,24 @@ object MatrixRepository {
     @Volatile
     private var roomListDirty = true
 
+    /**
+     * Phase-0 latency timers (SYNC-PERF-SPEC.md 2026-09-04): elapsed-realtime
+     * of the FIRST dirty set since the last publish ("store→publish" start)
+     * and of the last publish ("revision→RPC" start for getRooms). Stamping is
+     * unconditional and cheap (volatile writes); the logs are debugLog-gated.
+     * 0 = nothing pending.
+     */
+    @Volatile
+    private var roomListDirtyAt = 0L
+
+    @Volatile
+    private var roomListPublishedAt = 0L
+
+    private fun markRoomListDirty() {
+        if (roomListDirtyAt == 0L) roomListDirtyAt = android.os.SystemClock.elapsedRealtime()
+        roomListDirty = true
+    }
+
     /** Last full room map the resolver collected — the flags-only fast path
      *  re-stamps cached rows from it without re-collecting (see
      *  [flagsOnlyWake]). */
@@ -6651,7 +6684,7 @@ object MatrixRepository {
 
     private fun startRoomListResolver(c: MatrixClient) {
         roomListJob?.cancel()
-        roomListDirty = true
+        markRoomListDirty()
         roomListJob = scope.launch {
             android.util.Log.d(TAG, "room list resolver starting for ${c.userId.full}")
             // Hero-name memo: the profile store is warm, but resolving names for
@@ -7275,7 +7308,7 @@ object MatrixRepository {
             roomFlagsInvalidated = roomFlagsInvalidated + roomId
         }
         flagsOnlyWake = true
-        roomListDirty = true
+        markRoomListDirty()
         wakeRoomList()
     }
 
@@ -7283,7 +7316,7 @@ object MatrixRepository {
     private fun invalidateAllRoomFlags() {
         synchronized(flagsLock) { roomFlagsInvalidatedAll = true }
         flagsOnlyWake = true
-        roomListDirty = true
+        markRoomListDirty()
         wakeRoomList()
     }
 
@@ -8072,9 +8105,28 @@ object MatrixRepository {
         _roomList.value = rooms
         saveRoomListToDisk(rooms)
         roomListRevision++
+        if (debugLogging() && roomListDirtyAt > 0) {
+            android.util.Log.d(
+                TAG,
+                "store→publish: ${android.os.SystemClock.elapsedRealtime() - roomListDirtyAt}ms " +
+                    "(revision $roomListRevision)",
+            )
+        }
+        roomListDirtyAt = 0L
+        roomListPublishedAt = android.os.SystemClock.elapsedRealtime()
     }
 
     // --- internals -----------------------------------------------------------
+
+    /**
+     * Phase-0 latency timer (SYNC-PERF-SPEC.md): elapsed-realtime of the last
+     * /sync HTTP response completion — the start of the "sync processed"
+     * ingest measurement at the sync event subscriber. Set unconditionally
+     * (one volatile write per sync round); the log that reads it is
+     * debugLog-gated.
+     */
+    @Volatile
+    private var lastSyncResponseAt = 0L
 
     /**
      * Logs HTTP traffic to logcat for debugging the verification/binder/send
@@ -8093,10 +8145,11 @@ object MatrixRepository {
         if (path.contains("/sync")) {
             val t0 = android.os.SystemClock.elapsedRealtime()
             val response = chain.proceed(chain.request())
+            val t1 = android.os.SystemClock.elapsedRealtime()
+            lastSyncResponseAt = t1
             android.util.Log.d(
                 TAG,
-                "sync response: ${response.header("Content-Length") ?: "chunked"}B in " +
-                    "${android.os.SystemClock.elapsedRealtime() - t0}ms",
+                "sync response: ${response.header("Content-Length") ?: "chunked"}B in ${t1 - t0}ms",
             )
             return@Interceptor response
         }
@@ -8390,6 +8443,17 @@ object MatrixRepository {
                         ClientEvent.RoomEvent<EncryptedMessageEventContent.MegolmEncryptedMessageEventContent>
                     > { events ->
                         runCatching {
+                            // Phase-0 latency timer (SYNC-PERF-SPEC.md): HTTP response
+                            // → our visibility of the round's decrypted events ≈ the
+                            // ingest cost the 17–30 s model attributes to hop 1.
+                            if (debugLogging()) {
+                                android.util.Log.d(
+                                    TAG,
+                                    "sync processed: " +
+                                        "${android.os.SystemClock.elapsedRealtime() - lastSyncResponseAt}ms " +
+                                        "after HTTP response (${events.size} event(s))",
+                                )
+                            }
                             val outgoing = c.di.get<OutgoingRoomKeyRequestEventHandler>()
                             val olmStore = c.di.get<OlmCryptoStore>()
                             val missing = events.mapNotNull { e ->
