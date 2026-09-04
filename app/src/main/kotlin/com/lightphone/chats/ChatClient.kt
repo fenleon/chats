@@ -150,14 +150,18 @@ object ChatClient {
         ) is LightResult.Success
 
     /**
-     * Edits an own text message (Phase C, 2026-09-03). False when the
-     * companion rejected it (e.g. the edit is blank).
+     * Edits an own text message (Phase C, 2026-09-03). Returns null on
+     * success, the failure message otherwise (the composer displays it — a
+     * rejected edit must not read as an eternal "sending", LP3 2026-09-04).
      */
-    suspend fun editMessage(roomId: String, eventId: String, newBody: String): Boolean =
-        callRemoteServiceMethod(
+    suspend fun editMessage(roomId: String, eventId: String, newBody: String): String? =
+        when (val result = callRemoteServiceMethod(
             LightServiceMethod.EditMessage,
             LightServiceMethod.EditMessage.Request(roomId, eventId, newBody),
-        ) is LightResult.Success
+        )) {
+            is LightResult.Error -> result.extra ?: "edit failed"
+            else -> null
+        }
 
     /** Unsends (redacts) an own message — removed for everyone the bridge can
      *  reach (Phase C, 2026-09-03). False when the companion rejected it. */

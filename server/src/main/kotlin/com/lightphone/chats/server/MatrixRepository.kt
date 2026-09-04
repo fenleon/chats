@@ -3304,6 +3304,7 @@ object MatrixRepository {
         // device redacts the tag immediately, not one TTL later.
         val reactionsByEvent = if (beforeEventId == null && !fast) {
             reactionLabelsByEvent(c, matrixRoomId)
+                ?: reactionLabelsByEventCached(c, matrixRoomId)
         } else {
             reactionLabelsByEventCached(c, matrixRoomId)
         }
@@ -3740,16 +3741,19 @@ object MatrixRepository {
     private suspend fun reactionLabelsByEvent(
         c: MatrixClient,
         matrixRoomId: RoomId,
-    ): Map<String, List<String>> {
+    ): Map<String, List<String>>? {
         // Walk the RAW chain (like [sendStatusByEventId] and the page build),
         // not the handler's getLastTimelineEvents view: that view can miss
         // events after a chain gap — the Sophie room's existing reaction
         // never reached the served page's reactions map (LP3 2026-09-03; the
         // page build abandoned that API for the same reason). Reactions are
-        // never encrypted, so the fast walk is enough.
+        // never encrypted, so the fast walk is enough. Null = the head read
+        // timed out (LP3 2026-09-04: syncs regularly take 17–30 s here) — the
+        // caller falls back to the last known map instead of serving/caching
+        // an EMPTY one, which made every tag vanish for a TTL window.
         val start = withTimeoutOrNull(ROOM_BUDGET_MS) {
             c.room.getById(matrixRoomId).firstOrNull()?.lastEventId?.full
-        } ?: return emptyMap()
+        } ?: return null
         val collected = collectRelevantTimelineEvents(c, matrixRoomId, start, SEND_STATUS_WINDOW, fast = true).first
         return reactionTagsForEvents(c, matrixRoomId, collected)
     }
@@ -3772,6 +3776,11 @@ object MatrixRepository {
             if (now - fetchedAt < SEND_STATUS_CACHE_TTL_MS) return map
         }
         val map = reactionLabelsByEvent(c, matrixRoomId)
+        if (map == null) {
+            // Head read timed out — stale tags beat no tags (they self-heal on
+            // the next build); never cache an empty map as if it were truth.
+            return reactionCache[key]?.second ?: emptyMap()
+        }
         reactionCache[key] = now to map
         return map
     }
@@ -4503,26 +4512,34 @@ object MatrixRepository {
 
     /**
      * Edits an own text message (Phase C, 2026-09-03): an m.replace edit —
-     * the raw API call, same path [sendReaction] proves works E2EE. The outer
-     * body carries the spec's "* " fallback prefix (what older clients
-     * render); the clean text rides in m.new_content (what the page build
-     * serves). Throws on failure; the dispatch maps it to a tool-side error.
+     * sent through the SAME encrypted outbox DSL as [sendMessage]. The raw
+     * plaintext API this used before is rejected by Beeper's homeserver in
+     * bridged rooms ("cloud bridges aren't allowed to send unencrypted
+     * messages", LP3 2026-09-04 — the composer just sat on "sending" forever).
+     * The outer body carries the spec's "* " fallback prefix (what older
+     * clients render); the clean text rides in m.new_content (what the page
+     * build serves). Throws on failure; the dispatch maps it to a tool-side
+     * error, which the composer now displays.
      */
     suspend fun editMessage(roomId: String, eventId: String, newBody: String) {
         if (newBody.isBlank()) error("empty edit body")
         val c = client ?: error("not logged in")
-        c.api.room.sendMessageEvent(
-            RoomId(roomId),
-            RoomMessageEventContent.TextBased.Text(
-                body = "* $newBody",
-                relatesTo = RelatesTo.Replace(
-                    EventId(eventId),
-                    RoomMessageEventContent.TextBased.Text(body = newBody),
-                ),
-            ),
-        ).getOrThrow()
-        // The edit is a timeline event — same reasoning as [sendReaction]:
-        // this makes it visible on the next poll instead of one tick later.
+        val matrixRoomId = RoomId(roomId)
+        val txnId = c.room.sendMessage(matrixRoomId) {
+            content(RoomMessageEventContent.TextBased.Text(body = "* $newBody"))
+            relatesTo = RelatesTo.Replace(
+                EventId(eventId),
+                RoomMessageEventContent.TextBased.Text(body = newBody),
+            )
+        }
+        // Hold for the homeserver ack (bounded, like sendMessage) so a 403 or
+        // outbox failure surfaces as an error instead of a silent stall. The
+        // edit is a timeline event — refresh makes it visible on the next poll
+        // instead of one tick later.
+        if (awaitOutboxAck(c, matrixRoomId, txnId) == null) {
+            error("edit was not accepted — try again")
+        }
+        wakeAfterSend(matrixRoomId.full)
         refreshMessagePage(roomId)
     }
 
@@ -4715,7 +4732,17 @@ object MatrixRepository {
                 android.util.Log.w(TAG, "self-heal: HTTP stack rebuilt for ${restored.userId.full}")
                 if (syncEnabled) {
                     PushChannel.start(ctx, restored)
-                    applySyncModeForScreenState()
+                    // The FGS keep-alive survived the heal, but its sync loop
+                    // AND watchdog belong to the closed old client —
+                    // enterActiveSync's guard trusts ChatSyncService.isRunning
+                    // and would bail, leaving no long-poll and no push wakes
+                    // (onPushDelivered skips in ACTIVE mode) → a stuck
+                    // "Can't reach server" banner (LP3 2026-09-04). Re-kick
+                    // the service: onStartCommand sees syncedClient !==
+                    // restored and re-arms loop + watchdog on the new client.
+                    runCatching {
+                        ctx.startForegroundService(Intent(ctx, ChatSyncService::class.java))
+                    }.onFailure { applySyncModeForScreenState() }
                 }
             } finally {
                 mediaHealInFlight = false

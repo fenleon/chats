@@ -23,7 +23,9 @@ import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightIcon
+import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextInputEditor
+import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
@@ -61,6 +63,10 @@ class ComposerViewModel(
 
     val busy = MutableStateFlow(false)
 
+    /** Failure message from the last send/edit (null = none) — displayed so a
+     *  rejected send reads as an error, not a silent "still sending". */
+    val error = MutableStateFlow<String?>(null)
+
     override fun onScreenShow(screen: SimpleLightScreen<ComposerResult>) {
         super.onScreenShow(screen)
         // The composer is the only place the tool types; announce it for the
@@ -86,13 +92,16 @@ class ComposerViewModel(
         if (body.isEmpty() || busy.value) return
         viewModelScope.launch {
             busy.value = true
+            error.value = null
             try {
                 if (editTarget != null) {
-                    val ok = ChatClient.editMessage(roomId, editTarget.id, body)
-                    if (ok) {
+                    val editError = ChatClient.editMessage(roomId, editTarget.id, body)
+                    if (editError == null) {
                         // Same event id — the thread's optimistic edit overlay
                         // keys off it.
                         screen.goBack(ComposerResult(body, editTarget.id, editTarget.timestampMs))
+                    } else {
+                        error.value = editError
                     }
                 } else {
                     val response = ChatClient.sendMessage(roomId, body)
@@ -104,6 +113,8 @@ class ComposerViewModel(
                                 timestampMs = System.currentTimeMillis(),
                             ),
                         )
+                    } else {
+                        error.value = "couldn't send — check connection and try again"
                     }
                 }
             } finally {
@@ -185,6 +196,20 @@ class ComposerScreen(
                     topBarSubmitIcon = LightIcons.SEND,
                     initialCaps = true,
                 )
+                // Quiet failure line (same grammar as the thread's row error):
+                // a rejected send/edit shows here instead of reading as an
+                // eternal "sending" (LP3 2026-09-04: the 403'd edit stalled
+                // silently). Cleared on the next send attempt.
+                viewModel.error.collectAsState().value?.let { message ->
+                    LightText(
+                        text = message,
+                        variant = LightTextVariant.Superfine,
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .imePadding()
+                            .padding(start = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp()),
+                    )
+                }
                 // Clear-draft X, bottom-right corner of the screen (feedback
                 // 2026-08-21: the old 218 dp-above-keyboard position overlapped
                 // the draft's last line; the first bottom-right attempt

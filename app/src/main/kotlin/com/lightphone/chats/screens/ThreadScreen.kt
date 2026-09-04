@@ -808,8 +808,9 @@ class ThreadViewModel(
         val adding = !ownPresent
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + (key to adding)))
-        // Re-fetch with the overlay applied — the tag flips this frame, not on
-        // the next poll tick.
+        // The tag flips this frame, not on the next poll tick or when the
+        // re-fetch lands — re-render with the overlay applied right away.
+        messages.value = applyReactionOverlays(messages.value)
         loadNewest(quiet = true)
         viewModelScope.launch {
             val ok = if (adding) {
@@ -840,10 +841,11 @@ class ThreadViewModel(
      * (Phase B, 2026-09-03 — the context window's LIKE MESSAGE / REACT /
      * EDIT REACTION rows, one own reaction at a time, replace semantics):
      * unsends any existing own reaction(s) and sends [key]. Optimistic
-     * overlay for both directions; a failed RPC rolls every touched key back
-     * and surfaces the quiet row error. When the failure lands between the
-     * unsend and the send, the reaction is lost server-side — the error tag
-     * says so implicitly and the user can re-react.
+     * overlay for both directions; only a failed SEND rolls the new key back
+     * and surfaces the quiet row error — a failed unsend is best-effort (the
+     * new reaction wins display-side, so it must not fail the change). When
+     * the send fails after the unsend succeeded, the reaction is lost
+     * server-side — the error tag says so implicitly and the user can re-react.
      */
     fun setReaction(message: LightServiceMethod.GetMessages.Message, key: String) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
@@ -853,16 +855,22 @@ class ThreadViewModel(
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + updates))
         Log.d("ChatsDebug", "setReaction: id=${message.id} overlay=$updates")
+        messages.value = applyReactionOverlays(messages.value)
         loadNewest(quiet = true)
         viewModelScope.launch {
-            var ok = true
+            // Unsend best-effort: a miss (old reaction beyond the head window,
+            // or a transient failure) must NOT fail the whole change — the new
+            // reaction is what the display keeps (per-sender newest-wins), and
+            // the bridge replaces remotely anyway (reaction_count=1).
             for (old in own) {
-                ok = ChatClient.unsendReaction(room.id, message.id, old) && ok
+                ChatClient.unsendReaction(room.id, message.id, old)
             }
-            ok = ChatClient.sendReaction(room.id, message.id, key) && ok
+            val ok = ChatClient.sendReaction(room.id, message.id, key)
             Log.d("ChatsDebug", "setReaction RPC: ok=$ok")
             if (!ok) {
-                (own + key).forEach { revertReactionOverlay(message.id, it) }
+                // Only the new key reverts — the old keys' removal entries
+                // self-heal when a served page reflects them.
+                revertReactionOverlay(message.id, key)
                 reactionError.value = message.id to "reaction failed"
                 delay(VOICE_ERROR_DISMISS_MS)
                 if (reactionError.value?.first == message.id) reactionError.value = null
@@ -881,6 +889,7 @@ class ThreadViewModel(
         if (own.isEmpty()) return
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + own.associateWith { false }))
+        messages.value = applyReactionOverlays(messages.value)
         loadNewest(quiet = true)
         viewModelScope.launch {
             var ok = true
@@ -1104,7 +1113,13 @@ class ThreadViewModel(
                     // (re-import batches) a ts-sort moved the oldest row off the
                     // chain edge, dead-ending older-page fetches (feedback
                     // 2026-08-23: "scroll up doesn't refresh, nothing older").
-                    messages.value = (older + messages.value).distinctBy { it.id }
+                    // Overlays ride on the merged list too — a reaction tapped
+                    // on a row that only exists in paged history must flip the
+                    // tag here, not only on the newest page (LP3 2026-09-04:
+                    // reacting to an older message looked like a no-op).
+                    val merged = (older + messages.value).distinctBy { it.id }
+                    dropReflectedOverlays(merged)
+                    messages.value = applyMessageOverlays(applyReactionOverlays(merged))
                 }
                 hasMore.value = page?.hasMore ?: hasMore.value
             } finally {
