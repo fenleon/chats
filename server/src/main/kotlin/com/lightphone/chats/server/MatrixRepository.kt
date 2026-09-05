@@ -1631,6 +1631,10 @@ object MatrixRepository {
     private var pendingTheirSasStart: ActiveSasVerificationState.TheirSasStart? = null
     @Volatile
     private var pendingCompare: ActiveSasVerificationState.ComparisonByUser? = null
+    /** When their SAS start landed (elapsedRealtime), to recognize the
+     *  fan-out collision cancel (see the Cancel branch below). */
+    @Volatile
+    private var theirSasStartAtMs: Long = 0L
 
     /** E2EE status memoized for [E2EE_STATE_TTL_MS] — the network getDevices()
      *  on every poll (1-5 s) + every thread open was the slow, constant
@@ -1765,6 +1769,7 @@ object MatrixRepository {
         pendingReady = null
         pendingTheirSasStart = null
         pendingCompare = null
+        theirSasStartAtMs = 0L
         _verification.value = VerificationUi.Idle
     }
 
@@ -1813,14 +1818,29 @@ object MatrixRepository {
             else -> {
                 if (state is ActiveVerificationState.Cancel) {
                     verificationTimeoutJob?.cancel()
-                    // Trixnity quirk (LP3 2026-08-19): a spurious
-                    // m.unexpected_message cancel fires ~4 s in, right before
-                    // the partner's accept lands — swallow it while we're
-                    // still pre-flow (no Ready seen) so a healthy flow survives.
-                    if (pendingReady == null && state.content.code == VerificationCancelEventContent.Code.UnexpectedMessage) {
-                        android.util.Log.i(TAG, "verify: swallowing pre-flow spurious cancel (m.unexpected_message)")
+                    // Trixnity quirks (LP3 2026-08-19 + 2026-09-06): a spurious
+                    // m.unexpected_message cancel fires either pre-flow (~4 s
+                    // in, right before the partner's accept lands) or moments
+                    // after their SAS start when two devices answer the fan-out
+                    // request simultaneously (collision). Swallow both so a
+                    // healthy flow survives; anything else (a real user or
+                    // timeout cancel from the partner) still cancels the UI.
+                    val inCollisionWindow = theirSasStartAtMs > 0 &&
+                        android.os.SystemClock.elapsedRealtime() - theirSasStartAtMs < SAS_COLLISION_GRACE_MS
+                    if (state.content.code == VerificationCancelEventContent.Code.UnexpectedMessage &&
+                        (pendingReady == null || inCollisionWindow)
+                    ) {
+                        android.util.Log.i(
+                            TAG,
+                            "verify: swallowing spurious m.unexpected_message cancel (" +
+                                if (pendingReady == null) "pre-flow"
+                                else "${android.os.SystemClock.elapsedRealtime() - theirSasStartAtMs} ms after their SAS start" +
+                                    ", accepted by ${acceptingDeviceId ?: "?"}" +
+                                    "), content=${state.content}"
+                        )
                         _verification.value
                     } else {
+                        android.util.Log.w(TAG, "verify: cancelled — content=${state.content}")
                         VerificationUi.Cancelled
                     }
                 } else {
@@ -1836,6 +1856,7 @@ object MatrixRepository {
             is ActiveSasVerificationState.OwnSasStart -> VerificationUi.Verifying
             is ActiveSasVerificationState.TheirSasStart -> {
                 pendingTheirSasStart = state
+                theirSasStartAtMs = android.os.SystemClock.elapsedRealtime()
                 // Their start's from_device is the accepting device — the
                 // request fanned out to every other device, and the UI wants
                 // to show which one actually accepted.
@@ -9443,6 +9464,10 @@ object MatrixRepository {
      *  timer cancels it (Trixnity's own timeout events are not surfaced — see
      *  onVerificationState). */
     private const val VERIFICATION_TIMEOUT_MS = 10 * 60_000L
+    /** Grace window after their SAS start in which an m.unexpected_message
+     *  cancel is read as a fan-out collision (two devices answered at once),
+     *  not a real cancel — see the Cancel branch in onVerificationState. */
+    private const val SAS_COLLISION_GRACE_MS = 10_000L
     /** How long the memoized [e2eeState] result stays fresh (see the cache
      *  field) — long enough that the 1-5 s account polls + thread opens don't
      *  hit the network getDevices() on every call, short enough that a
