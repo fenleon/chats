@@ -36,12 +36,19 @@ object ChatClient {
             LightServiceMethod.BeeperRequestCode.Request(email),
         ).error?.extra
 
-    /** Beeper login, step 2: completes the login with the emailed [code]. @return null on success, else the companion's error message. */
-    suspend fun beeperLogin(email: String, code: String): String? =
-        callRemoteServiceMethod(
+    /**
+     * Beeper login, step 2: completes the login with the emailed [code]. The
+     * response carries [LightServiceMethod.SetBeeperAccount.Response.needsVerification].
+     * @return the response on success, else the companion's error message.
+     */
+    suspend fun beeperLogin(email: String, code: String): Result<LightServiceMethod.SetBeeperAccount.Response> =
+        when (val result = callRemoteServiceMethod(
             LightServiceMethod.SetBeeperAccount,
             LightServiceMethod.SetBeeperAccount.Request(email, code),
-        ).error?.extra
+        )) {
+            is LightResult.Success -> Result.success(result.data)
+            is LightResult.Error -> Result.failure(Exception(result.extra ?: "beeper login failed"))
+        }
 
     suspend fun accountState(): LightServiceMethod.GetAccountState.Response? =
         callRemoteServiceMethod(LightServiceMethod.GetAccountState, Unit).getOrNull()

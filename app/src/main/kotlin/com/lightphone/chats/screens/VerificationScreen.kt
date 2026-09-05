@@ -283,6 +283,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                             "verifying" -> CenteredPanel("Verifying…")
                             "compare" -> ComparePanel(
                                 emojis = state?.emoji.orEmpty(),
+                                deviceId = state?.deviceId,
                                 onMatch = { viewModel.act("match") },
                                 onNoMatch = { viewModel.act("no_match") },
                             )
@@ -551,6 +552,7 @@ private fun ComparePanel(
     emojis: List<String>,
     onMatch: () -> Unit,
     onNoMatch: () -> Unit,
+    deviceId: String? = null,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         Box(
@@ -577,6 +579,10 @@ private fun ComparePanel(
                     align = TextAlign.Center,
                     modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
                 )
+                if (deviceId != null) {
+                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                    LightText(text = "Accepted on device $deviceId", variant = LightTextVariant.Detail)
+                }
             }
         }
         PanelActionButton("THEY MATCH", onClick = onMatch)

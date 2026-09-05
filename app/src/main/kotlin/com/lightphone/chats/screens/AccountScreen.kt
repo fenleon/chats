@@ -193,14 +193,18 @@ class AccountViewModel : LightViewModel<Unit>() {
         }
     }
 
-    fun login() {
+    fun login(onNeedsVerification: () -> Unit = {}) {
         if (busy.value) return
         viewModelScope.launch(Dispatchers.IO) {
             busy.value = true
             error.value = null
             try {
-                val failure = if (beeperMode.value) {
-                    ChatClient.beeperLogin(beeperEmail.value.trim(), beeperCode.value.trim())
+                val needsVerification: Boolean
+                val failure: String?
+                if (beeperMode.value) {
+                    val result = ChatClient.beeperLogin(beeperEmail.value.trim(), beeperCode.value.trim())
+                    needsVerification = result.getOrNull()?.needsVerification == true
+                    failure = result.exceptionOrNull()?.message
                 } else {
                     val response = ChatClient.setAccount(
                         homeserver = homeserver.value.trim(),
@@ -208,7 +212,8 @@ class AccountViewModel : LightViewModel<Unit>() {
                         passwordOrToken = password.value,
                         tokenLogin = tokenLogin.value,
                     )
-                    if (response != null) null
+                    needsVerification = response?.needsVerification == true
+                    failure = if (response != null) null
                     else "Couldn't log in. Check the homeserver and credentials."
                 }
                 if (failure == null) {
@@ -217,6 +222,11 @@ class AccountViewModel : LightViewModel<Unit>() {
                     codeStatus.value = null
                     codeRequested.value = false
                     refreshStatus()
+                    // Verification is part of login when there is something to
+                    // verify against — the companion already started the request,
+                    // so go straight into the verify flow. The X on the screen
+                    // still skips; landing in the normal app is fine.
+                    if (needsVerification) onNeedsVerification()
                 } else {
                     error.value = failure
                 }
@@ -292,6 +302,10 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
         val busy by viewModel.busy.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
 
+        // Shared navigation into the verify flow (post-login auto-entry and
+        // the Verify Device row).
+        val goVerify: () -> Unit = { navigateTo(screenFactory = { VerificationScreen(it) }) }
+
         LightTheme(colors = themeColors) {
             Column(
                 modifier = Modifier
@@ -319,9 +333,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 settled = e2eeSettled,
                                 verifying = verification != null &&
                                     verification !in VERIFICATION_TERMINAL_STATES,
-                                onClick = if (e2ee?.verified == true || !e2eeSettled) null else {
-                                    { navigateTo(screenFactory = { VerificationScreen(it) }) }
-                                },
+                                onClick = if (e2ee?.verified == true || !e2eeSettled) null else goVerify,
                             )
                             AccountStatus(connection = connection)
                         } else {
@@ -374,7 +386,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                                 // SAVE — feedback 2026-08-19).
                                                 submitLabel = "SUBMIT",
                                             ) { code ->
-                                                if (code.isNotBlank()) viewModel.login()
+                                                if (code.isNotBlank()) viewModel.login(goVerify)
                                             }
                                         },
                                     )
@@ -444,7 +456,9 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                         } else {
                             LightBarButton.Text(
                                 text = if (busy) "…" else "LOG IN",
-                                onClick = if (busy) null else viewModel::login,
+                                onClick = if (busy) null else {
+                                    { viewModel.login(goVerify) }
+                                },
                             )
                         },
                     ),

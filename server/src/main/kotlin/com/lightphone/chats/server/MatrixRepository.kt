@@ -1307,8 +1307,49 @@ object MatrixRepository {
         syncMode = SyncMode.ACTIVE
         startSyncLoop(ctx)
         PushChannel.start(ctx, newClient)
+        // Verification is part of login (Beeper's model) — but only when there
+        // is something to verify against: the account has cross-signing keys
+        // uploaded and this fresh session isn't trusted yet. The request goes
+        // out here so it is already pending when the tool shows the verify UI;
+        // a fresh Synapse account (no cross-signing) skips the flow entirely.
+        lastLoginNeedsVerification = postLoginNeedsVerification(newClient)
+        if (lastLoginNeedsVerification) {
+            runCatching { startDeviceVerification() }
+                .onFailure { android.util.Log.w(TAG, "post-login verification auto-start failed: ${it.message}") }
+        }
         return newClient
     }
+
+    /** Whether the most recent login ended with device verification pending —
+     *  stamped by [finishLogin], read by ChatServiceMethods to add
+     *  `needsVerification` to the SetAccount/SetBeeperAccount responses. */
+    @Volatile
+    var lastLoginNeedsVerification: Boolean = false
+        private set
+
+    /**
+     * Whether a just-finished login should flow into device verification:
+     * the account has cross-signing keys uploaded server-side (something to
+     * verify against) and at least one other device exists. The trust read at
+     * the end only rules out an already-trusted session; a fresh login always
+     * mints a new device id, so a timed-out read counts as unverified here
+     * (the opposite of [isDeviceVerified]'s TOFU policy, which protects
+     * steady-state reads of a device already in use). Any failure (network,
+     * API) reads as "no verification needed" — the manual Verify Device row
+     * remains the fallback.
+     */
+    private suspend fun postLoginNeedsVerification(c: MatrixClient): Boolean = runCatching {
+        val keys = c.api.key.getKeys(mapOf(c.userId to emptySet<String>())).getOrThrow()
+        if (keys.masterKeys?.get(c.userId) == null && keys.userSigningKeys?.get(c.userId) == null) {
+            return@runCatching false // fresh account — no cross-signing to verify with
+        }
+        val others = c.api.device.getDevices().getOrThrow().count { it.deviceId != c.deviceId }
+        if (others == 0) return@runCatching false
+        val trust = withTimeoutOrNull(KEY_BACKUP_VERIFY_TIMEOUT_MS) {
+            c.key.getTrustLevel(c.userId, c.deviceId).firstOrNull()
+        }
+        trust !is de.connect2x.trixnity.crypto.key.DeviceTrustLevel.CrossSigned
+    }.getOrDefault(false)
 
     /**
      * One-time /sync filter migration (LP3 2026-08-28): Trixnity uploads the
@@ -1448,7 +1489,7 @@ object MatrixRepository {
         data object Accept : VerificationUi           // their request or their SAS start
         data object Start : VerificationUi            // both ready; this side starts the SAS
         data object Verifying : VerificationUi        // SAS exchange in progress (keys/macs)
-        data class Compare(val emoji: List<String>) : VerificationUi
+        data class Compare(val emoji: List<String>, val deviceId: String? = null) : VerificationUi
         data object Done : VerificationUi
         data object Cancelled : VerificationUi
         data class Error(val detail: String) : VerificationUi
@@ -1456,6 +1497,13 @@ object MatrixRepository {
 
     private val _verification = MutableStateFlow<VerificationUi>(VerificationUi.Idle)
     val verification: StateFlow<VerificationUi> = _verification.asStateFlow()
+
+    private var verificationCollectJob: Job? = null
+    private var verificationTimeoutJob: Job? = null
+
+    /** Device that accepted our verification request (their SAS start's from_device). */
+    @Volatile
+    private var acceptingDeviceId: String? = null
 
     @Volatile
     private var activeVerification: ActiveDeviceVerification? = null
@@ -1526,8 +1574,19 @@ object MatrixRepository {
         val request = c.verification.createDeviceVerificationRequest(c.userId, otherDevices).getOrThrow()
         activeVerification = request
         _verification.value = VerificationUi.Waiting
-        scope.launch {
+        verificationCollectJob?.cancel()
+        verificationCollectJob = scope.launch {
             request.state.collectLatest { state -> onVerificationState(state) }
+        }
+        verificationTimeoutJob?.cancel()
+        verificationTimeoutJob = scope.launch {
+            delay(VERIFICATION_TIMEOUT_MS)
+            if (activeVerification === request) {
+                android.util.Log.w(TAG, "verification timed out after ${VERIFICATION_TIMEOUT_MS / 60_000L} min — cancelling")
+                runCatching { request.cancel() }
+                verificationCollectJob?.cancel()
+                _verification.value = VerificationUi.Error("Verification timed out — try your recovery key")
+            }
         }
     }
 
@@ -1546,6 +1605,7 @@ object MatrixRepository {
                 is VerificationUi.Error -> "error"
             },
             emoji = (ui as? VerificationUi.Compare)?.emoji,
+            deviceId = (ui as? VerificationUi.Compare)?.deviceId,
             detail = (ui as? VerificationUi.Error)?.detail,
         )
     }
@@ -1579,6 +1639,11 @@ object MatrixRepository {
     }
 
     private fun resetVerification() {
+        verificationTimeoutJob?.cancel()
+        verificationCollectJob?.cancel()
+        verificationTimeoutJob = null
+        verificationCollectJob = null
+        acceptingDeviceId = null
         activeVerification = null
         pendingTheirRequest = null
         pendingReady = null
@@ -1611,6 +1676,7 @@ object MatrixRepository {
                 VerificationUi.Accept
             }
             is ActiveVerificationState.Done -> {
+                verificationTimeoutJob?.cancel()
                 e2eeStateCache = null // verification changed — recompute on next read
                 // The backup-key secret lands via /sync a moment after Done, but
                 // the login-time restore ran before it existed and set the 24h
@@ -1629,8 +1695,18 @@ object MatrixRepository {
                 VerificationUi.Done
             }
             else -> {
-                if (state::class.simpleName?.contains("Cancel", ignoreCase = true) == true) {
-                    VerificationUi.Cancelled
+                if (state is ActiveVerificationState.Cancel) {
+                    verificationTimeoutJob?.cancel()
+                    // Trixnity quirk (LP3 2026-08-19): a spurious
+                    // m.unexpected_message cancel fires ~4 s in, right before
+                    // the partner's accept lands — swallow it while we're
+                    // still pre-flow (no Ready seen) so a healthy flow survives.
+                    if (pendingReady == null && state.content.code == VerificationCancelEventContent.Code.UnexpectedMessage) {
+                        android.util.Log.i(TAG, "verify: swallowing pre-flow spurious cancel (m.unexpected_message)")
+                        _verification.value
+                    } else {
+                        VerificationUi.Cancelled
+                    }
                 } else {
                     VerificationUi.Waiting
                 }
@@ -1644,11 +1720,18 @@ object MatrixRepository {
             is ActiveSasVerificationState.OwnSasStart -> VerificationUi.Verifying
             is ActiveSasVerificationState.TheirSasStart -> {
                 pendingTheirSasStart = state
+                // Their start's from_device is the accepting device — the
+                // request fanned out to every other device, and the UI wants
+                // to show which one actually accepted.
+                state.content.fromDevice.takeIf { it.isNotBlank() }?.let { deviceId ->
+                    acceptingDeviceId = deviceId
+                    android.util.Log.i(TAG, "verify: accepted by device $deviceId")
+                }
                 VerificationUi.Accept
             }
             is ActiveSasVerificationState.ComparisonByUser -> {
                 pendingCompare = state
-                VerificationUi.Compare(state.emojis.map { it.second })
+                VerificationUi.Compare(state.emojis.map { it.second }, acceptingDeviceId)
             }
             // WaitForKeys / WaitForMacs are exchange progress — "Verifying…",
             // not "waiting for the other device to accept".
@@ -4038,7 +4121,9 @@ object MatrixRepository {
         return events
     }
 
-    /** Whether this device is cross-signing verified (so E2EE rooms can decrypt). */
+    /** Whether this device counts as trusted for E2EE (TOFU): any device
+     *  cross-signed by the account's user-signing key is trusted — Beeper
+     *  requires no per-device SAS (the local `verified` flag is NOT required). */
     private suspend fun isDeviceVerified(c: MatrixClient): Boolean {
         // A null read (timeout / trust store not warm) must NOT read as
         // "unverified": the encrypted-room fast path then fires intermittently
@@ -4049,7 +4134,7 @@ object MatrixRepository {
         val trust = withTimeoutOrNull(KEY_BACKUP_VERIFY_TIMEOUT_MS) {
             c.key.getTrustLevel(c.userId, c.deviceId).firstOrNull()
         } ?: return true
-        return trust is de.connect2x.trixnity.crypto.key.DeviceTrustLevel.CrossSigned && trust.verified
+        return trust is de.connect2x.trixnity.crypto.key.DeviceTrustLevel.CrossSigned
     }
 
     /** Loads the megolm sessions for the given events' undecrypted content from
@@ -8537,6 +8622,12 @@ object MatrixRepository {
                                         "after HTTP response (${events.size} event(s))",
                                 )
                             }
+                            // Unverified device: no key-backup access, nothing
+                            // to answer with — requesting per missing session
+                            // per round churned hundreds of m.room_key_request
+                            // to-device events (LP3 fresh login). Same gate as
+                            // the unread-count suppression.
+                            if (!isDeviceVerified(c)) return@runCatching
                             val outgoing = c.di.get<OutgoingRoomKeyRequestEventHandler>()
                             val olmStore = c.di.get<OlmCryptoStore>()
                             val missing = events.mapNotNull { e ->
@@ -9035,6 +9126,10 @@ object MatrixRepository {
     private const val KEY_BACKUP_VERIFY_TIMEOUT_MS = 1_000L
     /** Bound for a single megolm-session load (can hang waiting for a key). */
     private const val KEY_BACKUP_LOAD_TIMEOUT_MS = 2_000L
+    /** How long an interactive device verification may stay open before the
+     *  timer cancels it (Trixnity's own timeout events are not surfaced — see
+     *  onVerificationState). */
+    private const val VERIFICATION_TIMEOUT_MS = 10 * 60_000L
     /** How long the memoized [e2eeState] result stays fresh (see the cache
      *  field) — long enough that the 1-5 s account polls + thread opens don't
      *  hit the network getDevices() on every call, short enough that a

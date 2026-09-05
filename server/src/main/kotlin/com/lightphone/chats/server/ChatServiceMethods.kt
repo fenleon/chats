@@ -371,6 +371,7 @@ object ChatServiceMethods {
                 val response = LightServiceMethod.SetAccount.Response(
                     userId = client.userId.full,
                     deviceId = client.deviceId,
+                    needsVerification = MatrixRepository.lastLoginNeedsVerification,
                 )
                 LightResult.Success(LightServiceMethod.SetAccount.encodeResponse(response))
             },
@@ -393,6 +394,7 @@ object ChatServiceMethods {
                 val response = LightServiceMethod.SetBeeperAccount.Response(
                     userId = client.userId.full,
                     deviceId = client.deviceId,
+                    needsVerification = MatrixRepository.lastLoginNeedsVerification,
                 )
                 LightResult.Success(LightServiceMethod.SetBeeperAccount.encodeResponse(response))
             },
