@@ -8218,6 +8218,23 @@ object MatrixRepository {
             )
             return serverLastId to serverTs
         }
+        // A head that is a MESSAGE (text, media, or an encrypted payload that
+        // will decrypt to one) is real activity even when its content can't be
+        // read at resolve time — stamp the row with its id+time instead of
+        // serving the last-known-good row. Without this, a failed-decrypt head
+        // (megolm session missing until the backup restore, Beeper bridged
+        // rooms) fell through to the ghost machinery below and the row sat on
+        // the old message for hours-to-weeks while the thread itself showed
+        // the newer message (LP3 2026-09-05: Directing 3 h, Note to self 20 h,
+        // BRATS - Actors 12 days; ~150/296 rooms behind). Edits (m.replace)
+        // and flood ghosts are excluded — the row must not bump to edit time
+        // (2026-08-17) or to a re-import flood (2026-08-23). The ghost resolve
+        // below still runs so the preview heals once content resolves; member
+        // -join/ack heads keep the 2026-08-31 no-fake-time park.
+        if (serverLast != null && isMessageClassHead(serverLast) && !inFlood) {
+            effectiveLastCache[key] = EffectiveLast(serverLastId, serverLastId, serverTs)
+            return serverLastId to serverTs
+        }
         // The server's newest event renders as nothing — a dropped edit, a
         // bridge status ack / reaction / redaction, or an in-flood ghost. When
         // the fast window already holds a renderable event, resolve it
@@ -8909,6 +8926,16 @@ object MatrixRepository {
             (content == null && te.event.content is EncryptedMessageEventContent)
     }
 
+    /** Message-class head (text, media, encrypted payload) — the only event
+     *  class a room row may stamp its time from while undecryptable. Edits
+     *  (m.replace) excluded: the row follows the original message. */
+    private fun isMessageClassHead(te: TimelineEvent): Boolean =
+        when (val raw = te.event.content) {
+            is EncryptedMessageEventContent -> true
+            is RoomMessageEventContent -> raw.relatesTo !is RelatesTo.Replace
+            else -> false
+        }
+
     /**
      * The "[Message unsent]" tombstone row for a redacted message event (Phase
      * C, 2026-09-03): id/sender/name/time preserved so the row stays in its
@@ -9339,16 +9366,20 @@ object MatrixRepository {
     private const val GHOST_BURST_WINDOW_MS = 60_000L
     /** Flood fallback: real conversations rarely exceed this rate (re-imports are per-second). */
     private const val GHOST_FLOOD_THRESHOLD = 30
-    /** Room-list effective-last walk cap (decrypted events). */
-    private const val EFFECTIVE_LAST_WALK = 800
+    /** Room-list effective-last walk cap (decrypted events). Was 800 — walks
+     *  over that depth never completed inside [GHOST_WALK_BUDGET_MS] on the
+     *  LP3 (1284-room account, 2026-09-05), so rooms backed off instead of
+     *  healing; 100 still spans any ack/reaction/re-import run. */
+    private const val EFFECTIVE_LAST_WALK = 100
     /** In-path fast window — big enough to spot a >=[GHOST_FLOOD_THRESHOLD] flood. */
     private const val EFFECTIVE_LAST_FAST = 50
     /** How long a pending ghost-resolution is parked before the resolver retries. */
     private const val GHOST_WALK_RETRY_MS = 120_000L
-    /** Backoff after a ghost walk times out (can't complete within its budget):
-     *  the room isn't going to resolve, so re-attempting in 2 minutes just
-     *  re-runs the same doomed walk (battery 2026-08-17 audit). */
-    private const val GHOST_WALK_FAIL_BACKOFF_MS = 14_400_000L
+    /** Backoff after a ghost walk times out (can't complete within its budget).
+     *  Was 4 h — with the head-time stamp (2026-09-05) the row no longer
+     *  depends on the walk for its timestamp, so 15 min keeps the heal cheap
+     *  without a 4 h-stale row as the cost of a failed walk. */
+    private const val GHOST_WALK_FAIL_BACKOFF_MS = 900_000L
     /** Bound for the effective-last decrypting walk (one-time per room, cached). */
     private const val GHOST_WALK_BUDGET_MS = 8_000L
 
