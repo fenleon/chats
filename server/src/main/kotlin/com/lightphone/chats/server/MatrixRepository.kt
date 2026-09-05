@@ -88,8 +88,10 @@ import de.connect2x.trixnity.core.model.events.m.TagEventContent
 import de.connect2x.trixnity.core.model.push.PushAction
 import de.connect2x.trixnity.core.model.push.PushRuleKind
 import de.connect2x.trixnity.core.serialization.events.EventContentSerializerMappings
+import de.connect2x.trixnity.core.serialization.events.UnknownEventContentSerializer
 import de.connect2x.trixnity.core.serialization.events.default
 import de.connect2x.trixnity.core.serialization.events.invoke
+import de.connect2x.trixnity.core.serialization.events.messageOf
 import de.connect2x.trixnity.core.serialization.events.roomAccountDataOf
 import de.connect2x.trixnity.client.CryptoDriverModule
 import de.connect2x.trixnity.core.EventHandler
@@ -1905,14 +1907,25 @@ object MatrixRepository {
             android.util.Log.e(TAG, "restore: KeyBackupService not available via DI")
             return
         }
-        val backupVersion = runCatching { keyBackup.version.firstOrNull() }.getOrNull()
+        // Trixnity's version flow emits its current value immediately — null
+        // until the service has actually fetched /room_keys/version. A process
+        // restart before that fetch reads as "no backup configured" and stuck
+        // the account un-decryptable for the crawl's 24h interval (LP3
+        // 2026-09-06, post-verification restart). Wait for a real emission;
+        // null after the budget means genuinely absent/unreachable.
+        val backupVersion = withTimeoutOrNull(KEY_BACKUP_VERSION_BUDGET_MS) {
+            runCatching { keyBackup.version.filterNotNull().firstOrNull() }.getOrNull()
+        }
         android.util.Log.d(TAG, "restore: backup version = $backupVersion")
         if (backupVersion == null) {
             // No server-side backup — the per-room loadMegolmSession would
             // time out (2 s) on every room for nothing (LP3 2026-08-29 fresh
             // login: 296 × 2 s of logcat noise every day). Bail; the on-demand
-            // page path still restores the moment a backup appears.
+            // page path still restores the moment a backup appears. Clear the
+            // cooldown: a configured account whose service hadn't warmed must
+            // get a retry (the cost of a false bail is one version fetch).
             android.util.Log.w(TAG, "restore: no server-side key backup configured — skipping the daily crawl")
+            prefs.edit().remove(KEY_RESTORE_LAST_RUN_MS).apply()
             return
         }
         val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() } ?: return
@@ -2776,6 +2789,11 @@ object MatrixRepository {
                 if (merged != out.reactions) out = out.copy(reactions = merged)
             }
             if (!out.read && out.id in readEventIds) out = out.copy(read = true)
+            // Send status arrives in its own later event (bridge ack), usually
+            // a poll round AFTER the message row was appended — re-patch it
+            // here like read state, or the "delivered" tag never appears on
+            // rows already in the page (found 2026-09-06).
+            sendStatuses[m.id]?.takeIf { it != out.sendStatus }?.let { out = out.copy(sendStatus = it) }
             out
         }
         // The page is timestamp-sorted (bridged rooms ingest late — the full
@@ -3882,6 +3900,17 @@ object MatrixRepository {
         single<EventContentSerializerMappings> {
             EventContentSerializerMappings.default + EventContentSerializerMappings {
                 roomAccountDataOf(BEEPER_INBOX_DONE_EVENT_TYPE, BeeperInboxDoneContentSerializer)
+                // Registering the send-status type exists ONLY to land it in
+                // the sync filter's timeline whitelist — Trixnity's
+                // applyDefaultFilter builds that whitelist from the registered
+                // message mappings, and an unregistered type is stripped by
+                // spec-compliant servers (Synapse). Beeper's own server
+                // ignores filters, which is why the LP3 receives statuses
+                // while the emulator never did (found 2026-09-06 verifying
+                // the "delivered" tag). The UnknownEventContent serializer
+                // keeps events parsing exactly as before, so
+                // [sendStatusByEventId]'s raw walk is untouched.
+                messageOf(BEEPER_SEND_STATUS_EVENT_TYPE, UnknownEventContentSerializer(BEEPER_SEND_STATUS_EVENT_TYPE))
             }
         }
     }
@@ -3950,6 +3979,7 @@ object MatrixRepository {
             c.room.getById(matrixRoomId).firstOrNull()?.lastEventId?.full
         } ?: return emptyMap()
         val collected = collectRelevantTimelineEvents(c, matrixRoomId, start, SEND_STATUS_WINDOW, fast = true).first
+        android.util.Log.d("ChatsDebug", "sendStatusWalk: start=$start collected=${collected.size} types=${collected.map { (it.event.content as? UnknownEventContent)?.eventType ?: it.event.content?.javaClass?.simpleName }}")
         for (te in collected) {
             val content = te.event.content
             if (content !is UnknownEventContent || content.eventType != BEEPER_SEND_STATUS_EVENT_TYPE) continue
@@ -3979,6 +4009,7 @@ object MatrixRepository {
             // Newest-first: the first status for a message is the latest one.
             if (relatedEventId !in result) result[relatedEventId] = status
         }
+        android.util.Log.d("ChatsDebug", "sendStatusMap: $result")
         return result
     }
 
@@ -9340,7 +9371,7 @@ object MatrixRepository {
      *  account (see [migrateSyncFilterIfNeeded]) — e.g. when a new room
      *  account-data type joins the filter's whitelist and existing clients'
      *  cached filters would strip it. */
-    private const val SYNC_FILTER_MAPPINGS_VERSION = 6
+    private const val SYNC_FILTER_MAPPINGS_VERSION = 7
     private const val ROOMS_BUDGET_MS = 15_000L
     private const val ROOM_BUDGET_MS = 3_000L
     private const val MESSAGES_BUDGET_MS = 15_000L
@@ -9468,6 +9499,11 @@ object MatrixRepository {
      *  cancel is read as a fan-out collision (two devices answered at once),
      *  not a real cancel — see the Cancel branch in onVerificationState. */
     private const val SAS_COLLISION_GRACE_MS = 10_000L
+    /** How long the daily crawl waits for the key-backup version to actually
+     *  arrive before concluding there is no server-side backup (the flow emits
+     *  null until the service's first fetch — a cold-start null read as "no
+     *  backup" stuck the account un-decryptable for a day, LP3 2026-09-06). */
+    private const val KEY_BACKUP_VERSION_BUDGET_MS = 5_000L
     /** How long the memoized [e2eeState] result stays fresh (see the cache
      *  field) — long enough that the 1-5 s account polls + thread opens don't
      *  hit the network getDevices() on every call, short enough that a
