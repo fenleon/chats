@@ -53,6 +53,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -2398,11 +2400,19 @@ object MatrixRepository {
         // the hidden community rooms before the first resolver pass.
         val visible = hideStaleCommunityDuplicates(disk)
         visible.forEach { room ->
+            // A row whose name IS a bridge ghost's localpart ("whatsapp_lid-…")
+            // was persisted before the name resolved — treat it as unresolved
+            // so the next pass re-resolves it against the store + provision
+            // contacts (LP3 2026-09-05: "Anni" titled by its LID ghost for a
+            // whole disk-cache generation, the name fallback never re-ran).
+            val nameIsGhostLocalpart = BRIDGE_KEYS.any { room.name.startsWith("${it}_") } &&
+                !room.name.contains(' ')
             roomListCache.putIfAbsent(
                 room.id,
                 RoomListEntry(
                     room = room,
-                    nameResolved = room.name != ROOM_NAME_PLACEHOLDER && room.name.isNotBlank(),
+                    nameResolved = room.name != ROOM_NAME_PLACEHOLDER && room.name.isNotBlank() &&
+                        !nameIsGhostLocalpart,
                     previewResolved = room.lastMessage.isNotBlank() &&
                         !room.lastMessage.startsWith("[Encrypted"),
                     previewRetryAtMs = 0L,
@@ -3109,6 +3119,9 @@ object MatrixRepository {
         return out
     }
 
+    /** Bounds concurrent [readTimelineChainFromDb] walks — see the comment there. */
+    private val chainDbSemaphore = Semaphore(permits = 2)
+
     /**
      * The room's timeline chain (newest-first, [startEventId] inclusive)
      * straight from the store via a recursive SQL walk over the stored
@@ -3129,44 +3142,52 @@ object MatrixRepository {
             android.util.Log.w(TAG, "readTimelineChainFromDb: TrixnityRoomDatabase not in DI — falling back to the API walk", e)
         }.getOrNull() ?: return null
         val json = runCatching { c.di.get<Json>() }.getOrNull() ?: return null
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                val sql = """
-                    WITH RECURSIVE chain(prev, value, n) AS (
-                        SELECT json_extract(value, '$.previousEventId'), value, 1
-                        FROM TimelineEvent WHERE roomId = ? AND eventId = ?
-                        UNION ALL
-                        SELECT json_extract(t.value, '$.previousEventId'), t.value, c.n + 1
-                        FROM TimelineEvent t JOIN chain c ON t.eventId = c.prev
-                        WHERE c.n < ?
-                    )
-                    SELECT value FROM chain ORDER BY n
-                """.trimIndent()
-                val events = ArrayList<TimelineEvent>()
-                var hasMore = false
-                db.openHelper.writableDatabase.query(
-                    sql,
-                    // maxEvents must bind as a number — a string makes SQLite's
-                    // `n < '21'` (INTEGER vs TEXT) compare true for every row.
-                    arrayOf<Any>(matrixRoomId.full, startEventId, maxEvents),
-                ).use { cursor ->
-                    while (cursor.moveToNext()) {
-                        val value = cursor.getString(0) ?: continue
-                        // The DI Json carries the store's serializers module,
-                        // which registers TimelineEvent's serializer — the
-                        // reified decode resolves it.
-                        events += json.decodeFromString<TimelineEvent>(value)
+        // The recursive CTE streams potentially hundreds of rows per call, and
+        // the crawl + thread precompute + ghost walks + tool RPCs all fire it
+        // concurrently — at 4 simultaneous walks the SQLite pool (4 connections)
+        // was fully occupied and SENDS waited 30+s for a connection (LP3
+        // 2026-09-05: "compose hangs, then it sends"). Bound the concurrency;
+        // the walks are CPU/IO-cheap enough that 2 run near-linearly anyway.
+        return chainDbSemaphore.withPermit {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val sql = """
+                        WITH RECURSIVE chain(prev, value, n) AS (
+                            SELECT json_extract(value, '$.previousEventId'), value, 1
+                            FROM TimelineEvent WHERE roomId = ? AND eventId = ?
+                            UNION ALL
+                            SELECT json_extract(t.value, '$.previousEventId'), t.value, c.n + 1
+                            FROM TimelineEvent t JOIN chain c ON t.eventId = c.prev
+                            WHERE c.n < ?
+                        )
+                        SELECT value FROM chain ORDER BY n
+                    """.trimIndent()
+                    val events = ArrayList<TimelineEvent>()
+                    var hasMore = false
+                    db.openHelper.writableDatabase.query(
+                        sql,
+                        // maxEvents must bind as a number — a string makes SQLite's
+                        // `n < '21'` (INTEGER vs TEXT) compare true for every row.
+                        arrayOf<Any>(matrixRoomId.full, startEventId, maxEvents),
+                    ).use { cursor ->
+                        while (cursor.moveToNext()) {
+                            val value = cursor.getString(0) ?: continue
+                            // The DI Json carries the store's serializers module,
+                            // which registers TimelineEvent's serializer — the
+                            // reified decode resolves it.
+                            events += json.decodeFromString<TimelineEvent>(value)
+                        }
                     }
-                }
-                if (events.isNotEmpty()) {
-                    // The deepest event's stored prev link decides hasMore.
-                    hasMore = events.last().previousEventId != null
-                }
-                android.util.Log.d(TAG, "readTimelineChainFromDb: $matrixRoomId from=$startEventId → ${events.size} events hasMore=$hasMore")
-                events to hasMore
-            }.onFailure { e ->
-                android.util.Log.w(TAG, "readTimelineChainFromDb: store query failed — falling back to the API walk", e)
-            }.getOrNull()
+                    if (events.isNotEmpty()) {
+                        // The deepest event's stored prev link decides hasMore.
+                        hasMore = events.last().previousEventId != null
+                    }
+                    android.util.Log.d(TAG, "readTimelineChainFromDb: $matrixRoomId from=$startEventId → ${events.size} events hasMore=$hasMore")
+                    events to hasMore
+                }.onFailure { e ->
+                    android.util.Log.w(TAG, "readTimelineChainFromDb: store query failed — falling back to the API walk", e)
+                }.getOrNull()
+            }
         }
     }
 
@@ -4584,19 +4605,18 @@ object MatrixRepository {
         // Fetch the echo + refresh the panel even in slow-sync mode (screen off).
         wakeAfterSend(matrixRoomId.full)
         android.util.Log.d(TAG, "SendMessage: room=$roomId txn=$txnId body=$body")
-        // Hold the RPC for the homeserver ack (bounded) so the response carries
-        // the real event id — the composer then lands back on the thread with
-        // the row already confirmed instead of showing SENDING until a later
-        // polled page echoes the send (Beeper's SENT_PENDING_SERVER_ECHO
-        // pattern). The wake round above drains the outbox; the /send 200 sets
-        // the outbox row's event id ~1 s later. Ack timeout or a local send
-        // error → null event id, and the optimistic path holds (2026-08-14
-        // behavior: the composer still pops back immediately, and the outbox
-        // keeps delivering the send).
-        val eventId = awaitOutboxAck(c, matrixRoomId, txnId)
+        // No composer hold for the homeserver ack: the thread's pending-row
+        // machinery (optimistic injection via bumpMessagePageRevision + the
+        // pending override in the room list) renders the send instantly, and
+        // the ack/sync echo confirm it in the background. Holding the RPC up
+        // to SEND_ACK_WAIT_MS blocked the composer for seconds on a loaded DB
+        // (LP3 2026-09-05: "compose hangs then it sends") — Beeper's outbox
+        // model renders the echo immediately, network ack invisibly later.
+        // Event id is null here; the sync echo replaces the optimistic row
+        // (matched by txn id) ~1-3 s later.
         return com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response(
             transactionId = txnId,
-            eventId = eventId,
+            eventId = null,
         )
         } catch (e: Exception) {
             // A send that dies before enqueueing used to be invisible: the RPC
@@ -4746,13 +4766,11 @@ object MatrixRepository {
             replace(EventId(eventId))
             text(newBody)
         }
-        // Hold for the homeserver ack (bounded, like sendMessage) so a 403 or
-        // outbox failure surfaces as an error instead of a silent stall. The
-        // edit is a timeline event — refresh makes it visible on the next poll
-        // instead of one tick later.
-        if (awaitOutboxAck(c, matrixRoomId, txnId) == null) {
-            error("edit was not accepted — try again")
-        }
+        // No ack hold (matching sendMessage): the edit is already enqueued —
+        // the 500 ms wait timed out unconfirmed under crawl load and the throw
+        // showed the user "failed" for an edit that landed seconds later
+        // (LP3 2026-09-05). Failures surface as the edit never appearing (the
+        // outbox keeps retrying); the echo applies it on the next poll.
         wakeAfterSend(matrixRoomId.full)
         refreshMessagePage(roomId)
     }
@@ -6753,8 +6771,11 @@ object MatrixRepository {
 
     /** Bounds for [yieldToSyncIngest]: heavy in-process work waits at most this
      *  long for a running sync ingest before proceeding anyway (a wedged round
-     *  must not starve the resolver forever). */
-    private const val SYNC_INGEST_YIELD_MAX_MS = 8_000L
+     *  must not starve the resolver forever). Generous by design — an 8 s cap
+     *  let gated consumers barge in cycles during the 22:59 cold-start catchup
+     *  and starved a 44-event ingest for 175 s (LP3 2026-09-05); only a wedged
+     *  round outlives 60 s. */
+    private const val SYNC_INGEST_YIELD_MAX_MS = 60_000L
     private const val SYNC_INGEST_YIELD_STEP_MS = 100L
 
     /**
@@ -7771,10 +7792,39 @@ object MatrixRepository {
     }
 
     /** A hero's display name, or its localpart when the user lookup times out. */
-    private suspend fun heroName(c: MatrixClient, roomId: RoomId, hero: UserId): String =
-        withTimeoutOrNull(ROOM_BUDGET_MS) {
-            c.user.getById(roomId, hero).firstOrNull()?.name ?: hero.localpart
-        } ?: hero.localpart
+    private suspend fun heroName(c: MatrixClient, roomId: RoomId, hero: UserId): String {
+        val storeName = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.user.getById(roomId, hero).firstOrNull()?.name
+        }?.takeIf { it.isNotBlank() }
+        val bridgeId = bridgeIdOf(hero.full)
+        val bridgeName = bridgeId?.let { bridgeContactsCache[it]?.get(hero.full)?.name }
+            ?.takeIf { it.isNotBlank() }
+        // Diagnostics for the LID-migration title regression (LP3 2026-09-05):
+        // "whatsapp_lid-…" titles mean store name null AND bridge cache miss.
+        if (debugLogging() && storeName == null && bridgeName == null &&
+            hero.localpart.contains("_lid-")
+        ) {
+            android.util.Log.d(
+                TAG,
+                "heroName: $hero — no store displayname, bridge cache miss " +
+                    "(bridge=$bridgeId, cached=${bridgeContactsCache[bridgeId]?.size ?: 0})",
+            )
+        }
+        return storeName ?: bridgeName ?: hero.localpart
+    }
+
+    /** The provision contact list's name for a bridge ghost. WhatsApp's
+     *  privacy-LID migration re-keys DM heroes to @whatsapp_lid-… ghosts whose
+     *  member event carries no displayname (the bridge only surfaces the name
+     *  via the provision API — invisible to room data, see [bridgeContacts]),
+     *  and the localpart fallback then titles the room "whatsapp_lid-27358…"
+     *  (pinned active DM, LP3 2026-09-05). Cache read only: the resolver pass
+     *  prefetches each bridge's list (see the [bridgeContacts] loop); a cold
+     *  cache keeps the previous fallback. */
+    private fun bridgeContactNameOf(hero: UserId): String? {
+        val bridgeId = bridgeIdOf(hero.full) ?: return null
+        return bridgeContactsCache[bridgeId]?.get(hero.full)?.name?.takeIf { it.isNotBlank() }
+    }
 
     /**
      * Heroes that deserve a spot in a generated title. Self-hosted bridges
@@ -8898,8 +8948,10 @@ object MatrixRepository {
         if (heroes.isNotEmpty()) {
             val names = heroes.mapNotNull { hero ->
                 withTimeoutOrNull(ROOM_BUDGET_MS) {
-                    c.user.getById(roomId, hero).firstOrNull()?.name ?: hero.localpart
-                }
+                    c.user.getById(roomId, hero).firstOrNull()?.name
+                }?.takeIf { it.isNotBlank() }
+                    ?: bridgeContactNameOf(hero)
+                    ?: hero.localpart
             }.filter { it.isNotBlank() }
             if (names.isNotEmpty()) return names.joinToString(", ")
         }
@@ -9299,7 +9351,11 @@ object MatrixRepository {
     private const val OUTBOX_READ_TIMEOUT_MS = 500L
     /** Bounded wait for the homeserver ack of a text send ([awaitOutboxAck]) —
      *  the /send 200 typically lands ~1 s after enqueue on the wake round. */
-    private const val SEND_ACK_WAIT_MS = 2_000L
+    /** The composer hold for the homeserver ack. 2 s timed out unconfirmed on
+     *  every send during crawl load (LP3 2026-09-05: "compose hangs then it
+     *  sends" — the optimistic row shows instantly anyway), so the hold is
+     *  now just the ultra-warm case; slower acks confirm via the sync echo. */
+    private const val SEND_ACK_WAIT_MS = 500L
     /** Poll cadence on the outbox row while awaiting the ack. */
     private const val SEND_ACK_POLL_INTERVAL_MS = 100L
     /** Whole-outbox read for the restart pending reconstruction (one query;
