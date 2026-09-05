@@ -3979,7 +3979,6 @@ object MatrixRepository {
             c.room.getById(matrixRoomId).firstOrNull()?.lastEventId?.full
         } ?: return emptyMap()
         val collected = collectRelevantTimelineEvents(c, matrixRoomId, start, SEND_STATUS_WINDOW, fast = true).first
-        android.util.Log.d("ChatsDebug", "sendStatusWalk: start=$start collected=${collected.size} types=${collected.map { (it.event.content as? UnknownEventContent)?.eventType ?: it.event.content?.javaClass?.simpleName }}")
         for (te in collected) {
             val content = te.event.content
             if (content !is UnknownEventContent || content.eventType != BEEPER_SEND_STATUS_EVENT_TYPE) continue
@@ -4009,7 +4008,6 @@ object MatrixRepository {
             // Newest-first: the first status for a message is the latest one.
             if (relatedEventId !in result) result[relatedEventId] = status
         }
-        android.util.Log.d("ChatsDebug", "sendStatusMap: $result")
         return result
     }
 
