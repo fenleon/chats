@@ -40,6 +40,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -6727,6 +6728,18 @@ object MatrixRepository {
     fun roomListRevision(): Long = roomListRevision
 
     /**
+     * Wake signal for [waitForChange] — emitted beside every revision bump so
+     * the tool's long-poll wait returns in milliseconds instead of waiting
+     * for its next fixed tick. tryEmit into a DROP_OLDEST buffer: the wait's
+     * fast-path revision re-check makes a dropped signal harmless (worst case
+     * it lapses to the timeout).
+     */
+    private val changeSignal = MutableSharedFlow<Unit>(
+        replay = 0, extraBufferCapacity = 64,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+
+    /**
      * Monotonic revision of a room's cached newest page (2026-09-01): bumped
      * wherever the page cache's content changes (new/edited events,
      * read-receipt patches, pending-echo state). The thread's 3s poll reads
@@ -6741,6 +6754,27 @@ object MatrixRepository {
 
     private fun bumpMessagePageRevision(roomId: String) {
         messagePageRevision[roomId] = (messagePageRevision[roomId] ?: 0L) + 1
+        changeSignal.tryEmit(Unit)
+    }
+
+    /**
+     * Holds the caller until a watched revision moves past [lastSeen] or
+     * [timeoutMs] elapses (the server half of [LightServiceMethod.WaitForChange]
+     * — the tool's poll ticks became this). Returns the current revision either
+     * way; the caller compares and refetches. Fast path first: an already-
+     * moved revision (raced signal) returns immediately.
+     */
+    suspend fun waitForChange(watch: String, roomId: String?, lastSeen: Long, timeoutMs: Long): Long {
+        fun current(): Long =
+            if (watch == "rooms") roomListRevision else messagePageRevision[roomId] ?: 0L
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        while (true) {
+            val now = current()
+            if (now != lastSeen) return now
+            val remaining = deadline - android.os.SystemClock.elapsedRealtime()
+            if (remaining <= 0) return now
+            withTimeoutOrNull(remaining) { changeSignal.first() }
+        }
     }
 
     @Volatile
@@ -6988,6 +7022,7 @@ object MatrixRepository {
         flagsOnlyWake = false
         lastRoomsMap = null
         roomListRevision++ // a reset IS a list change — the tool must re-fetch
+        changeSignal.tryEmit(Unit)
     }
 
     /**
@@ -8515,6 +8550,7 @@ object MatrixRepository {
         _roomList.value = rooms
         saveRoomListToDisk(rooms)
         roomListRevision++
+        changeSignal.tryEmit(Unit)
         if (debugLogging() && roomListDirtyAt > 0) {
             android.util.Log.d(
                 TAG,

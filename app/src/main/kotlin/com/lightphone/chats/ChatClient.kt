@@ -105,6 +105,25 @@ object ChatClient {
         ).getOrNull()?.revision ?: 0L
 
     /**
+     * Long-poll wait for the room-list revision to move past [lastSeen] (the
+     * list poll's fixed tick, deleted 2026-09-06 — the companion holds the
+     * call until the list changes or the window elapses). Returns the current
+     * revision; equals [lastSeen] when the window elapsed unchanged.
+     */
+    suspend fun waitForRoomListChange(lastSeen: Long, timeoutMs: Long = 25_000): Long =
+        callRemoteServiceMethod(
+            LightServiceMethod.WaitForChange,
+            LightServiceMethod.WaitForChange.Request("rooms", null, lastSeen, timeoutMs),
+        ).getOrNull()?.revision ?: lastSeen
+
+    /** [waitForRoomListChange] for a room's newest-page revision (thread poll). */
+    suspend fun waitForPageChange(roomId: String, lastSeen: Long, timeoutMs: Long = 25_000): Long =
+        callRemoteServiceMethod(
+            LightServiceMethod.WaitForChange,
+            LightServiceMethod.WaitForChange.Request("page", roomId, lastSeen, timeoutMs),
+        ).getOrNull()?.revision ?: lastSeen
+
+    /**
      * Sends [body] to [roomId]. The response carries the outbox transaction id
      * plus the timeline event id once the homeserver acked (null until then) —
      * the thread uses it for an optimistic row the sync echo replaces.

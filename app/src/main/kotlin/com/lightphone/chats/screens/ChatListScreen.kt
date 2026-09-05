@@ -263,19 +263,19 @@ class ChatListViewModel : LightViewModel<Unit>() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
             // Seed with the revision the show-time refresh reflected, so the
-            // first poll skips a list that hasn't moved since.
+            // first poll skips a list that hasn't moved since. The wait holds
+            // the binder call until the revision moves or the window elapses
+            // (2026-09-06: replaced the fixed 2 s tick — a change lands within
+            // milliseconds; an idle list costs one held call per window).
             var lastRevision = ChatClient.roomListRevision()
             while (true) {
-                delay(POLL_INTERVAL_MS)
-                val revision = ChatClient.roomListRevision()
-                // 0 = nothing published yet (cold restore) — the show-time
-                // refresh + retry budget handle settling, don't churn here.
+                val revision = ChatClient.waitForRoomListChange(lastRevision)
                 if (revision > 0 && revision != lastRevision) {
                     lastRevision = revision
                     refresh(quiet = true)
                 } else {
-                    // List unchanged — keep the banner live with the tiny
-                    // connection read instead of the full payload.
+                    // Window elapsed unchanged — keep the banner live with the
+                    // tiny connection read instead of the full payload.
                     ChatClient.connectionState()?.let { connection.value = it }
                 }
             }
@@ -379,10 +379,6 @@ class ChatListViewModel : LightViewModel<Unit>() {
         // which can take several seconds after a fresh boot/reinstall.
         const val REFRESH_RETRIES = 10
         const val REFRESH_RETRY_DELAY_MS = 1_000L
-        // Phase 2 (SYNC-PERF-SPEC 2026-09-04): 5 s → 2 s — the poll is a cheap
-        // revision binder read when nothing moved; only the changed revision
-        // fetches the full payload.
-        const val POLL_INTERVAL_MS = 2_000L
         const val INITIAL_VISIBLE_COUNT = 20
         const val REVEAL_STEP = 20
     }

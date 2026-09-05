@@ -346,6 +346,20 @@ object ChatServiceMethods {
                     LightResult.Success(LightServiceMethod.GetMessagePageRevision.encodeResponse(response))
                 }
 
+                LightServiceMethod.WaitForChange.id -> {
+                    val request = LightServiceMethod.WaitForChange.decodeRequest(payload!!)
+                    val revision = runBlocking {
+                        MatrixRepository.waitForChange(
+                            request.watch, request.roomId, request.lastSeen, request.timeoutMs,
+                        )
+                    }
+                    LightResult.Success(
+                        LightServiceMethod.WaitForChange.encodeResponse(
+                            LightServiceMethod.WaitForChange.Response(revision),
+                        )
+                    )
+                }
+
                 else -> LightResult.Error(
                     LightResult.ErrorCode.Unknown,
                     "unknown method: $methodId",

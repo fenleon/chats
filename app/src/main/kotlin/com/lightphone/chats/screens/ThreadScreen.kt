@@ -499,12 +499,21 @@ class ThreadViewModel(
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
             // Seed with the revision the initial load reflected, so the first
-            // poll skips a page that hasn't moved since.
+            // poll skips a page that hasn't moved since. The wait holds the
+            // binder call until the page revision moves or the window elapses
+            // (2026-09-06: replaced the fixed 1.5 s tick). A playing voice
+            // note keeps the short tick: its position advances without any
+            // page change, and only a poll reads it back.
             var lastRevision = ChatClient.messagePageRevision(room.id)
             while (true) {
-                delay(THREAD_POLL_MS)
-                val revision = ChatClient.messagePageRevision(room.id)
-                if (revision != lastRevision || playingEventId.value != null) {
+                if (playingEventId.value != null) {
+                    delay(THREAD_POLL_MS)
+                    lastRevision = ChatClient.messagePageRevision(room.id)
+                    loadNewest(quiet = true)
+                    continue
+                }
+                val revision = ChatClient.waitForPageChange(room.id, lastRevision)
+                if (revision != lastRevision) {
                     lastRevision = revision
                     loadNewest(quiet = true)
                 }
