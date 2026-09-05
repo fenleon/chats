@@ -645,17 +645,24 @@ object MatrixRepository {
     private const val NETWORK_RESET_MIN_INTERVAL_MS = 60_000L
 
     /**
-     * Per-room timeline window the sync filters request (PLAN §8.1, 2026-08-28):
-     * bounds each room's per-/sync payload — the 30-50 s CPU per sync on the
-     * 1284-room account was mostly pages of timeline events nobody read. 50 is
-     * high enough to never truncate a busy bridged room's burst: Trixnity marks
-     * `limited` syncs but never backfills, so a truncated burst is a silent
-     * message gap. One limit for the long-poll AND the syncOnce (background
-     * rounds + push wakes — the syncOnce's 20 was raised to 50 on 2026-09-01:
-     * a bridged burst >20 truncated the wake's syncOnce and the rest only
-     * arrived on the next 5/15-min round).
+     * Per-room timeline window for the ACTIVE long-poll filter (PLAN §8.1,
+     * 2026-08-28): bounds each room's per-/sync payload — the 30-50 s CPU per
+     * sync on the 1284-room account was mostly pages of timeline events nobody
+     * read. 50 is high enough to never truncate a busy bridged room's burst:
+     * Trixnity marks `limited` syncs but never backfills, so a truncated burst
+     * is a silent message gap — and while the screen is on, gap-fill matters.
      */
     private const val SYNC_TIMELINE_LIMIT = 50L
+
+    /**
+     * Background-only timeline window (SYNC-PERF-SPEC §Phase 1, 2026-09-05):
+     * the syncOnce filter (slow rounds / push wakes / send-wakes) serves steady
+     * incremental deltas, not gap-fill, so a slimmer window parses, decrypts
+     * and stores less per round. 20, not 10: a burst deeper than the window
+     * truncates (the 2026-09-01 incident), and the wake's [isEventStored]
+     * verification then misses → retries → a false sync-pending notification.
+     */
+    private const val SYNC_TIMELINE_LIMIT_BACKGROUND = 20L
 
     /** Screen on/off → sync cadence. Registered on the app context in [init],
      *  so it lives as long as the process (which the FGS keeps alive). */
@@ -938,6 +945,13 @@ object MatrixRepository {
                 appContext?.let { ChatNotifier.clearSyncPending(it) }
             }
             .onFailure { _connectionState.value = ChatConnectionState.Offline("sync failed") }
+        // The round's ingest (parse/decrypt/store) is done once syncOnce
+        // returns — release the sync-ingest gate here. In slow mode no further
+        // /sync request follows for minutes, so without this stamp the gate
+        // would read "in flight" until the next round and every heavy consumer
+        // would burn its full 8s yield for nothing (emulator 2026-09-05: deep
+        // catch-up round's room-row publish delayed 23s ≈ 3 × 8s yields).
+        syncRoundEndedAt = android.os.SystemClock.elapsedRealtime()
         android.util.Log.d(TAG, "syncOnce took ${android.os.SystemClock.elapsedRealtime() - t0}ms ($reason)")
         return result
     }
@@ -6206,6 +6220,11 @@ object MatrixRepository {
             while (true) {
                 delay(ACTIVE_ROOM_REFRESH_MS)
                 if (activeRoomId != roomId) break
+                // Sync-ingest gate: a page rebuild walks the whole head chain —
+                // don't race a running sync ingest for the store (SYNC-PERF-SPEC
+                // §Phase 1). Bounded; the room may have changed while waiting.
+                yieldToSyncIngest()
+                if (activeRoomId != roomId) break
                 refreshMessagePage(roomId)
             }
         }
@@ -6730,6 +6749,49 @@ object MatrixRepository {
     @Volatile
     private var roomListPublishedAt = 0L
 
+    // --- sync-ingest gate (SYNC-PERF-SPEC §Phase 1, 2026-09-05) --------------
+
+    /** Bounds for [yieldToSyncIngest]: heavy in-process work waits at most this
+     *  long for a running sync ingest before proceeding anyway (a wedged round
+     *  must not starve the resolver forever). */
+    private const val SYNC_INGEST_YIELD_MAX_MS = 8_000L
+    private const val SYNC_INGEST_YIELD_STEP_MS = 100L
+
+    /**
+     * Wall-clock bookkeeping of the last sync round's INGEST window (post-HTTP
+     * parse/decrypt/store): [syncRoundStartedAt] is stamped by the /sync
+     * interceptor when a response lands, [syncRoundEndedAt] when the sync loop
+     * issues the NEXT request or a [timedSyncOnce] round finishes — Trixnity
+     * processes rounds sequentially, so either proves the previous ingest
+     * finished (the timedSyncOnce stamp matters in slow mode, where no next
+     * request follows for minutes). All syncs (long-poll, syncOnce) share one
+     * OkHttp engine, so the interceptor covers both. Unconditional volatile
+     * stamps; the reads are the soft gate below.
+     */
+    @Volatile
+    private var syncRoundStartedAt = 0L
+
+    @Volatile
+    private var syncRoundEndedAt = 0L
+
+    private fun syncIngestInFlight(): Boolean = syncRoundStartedAt > syncRoundEndedAt
+
+    /**
+     * Yields to a running sync ingest: heavy in-process work (resolver passes,
+     * page rebuilds, ghost walks) shares the Room DB + CPU with Trixnity's
+     * parse/decrypt/store, and that contention is the suspected multiplier
+     * that turns a sub-second ingest into 17-30 s on the live 1284-room
+     * account (SYNC-PERF-SPEC §Phase 1 lever 1). Bounded by [maxMs]; a no-op
+     * when no ingest is in flight.
+     */
+    private suspend fun yieldToSyncIngest(maxMs: Long = SYNC_INGEST_YIELD_MAX_MS) {
+        if (!syncIngestInFlight()) return
+        val deadline = android.os.SystemClock.elapsedRealtime() + maxMs
+        while (syncIngestInFlight() && android.os.SystemClock.elapsedRealtime() < deadline) {
+            delay(SYNC_INGEST_YIELD_STEP_MS)
+        }
+    }
+
     private fun markRoomListDirty() {
         if (roomListDirtyAt == 0L) roomListDirtyAt = android.os.SystemClock.elapsedRealtime()
         roomListDirty = true
@@ -6962,6 +7024,10 @@ object MatrixRepository {
                     continue
                 }
                 roomListDirty = false
+                // Sync-ingest gate: don't crawl the store against a running
+                // sync ingest — the pass's reads stretch the round (SYNC-PERF-
+                // SPEC §Phase 1). Bounded, so a wedged round can't stall us.
+                yieldToSyncIngest()
                 // Flags-only fast path: a local PIN/MUTE/ARCHIVE write doesn't
                 // need the full room collect + preview pass (up to 15 s each on
                 // a big account) before the tool sees it — re-stamp the cached
@@ -7054,6 +7120,10 @@ object MatrixRepository {
                     // deadline — the rest finish on the next pass.
                     for ((roomId, room) in loaded) {
                         if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
+                        // Sync-ingest gate: the per-room preview resolves are
+                        // the pass's heaviest store work — yield mid-pass too
+                        // (the pass deadline still bounds the crawl overall).
+                        yieldToSyncIngest()
                         resolveRoomListEntry(
                             c, roomId, room, nameMemo,
                             resolvePreview = true,
@@ -7088,6 +7158,8 @@ object MatrixRepository {
                         for ((roomId, _) in loaded) {
                             if (precomputed >= EAGER_PAGES_PER_PASS) break
                             if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
+                            // Sync-ingest gate: page builds walk the store.
+                            yieldToSyncIngest()
                             val key = roomId.full
                             // Any in-memory page (fresh OR stale) already covers
                             // this room — getMessages serves stale memory and
@@ -8217,6 +8289,10 @@ object MatrixRepository {
         if (!ghostResolveInFlight.add("$key|$serverLastId")) return
         scope.launch {
             try {
+                // Sync-ingest gate: the walk (collect + key-backup restore) is
+                // exactly the heavy store/CPU work that must not contend with
+                // a running sync ingest (SYNC-PERF-SPEC §Phase 1).
+                yieldToSyncIngest()
                 val walked = withTimeoutOrNull(GHOST_WALK_BUDGET_MS) {
                     val events = collectTimelineEvents(c, matrixRoomId, serverLastId, EFFECTIVE_LAST_WALK)
                     // Skip the re-collect when the restore found nothing to
@@ -8410,10 +8486,17 @@ object MatrixRepository {
         // (battery 2026-08-17 audit; no body buffering — this must stay cheap).
         val path = chain.request().url.encodedPath
         if (path.contains("/sync")) {
+            // A new /sync request proves the previous round's ingest finished
+            // (Trixnity processes rounds sequentially) — sync-ingest gate.
+            syncRoundEndedAt = android.os.SystemClock.elapsedRealtime()
             val t0 = android.os.SystemClock.elapsedRealtime()
             val response = chain.proceed(chain.request())
             val t1 = android.os.SystemClock.elapsedRealtime()
             lastSyncResponseAt = t1
+            // Response in hand = parse/decrypt/store about to run; the gate
+            // reads "in flight" until the next request starts (above) or the
+            // syncOnce wrapper stamps the round's end (timedSyncOnce).
+            syncRoundStartedAt = t1
             android.util.Log.d(
                 TAG,
                 "sync response: ${response.header("Content-Length") ?: "chunked"}B in ${t1 - t0}ms",
@@ -8542,8 +8625,20 @@ object MatrixRepository {
         syncOnceFilter = Filters(
             presence = Filters.EventFilter(notTypes = setOf("*")),
             room = Filters.RoomFilter(
-                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT),
+                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT_BACKGROUND),
                 ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing", "m.receipt")),
+                // SYNC-PERF-SPEC §Phase 1 lever 3: state deltas are pure
+                // overhead in background rounds — the UI reads the local store,
+                // and the active long-poll (syncFilter keeps state) catches up
+                // names/membership the moment the screen is on. notTypes="*"
+                // survives applyDefaultFilter's merge (same mechanism as the
+                // ephemeral slimming above — Trixnity replaces `types`, not
+                // `notTypes`). Invites are unaffected: rooms.invite carries
+                // stripped invite_state, which the state filter doesn't govern.
+                // Gap-fill trade-off: a `limited` background timeline no longer
+                // carries the gap's state delta (member events in a >20 burst
+                // gap arrive on the next active round instead).
+                state = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("*")),
             ),
         )
         // Room "last relevant event" = actual messages only (reference-messenger

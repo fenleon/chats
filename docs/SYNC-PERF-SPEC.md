@@ -69,6 +69,8 @@ Target: per-round ingest from 17–30 s → low single-digit seconds. Levers, in
 
 Ceiling note (`ponytail:`): if ingest is still > 5 s after 1–3, the next step is Trixnity-level (decrypt-off-critical-path / repository write batching) — out of scope until measured.
 
+**IMPLEMENTED 2026-09-05 (emulator-verified, uncommitted — see WORKLOG):** all three levers kept. Ingest gate = `yieldToSyncIngest()` (sync-round stamping in the /sync interceptor + `timedSyncOnce`, so both ACTIVE long-poll and SLOW syncOnce rounds gate it; the slow-mode "round already ended" bug was found and fixed during verification); `syncOnceFilter` timeline limit 50 → 20; background `state` excluded (`notTypes = ["*"]`). Emulator: no regression on any scenario, deep 35-event truncation backlog caught up fully via Trixnity's limited-loop, invite delivery works from stripped invite_state, wake verification never missed. **The emulator cannot reproduce the 17–30 s contention (28 rooms, no CPU pressure) — these runs prove no-regression + correctness; the actual win needs one instrumented logcat window on the LP3 (1284-room account) during a burst.**
+
 ### Phase 2 — Shrink the tail after the store (target: store→UI < 5 s)
 
 1. **Publish dirty rooms incrementally.** `publishRoomList()` runs only at pass end after a ≤12 s budgeted crawl. Publish the single dirty room's row immediately when its collector fires (`observeNotifications` already sets `roomListDirty` there), and keep the full pass for reordering/crawl work. This is the root-cause fix for "row appears one pass late".
