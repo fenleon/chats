@@ -40,7 +40,11 @@ phone does one authenticated, encrypted `/sync` and posts the notification.
    bounded retries with 2 s/4 s backoff, then a low-key "Checking for messages
    failed — will retry" notification (cleared on the next successful sync or
    foreground). A wake whose event a fallback round already delivered skips
-   the sync entirely.
+   the sync entirely. **Durable queue (2026-09-05)** — every real-message push
+   is persisted (ids only, ≤50 entries, 12h age) until the wake proves the
+   event in the store, so a process death between delivery and catchup can't
+   silently drop it; on restart `drainPushQueue()` re-wakes at the first
+   slow-sync engagement (the ntfy `?since=` replay remains the second net).
 4. **Fallback** — the screen-off `syncOnce` rounds stay as a safety net: a
    silent SSE drop (or Beeper not POSTing) must not mean missed messages. The
    cadence is push-gated (2026-08-31): 15-min lazy while the SSE channel is

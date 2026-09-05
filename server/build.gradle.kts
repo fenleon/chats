@@ -7,6 +7,7 @@ plugins {
     id("com.android.library")
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization) // durable push queue JSON (MatrixRepository QueuedPush)
 }
 android {
     namespace = "com.lightphone.chats.server"

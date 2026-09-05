@@ -57,7 +57,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.descriptors.buildClassSerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
@@ -551,6 +553,93 @@ object MatrixRepository {
     /** Backoff base between push-wake retries. */
     private const val PUSH_WAKE_RETRY_DELAY_MS = 2_000L
 
+    // ---- Durable push queue (SYNC-PERF-SPEC §3.2) ---------------------------
+    //
+    // A push delivered over SSE whose catch-up never completed must survive a
+    // process death: the queue persists it (ids only) until a sync is proven
+    // to have caught up. ntfy's `?since=` replay is the only other net, and
+    // only for ntfy URLs.
+
+    /** A delivered-but-not-caught-up push. Ids only — the push payload itself
+     *  carries no content (push/README.md), so neither does the queue. */
+    @Serializable
+    private data class QueuedPush(val eventId: String, val roomId: String, val at: Long)
+
+    private const val PUSH_QUEUE_PREFS = "push_queue"
+    private const val PUSH_QUEUE_KEY = "pending"
+    /** Age bound: ntfy replays the stream ~12h (push/README.md) — an older gap
+     *  is unreachable anyway, and the entry would only ever wake on stale
+     *  evidence. Entries beyond this age out of the queue. */
+    private const val PUSH_QUEUE_MAX_AGE_MS = 12L * 60 * 60 * 1000
+    private const val PUSH_QUEUE_MAX_ENTRIES = 50
+
+    private val pushQueueJson = Json { ignoreUnknownKeys = true }
+    private val pushQueueLock = Any()
+
+    /** One drain attempt per process (retried while the client is still null). */
+    @Volatile
+    private var pushQueueDrained = false
+
+    /** The queue lives as one JSON array in SharedPreferences — a bounded,
+     *  ids-only file. */
+    private fun loadPushQueue(): List<QueuedPush> =
+        runCatching {
+            appContext?.getSharedPreferences(PUSH_QUEUE_PREFS, Context.MODE_PRIVATE)
+                ?.getString(PUSH_QUEUE_KEY, null)
+                ?.let { pushQueueJson.decodeFromString<List<QueuedPush>>(it) }
+        }.getOrNull().orEmpty()
+            .filter { it.at > System.currentTimeMillis() - PUSH_QUEUE_MAX_AGE_MS }
+
+    private fun savePushQueue(queue: List<QueuedPush>) {
+        appContext?.getSharedPreferences(PUSH_QUEUE_PREFS, Context.MODE_PRIVATE)?.edit()
+            ?.putString(
+                PUSH_QUEUE_KEY,
+                queue.takeLast(PUSH_QUEUE_MAX_ENTRIES)
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { pushQueueJson.encodeToString(it) },
+            )
+            ?.apply()
+    }
+
+    private fun enqueuePush(eventId: String, roomId: String) {
+        synchronized(pushQueueLock) {
+            savePushQueue(
+                loadPushQueue().filterNot { it.eventId == eventId } +
+                    QueuedPush(eventId, roomId, System.currentTimeMillis()),
+            )
+        }
+    }
+
+    private fun clearPushQueue() {
+        synchronized(pushQueueLock) { savePushQueue(emptyList()) }
+    }
+
+    /**
+     * Re-wake a push that was delivered over SSE but never proven caught up —
+     * the process died between delivery and sync (SYNC-PERF-SPEC §3.2). Runs
+     * once per process when slow sync first engages; entries the restore's
+     * initial sync already delivered cost one store query each. One catch-up
+     * wake covers the whole queue: the syncOnce runs to the present, so
+     * everything queued before it landed too.
+     */
+    private suspend fun drainPushQueue() {
+        if (pushQueueDrained) return
+        val c = client ?: return
+        pushQueueDrained = true
+        val pending = loadPushQueue()
+        val missing = pending.firstOrNull { !isEventStored(c, it.roomId, it.eventId) }
+        if (missing == null) {
+            if (pending.isNotEmpty()) clearPushQueue()
+            return
+        }
+        android.util.Log.i(TAG, "push queue: ${pending.size} pending — catching up")
+        runPushWake(c, missing.eventId, missing.roomId) // clears the queue when caught up
+        // Fallback rounds own anything the wake couldn't reach; keeping the
+        // ids would only re-wake on stale evidence (the age bound caps both).
+        clearPushQueue()
+    }
+
+
     /** Min gap between network-triggered sync restarts (flappy-radio guard,
      *  2026-09-01 — see [networkCallback]). */
     private const val NETWORK_RESET_MIN_INTERVAL_MS = 60_000L
@@ -820,6 +909,10 @@ object MatrixRepository {
         inProcessSyncRunning = false
         slowSyncJob?.cancel()
         slowSyncJob = startSlowSyncRounds(c)
+        // Catch up on pushes the previous process delivered but never synced
+        // (SYNC-PERF-SPEC §3.2) — slow sync is the cadence whose gaps the
+        // queue exists to close; active long-poll delivery needs no replay.
+        scope.launch { drainPushQueue() }
         android.util.Log.d(
             TAG,
             "sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s)",
@@ -944,7 +1037,12 @@ object MatrixRepository {
             return
         }
         // Real-message push: coalesce bursts. The window's last push wins — the
-        // sync runs once at the end instead of once per push.
+        // sync runs once at the end instead of once per push. The push is
+        // queued first: if the process dies before the wake's sync completes,
+        // drainPushQueue() re-wakes it on the next slow-sync engagement
+        // (SYNC-PERF-SPEC §3.2). Cleared by runPushWake once the event is
+        // proven in the store.
+        if (eventId != null && roomId != null) enqueuePush(eventId, roomId)
         pushWakeJob?.cancel()
         pushWakeJob = scope.launch {
             delay(PUSH_WAKE_DEBOUNCE_MS)
@@ -994,6 +1092,7 @@ object MatrixRepository {
         // notification watcher posted it when it was stored).
         if (eventId != null && roomId != null && isEventStored(c, roomId, eventId)) {
             android.util.Log.d(TAG, "push wake skipped — event already in store")
+            clearPushQueue() // the round/sync that stored it already ran to the present
             return
         }
         slowSyncJob?.cancel()
@@ -1017,7 +1116,7 @@ object MatrixRepository {
         // Retries exhausted without the event landing — tell the user
         // something may be waiting (WAKE-COMPARISON.md #3). The fallback
         // rounds keep retrying, and the next successful sync clears it.
-        if (!caughtUp) appContext?.let { ChatNotifier.notifySyncPending(it) }
+        if (!caughtUp) appContext?.let { ChatNotifier.notifySyncPending(it) } else clearPushQueue()
         lastPushWakeSyncAtMs = android.os.SystemClock.elapsedRealtime()
         // A push means events landed in the store — end the resolver's
         // screen-off sleep so the next list read is fresh (feedback 2026-08-17).
