@@ -236,20 +236,24 @@ class ThreadViewModel(
 
     /**
      * Keeps the contact panel honest with OTHER devices (LP3 feedback
-     * 2026-08-28): polls the companion's synced flags every few seconds and
-     * updates [muted]/[pinned]/[archived], so a pin/mute/archive done on a
-     * Beeper device reaches the panel live (items 1/5). Runs while the thread
-     * — and the contact panel over it — is on screen (started on
-     * [onScreenShow], NOT stopped on [onScreenHide]); stops when the app
-     * backgrounds and dies with the ViewModel on back-navigation.
+     * 2026-08-28): waits on the companion's flags revision (bumped wherever a
+     * flag fact commits — own toggles, Beeper-side sync) and refetches the
+     * synced flags on movement, updating [muted]/[pinned]/[archived] live
+     * (items 1/5). Runs while the thread — and the contact panel over it — is
+     * on screen (started on [onScreenShow], NOT stopped on [onScreenHide]);
+     * stops when the app backgrounds and dies with the ViewModel on
+     * back-navigation.
      */
     private var flagSyncJob: Job? = null
 
     fun startFlagSync() {
         if (flagSyncJob?.isActive == true) return
         flagSyncJob = viewModelScope.launch {
+            var lastFlags = 0L
             while (true) {
-                delay(FLAG_SYNC_MS)
+                val revision = ChatClient.waitForFlagChange(lastFlags)
+                if (revision == lastFlags) continue
+                lastFlags = revision
                 val flags = ChatClient.getRoomFlags(room.id) ?: continue
                 muted.value = flags.muted
                 pinned.value = flags.pinned
@@ -1149,11 +1153,9 @@ class ThreadViewModel(
         const val PAGE_SIZE = 20
         /** Older-page size: 6 ≈ one screenful per scroll-up load (2026-08-23). */
         const val OLDER_PAGE_SIZE = 6
-        /** Poll cadence while the thread is on screen (feedback pass). Phase 2
-         *  (SYNC-PERF-SPEC 2026-09-04): 3 s → 1.5 s — revision-gated cheap read. */
+        /** Poll cadence while a voice note plays: its position advances
+         *  without any page change, and only a poll reads it back. */
         const val THREAD_POLL_MS = 1_500L
-        /** Contact-panel flag poll (pin/mute/archive from other devices). */
-        const val FLAG_SYNC_MS = 3_000L
         /** How close (ms) a real echo's timestamp must be to a "local-…" row. */
         const val OPTIMISTIC_MATCH_WINDOW_MS = 5 * 60 * 1000L
         /** Media fetch retries when the first read comes back null. */

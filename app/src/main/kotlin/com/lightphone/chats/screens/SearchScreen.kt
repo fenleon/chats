@@ -42,7 +42,6 @@ import com.thelightphone.sdk.ui.defaultKeyboardOptions
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -95,12 +94,16 @@ class SearchViewModel(
 
     /** Re-fetches the census while the screen stays open (a cold process can
      *  answer the first call with an empty list while the companion's
-     *  resolver seeds — the poll fills the results in, same as the main list). */
+     *  resolver seeds — the first publish bumps the room-list revision, which
+     *  wakes this wait and fills the results in, same as the main list). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
+            var lastRevision = 0L
             while (true) {
-                delay(POLL_INTERVAL_MS)
+                val revision = ChatClient.waitForRoomListChange(lastRevision)
+                if (revision == lastRevision) continue
+                lastRevision = revision
                 refreshRooms()
             }
         }
@@ -138,10 +141,7 @@ class SearchViewModel(
             .sortedBy { it.name.lowercase() }
     }
 
-    private companion object {
-        /** Results refresh cadence — matches the main list's poll. */
-        const val POLL_INTERVAL_MS = 5_000L
-    }
+    private companion object
 }
 
 class SearchScreen(

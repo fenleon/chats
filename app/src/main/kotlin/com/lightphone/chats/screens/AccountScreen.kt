@@ -114,12 +114,18 @@ class AccountViewModel : LightViewModel<Unit>() {
         stopPolling()
     }
 
-    /** Keeps the status fresh while Account is visible (sync state, rooms). */
+    /** Keeps the status fresh while Account is visible (sync state, rooms).
+     *  A long-poll wait on the companion's status revision (bumped wherever a
+     *  connection/verification fact commits) replaces the fixed 5 s tick; the
+     *  wait's timeout window doubles as the dead-man re-check that settles
+     *  the e2ee verdict (two consecutive reads). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
+            var last = 0L
             while (true) {
-                delay(POLL_INTERVAL_MS)
+                val revision = ChatClient.waitForStatusChange(last)
+                if (revision != last) last = revision
                 refreshStatus()
             }
         }
@@ -260,10 +266,6 @@ class AccountViewModel : LightViewModel<Unit>() {
     }
 
     private var pollJob: Job? = null
-
-    private companion object {
-        const val POLL_INTERVAL_MS = 5_000L
-    }
 }
 
 class AccountScreen(sealedActivity: SealedLightActivity) :

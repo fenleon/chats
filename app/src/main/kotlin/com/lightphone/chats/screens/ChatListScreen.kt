@@ -67,9 +67,6 @@ import kotlinx.coroutines.launch
 /** Grow the list slice when the last visible row is within this many of the end. */
 private const val REVEAL_THRESHOLD = 4
 
-/** Live flag poll for the long-press contact panel (same cadence as the thread). */
-private const val PANEL_FLAG_SYNC_MS = 3_000L
-
 /** Shown while the initial sync pulls the whole account (can take minutes). */
 private const val DOWNLOADING_TEXT = "Downloading your chat history…"
 
@@ -124,8 +121,9 @@ class ChatListViewModel : LightViewModel<Unit>() {
     /**
      * Contact-panel state for the long-press entry (2026-08-29): long-pressing
      * a room row opens the same contact panel as the thread's name, seeded from
-     * the row's flags and polled while the panel is open so a Beeper-side
-     * toggle reaches it live (same pattern as ThreadViewModel's flag sync).
+     * the row's flags and refreshed from the companion's flags revision while
+     * the panel is open, so a Beeper-side toggle reaches it live (same pattern
+     * as ThreadViewModel's flag sync).
      */
     val panelMuted = MutableStateFlow(false)
     val panelPinned = MutableStateFlow(false)
@@ -133,10 +131,10 @@ class ChatListViewModel : LightViewModel<Unit>() {
     private var panelRoomId: String? = null
     private var panelFlagSyncJob: Job? = null
 
-    /** Seeds the panel from the row and starts the live flag poll. */
+    /** Seeds the panel from the row and starts the live flag wait. */
     fun openContactPanel(room: LightServiceMethod.GetRooms.Room) {
-        // Kill any poll leaked by an earlier panel before starting this one:
-        // startPanelFlagSync's guard would otherwise keep polling the FIRST
+        // Kill any waiter leaked by an earlier panel before starting this one:
+        // startPanelFlagSync's guard would otherwise keep watching the FIRST
         // panel's room and clobber this panel's flags with them (2026-08-29:
         // archive toggles flipped back to ARCHIVE after 3 s for exactly that).
         panelFlagSyncJob?.cancel()
@@ -148,7 +146,7 @@ class ChatListViewModel : LightViewModel<Unit>() {
         startPanelFlagSync(room.id)
     }
 
-    /** Stops the poll when the panel is dismissed (X pops back to the list). */
+    /** Stops the wait when the panel is dismissed (X pops back to the list). */
     fun closeContactPanel() {
         panelFlagSyncJob?.cancel()
         panelFlagSyncJob = null
@@ -158,8 +156,11 @@ class ChatListViewModel : LightViewModel<Unit>() {
     private fun startPanelFlagSync(roomId: String) {
         if (panelFlagSyncJob?.isActive == true) return
         panelFlagSyncJob = viewModelScope.launch {
+            var lastFlags = 0L
             while (true) {
-                delay(PANEL_FLAG_SYNC_MS)
+                val revision = ChatClient.waitForFlagChange(lastFlags)
+                if (revision == lastFlags) continue
+                lastFlags = revision
                 val flags = ChatClient.getRoomFlags(roomId) ?: continue
                 panelMuted.value = flags.muted
                 panelPinned.value = flags.pinned

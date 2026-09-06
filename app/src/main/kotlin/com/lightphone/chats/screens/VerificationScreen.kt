@@ -41,7 +41,6 @@ import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -77,22 +76,25 @@ class VerificationViewModel : LightViewModel<Unit>() {
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
-        // Poll while the screen is up; the companion's state machine updates as
-        // the other device answers (and the recovery key updates e2ee state).
+        // One-shot fetch on entry, then a long-poll wait on the companion's
+        // status revision (bumped wherever the server-side verification state
+        // machine commits) — the screen never polls. The e2ee read includes a
+        // server round-trip, so it rides the wait's dead-man window and the
+        // Done transition; the recovery/accept actions refresh it directly
+        // anyway (feedback 2026-08-23).
         viewModelScope.launch {
-            // verificationState stays at 1 s; e2eeState is throttled to every
-            // ~10 s — it includes a server round-trip (network), and the
-            // recovery-key/accept actions refresh it directly anyway
-            // (feedback 2026-08-23).
-            var tick = 0
+            state.value = ChatClient.verificationState()
+            e2ee.value = ChatClient.e2eeState()
+            var last = 0L
             while (true) {
+                val revision = ChatClient.waitForStatusChange(last)
+                val moved = revision != last
+                last = revision
                 state.value = ChatClient.verificationState()
-                if (tick % E2EE_POLL_TICKS == 0) {
+                if (starting.value && state.value?.state != "none") starting.value = false
+                if (!moved || state.value?.state == "done") {
                     e2ee.value = ChatClient.e2eeState()
                 }
-                if (starting.value && state.value?.state != "none") starting.value = false
-                tick++
-                delay(POLL_MS)
             }
         }
     }
@@ -165,12 +167,6 @@ class VerificationViewModel : LightViewModel<Unit>() {
             if (failure != null) error.value = failure
             state.value = ChatClient.verificationState()
         }
-    }
-
-    private companion object {
-        const val POLL_MS = 1_000L
-        /** e2eeState is fetched once per this many 1 s polls (~10 s). */
-        const val E2EE_POLL_TICKS = 10
     }
 }
 

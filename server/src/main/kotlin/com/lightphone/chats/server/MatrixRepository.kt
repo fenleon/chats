@@ -803,7 +803,7 @@ object MatrixRepository {
                     // zero latency — see PushChannel.
                     PushChannel.start(app, client!!)
                 } else {
-                    _connectionState.value = ChatConnectionState.Offline("sync paused")
+                    setConnectionState(ChatConnectionState.Offline("sync paused"))
                     android.util.Log.d(TAG, "sync disabled by preference — session restored, no sync loop")
                 }
             }
@@ -839,7 +839,7 @@ object MatrixRepository {
             activeRoomRefreshJob = null
             PushChannel.stop()
             ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
-            _connectionState.value = ChatConnectionState.Offline("sync paused")
+            setConnectionState(ChatConnectionState.Offline("sync paused"))
             android.util.Log.d(TAG, "sync paused by user")
         } else {
             if (c == null) {
@@ -953,12 +953,12 @@ object MatrixRepository {
         val t0 = android.os.SystemClock.elapsedRealtime()
         val result = runCatching { c.syncOnce(Presence.OFFLINE).getOrThrow() }
             .onSuccess {
-                _connectionState.value = ChatConnectionState.Syncing
+                setConnectionState(ChatConnectionState.Syncing)
                 // Any successful sync means the "checking failed" signal (if
                 // any) is stale (WAKE-COMPARISON.md #3).
                 appContext?.let { ChatNotifier.clearSyncPending(it) }
             }
-            .onFailure { _connectionState.value = ChatConnectionState.Offline("sync failed") }
+            .onFailure { setConnectionState(ChatConnectionState.Offline("sync failed")) }
         // The round's ingest (parse/decrypt/store) is done once syncOnce
         // returns — release the sync-ingest gate here. In slow mode no further
         // /sync request follows for minutes, so without this stamp the gate
@@ -1264,7 +1264,7 @@ object MatrixRepository {
             inProcessSyncJob?.cancel()
             inProcessSyncJob = null
             inProcessSyncRunning = false
-            _connectionState.value = ChatConnectionState.Connecting
+            setConnectionState(ChatConnectionState.Connecting)
 
             // Accept a bare domain ("matrix.org") or a full URL; .well-known
             // discovery runs when the host serves one, else the URL is used as-is.
@@ -1354,7 +1354,7 @@ object MatrixRepository {
             inProcessSyncJob?.cancel()
             inProcessSyncJob = null
             inProcessSyncRunning = false
-            _connectionState.value = ChatConnectionState.Connecting
+            setConnectionState(ChatConnectionState.Connecting)
 
             val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val requestId = prefs.getString(KEY_BEEPER_REQUEST_ID, null)
@@ -1704,7 +1704,7 @@ object MatrixRepository {
         // verification events); Trixnity's own state machine drives the rest.
         val request = c.verification.createDeviceVerificationRequest(c.userId, otherDevices).getOrThrow()
         activeVerification = request
-        _verification.value = VerificationUi.Waiting
+        setVerificationUi(VerificationUi.Waiting)
         verificationCollectJob?.cancel()
         verificationCollectJob = scope.launch {
             request.state.collectLatest { state -> onVerificationState(state) }
@@ -1716,7 +1716,7 @@ object MatrixRepository {
                 android.util.Log.w(TAG, "verification timed out after ${VERIFICATION_TIMEOUT_MS / 60_000L} min — cancelling")
                 runCatching { request.cancel() }
                 verificationCollectJob?.cancel()
-                _verification.value = VerificationUi.Error("Verification timed out — try your recovery key")
+                setVerificationUi(VerificationUi.Error("Verification timed out — try your recovery key"))
             }
         }
     }
@@ -1781,12 +1781,13 @@ object MatrixRepository {
         pendingTheirSasStart = null
         pendingCompare = null
         theirSasStartAtMs = 0L
-        _verification.value = VerificationUi.Idle
+        setVerificationUi(VerificationUi.Idle)
     }
 
     private suspend fun onVerificationState(state: ActiveVerificationState) {
         android.util.Log.i(TAG, "verify: top-level state -> ${state::class.simpleName}")
-        _verification.value = when (state) {
+        setVerificationUi(
+            when (state) {
             is ActiveVerificationState.OwnRequest -> VerificationUi.Waiting
             is ActiveVerificationState.TheirRequest -> {
                 pendingTheirRequest = state
@@ -1858,12 +1859,14 @@ object MatrixRepository {
                     VerificationUi.Waiting
                 }
             }
-        }
+        },
+    )
     }
 
     private suspend fun onSasState(state: ActiveSasVerificationState) {
         android.util.Log.i(TAG, "verify: SAS state -> ${state::class.simpleName}")
-        _verification.value = when (state) {
+        setVerificationUi(
+            when (state) {
             is ActiveSasVerificationState.OwnSasStart -> VerificationUi.Verifying
             is ActiveSasVerificationState.TheirSasStart -> {
                 pendingTheirSasStart = state
@@ -1884,7 +1887,8 @@ object MatrixRepository {
             // WaitForKeys / WaitForMacs are exchange progress — "Verifying…",
             // not "waiting for the other device to accept".
             else -> VerificationUi.Verifying
-        }
+            },
+        )
     }
 
     /**
@@ -2104,7 +2108,7 @@ object MatrixRepository {
             clearDiskCache()
             sessionExpired = false
             manualLogout = false
-            _connectionState.value = ChatConnectionState.LoggedOut
+            setConnectionState(ChatConnectionState.LoggedOut)
         }
     }
 
@@ -6324,7 +6328,8 @@ object MatrixRepository {
 
     /** The room's effective pinned/muted/archived flags (optimistic writes win;
      *  the store collectors keep the cache fresh within seconds of a
-     *  Beeper-side change — the contact panel polls this, 2026-08-28). */
+     *  Beeper-side change — the flag loops wait on the flags revision and
+     *  refetch this, 2026-08-28). */
     suspend fun getRoomFlags(roomId: String): RoomFlags =
         roomFlagsOverlay[roomId] ?: roomFlagsCache[roomId] ?: RoomFlags()
 
@@ -6339,6 +6344,7 @@ object MatrixRepository {
         val updated = transform(base)
         roomFlagsCache = roomFlagsCache + (roomId to updated)
         roomFlagsOverlay = roomFlagsOverlay + (roomId to updated)
+        bumpRoomFlagsRevision() // the flag-wait loops refetch immediately
         flagsOnlyWake = true
         markRoomListDirty()
         wakeRoomList()
@@ -6899,6 +6905,48 @@ object MatrixRepository {
     }
 
     /**
+     * Monotonic revision of the room-flags cache (Phase C, 2026-09-06):
+     * bumped where the flags fact commits — optimistic writes
+     * ([updateRoomFlagsLocal]) and store-fresh rebuilds ([roomFlagsByRoom]).
+     * The thread/contact-panel flag loops wait on it ("flags" scope) instead
+     * of polling [getRoomFlags] on a timer.
+     */
+    @Volatile
+    private var roomFlagsRevision = 0L
+
+    private fun bumpRoomFlagsRevision() {
+        roomFlagsRevision++
+        changeSignal.tryEmit(Unit)
+    }
+
+    /**
+     * Monotonic revision of the tool-visible account/connection/verification
+     * status facts (Phase C, 2026-09-06): bumped beside every
+     * [_connectionState] and [_verification] commit. The Account/Verification/
+     * Settings screens wait on it ("status" scope) instead of polling
+     * [accountState]/[connectionState]/[verificationState] on a timer.
+     */
+    @Volatile
+    private var statusRevision = 0L
+
+    private fun bumpStatusRevision() {
+        statusRevision++
+        changeSignal.tryEmit(Unit)
+    }
+
+    /** Commits [_connectionState] and wakes the status waiters. */
+    private fun setConnectionState(state: ChatConnectionState) {
+        _connectionState.value = state
+        bumpStatusRevision()
+    }
+
+    /** Commits [_verification] and wakes the status waiters. */
+    private fun setVerificationUi(ui: VerificationUi) {
+        _verification.value = ui
+        bumpStatusRevision()
+    }
+
+    /**
      * Holds the caller until a watched revision moves past [lastSeen] or
      * [timeoutMs] elapses (the server half of [LightServiceMethod.WaitForChange]
      * — the tool's poll ticks became this). Returns the current revision either
@@ -6906,8 +6954,12 @@ object MatrixRepository {
      * moved revision (raced signal) returns immediately.
      */
     suspend fun waitForChange(watch: String, roomId: String?, lastSeen: Long, timeoutMs: Long): Long {
-        fun current(): Long =
-            if (watch == "rooms") roomListRevision else messagePageRevision[roomId] ?: 0L
+        fun current(): Long = when (watch) {
+            "rooms" -> roomListRevision
+            "flags" -> roomFlagsRevision
+            "status" -> statusRevision
+            else -> messagePageRevision[roomId] ?: 0L
+        }
         val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
         while (true) {
             val now = current()
@@ -7917,6 +7969,10 @@ object MatrixRepository {
         result.putAll(roomFlagsOverlay)
         roomFlagsCache = result
         roomFlagsBuiltAtMs = now
+        // Only reached on a real rebuild (the TTL fast path returned early) —
+        // the fresh flags just committed; wake the flag-wait loops. A rebuild
+        // without flag changes wakes them into a same-value refetch: harmless.
+        bumpRoomFlagsRevision()
         return roomFlagsCache + roomFlagsOverlay
     }
 
@@ -8986,25 +9042,27 @@ object MatrixRepository {
     private fun observeSyncState(c: MatrixClient) {
         scope.launch {
             c.syncState.collect { state ->
-                _connectionState.value = when (state) {
-                    SyncState.INITIAL_SYNC -> ChatConnectionState.Connecting
-                    SyncState.STARTED, SyncState.RUNNING -> ChatConnectionState.Syncing
-                    SyncState.ERROR, SyncState.TIMEOUT -> ChatConnectionState.Offline("sync $state")
-                    SyncState.STOPPED -> when {
-                        // Slow sync (screen off) stops the long-poll between
-                        // periodic syncOnce rounds — that's still "syncing",
-                        // not an outage.
-                        isSlowSyncing -> ChatConnectionState.Syncing
-                        // The sync toggle is the source of truth while paused —
-                        // the restored client reports STOPPED until resumed, and
-                        // that must read as "paused", not "stopped" (or, worse,
-                        // the race with init's explicit assignment).
-                        !syncEnabled -> ChatConnectionState.Offline("sync paused")
-                        c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> ChatConnectionState.Offline("sync stopped")
-                        sessionExpired -> ChatConnectionState.Offline("session expired — sign in again")
-                        else -> ChatConnectionState.LoggedOut
-                    }
-                }
+                setConnectionState(
+                    when (state) {
+                        SyncState.INITIAL_SYNC -> ChatConnectionState.Connecting
+                        SyncState.STARTED, SyncState.RUNNING -> ChatConnectionState.Syncing
+                        SyncState.ERROR, SyncState.TIMEOUT -> ChatConnectionState.Offline("sync $state")
+                        SyncState.STOPPED -> when {
+                            // Slow sync (screen off) stops the long-poll between
+                            // periodic syncOnce rounds — that's still "syncing",
+                            // not an outage.
+                            isSlowSyncing -> ChatConnectionState.Syncing
+                            // The sync toggle is the source of truth while paused —
+                            // the restored client reports STOPPED until resumed, and
+                            // that must read as "paused", not "stopped" (or, worse,
+                            // the race with init's explicit assignment).
+                            !syncEnabled -> ChatConnectionState.Offline("sync paused")
+                            c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> ChatConnectionState.Offline("sync stopped")
+                            sessionExpired -> ChatConnectionState.Offline("session expired — sign in again")
+                            else -> ChatConnectionState.LoggedOut
+                        }
+                    },
+                )
             }
         }
     }
@@ -9033,7 +9091,7 @@ object MatrixRepository {
                 sessionExpired = true
                 PushChannel.stop()
                 android.util.Log.w(TAG, "session no longer logged in ($state) — treating as expired")
-                _connectionState.value = ChatConnectionState.Offline("session expired — sign in again")
+                setConnectionState(ChatConnectionState.Offline("session expired — sign in again"))
                 scheduleSyncStop()
             }
         }
@@ -9537,12 +9595,13 @@ object MatrixRepository {
     private const val UNSENT_MARKER_MAX = 256
     /** Local outbox read for the pending-row state (event id / send error). */
     private const val OUTBOX_READ_TIMEOUT_MS = 500L
-    /** Bounded wait for the homeserver ack of a text send ([awaitOutboxAck]) —
-     *  the /send 200 typically lands ~1 s after enqueue on the wake round. */
-    /** The composer hold for the homeserver ack. 2 s timed out unconfirmed on
-     *  every send during crawl load (LP3 2026-09-05: "compose hangs then it
-     *  sends" — the optimistic row shows instantly anyway), so the hold is
-     *  now just the ultra-warm case; slower acks confirm via the sync echo. */
+    /** Bounded wait for the homeserver ack of a send ([awaitOutboxAck]) —
+     *  kept for voice sends only: the recording activity's "sending" state
+     *  holds until the RPC returns, and caching the acked id keeps the
+     *  pending row from flickering back to SENDING (2026-09-02). Text sends
+     *  no longer wait (LP3 2026-09-05: "compose hangs then it sends" — the
+     *  optimistic row shows instantly anyway; slower acks confirm via the
+     *  sync echo). */
     private const val SEND_ACK_WAIT_MS = 500L
     /** Poll cadence on the outbox row while awaiting the ack. */
     private const val SEND_ACK_POLL_INTERVAL_MS = 100L

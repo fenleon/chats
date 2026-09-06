@@ -124,6 +124,30 @@ object ChatClient {
         ).getOrNull()?.revision ?: lastSeen
 
     /**
+     * Long-poll wait for the room-flags revision (Phase C, 2026-09-06): the
+     * companion bumps it wherever a flag fact commits (own optimistic toggles,
+     * store-fresh rebuilds after a Beeper-side change). The thread/contact-
+     * panel flag loops refetch [getRoomFlags] on movement instead of polling.
+     */
+    suspend fun waitForFlagChange(lastSeen: Long, timeoutMs: Long = 25_000): Long =
+        callRemoteServiceMethod(
+            LightServiceMethod.WaitForChange,
+            LightServiceMethod.WaitForChange.Request("flags", null, lastSeen, timeoutMs),
+        ).getOrNull()?.revision ?: lastSeen
+
+    /**
+     * Long-poll wait for the status revision (Phase C, 2026-09-06): the
+     * companion bumps it wherever a connection-state or verification-state
+     * fact commits. The Account/Verification/Settings screens refetch their
+     * status on movement instead of polling.
+     */
+    suspend fun waitForStatusChange(lastSeen: Long, timeoutMs: Long = 25_000): Long =
+        callRemoteServiceMethod(
+            LightServiceMethod.WaitForChange,
+            LightServiceMethod.WaitForChange.Request("status", null, lastSeen, timeoutMs),
+        ).getOrNull()?.revision ?: lastSeen
+
+    /**
      * Sends [body] to [roomId]. The response carries the outbox transaction id
      * plus the timeline event id once the homeserver acked (null until then) —
      * the thread uses it for an optimistic row the sync echo replaces.

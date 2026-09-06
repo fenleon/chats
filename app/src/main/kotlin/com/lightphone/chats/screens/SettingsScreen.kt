@@ -86,6 +86,22 @@ class SettingsViewModel : LightViewModel<Unit>() {
                     delay(STARTING_SYNC_TIMEOUT_MS)
                     startingSync.value = false
                 }
+                // Wake half: the companion bumps the status revision the instant
+                // the connection state commits — clear the starting state as
+                // soon as "syncing" lands instead of riding out the window.
+                launch {
+                    var last = 0L
+                    while (startingSync.value) {
+                        val revision = ChatClient.waitForStatusChange(last)
+                        if (revision == last) break
+                        last = revision
+                        connection.value = ChatClient.connectionState()
+                        if (connection.value?.state == "syncing") {
+                            startingSync.value = false
+                            break
+                        }
+                    }
+                }
             }
             ChatClient.setSyncEnabled(value)
             refresh()
