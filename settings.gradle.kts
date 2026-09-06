@@ -40,3 +40,14 @@ includeBuild("../light-sdk") {
         substitute(module("com.thelightphone:sdk-shared")).using(project(":sdk:shared"))
     }
 }
+
+// Local Trixnity patch (OTK regen + /keys/upload off the sync emit path, see
+// LIGHT-SDK-PATCHES.md). Conditional: on machines without the ../trixnity clone
+// (e.g. CI) the upstream 5.8.0 artifact from Maven Central is used unchanged.
+if (file("../trixnity").exists()) {
+    includeBuild("../trixnity") {
+        dependencySubstitution {
+            substitute(module("de.connect2x.trixnity:trixnity-crypto")).using(project(":trixnity-crypto"))
+        }
+    }
+}
