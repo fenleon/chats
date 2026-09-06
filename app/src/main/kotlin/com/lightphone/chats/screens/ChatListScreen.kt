@@ -580,7 +580,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                 // flash "No conversations" while it's still running
                                 // (the retry budget can exhaust before rooms land).
                                 loading && rooms.isEmpty() -> StatusText(
-                                    if (connecting) DOWNLOADING_TEXT else "Loading…",
+                                    if (connecting) DOWNLOADING_TEXT else "loading…",
                                 )
                                 filteredRooms.isNotEmpty() -> LightLazyScrollView(
                                     // Rows are ~70dp; a uniform estimate keeps the lazy
@@ -806,14 +806,18 @@ private fun OfflineBanner(text: String) {
 @Composable
 private fun StatusText(text: String) {
     // Centered like the LP3's own loading state (LP3 feedback 2026-09-03):
-    // the "Loading…" used to sit top-left.
+    // the "Loading…" used to sit top-left. Bottom padding biases the center
+    // slightly upward — optical centering (feedback 2026-09-06).
     Box(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(bottom = 4f.gridUnitsAsDp()),
         contentAlignment = Alignment.Center,
     ) {
         LightText(
             text = text,
-            variant = LightTextVariant.Copy,
+            // One size up from Copy (feedback 2026-09-06).
+            variant = LightTextVariant.Heading,
             align = TextAlign.Center,
             modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp()),
         )

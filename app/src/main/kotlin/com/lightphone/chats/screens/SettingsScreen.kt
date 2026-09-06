@@ -174,7 +174,7 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                             )
                             ToggleRow(
                                 checked = showReadStatus,
-                                title = "Read Status",
+                                title = "Seen Status",
                                 subtitle = "visible under your messages",
                                 onToggle = {
                                     viewModel.setShowReadStatus(lightContext, !showReadStatus)
@@ -183,7 +183,7 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                             ToggleRow(
                                 checked = !downloadOverMobile,
                                 title = "Data Saver Mode",
-                                subtitle = "only use WiFi for downloading media",
+                                subtitle = "Only use Wifi for downloading media",
                                 onToggle = {
                                     viewModel.setDownloadOverMobile(lightContext, !downloadOverMobile)
                                 },

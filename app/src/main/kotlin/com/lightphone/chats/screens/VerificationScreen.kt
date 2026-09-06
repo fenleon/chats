@@ -242,22 +242,27 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                     return@Column
                 }
 
-                LightTopBar(
-                    leftButton = if (confirmOpen) {
-                        // The confirm panel's X (bottom-left) is the only exit —
-                        // no top-bar back (feedback 2026-08-19).
-                        null
-                    } else {
-                        LightBarButton.LightIcon(
-                            icon = LightIcons.BACK,
-                            onClick = { goBack() },
-                            contentDescription = "Back to settings",
-                        )
-                    },
-                    center = LightTopBarCenter.Text(
-                        if (state?.state == "compare" && !confirmOpen) "Compare the emoji" else "Verify Device",
-                    ),
-                )
+                // Cancelled/failed: no top bar at all — no back navigation, no
+                // title; Try Again / Use Recovery Key are the only ways out
+                // (feedback 2026-09-06).
+                if (state?.state != "cancelled" && state?.state != "error") {
+                    LightTopBar(
+                        leftButton = if (confirmOpen) {
+                            // The confirm panel's X (bottom-left) is the only exit —
+                            // no top-bar back (feedback 2026-08-19).
+                            null
+                        } else {
+                            LightBarButton.LightIcon(
+                                icon = LightIcons.BACK,
+                                onClick = { goBack() },
+                                contentDescription = "Back to settings",
+                            )
+                        },
+                        center = LightTopBarCenter.Text(
+                            if (state?.state == "compare" && !confirmOpen) "Compare the emoji" else "Verify Device",
+                        ),
+                    )
+                }
 
                 Box(modifier = Modifier.weight(1f)) {
                     when {
@@ -283,7 +288,6 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                             "verifying" -> CenteredPanel("Verifying…")
                             "compare" -> ComparePanel(
                                 emojis = state?.emoji.orEmpty(),
-                                deviceId = state?.deviceId,
                                 onMatch = { viewModel.act("match") },
                                 onNoMatch = { viewModel.act("no_match") },
                             )
@@ -386,10 +390,9 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
         }
     }
 
-    private fun cancelButton(): LightBarButton = LightBarButton.LightIcon(
-        icon = LightIcons.CLOSE,
+    private fun cancelButton(): LightBarButton = LightBarButton.Text(
+        text = "CANCEL",
         onClick = { viewModel.act("cancel") },
-        contentDescription = "Cancel",
     )
 
     private fun openRecoveryEditor() {
@@ -501,12 +504,21 @@ private fun TerminalPanel(
                 }
             }
         }
-        PanelActionButton("USE RECOVERY KEY", onClick = onUseRecoveryKey)
-        PanelActionButton("TRY AGAIN", onClick = onTryAgain)
+        // Buttons centered in the space between the panel text and the bottom
+        // CANCEL (feedback 2026-09-06) — equal halves, like the text half.
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                PanelActionButton("TRY AGAIN", onClick = onTryAgain)
+                PanelActionButton("USE RECOVERY KEY", onClick = onUseRecoveryKey)
+            }
+        }
     }
-}
-
-/** The accept/start panel (2026-08-29): centered question, ACCEPT as a button
+}/** The accept/start panel (2026-08-29): centered question, ACCEPT as a button
  *  bottom-anchored above the bottom bar; the X cancel stays in the bar. */
 @Composable
 private fun AcceptPanel(onAccept: () -> Unit) {
@@ -524,7 +536,16 @@ private fun AcceptPanel(onAccept: () -> Unit) {
                 modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
             )
         }
-        PanelActionButton("ACCEPT", onClick = onAccept)
+        // ACCEPT centered between the question and the bottom CANCEL bar
+        // (feedback 2026-09-06), matching the terminal panel.
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            PanelActionButton("ACCEPT", onClick = onAccept)
+        }
     }
 }
 
@@ -552,7 +573,6 @@ private fun ComparePanel(
     emojis: List<String>,
     onMatch: () -> Unit,
     onNoMatch: () -> Unit,
-    deviceId: String? = null,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         Box(
@@ -574,15 +594,11 @@ private fun ComparePanel(
                 }
                 Spacer(Modifier.height(1f.gridUnitsAsDp()))
                 LightText(
-                    text = "Both devices show the same emojis. Tap MATCH below to confirm.",
+                    text = "Confirm the Emojis match the ones shown on your other device",
                     variant = LightTextVariant.Copy,
                     align = TextAlign.Center,
                     modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
                 )
-                if (deviceId != null) {
-                    Spacer(Modifier.height(1f.gridUnitsAsDp()))
-                    LightText(text = "Accepted on device $deviceId", variant = LightTextVariant.Detail)
-                }
             }
         }
         PanelActionButton("THEY MATCH", onClick = onMatch)

@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -181,7 +183,7 @@ class AccountViewModel : LightViewModel<Unit>() {
                     error.value = failure
                 } else {
                     codeRequested.value = true
-                    codeStatus.value = "Code sent to $email — check your email"
+                    codeStatus.value = "Code sent to $email"
                     onSuccess(email)
                 }
             } finally {
@@ -321,7 +323,13 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                     center = LightTopBarCenter.Text("Account"),
                 )
                 Box(modifier = Modifier.weight(1f)) {
-                    LightScrollView {
+                    // Settings rows start 0.5 gu below the top bar (its scroll
+                    // Column carries vertical 0.5 gu padding) — match it so the
+                    // "Server" row sits at the same height as Settings'
+                    // "Account" row (feedback 2026-09-06).
+                    LightScrollView(
+                        modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
+                    ) {
                         if (account?.loggedIn == true) {
                             // Logged in: just the account status + actions — the
                             // login form (email/code) would be dead weight here.
@@ -365,7 +373,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                             )
                             if (beeperMode) {
                                 FormField(
-                                    label = "Beeper email:",
+                                    label = "Beeper email",
                                     value = beeperEmail,
                                     placeholder = "you@example.com",
                                     onClick = { editField("Beeper email", viewModel.beeperEmail) },
@@ -373,14 +381,17 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 // The Enter code entry appears once a code has
                                 // been requested (feedback 2026-08-19: the
                                 // request-code overlay dismisses back here).
+                                // The removed "Code sent to…" status line's
+                                // info lives in the label now (feedback
+                                // 2026-09-06).
                                 if (codeStatus != null || beeperCode.isNotEmpty()) {
                                     FormField(
-                                        label = "Enter code:",
+                                        label = "Enter code sent to $beeperEmail",
                                         value = beeperCode,
                                         placeholder = "6-digit code",
                                         onClick = {
                                             editField(
-                                                title = "Enter code",
+                                                title = "Enter code sent to $beeperEmail",
                                                 field = viewModel.beeperCode,
                                                 // The code editor submits (was
                                                 // SAVE — feedback 2026-08-19).
@@ -418,7 +429,10 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 )
                             }
                             error?.let { message -> StatusLine(message) }
-                            codeStatus?.let { status -> StatusLine(status) }
+                            // "Code sent to…" line removed (feedback
+                            // 2026-09-06) — the Enter code field's label
+                            // carries the email now; codeStatus still gates
+                            // the field's appearance.
                         }
                     }
                 }
@@ -673,6 +687,13 @@ class CodeSentPanel(
         val themeColors by LightThemeController.colors.collectAsState()
         val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
 
+        // Auto-dismiss (feedback 2026-09-06): the panel is a confirmation, not
+        // a roadblock — the Enter code field waits on the account panel.
+        LaunchedEffect(Unit) {
+            delay(3_000L)
+            goBack()
+        }
+
         LightTheme(colors = themeColors) {
             Column(
                 modifier = Modifier
@@ -690,12 +711,13 @@ class CodeSentPanel(
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         LightText(
-                            text = "A code has been sent to $email.",
+                            text = "A code has been sent to $email",
                             variant = LightTextVariant.Copy,
                             align = TextAlign.Center,
                         )
+                        Spacer(Modifier.height(1f.gridUnitsAsDp()))
                         LightText(
-                            text = "Check your email.",
+                            text = "Check your email",
                             variant = LightTextVariant.Copy,
                             align = TextAlign.Center,
                         )
@@ -745,7 +767,7 @@ class LogoutConfirmPanel(
                     contentAlignment = Alignment.Center,
                 ) {
                     LightText(
-                        text = "Do you want to log out of your account?",
+                        text = "Are you sure you want to log out of your account?",
                         variant = LightTextVariant.Copy,
                         align = TextAlign.Center,
                         modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
@@ -785,7 +807,9 @@ private fun AccountStatus(
             // Feedback 2026-08-19: the status line reads plainly — "sync
             // paused" when the toggle is off, "offline" when there's simply
             // no connection. The thread count shares the same line
-            // (2026-08-29): "Syncing · 34 of 52 threads".
+            // (2026-08-29): "Syncing 34 of 52 threads" (no separator dot —
+            // feedback 2026-09-06). Same Fine size as the restore line below
+            // (feedback 2026-09-06).
             val statusText = when {
                 allSynced -> "Synced"
                 state.state == "syncing" -> "Syncing"
@@ -800,15 +824,15 @@ private fun AccountStatus(
                 else -> "${state.roomsResolved} of ${pluralThreads(state.roomsTotal)}"
             }
             LightText(
-                text = countText?.let { "$statusText · $it" } ?: statusText,
-                variant = LightTextVariant.Detail,
+                text = countText?.let { "$statusText $it" } ?: statusText,
+                variant = LightTextVariant.Fine,
             )
             // Key-backup restore crawl (2026-08-29): "Recovering… x of y
             // rooms" while the daily restore runs; "All messages restored"
             // once it finished AND sync has fully caught up.
             if (state.restoreScanning && state.restoreRoomsTotal > 0) {
                 LightText(
-                    text = "Recovering… ${state.restoreScanned} of ${state.restoreRoomsTotal} rooms",
+                    text = "Recovering ${state.restoreScanned} of ${state.restoreRoomsTotal} rooms",
                     variant = LightTextVariant.Fine,
                     modifier = Modifier.padding(top = 1.dp),
                 )
