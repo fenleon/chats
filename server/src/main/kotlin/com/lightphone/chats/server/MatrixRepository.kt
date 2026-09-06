@@ -121,10 +121,13 @@ import de.connect2x.trixnity.client.room.message.replace
 import de.connect2x.trixnity.client.room.message.text
 import de.connect2x.trixnity.client.serverDiscovery
 import de.connect2x.trixnity.client.store.GlobalAccountDataStore
+import de.connect2x.trixnity.client.store.KeyStore
 import de.connect2x.trixnity.client.store.OlmCryptoStore
 import de.connect2x.trixnity.client.store.Room as MatrixRoom
+import de.connect2x.trixnity.client.store.StoredSecretKeyRequest
 import de.connect2x.trixnity.client.store.StoreTransactionManager
 import de.connect2x.trixnity.client.store.TimelineEvent
+import de.connect2x.trixnity.client.store.isVerified
 import de.connect2x.trixnity.client.store.joinedMemberCount
 import de.connect2x.trixnity.client.store.repository.RoomStateRepository
 import de.connect2x.trixnity.client.store.repository.RoomStateRepositoryKey
@@ -133,6 +136,11 @@ import de.connect2x.trixnity.client.store.repository.room.TrixnityRoomDatabase
 import de.connect2x.trixnity.client.store.repository.room.room
 import de.connect2x.trixnity.client.user
 import de.connect2x.trixnity.client.verification
+import de.connect2x.trixnity.core.model.events.m.KeyRequestAction
+import de.connect2x.trixnity.core.model.events.m.secret.SecretKeyRequestEventContent
+import de.connect2x.trixnity.crypto.SecretType
+import de.connect2x.trixnity.crypto.core.SecureRandom
+import kotlin.time.Clock
 import de.connect2x.trixnity.client.verification.ActiveDeviceVerification
 import de.connect2x.trixnity.client.verification.ActiveSasVerificationMethod
 import de.connect2x.trixnity.client.verification.ActiveSasVerificationState
@@ -172,6 +180,7 @@ import de.connect2x.trixnity.crypto.key.decodeRecoveryKey
 import de.connect2x.trixnity.crypto.olm.OlmEncryptionService
 import de.connect2x.trixnity.crypto.olm.OlmEncryptionServiceImpl
 import de.connect2x.trixnity.client.cryptodriver.libolm.libOlm
+import de.connect2x.trixnity.utils.nextString
 import de.connect2x.trixnity.utils.ReadTransaction
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Path.Companion.toPath
@@ -1879,6 +1888,60 @@ object MatrixRepository {
     }
 
     /**
+     * Process-death recovery (LP3 2026-09-06): a restart loses the cached SSSS
+     * secrets (backup key, cross-signing keys) that Trixnity normally receives
+     * exactly once, right after device verification — its own auto-request is
+     * a one-shot at client start and never re-fires. Ask our verified own
+     * devices for the missing secrets via to-device m.secret.request and
+     * register the request with the KeyStore: that's what lets Trixnity's own
+     * answer handler accept the Olm-encrypted m.secret.send reply, validate it
+     * and persist the secret — after which version/restore recover on their
+     * own. Returns true if at least one request was sent.
+     */
+    private suspend fun reRequestMissingSecrets(c: MatrixClient): Boolean = runCatching {
+        val keyStore = c.di.get<KeyStore>(KeyStore::class)
+        val missing = SecretType.entries.filter { it.cacheable }
+            .subtract(keyStore.getSecrets().keys)
+            .subtract(
+                keyStore.getAllSecretKeyRequests()
+                    .mapNotNull { req -> req.content.name?.let { SecretType.ofId(it) } }
+                    .toSet()
+            )
+        if (missing.isEmpty()) return@runCatching false
+        // Answers only come back Olm-encrypted from devices that have the
+        // secret — i.e. our own verified devices.
+        val receivers = keyStore.getDeviceKeys(c.userId).first().orEmpty()
+            .filter {
+                it.value.trustLevel.isVerified &&
+                    it.value.value.signed.deviceId != c.deviceId
+            }
+            .map { it.value.value.signed.deviceId }
+            .toSet()
+        if (receivers.isEmpty()) {
+            android.util.Log.w(TAG, "restore: no verified device to re-request secrets from")
+            return@runCatching false
+        }
+        missing.forEach { secret ->
+            val request = SecretKeyRequestEventContent(
+                name = secret.id,
+                action = KeyRequestAction.REQUEST,
+                requestingDeviceId = c.deviceId,
+                requestId = SecureRandom.nextString(22),
+            )
+            c.api.user
+                .sendToDevice(mapOf(c.userId to receivers.associateWith { request }))
+                .getOrThrow()
+            c.di.get<StoreTransactionManager>(StoreTransactionManager::class).writeTransaction {
+                keyStore.addSecretKeyRequest(StoredSecretKeyRequest(request, receivers, Clock.System.now()))
+            }
+            android.util.Log.i(TAG, "restore: re-requested secret ${secret.id} from $receivers")
+        }
+        true
+    }.onFailure {
+        android.util.Log.w(TAG, "restore: secret re-request failed: ${it.message}")
+    }.getOrDefault(false)
+
+    /**
      * After the device is verified, load every undecrypted event's megolm session
      * from the server-side key backup so the room store can decrypt it. Called on
      * verification success; loading a session decrypts what the session covers.
@@ -1893,28 +1956,56 @@ object MatrixRepository {
     private suspend fun restoreMegolmSessions() {
         val ctx = appContext ?: return
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val lastRun = prefs.getLong(KEY_RESTORE_LAST_RUN_MS, 0L)
-        val now = System.currentTimeMillis()
-        if (now - lastRun < RESTORE_INTERVAL_MS) {
-            android.util.Log.d(TAG, "restore: skipped — last run ${(now - lastRun) / 60_000}m ago")
+        val c = client ?: return
+        if (!isDeviceVerified(c)) {
+            // Mid-verification (fresh login): every room would log "skipping
+            // restore" and the walk just burns CPU while the SAS waits. The
+            // post-Done ladder relaunches this once verification completes.
+            android.util.Log.i(TAG, "restore: device not verified — deferring crawl until verification completes")
             return
         }
-        // Written on START: even a scan that dies mid-run won't re-run for a day.
-        prefs.edit().putLong(KEY_RESTORE_LAST_RUN_MS, now).apply()
-        val c = client ?: return
         val keyBackup = keyBackupOf(c)
         if (keyBackup == null) {
             android.util.Log.e(TAG, "restore: KeyBackupService not available via DI")
             return
         }
+        val lastRun = prefs.getLong(KEY_RESTORE_LAST_RUN_MS, 0L)
+        val now = System.currentTimeMillis()
+        if (now - lastRun < RESTORE_INTERVAL_MS) {
+            // The cooldown must not silence the re-request recovery: a restart
+            // that dropped the cached backup secret (LP3 2026-09-06) would
+            // otherwise stay un-decryptable for a day. Missing secret → run.
+            val hasBackupSecret = runCatching {
+                c.di.get<KeyStore>(KeyStore::class).getSecrets().containsKey(SecretType.M_MEGOLM_BACKUP_V1)
+            }.getOrDefault(true)
+            if (hasBackupSecret) {
+                android.util.Log.d(TAG, "restore: skipped — last run ${(now - lastRun) / 60_000}m ago")
+                return
+            }
+            android.util.Log.w(TAG, "restore: cooldown active but backup secret missing — re-running to re-request it")
+        }
+        // Written on START: even a scan that dies mid-run won't re-run for a day.
+        prefs.edit().putLong(KEY_RESTORE_LAST_RUN_MS, now).apply()
         // Trixnity's version flow emits its current value immediately — null
         // until the service has actually fetched /room_keys/version. A process
         // restart before that fetch reads as "no backup configured" and stuck
         // the account un-decryptable for the crawl's 24h interval (LP3
         // 2026-09-06, post-verification restart). Wait for a real emission;
         // null after the budget means genuinely absent/unreachable.
-        val backupVersion = withTimeoutOrNull(KEY_BACKUP_VERSION_BUDGET_MS) {
+        var backupVersion = withTimeoutOrNull(KEY_BACKUP_VERSION_BUDGET_MS) {
             runCatching { keyBackup.version.filterNotNull().firstOrNull() }.getOrNull()
+        }
+        // Process-death recovery (LP3 2026-09-06): version stays null when the
+        // cached backup secret didn't survive a restart (Trixnity receives it
+        // exactly once, right after verification, and never re-requests). If
+        // the server still has a backup, re-request the missing secrets from
+        // our verified own devices and give the answer a moment to land.
+        if (backupVersion == null && c.api.key.getRoomKeysVersion().isSuccess) {
+            if (reRequestMissingSecrets(c)) {
+                backupVersion = withTimeoutOrNull(SECRET_RE_REQUEST_BUDGET_MS) {
+                    runCatching { keyBackup.version.filterNotNull().firstOrNull() }.getOrNull()
+                }
+            }
         }
         android.util.Log.d(TAG, "restore: backup version = $backupVersion")
         if (backupVersion == null) {
@@ -8642,6 +8733,17 @@ object MatrixRepository {
             // A new /sync request proves the previous round's ingest finished
             // (Trixnity processes rounds sequentially) — sync-ingest gate.
             syncRoundEndedAt = android.os.SystemClock.elapsedRealtime()
+            // Ingest-gap attribution (LP3 2026-09-06 verify stall): the time
+            // between the last response arriving and this next request is the
+            // previous round's emit/ingest. Normally ≈ instant; when it blows
+            // past one long-poll period the emit path (e.g. Trixnity's inline
+            // OTK regen + /keys/upload) froze the whole loop — name it.
+            if (lastSyncResponseAt > 0) {
+                val ingestGap = android.os.SystemClock.elapsedRealtime() - lastSyncResponseAt
+                if (ingestGap > 35_000L) {
+                    android.util.Log.w(TAG, "sync ingest gap: ${ingestGap}ms between last response and this request — emit path stalled the loop")
+                }
+            }
             val t0 = android.os.SystemClock.elapsedRealtime()
             val response = chain.proceed(chain.request())
             val t1 = android.os.SystemClock.elapsedRealtime()
@@ -9502,6 +9604,9 @@ object MatrixRepository {
      *  null until the service's first fetch — a cold-start null read as "no
      *  backup" stuck the account un-decryptable for a day, LP3 2026-09-06). */
     private const val KEY_BACKUP_VERSION_BUDGET_MS = 5_000L
+    /** How long to wait for an m.secret.send answer after re-requesting the
+     *  missing SSSS secrets (process-death recovery, LP3 2026-09-06). */
+    private const val SECRET_RE_REQUEST_BUDGET_MS = 15_000L
     /** How long the memoized [e2eeState] result stays fresh (see the cache
      *  field) — long enough that the 1-5 s account polls + thread opens don't
      *  hit the network getDevices() on every call, short enough that a
