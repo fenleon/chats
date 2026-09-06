@@ -115,6 +115,9 @@ import de.connect2x.trixnity.client.room
 import de.connect2x.trixnity.client.room.GetTimelineEventConfig
 import de.connect2x.trixnity.client.room.GetTimelineEventsConfig
 import de.connect2x.trixnity.client.room.TimelineEventHandler
+import de.connect2x.trixnity.client.room.MegolmRoomEventEncryptionService
+import de.connect2x.trixnity.client.room.RoomEventEncryptionService
+import de.connect2x.trixnity.client.room.TimelineEventHandlerImpl
 import de.connect2x.trixnity.client.room.message.image
 import de.connect2x.trixnity.client.room.message.reply
 import de.connect2x.trixnity.client.room.message.replace
@@ -124,6 +127,7 @@ import de.connect2x.trixnity.client.store.GlobalAccountDataStore
 import de.connect2x.trixnity.client.store.KeyStore
 import de.connect2x.trixnity.client.store.OlmCryptoStore
 import de.connect2x.trixnity.client.store.Room as MatrixRoom
+import de.connect2x.trixnity.client.store.RoomTimelineStore
 import de.connect2x.trixnity.client.store.StoredSecretKeyRequest
 import de.connect2x.trixnity.client.store.StoreTransactionManager
 import de.connect2x.trixnity.client.store.TimelineEvent
@@ -2385,17 +2389,35 @@ object MatrixRepository {
         limit: Int,
         gapEventId: String,
     ): Pair<List<TimelineEvent>, Boolean>? {
-        val ok = withTimeoutOrNull(GAP_BACKFILL_BUDGET_MS) {
+        // Cold Wi-Fi round-trips (headers + TLS + a 30-event page) blow the
+        // 8 s cellular budget — the LP3 2026-09-06 window failed fills with
+        // the cause invisible, so the budget is network-aware and the cause
+        // (exception vs timeout vs token) is logged now to decide the
+        // stale-token fallback.
+        val budget =
+            if (isOnCellularData()) GAP_BACKFILL_BUDGET_MS else GAP_BACKFILL_BUDGET_WIFI_MS
+        val failure: String = withTimeoutOrNull(budget) {
             runCatching {
-                c.di.get<TimelineEventHandler>()
+                // Trixnity registers this binding qualified
+                // (bind<TimelineEventHandler>(); named<TimelineEventHandlerImpl>())
+                // — an unqualified lookup throws "No definition found" and every
+                // backfill silently failed forever (LP3 2026-09-06, 'Daniel').
+                c.di.get<TimelineEventHandler>(
+                    org.koin.core.qualifier.named<TimelineEventHandlerImpl>(),
+                )
                     .unsafeFillTimelineGaps(EventId(gapEventId), matrixRoomId, GAP_BACKFILL_LIMIT)
                     .getOrThrow()
-                true
-            }.getOrDefault(false)
-        } ?: false
-        if (!ok) {
+            }.fold(
+                onSuccess = { return@withTimeoutOrNull "" },
+                onFailure = { it.message ?: it::class.simpleName ?: "error" },
+            )
+        } ?: "timeout after ${budget / 1000}ms"
+        if (failure.isNotEmpty()) {
             parkGapBackfill(matrixRoomId)
-            android.util.Log.d(TAG, "gap backfill failed for $matrixRoomId — retrying in ${GAP_BACKFILL_COOLDOWN_MS / 1000}s")
+            android.util.Log.d(
+                TAG,
+                "gap backfill failed for $matrixRoomId ($failure) — retrying in ${GAP_BACKFILL_COOLDOWN_MS / 1000}s",
+            )
             return null
         }
         // The store now holds the missing window — re-walk the chain.
@@ -2674,8 +2696,9 @@ object MatrixRepository {
     /**
      * Quiet-room guard patch: recomputes the cached page's parts that don't
      * move the room's last event id — read receipts (sync ephemeral, feedback
-     * 2026-08-30) and reaction tags (see [patchReactionTags]). null when
-     * neither changed, so the caller keeps the cache and disk as-is.
+     * 2026-08-30), reaction tags (see [patchReactionTags]) and send-status tags
+     * (see [patchSendStatuses]). null when none changed, so the caller keeps
+     * the cache and disk as-is.
      */
     private suspend fun patchQuietPage(
         c: MatrixClient,
@@ -2689,7 +2712,34 @@ object MatrixRepository {
                 receiptPatched?.let { MessagePageEntry(it, cached.limit, cached.refreshedAtMs) } ?: cached,
             )
         }.getOrNull()
-        return tagPatched ?: receiptPatched
+        val tagEntry = tagPatched?.let { MessagePageEntry(it, cached.limit, cached.refreshedAtMs) } ?: cached
+        val statusPatched = runCatching { patchSendStatuses(c, roomId, tagEntry) }.getOrNull()
+        return statusPatched ?: tagPatched ?: receiptPatched
+    }
+
+    /**
+     * Recomputes a cached newest page's send-status tags ("SENDING" →
+     * "delivered"). The bridge's ack is its own timeline event: the incremental
+     * refresh that consumed it may have read a stale [sendStatusesByEventIdCached]
+     * map (15 s TTL) and baked SENDING into the rows, after which the room is
+     * quiet — the head never moves again, and the quiet ticks that patch
+     * receipts/reactions never re-read statuses, so the tag sat until the room
+     * was reopened or another message landed (LP3 feedback 2026-09-06). The
+     * map TTL bounds how long the patch trails the ack.
+     */
+    private suspend fun patchSendStatuses(
+        c: MatrixClient,
+        roomId: String,
+        cached: MessagePageEntry,
+    ): MessagesPage? {
+        val sendStatuses = sendStatusesByEventIdCached(c, RoomId(roomId))
+        if (sendStatuses.isEmpty()) return null
+        var changed = false
+        val patched = cached.page.messages.map { m ->
+            sendStatuses[m.id]?.takeIf { it != m.sendStatus }?.let { changed = true; m.copy(sendStatus = it) } ?: m
+        }
+        if (!changed) return null
+        return MessagesPage(patched, cached.page.hasMore, cached.page.encrypted)
     }
 
     /**
@@ -3201,7 +3251,20 @@ object MatrixRepository {
         // full-page refresh resolves them; the fast page may briefly show
         // "[Encrypted message]" placeholders instead of a long loading state.
         if (!fast) {
-            val undecrypted = events.filter { it.content?.isFailure == true }
+            val undecrypted = events.filter {
+                it.content?.isFailure == true ||
+                    // Decrypt never ATTEMPTED (content unresolved) counts too —
+                    // the LP3's stuck rows are exactly this class, and the old
+                    // failure-only filter kept them away from the key-backup
+                    // restore forever (drive 3, 2026-09-06: key requests fired,
+                    // backup never consulted). Age-gated like the placeholder:
+                    // young pending events decrypt in-band; only stuck ones
+                    // justify the backup round-trip.
+                    (it.content == null &&
+                        it.event.content is EncryptedMessageEventContent &&
+                        System.currentTimeMillis() - it.event.originTimestamp >
+                            DECRYPT_PENDING_PLACEHOLDER_AFTER_MS)
+            }
             if (undecrypted.isNotEmpty()) {
                 // Battery (2026-08-15 audit): events that can't decrypt (e.g.
                 // pre-verification history — the bridge never re-shares those
@@ -4431,6 +4494,7 @@ object MatrixRepository {
         matrixRoomId: RoomId,
         events: List<TimelineEvent>,
     ): Int {
+        val sessionToEvents = HashMap<String, MutableList<TimelineEvent>>()
         val sessionIds = events.mapNotNull { te ->
             // Only events that failed to decrypt need a key-backup restore:
             // already-resolved events have their megolm session in the local
@@ -4440,7 +4504,10 @@ object MatrixRepository {
             // nothing needed restoring.
             val content = te.content
             if (content?.getOrNull() != null) null
-            else (te.event.content as? EncryptedMessageEventContent.MegolmEncryptedMessageEventContent)?.sessionId
+            else (te.event.content as? EncryptedMessageEventContent.MegolmEncryptedMessageEventContent)
+                ?.sessionId?.also { sid ->
+                    sessionToEvents.getOrPut(sid) { mutableListOf() }.add(te)
+                }
         }.distinct()
         android.util.Log.d(TAG, "restoreRoomSessions: $matrixRoomId — ${events.size} events, ${sessionIds.size} megolm sessions, " +
             "encrypted classes: ${events.map { it.event.content::class.simpleName }.distinct()}")
@@ -4459,12 +4526,42 @@ object MatrixRepository {
             return 0
         }
         var loaded = 0
+        val timelineStore = c.di.get<RoomTimelineStore>()
+        val tm = c.di.get<StoreTransactionManager>()
+        val encryptionService = c.di.get<RoomEventEncryptionService>(
+            org.koin.core.qualifier.named<MegolmRoomEventEncryptionService>(),
+        )
         sessionIds.forEach { sessionId ->
             try {
                 val ok = withTimeoutOrNull(KEY_BACKUP_LOAD_TIMEOUT_MS) {
                     keyBackup.loadMegolmSession(matrixRoomId, sessionId)
                 }
-                if (ok != null) loaded++ else {
+                if (ok != null) {
+                    loaded++
+                    // Re-decrypt + re-persist: getTimelineEvent only reads the
+                    // store's cached result, so a freshly loaded session never
+                    // reaches the stored rows through it (drive 5, 2026-09-06:
+                    // loaded 1/1, then 49/50 events still stuck). Run the megolm
+                    // service directly and write the result back.
+                    var resolved = 0
+                    val sessionEvents = sessionToEvents[sessionId].orEmpty()
+                    sessionEvents.forEach { te ->
+                        val messageEvent = te.event as? ClientEvent.RoomEvent.MessageEvent<*>
+                        if (messageEvent == null) return@forEach
+                        val decrypted = runCatching { encryptionService.decrypt(messageEvent) }
+                            .getOrNull()?.getOrNull() ?: return@forEach
+                        tm.writeTransaction {
+                            timelineStore.update(te.event.id, matrixRoomId) { old ->
+                                old?.copy(content = Result.success(decrypted))
+                            }
+                        }
+                        resolved++
+                    }
+                    android.util.Log.d(
+                        TAG,
+                        "restoreRoomSessions: re-decrypted $resolved/${sessionEvents.size} events for $matrixRoomId / $sessionId",
+                    )
+                } else {
                     android.util.Log.w(TAG, "restoreRoomSessions: loadMegolmSession timed out for $matrixRoomId / $sessionId")
                 }
             } catch (e: Exception) {
@@ -6125,7 +6222,10 @@ object MatrixRepository {
     }
 
     suspend fun markRead(roomId: String, eventId: String) {
-        val c = client ?: return
+        val c = client ?: run {
+            android.util.Log.w(TAG, "markRead: room=$roomId — no client, dropped")
+            return
+        }
         val matrixRoomId = RoomId(roomId)
         // Mark at the event the tool asked for — the newest message it actually
         // rendered. The old behavior bumped the marker to the store's current
@@ -6138,14 +6238,65 @@ object MatrixRepository {
         // thread's quiet poll re-marks at the real newest once the page (and
         // the user's screen) catch up. Only a marker that IS the room's head
         // message keeps the optimistic badge clear below.
-        val room = withTimeoutOrNull(ROOM_BUDGET_MS) {
+        var room = withTimeoutOrNull(ROOM_BUDGET_MS) {
             c.room.getById(matrixRoomId).firstOrNull()
         }
-        val atHead = eventId == room?.lastRelevantEventId?.full
+        // Cold-start race: getById can return the room before Trixnity has
+        // loaded its timeline view — lastRelevantEventId null (LP3 drive 4,
+        // 2026-09-06: Rewrites marked read head=null 2 ms after open; the
+        // quiet poll's rendered id never changes, so the receipt stayed
+        // behind the head forever and the badge never cleared). Give the
+        // head a short bounded window to resolve before deciding.
+        var headResolveWaits = 0
+        while (room?.lastRelevantEventId == null &&
+            headResolveWaits < HEAD_RESOLVE_RETRIES
+        ) {
+            kotlinx.coroutines.delay(HEAD_RESOLVE_RETRY_MS)
+            room = withTimeoutOrNull(ROOM_BUDGET_MS) {
+                c.room.getById(matrixRoomId).firstOrNull()
+            }
+            headResolveWaits++
+        }
+        val headId = room?.lastRelevantEventId
+        var atHead = eventId == headId?.full
+        var markerId = eventId
+        // Head that never resolves at all: this room's Trixnity timeline view
+        // doesn't load (Rewrites, LP3 2026-09-06 — null even 18 s into a fresh
+        // process, across restarts, while every other room resolves instantly).
+        // The receipt still goes out at the rendered row; without the clear the
+        // badge could never clear by design. Clear optimistically — the
+        // suppression lifts as soon as a newer message arrives ([servedUnread]),
+        // so nothing newer is ever silently marked seen.
+        if (headId == null) {
+            android.util.Log.w(
+                TAG,
+                "markRead: room=$matrixRoomId — head unresolved after $headResolveWaits retries; clearing badge optimistically",
+            )
+            atHead = true
+        }
+        // A head that can never render a row (blank re-import copy, edit,
+        // still-young pending decrypt) pins the receipt one row behind the
+        // head forever: the tool marks read at the newest rendered row and
+        // the quiet poll never advances (the rendered id never changes),
+        // while both our atHead check and Trixnity's notification clear need
+        // an exact head match (LP3 2026-09-06: "1 euro film - Rewrites"
+        // unread never cleared). Snap the receipt to the head in that case —
+        // nothing rendered sits above the marker, so no message is marked
+        // seen that the user could have read.
+        if (!atHead && headId != null && headNeverRenders(c, matrixRoomId, headId)) {
+            markerId = headId.full
+            atHead = true
+        }
+        // Ungated on purpose: one line per thread open, and the debugLog flag
+        // keeps being off exactly when this path needs debugging (LP3 2026-09-06).
+        android.util.Log.d(
+            TAG,
+            "markRead: room=$matrixRoomId at=$eventId head=${headId?.full} marker=$markerId atHead=$atHead",
+        )
         c.api.room.setReadMarkers(
             roomId = matrixRoomId,
-            fullyRead = EventId(eventId),
-            read = EventId(eventId),
+            fullyRead = EventId(markerId),
+            read = EventId(markerId),
         )
         // Opening the thread makes the room's notification moot.
         appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
@@ -6156,7 +6307,7 @@ object MatrixRepository {
             // used to leave the badge up long after the thread was opened. The
             // resolver keeps serving 0 until the echo confirms or a newer
             // event arrives ([servedUnread]).
-            pendingReadClear[roomId] = eventId to
+            pendingReadClear[roomId] = markerId to
                 (room?.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L)
             roomListCache[roomId]?.let { entry ->
                 if (entry.room.unreadCount > 0) {
@@ -6166,6 +6317,31 @@ object MatrixRepository {
                 }
             }
             markRoomListDirty()
+        }
+    }
+
+    /** True when the head event can never produce a rendered row (i.e.
+     *  [messageFrom] returns null for it however often it is fetched):
+     *  m.replace edits, blank-body re-import copies, and pending decryptions
+     *  still inside the no-flash skip window. Used by [markRead] to decide
+     *  whether the receipt may snap to the head (see the call site). */
+    private suspend fun headNeverRenders(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        headId: EventId,
+    ): Boolean {
+        val te = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getTimelineEvent(matrixRoomId, headId).firstOrNull()
+        } ?: return false
+        return when (val content = te.content?.getOrNull()) {
+            is RoomMessageEventContent.TextBased ->
+                stripForwardHeader(stripReplyQuote(content.body)).first.isBlank()
+            null ->
+                isReplaceEdit(te) ||
+                    (te.event.content is EncryptedMessageEventContent &&
+                        System.currentTimeMillis() - te.event.originTimestamp <=
+                        DECRYPT_PENDING_PLACEHOLDER_AFTER_MS)
+            else -> isReplaceEdit(te)
         }
     }
 
@@ -9450,15 +9626,22 @@ object MatrixRepository {
             // A genuinely undecryptable message renders as a single calm
             // placeholder (2026-08-19 feedback round — was "[Encrypted —
             // waiting for key…]" and "[Encrypted]" depending on the failure
-            // state; same meaning, one label). Only a real decrypt FAILURE
-            // shows it: an event whose decrypt is still pending (content
-            // unresolved, raw content still m.room.encrypted) returns null,
-            // so the thread skips the row and it appears once decrypted —
-            // new messages no longer flash "[Encrypted message]" for a poll
-            // (feedback 2026-08-20: "new messages come through as [encrypted
-            // message] and are decrypted shortly after").
+            // state; same meaning, one label).
+            // Two render paths: a real decrypt FAILURE shows it outright; a
+            // still-PENDING decrypt (content unresolved, raw content still
+            // m.room.encrypted) skips the row only while the event is young —
+            // new messages never flash the placeholder (feedback 2026-08-20).
+            // Past [DECRYPT_PENDING_PLACEHOLDER_AFTER_MS] pending means stuck:
+            // skipping the row froze older-page pagination and markRead behind
+            // the head (unread flag stuck — LP3 window 2026-09-06), so the
+            // placeholder renders and the row exists; a late-arriving key
+            // re-renders it as real content.
             te.content?.isFailure == true -> "[Encrypted message]"
-            else -> null
+            else ->
+                if (System.currentTimeMillis() - te.event.originTimestamp >
+                    DECRYPT_PENDING_PLACEHOLDER_AFTER_MS &&
+                    te.event.content is EncryptedMessageEventContent
+                ) "[Encrypted message]" else null
         }
     }
 
@@ -9586,6 +9769,19 @@ object MatrixRepository {
     private const val DECRYPT_WAIT_MS = 3_000L
     /** Peek budget for events after the first one failed to decrypt. */
     private const val QUICK_DECRYPT_WAIT_MS = 100L
+    /** Older than this at render time, a still-PENDING decrypt (content never
+     *  resolved) is stuck, not transient: the row renders as "[Encrypted
+     *  message]" instead of being skipped. Skipped rows freeze older-page
+     *  pagination (the fetch returns the window, no row can render, the next
+     *  scroll-up re-requests the same window) and park markRead behind the
+     *  head, so the room's unread flag never clears (LP3 window 2026-09-06).
+     *  Younger events keep the skip — live traffic never flashes the
+     *  placeholder (feedback 2026-08-20). */
+    private const val DECRYPT_PENDING_PLACEHOLDER_AFTER_MS = 60_000L
+    /** markRead cold-start race: retries while Trixnity's room view loads its
+     *  timeline (lastRelevantEventId null) before deciding the receipt. */
+    private const val HEAD_RESOLVE_RETRIES = 6
+    private const val HEAD_RESOLVE_RETRY_MS = 500L
     /** Quiet-guard reaction patch (see [patchReactionTags]): unresolved events
      *  API-resolved per pass, and the backoff after a pass that resolved none. */
     private const val REACTION_RESOLVE_MAX = 2
@@ -9642,6 +9838,8 @@ object MatrixRepository {
     private const val GAP_BACKFILL_LIMIT = 30L
     /** A fill must complete within this (the sync-aware retry can back off long). */
     private const val GAP_BACKFILL_BUDGET_MS = 8_000L
+    /** Wi-Fi fill budget — cold round-trips regularly exceed the cellular one. */
+    private const val GAP_BACKFILL_BUDGET_WIFI_MS = 20_000L
     /** After a failed/blocked fill, back off this long before retrying. */
     private const val GAP_BACKFILL_COOLDOWN_MS = 300_000L
     /** Delay before stopping the sync service after an expiry detection. */

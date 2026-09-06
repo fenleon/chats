@@ -1,6 +1,7 @@
 package com.lightphone.chats
 
 import com.thelightphone.sdk.callRemoteServiceMethod
+import android.util.Log
 import com.thelightphone.sdk.shared.LightResult
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.error
@@ -222,10 +223,13 @@ object ChatClient {
         ) is LightResult.Success
 
     suspend fun markRead(roomId: String, eventId: String) {
-        callRemoteServiceMethod(
+        val result = callRemoteServiceMethod(
             LightServiceMethod.MarkRead,
             LightServiceMethod.MarkRead.Request(roomId, eventId),
         )
+        if (result !is LightResult.Success) {
+            Log.d("ChatsDebug", "markRead: FAILED room=$roomId at=$eventId result=$result")
+        }
     }
 
     suspend fun setTyping(roomId: String, active: Boolean) {

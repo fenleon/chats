@@ -99,6 +99,7 @@ Ceiling note (`ponytail:`): if ingest is still > 5 s after 1–3, the next step 
 
 - Emulator (Synapse, seeded multi-room): Phase 0 timers show each hop's ms; Phase 1 ingest < 5 s; Phase 2 row appears < 5 s after server-side event, cold restart shows list without re-crawl.
 - LP3: one instrumented logcat window before/after Phase 1 (read-only capture, user drives install). Battery: one overnight after Phase 3 vs 08-20 control night.
+  **DONE 2026-09-06 (WORKLOG, `chats-audit-2026-09-06/phaseI-window-full.log`):** post-Phase-1 window on the 1284-room account — ingest sub-second, 0 round gaps > 35 s, sends 35–68 ms; the ~20 s model is gone. Hop-2/3 stage lines never emitted in-window (paths didn't trigger) — one targeted re-check outstanding. Felt problems in the window are decryption-state bugs (null-content skip / cooldown park / unanswered key requests / gap backfill), see WORKLOG for the ranked fix list.
 - Design review (`lightos-design` skill) only if any UI touch (Phase 2.3 doesn't change UI).
 - `tools/check-agents-size` at the end; WORKLOG entry per session.
 
