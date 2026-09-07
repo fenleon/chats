@@ -1859,15 +1859,15 @@ object MatrixRepository {
         val c = client ?: return com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response(
             verified = false, canVerify = false, detail = "not logged in",
         )
+        fun response(verified: Boolean, devices: Int) =
+            com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response(
+                verified = verified,
+                canVerify = devices > 0,
+                detail = if (verified) null else "not verified",
+            )
         val now = android.os.SystemClock.elapsedRealtime()
         e2eeStateCache?.let { (fetchedAt, verified, devices) ->
-            if (now - fetchedAt < E2EE_STATE_TTL_MS) {
-                return com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response(
-                    verified = verified,
-                    canVerify = devices > 0,
-                    detail = if (verified) null else "not verified",
-                )
-            }
+            if (now - fetchedAt < E2EE_STATE_TTL_MS) return response(verified, devices)
         }
         // Same policy as [isDeviceVerified]: a timed-out trust read must NOT
         // read as "unverified" — on the LP3 the first read after opening the
@@ -1884,11 +1884,7 @@ object MatrixRepository {
             c.api.device.getDevices().getOrNull()?.map { it.deviceId }?.filter { it != c.deviceId }?.size ?: 0
         }.getOrDefault(0)
         e2eeStateCache = Triple(now, verified, devices)
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response(
-            verified = verified,
-            canVerify = devices > 0,
-            detail = if (verified) null else "not verified",
-        )
+        return response(verified, devices)
     }
 
     /** Starts SAS verification with the account's other devices (their Beeper app responds). */
@@ -2279,7 +2275,7 @@ object MatrixRepository {
                     // nothing to load) — an all-decrypted room must not have its
                     // restore suppressed for the next 4h.
                     if (loaded == 0 && events.any { it.content?.isFailure == true }) {
-                        parkFutileRestore(roomId)
+                        decryptRestoreCooldown.park(roomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
                     }
                     roomsTouched++
                 }
@@ -2565,52 +2561,46 @@ object MatrixRepository {
         }
     }
 
-    /** Room → elapsed-realtime timestamp until which the futile key-backup
-     *  restore is suppressed. */
-    private val decryptRestoreCooldown = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** key → elapsed-realtime timestamp until which an action is suppressed
+     *  (park now, re-check later). ConcurrentHashMap-backed like the raw maps
+     *  it replaces. */
+    private class CooldownMap {
+        private val untilByKey = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
-    /** True while the room's key-backup restore is in the futile cooldown. */
-    private fun inDecryptRestoreCooldown(matrixRoomId: RoomId): Boolean {
-        val until = decryptRestoreCooldown[matrixRoomId.full] ?: return false
-        return android.os.SystemClock.elapsedRealtime() < until
+        fun park(key: String, durationMs: Long) {
+            untilByKey[key] = android.os.SystemClock.elapsedRealtime() + durationMs
+        }
+
+        /** True when the cooldown has elapsed (or was never parked). */
+        fun allowed(key: String): Boolean =
+            android.os.SystemClock.elapsedRealtime() >= (untilByKey[key] ?: 0L)
+
+        /** The parked retry timestamp, 0 when none is parked. */
+        fun until(key: String): Long = untilByKey[key] ?: 0L
+
+        fun remove(key: String) {
+            untilByKey.remove(key)
+        }
     }
 
-    /** Room → elapsed-realtime until which the quiet-room guard skips the
-     *  API-resolve attempts for still-unresolved reactions (battery: a key
-     *  that never arrives must not turn the 3 s guard into a decrypt loop —
-     *  see [patchReactionTags]). */
-    private val reactionResolveRetryAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
-
-    /** Parks a room whose key-backup restore found nothing to load: every retry
-     *  path (preview, ghost walk, page build, daily crawl) stops re-attempting
-     *  until the park expires. In-band sync decryption is unaffected, so a real
-     *  session arriving mid-park still decrypts events. (Battery
+    /** Suppresses the futile key-backup restore per room: every retry path
+     *  (preview, ghost walk, page build, daily crawl) stops re-attempting
+     *  until the park expires. In-band sync decryption is unaffected, so a
+     *  real session arriving mid-park still decrypts events. (Battery
      *  audit — the pre-verification history on this account never gets its
      *  sessions back, yet the retry paths re-ran doomed restores every 60-120 s,
      *  ~3 cores continuously.) */
-    private fun parkFutileRestore(matrixRoomId: RoomId) {
-        decryptRestoreCooldown[matrixRoomId.full] =
-            android.os.SystemClock.elapsedRealtime() + DECRYPT_RESTORE_COOLDOWN_MS
-    }
+    private val decryptRestoreCooldown = CooldownMap()
 
-    /** Room → elapsed-realtime until which a failed gap backfill is suppressed
-     *  (battery: a fill that errored (network, token) is retried at most once
-     *  per [GAP_BACKFILL_COOLDOWN_MS], and only while the room is active). */
-    private val gapBackfillCooldown = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** Suppresses the quiet-room guard's API-resolve attempts for
+     *  still-unresolved reactions (battery: a key that never arrives must not
+     *  turn the 3 s guard into a decrypt loop — see [patchReactionTags]). */
+    private val reactionResolveRetryAt = CooldownMap()
 
-    /** True when a gap backfill is allowed for this room: the user must be
-     *  looking at it (throttle — the fill is a network + store + decrypt cost)
-     *  and a previous failed fill's cooldown must have elapsed. */
-    private fun isGapBackfillAllowed(matrixRoomId: RoomId): Boolean {
-        if (activeRoomId != matrixRoomId.full) return false
-        val until = gapBackfillCooldown[matrixRoomId.full] ?: return true
-        return android.os.SystemClock.elapsedRealtime() >= until
-    }
-
-    private fun parkGapBackfill(matrixRoomId: RoomId) {
-        gapBackfillCooldown[matrixRoomId.full] =
-            android.os.SystemClock.elapsedRealtime() + GAP_BACKFILL_COOLDOWN_MS
-    }
+    /** Suppresses a failed gap backfill per room (battery: a fill that errored
+     *  (network, token) is retried at most once per [GAP_BACKFILL_COOLDOWN_MS],
+     *  and only while the room is active). */
+    private val gapBackfillCooldown = CooldownMap()
 
     /** Fills a room's timeline gap from the server (Trixnity's
      *  [de.connect2x.trixnity.client.room.TimelineEventHandler.unsafeFillTimelineGaps]
@@ -2653,7 +2643,7 @@ object MatrixRepository {
             )
         } ?: "timeout after ${budget / 1000}ms"
         if (failure.isNotEmpty()) {
-            parkGapBackfill(matrixRoomId)
+            gapBackfillCooldown.park(matrixRoomId.full, GAP_BACKFILL_COOLDOWN_MS)
             android.util.Log.d(
                 TAG,
                 "gap backfill failed for $matrixRoomId ($failure) — retrying in ${GAP_BACKFILL_COOLDOWN_MS / 1000}s",
@@ -2818,6 +2808,13 @@ object MatrixRepository {
     private var activeRoomRefreshJob: Job? = null
 
     /** Recomputes and re-stores a room's newest page in the background. */
+    /** Shared timeout config for the [MatrixClient.room.getTimelineEvent]
+     *  re-reads that nudge a decrypt to land. */
+    private val timelineEventConfig: GetTimelineEventConfig.() -> Unit = {
+        fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
+        decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
+    }
+
     private fun refreshMessagePage(roomId: String, limit: Int = THREAD_PAGE_SIZE) {
         // Battery: never pile up refreshes — a tick that
         // finds one already in flight is a no-op (the 2s ticker used to launch
@@ -2839,6 +2836,15 @@ object MatrixRepository {
                 // skipped the rebuild — the anni-room misorder stayed on the
                 // LP3 screen long after the page build was fixed.
                 val cached = messagePageCache[roomId]
+
+                fun publish(page: MessagesPage, limit: Int, advanceHead: Boolean) {
+                    messagePageCache[roomId] = MessagePageEntry(
+                        page, limit, android.os.SystemClock.elapsedRealtime(),
+                    )
+                    if (advanceHead) lastRefreshedEventId[roomId] = lastId
+                    saveMessagePageToDisk(roomId, page)
+                    bumpMessagePageRevision(roomId)
+                }
                 if (cached != null && cached.limit >= limit && lastRefreshedEventId[roomId] == lastId) {
                     // Read receipts are ephemeral — they never move the room's
                     // last TIMELINE event, so this quiet-room guard would freeze
@@ -2851,11 +2857,7 @@ object MatrixRepository {
                     // and disk stay untouched.
                     runCatching {
                         patchQuietPage(c, roomId, cached)?.let { updated ->
-                            messagePageCache[roomId] = MessagePageEntry(
-                                updated, cached.limit, android.os.SystemClock.elapsedRealtime(),
-                            )
-                            saveMessagePageToDisk(roomId, updated)
-                            bumpMessagePageRevision(roomId)
+                            publish(updated, cached.limit, advanceHead = false)
                         }
                     }
                     return@launch
@@ -2872,25 +2874,11 @@ object MatrixRepository {
                     runCatching { incrementMessagePage(c, roomId, prevId, lastId, cached) }.getOrNull()
                 } else null
                 if (updated != null) {
-                    messagePageCache[roomId] = MessagePageEntry(
-                        updated,
-                        cached!!.limit,
-                        android.os.SystemClock.elapsedRealtime(),
-                    )
-                    lastRefreshedEventId[roomId] = lastId
-                    saveMessagePageToDisk(roomId, updated)
-                    bumpMessagePageRevision(roomId)
+                    publish(updated, cached!!.limit, advanceHead = true)
                 } else {
                     runCatching {
                         val page = computeMessagesPage(roomId, null, limit)
-                        messagePageCache[roomId] = MessagePageEntry(
-                            page,
-                            limit,
-                            android.os.SystemClock.elapsedRealtime(),
-                        )
-                        lastRefreshedEventId[roomId] = lastId
-                        saveMessagePageToDisk(roomId, page)
-                        bumpMessagePageRevision(roomId)
+                        publish(page, limit, advanceHead = true)
                     }
                 }
             } finally {
@@ -3011,22 +2999,17 @@ object MatrixRepository {
         }
         val resolved = mutableListOf<TimelineEvent>()
         if (unresolved.isNotEmpty()) {
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now >= (reactionResolveRetryAt[roomId] ?: 0L)) {
-                val config: GetTimelineEventConfig.() -> Unit = {
-                    fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
-                    decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
-                }
+            if (reactionResolveRetryAt.allowed(roomId)) {
                 for (te in unresolved.take(REACTION_RESOLVE_MAX)) {
                     withTimeoutOrNull(DECRYPT_WAIT_MS) {
-                        c.room.getTimelineEvent(matrixRoomId, te.event.id, config)
+                        c.room.getTimelineEvent(matrixRoomId, te.event.id, timelineEventConfig)
                             .filterNotNull().firstOrNull { it.content?.getOrNull() != null }
                     }?.let { resolved.add(it) }
                 }
                 // A dry pass backs the resolve attempts off — the walk below
                 // still picks the tag up the moment sync lands the key and the
                 // store row resolves on its own.
-                if (resolved.isEmpty()) reactionResolveRetryAt[roomId] = now + REACTION_RESOLVE_RETRY_MS
+                if (resolved.isEmpty()) reactionResolveRetryAt.park(roomId, REACTION_RESOLVE_RETRY_MS)
                 else reactionResolveRetryAt.remove(roomId)
             }
         }
@@ -3456,7 +3439,9 @@ object MatrixRepository {
         // instant. A gap on the room's newest event (the walk's head) is
         // skipped: the next sync naturally picks up those events, and
         // Trixnity's fill no-ops it anyway.
-        if (!fast && isGapBackfillAllowed(matrixRoomId)) {
+        // Active room only (throttle — the fill is a network + store + decrypt
+        // cost) and a previous failed fill's cooldown must have elapsed.
+        if (!fast && activeRoomId == matrixRoomId.full && gapBackfillCooldown.allowed(matrixRoomId.full)) {
             val head = events.firstOrNull()
             val gapEvent = events.firstOrNull { it.gap != null && it !== head }
             if (gapEvent != null) {
@@ -3495,18 +3480,13 @@ object MatrixRepository {
                 // nothing to load, back off for a cooldown — the normal sync path
                 // decrypts in-band the moment real sessions do arrive.
                 val roomKey = matrixRoomId.full
-                val cooldownUntil = decryptRestoreCooldown[roomKey]
-                if (cooldownUntil == null || android.os.SystemClock.elapsedRealtime() >= cooldownUntil) {
+                if (decryptRestoreCooldown.allowed(roomKey)) {
                     val loaded = restoreRoomSessions(c, matrixRoomId, undecrypted)
-                    if (loaded == 0) parkFutileRestore(matrixRoomId)
-                    val config: GetTimelineEventConfig.() -> Unit = {
-                        fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
-                        decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
-                    }
+                    if (loaded == 0) decryptRestoreCooldown.park(roomKey, DECRYPT_RESTORE_COOLDOWN_MS)
                     val resolved = HashMap<String, TimelineEvent>()
                     undecrypted.forEach { te ->
                         withTimeoutOrNull(DECRYPT_WAIT_MS) {
-                            c.room.getTimelineEvent(matrixRoomId, te.event.id, config).firstOrNull()
+                            c.room.getTimelineEvent(matrixRoomId, te.event.id, timelineEventConfig).firstOrNull()
                                 ?.takeIf { it.content?.getOrNull() != null }
                         }?.let { resolved[te.event.id.full] = it }
                     }
@@ -3626,12 +3606,8 @@ object MatrixRepository {
     ): TimelineEvent? {
         val echo = events.firstOrNull { txnIdOf(it) == txnId } ?: return null
         if (echo.content?.getOrNull() != null) return echo
-        val config: GetTimelineEventConfig.() -> Unit = {
-            fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
-            decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
-        }
         return withTimeoutOrNull(DECRYPT_WAIT_MS) {
-            c.room.getTimelineEvent(matrixRoomId, echo.event.id, config)
+            c.room.getTimelineEvent(matrixRoomId, echo.event.id, timelineEventConfig)
                 .filterNotNull().firstOrNull { it.content?.getOrNull() != null }
         }
     }
@@ -3828,7 +3804,7 @@ object MatrixRepository {
                 // as the page-build path, so opening a doomed room doesn't re-seed
                 // a restore on every read.
                 if (restoreRoomSessions(c, matrixRoomId, seed) == 0) {
-                    parkFutileRestore(matrixRoomId)
+                    decryptRestoreCooldown.park(matrixRoomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
                 }
             }
         }
@@ -3846,7 +3822,7 @@ object MatrixRepository {
         // the restore cooldown they can't succeed — skip them (battery audit);
         // the fast first-page path skips them too (the background refresh
         // re-reads with full decrypt handling).
-        if (!fast && !inDecryptRestoreCooldown(matrixRoomId)) {
+        if (!fast && decryptRestoreCooldown.allowed(matrixRoomId.full)) {
             repeat(DECRYPT_RETRIES) {
                 val stillEncrypted = events.any { it.content?.isFailure == true }
                 if (!stillEncrypted) return@repeat
@@ -4301,6 +4277,14 @@ object MatrixRepository {
      *  its own stale map. */
     private val reactionCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Map<String, List<String>>>>()
 
+    /** Value in a room-keyed TTL cache ([key] → fetchedAt elapsedRealtime to
+     *  value) when its fetch is within [ttlMs] of [now], else null. */
+    private fun <V> java.util.concurrent.ConcurrentHashMap<String, Pair<Long, V>>.fresh(
+        key: String,
+        ttlMs: Long,
+        now: Long,
+    ): V? = this[key]?.takeIf { (fetchedAt, _) -> now - fetchedAt < ttlMs }?.second
+
     /** [sendStatusByEventId] with a per-room TTL cache — statuses must reach
      *  messages on ANY page (the FAIL marker disappearing once a message
      *  scrolled past the newest page read as "sent but not delivered"),
@@ -4311,9 +4295,7 @@ object MatrixRepository {
     ): Map<String, String> {
         val key = matrixRoomId.full
         val now = android.os.SystemClock.elapsedRealtime()
-        sendStatusCache[key]?.let { (fetchedAt, map) ->
-            if (now - fetchedAt < SEND_STATUS_CACHE_TTL_MS) return map
-        }
+        sendStatusCache.fresh(key, SEND_STATUS_CACHE_TTL_MS, now)?.let { return it }
         val map = sendStatusByEventId(c, matrixRoomId)
         sendStatusCache[key] = now to map
         return map
@@ -4410,9 +4392,7 @@ object MatrixRepository {
     ): Map<String, List<String>> {
         val key = matrixRoomId.full
         val now = android.os.SystemClock.elapsedRealtime()
-        reactionCache[key]?.let { (fetchedAt, map) ->
-            if (now - fetchedAt < SEND_STATUS_CACHE_TTL_MS) return map
-        }
+        reactionCache.fresh(key, SEND_STATUS_CACHE_TTL_MS, now)?.let { return it }
         val map = reactionLabelsByEvent(c, matrixRoomId)
         if (map == null) {
             // Head read timed out — stale tags beat no tags (they self-heal on
@@ -4748,7 +4728,7 @@ object MatrixRepository {
             android.util.Log.d(TAG, "restoreRoomSessions: $matrixRoomId — all ${sessionIds.size} session(s) local, re-decrypted $resolvedLocal event(s), no backup needed")
             return resolvedLocal
         }
-        if (inDecryptRestoreCooldown(matrixRoomId)) return resolvedLocal
+        if (decryptRestoreCooldown.allowed(matrixRoomId.full)) return resolvedLocal
         backupSessionIds.forEach { sessionId ->
             try {
                 val ok = withTimeoutOrNull(KEY_BACKUP_LOAD_TIMEOUT_MS) {
@@ -5598,31 +5578,24 @@ object MatrixRepository {
             if (current != null && current !== c) c = current
         }
         val matrixRoomId = RoomId(roomId)
-        val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-            var event: TimelineEvent? = null
-            repeat(MEDIA_CONTENT_RETRIES) {
-                event = c.room.getTimelineEvent(matrixRoomId, EventId(eventId)).firstOrNull()
-                if (event?.content?.getOrNull() != null) return@withTimeoutOrNull event
-                // An older note's megolm session is often not in the local
-                // store (sessions load lazily per room, mostly via getMessages)
-                // — the content stays encrypted and the note silently "doesn't
-                // play". Pull the session from the key
-                // backup, then re-read so decryption can land. Retried on every
-                // iteration (unless parked): a session the backup index hadn't
-                // caught up with on the first try may be there a moment later.
-                // EXPLICIT play bypasses the futile-restore park: a
-                // freshly-arrived note whose session isn't cached yet would
-                // otherwise be unrecoverable for 4h. Parking
-                // still fires on failure, so repeated taps on a genuinely
-                // undecryptable note keep backing off (other paths honor it).
-                if (event?.content?.isFailure == true) {
-                    if (restoreRoomSessions(c, matrixRoomId, listOf(event)) == 0) {
-                        parkFutileRestore(matrixRoomId)
-                    }
+        val te = resolvedTimelineEvent(c, matrixRoomId, eventId) { event ->
+            // An older note's megolm session is often not in the local
+            // store (sessions load lazily per room, mostly via getMessages)
+            // — the content stays encrypted and the note silently "doesn't
+            // play". Pull the session from the key
+            // backup, then re-read so decryption can land. Retried on every
+            // iteration (unless parked): a session the backup index hadn't
+            // caught up with on the first try may be there a moment later.
+            // EXPLICIT play bypasses the futile-restore park: a
+            // freshly-arrived note whose session isn't cached yet would
+            // otherwise be unrecoverable for 4h. Parking
+            // still fires on failure, so repeated taps on a genuinely
+            // undecryptable note keep backing off (other paths honor it).
+            if (event?.content?.isFailure == true) {
+                if (restoreRoomSessions(c, matrixRoomId, listOf(event)) == 0) {
+                    decryptRestoreCooldown.park(matrixRoomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
                 }
-                delay(MEDIA_CONTENT_RETRY_DELAY_MS)
             }
-            event
         }
         val content = te?.content?.getOrNull()
         if (content == null && te?.content?.isFailure == true) {
@@ -5848,14 +5821,7 @@ object MatrixRepository {
      * calls [stopAudioPlayback]).
      */
     private fun releaseFinishedPlayback() {
-        playingAudioEventId = null
-        pausedAudioEventId = null
-        playingAudioRoomId = null
-        runCatching { audioPlayer?.stop() }
-        runCatching { audioPlayer?.release() }
-        audioPlayer = null
-        audioPlayerFile?.delete()
-        audioPlayerFile = null
+        stopAudioPlayback(releaseFocus = false)
     }
 
     /**
@@ -5949,8 +5915,10 @@ object MatrixRepository {
         return out
     }
 
-    /** Stops any in-flight voice-note playback and clears its state. */
-    private fun stopAudioPlayback() {
+    /** Stops any in-flight voice-note playback and clears its state. The audio
+     *  focus is kept when [releaseFocus] is false (natural completion — see
+     *  [releaseFinishedPlayback]). */
+    private fun stopAudioPlayback(releaseFocus: Boolean = true) {
         playingAudioEventId = null
         pausedAudioEventId = null
         playingAudioRoomId = null
@@ -5959,6 +5927,7 @@ object MatrixRepository {
         audioPlayer = null
         audioPlayerFile?.delete()
         audioPlayerFile = null
+        if (!releaseFocus) return
         audioFocusRequest?.let { focus ->
             runCatching {
                 (appContext?.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager)
@@ -6294,6 +6263,29 @@ object MatrixRepository {
     }
 
     /**
+     * Re-reads an event until its content resolves (the decrypt is async on
+     * encrypted rooms — the first read can lag) or [MEDIA_CONTENT_RETRIES]
+     * attempts pass, bounded by [MEDIA_BUDGET_MS]. [onStillEncrypted] runs per
+     * unresolved attempt (playback uses it to pull the megolm session from the
+     * key backup); the last (possibly unresolved) event is returned.
+     */
+    private suspend fun resolvedTimelineEvent(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        eventId: String,
+        onStillEncrypted: suspend (TimelineEvent?) -> Unit = {},
+    ): TimelineEvent? = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+        var event: TimelineEvent? = null
+        repeat(MEDIA_CONTENT_RETRIES) {
+            event = c.room.getTimelineEvent(matrixRoomId, EventId(eventId)).firstOrNull()
+            if (event?.content?.getOrNull() != null) return@withTimeoutOrNull event
+            onStillEncrypted(event)
+            delay(MEDIA_CONTENT_RETRY_DELAY_MS)
+        }
+        event
+    }
+
+    /**
      * Display-ready JPEG for an image message: reads the event from the store,
      * downloads its media (decrypting when the room is encrypted — the
      * timeline content carries the EncryptedFile), compresses to a
@@ -6324,15 +6316,7 @@ object MatrixRepository {
         // The event's content can lag its first read on encrypted rooms (the
         // decrypt is async) — re-read a few times before giving up, or the row
         // stays on its text fallback even though the media exists.
-        val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-            var event: TimelineEvent? = null
-            repeat(MEDIA_CONTENT_RETRIES) {
-                event = c.room.getTimelineEvent(matrixRoomId, EventId(eventId)).firstOrNull()
-                if (event?.content?.getOrNull() != null) return@withTimeoutOrNull event
-                delay(MEDIA_CONTENT_RETRY_DELAY_MS)
-            }
-            event
-        }
+        val te = resolvedTimelineEvent(c, matrixRoomId, eventId)
         val content = when (val raw = te?.content?.getOrNull()) {
             // Beeper's RCS bridge sends direct photos as m.file with an image/*
             // mimetype instead of m.image — accept both,
@@ -6394,15 +6378,7 @@ object MatrixRepository {
         if (eventId.startsWith(LOCAL_PENDING_ID_PREFIX)) return false
         val ctx = appContext ?: return false
         val matrixRoomId = RoomId(roomId)
-        val te = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-            var event: TimelineEvent? = null
-            repeat(MEDIA_CONTENT_RETRIES) {
-                event = c.room.getTimelineEvent(matrixRoomId, EventId(eventId)).firstOrNull()
-                if (event?.content?.getOrNull() != null) return@withTimeoutOrNull event
-                delay(MEDIA_CONTENT_RETRY_DELAY_MS)
-            }
-            event
-        }
+        val te = resolvedTimelineEvent(c, matrixRoomId, eventId)
         val content = when (val raw = te?.content?.getOrNull()) {
             is RoomMessageEventContent.FileBased.Image -> raw
             is RoomMessageEventContent.FileBased.File ->
@@ -9072,14 +9048,15 @@ object MatrixRepository {
         // background with a session restore (the copies' originals are old
         // messages whose keys load from the backup — slow, so not on the
         // resolver's critical path). Keep the server's values until it lands.
-        if (inDecryptRestoreCooldown(matrixRoomId)) {
+        if (decryptRestoreCooldown.allowed(matrixRoomId.full)) {
             // Parked room (futile restore): a ghost walk can't resolve it
             // either — the originals' sessions are gone, so the dedup can't
             // identify the real event. Retry at the park's end, not in 2
             // minutes.
             effectiveLastCache[key] = EffectiveLast(
                 serverLastId, prev?.effectiveEventId ?: serverLastId, prev?.effectiveTs ?: serverTs,
-                retryAtMs = decryptRestoreCooldown[key] ?: (now + GHOST_WALK_RETRY_MS),
+                retryAtMs = decryptRestoreCooldown.until(key).takeIf { it > 0L }
+                    ?: (now + GHOST_WALK_RETRY_MS),
             )
             return (prev?.effectiveEventId ?: serverLastId) to (prev?.effectiveTs ?: serverTs)
         }
@@ -9209,8 +9186,8 @@ object MatrixRepository {
             // room's state change re-resolves this preview fresh. Park the
             // room instead of re-attempting every 60 s forever; the park also
             // lets the resolver's pass loop idle (no pending work to wake for).
-            parkFutileRestore(roomId)
-            return Triple("", false, decryptRestoreCooldown[roomId.full] ?: 0L)
+            decryptRestoreCooldown.park(roomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
+            return Triple("", false, decryptRestoreCooldown.until(roomId.full))
         }
         val text = previewText(te) ?: ""
         val encrypted = text.startsWith("[Encrypted")
@@ -9232,8 +9209,8 @@ object MatrixRepository {
             preview,
             !encrypted,
             if (encrypted) {
-                parkFutileRestore(roomId)
-                decryptRestoreCooldown[roomId.full] ?: 0L
+                decryptRestoreCooldown.park(roomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
+                decryptRestoreCooldown.until(roomId.full)
             } else 0L,
         )
     }
