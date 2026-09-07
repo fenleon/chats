@@ -25,9 +25,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -56,7 +54,6 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
-import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -683,8 +680,7 @@ private fun RoomRow(
 ) {
     val currentOnOpen by rememberUpdatedState(onOpen)
     val currentOnLongPress by rememberUpdatedState(onLongPress)
-    val haptic = LocalHapticFeedback.current
-    val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
+    val buzz = rememberHapticBuzz()
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -697,15 +693,11 @@ private fun RoomRow(
             .pointerInput(Unit) {
                 detectTapGestures(
                     onTap = {
-                        if (currentHapticsEnabled) {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        }
+                        buzz()
                         currentOnOpen()
                     },
                     onLongPress = {
-                        if (currentHapticsEnabled) {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        }
+                        buzz()
                         currentOnLongPress()
                     },
                 )

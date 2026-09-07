@@ -21,7 +21,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.roomMatchesQuery
-import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -91,17 +90,11 @@ class SearchViewModel(
 
     /** The live census (NO-SEAM — the revision-wait poll is
      *  gone): the repository's roomList flow fills and keeps the results
-     *  current while the screen is open. The trimmed row shape matches the
-     *  old GetAllRooms reply (no preview/unread on search rows). */
+     *  current while the screen is open (see [collectRoomCensus]; no
+     *  preview/unread on search rows). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
-        pollJob = viewModelScope.launch {
-            MatrixRepository.roomList.collect { census ->
-                census.map { it.copy(lastMessage = "", unreadCount = 0, lastEventId = null) }
-                    .takeIf { it.isNotEmpty() || rooms.value.isEmpty() }
-                    ?.let { rooms.value = it }
-            }
-        }
+        pollJob = collectRoomCensus(viewModelScope, rooms)
     }
 
     private fun stopPolling() {

@@ -158,13 +158,11 @@ class ServerBootstrapProvider : ContentProvider() {
         }
         val md = MessageDigest.getInstance("SHA-256")
         val matches = signers.any { sig ->
-            md.digest(sig.toByteArray()).toHexString()
+            md.digest(sig.toByteArray()).toHexString(HexFormat { upperCase = true })
                 .equals(LIGHTSDK_DEV_CERT_SHA256, ignoreCase = true)
         }
         return if (matches) ClientCertType.LightSdkSignedUnverified else ClientCertType.Unknown
     }
-
-    private fun ByteArray.toHexString(): String = joinToString("") { "%02X".format(it) }
 
     // The provider exists for its onCreate only; no content is served.
     override fun query(

@@ -22,7 +22,6 @@ import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.roomMatchesQuery
-import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -100,18 +99,10 @@ class ContactsViewModel(
 
     /** The live census (NO-SEAM — the revision-wait poll is
      *  gone): the repository's roomList flow fills and keeps the panel
-     *  current while it is open. The trimmed row shape matches the old
-     *  GetAllRooms reply; an empty census never wipes the first frame's
-     *  seed (or an already-loaded list) during a cold start. */
+     *  current while it is open (see [collectRoomCensus]). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
-        pollJob = viewModelScope.launch {
-            MatrixRepository.roomList.collect { census ->
-                census.map { it.copy(lastMessage = "", unreadCount = 0, lastEventId = null) }
-                    .takeIf { it.isNotEmpty() || rooms.value.isEmpty() }
-                    ?.let { rooms.value = it }
-            }
-        }
+        pollJob = collectRoomCensus(viewModelScope, rooms)
     }
 
     private fun stopPolling() {

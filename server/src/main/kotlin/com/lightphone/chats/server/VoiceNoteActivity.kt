@@ -441,6 +441,17 @@ class VoiceNoteActivity : ComponentActivity() {
     /** Transient media focus while recording — background audio pauses. */
     private fun recordFocus() {
         if (recordFocusRequest != null) return
+        recordFocusRequest = requestTransientSpeechFocus()
+    }
+
+    private fun abandonRecordFocus() {
+        abandonFocus(recordFocusRequest)
+        recordFocusRequest = null
+    }
+
+    /** Builds + requests transient media focus with speech content (the shared
+     *  shape of the recorder and pre-send-preview blocks). */
+    private fun requestTransientSpeechFocus(): android.media.AudioFocusRequest {
         val request = android.media.AudioFocusRequest.Builder(
             android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
         )
@@ -455,16 +466,14 @@ class VoiceNoteActivity : ComponentActivity() {
             (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
                 .requestAudioFocus(request)
         }
-        recordFocusRequest = request
+        return request
     }
 
-    private fun abandonRecordFocus() {
-        recordFocusRequest?.let { request ->
-            runCatching {
-                (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
-                    .abandonAudioFocusRequest(request)
-            }
-            recordFocusRequest = null
+    private fun abandonFocus(request: android.media.AudioFocusRequest?) {
+        request ?: return
+        runCatching {
+            (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
+                .abandonAudioFocusRequest(request)
         }
     }
 
@@ -472,31 +481,12 @@ class VoiceNoteActivity : ComponentActivity() {
      *  as [recordFocus] — feedback 2026-08-21). */
     private fun previewFocus() {
         if (previewFocusRequest != null) return
-        val request = android.media.AudioFocusRequest.Builder(
-            android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
-        )
-            .setAudioAttributes(
-                android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build(),
-            )
-            .build()
-        runCatching {
-            (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
-                .requestAudioFocus(request)
-        }
-        previewFocusRequest = request
+        previewFocusRequest = requestTransientSpeechFocus()
     }
 
     private fun abandonPreviewFocus() {
-        previewFocusRequest?.let { request ->
-            runCatching {
-                (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
-                    .abandonAudioFocusRequest(request)
-            }
-            previewFocusRequest = null
-        }
+        abandonFocus(previewFocusRequest)
+        previewFocusRequest = null
     }
 
     /** Stops + releases the recorder (idempotent). */

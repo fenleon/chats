@@ -36,9 +36,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -73,7 +71,6 @@ import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
-import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import com.thelightphone.sdk.ui.scaledForScreenHeight
@@ -769,9 +766,7 @@ class ThreadViewModel(
             val (playing, error) = ChatClient.playVoiceNote(room.id, eventId)
             playingEventId.value = if (playing) eventId else null
             if (!playing && error != null) {
-                voiceError.value = eventId to error
-                delay(VOICE_ERROR_DISMISS_MS)
-                if (voiceError.value?.first == eventId) voiceError.value = null
+                showRowError(voiceError, eventId, error)
             }
         }
     }
@@ -835,11 +830,23 @@ class ThreadViewModel(
             }
             if (!ok) {
                 revertReactionOverlay(message.id, key)
-                reactionError.value = message.id to "reaction failed"
-                delay(VOICE_ERROR_DISMISS_MS)
-                if (reactionError.value?.first == message.id) reactionError.value = null
+                showRowError(reactionError, message.id, "reaction failed")
             }
         }
+    }
+
+    /**
+     * Surfaces the quiet row error tag on [slot] and clears it after the
+     * dismiss delay — unless a newer error replaced it first.
+     */
+    private suspend fun showRowError(
+        slot: MutableStateFlow<Pair<String, String>?>,
+        eventId: String,
+        text: String,
+    ) {
+        slot.value = eventId to text
+        delay(VOICE_ERROR_DISMISS_MS)
+        if (slot.value?.first == eventId) slot.value = null
     }
 
     /** Rolls back one key's optimistic overlay entry after a failed RPC. */
@@ -884,9 +891,7 @@ class ThreadViewModel(
                 // Only the new key reverts — the old keys' removal entries
                 // self-heal when a served page reflects them.
                 revertReactionOverlay(message.id, key)
-                reactionError.value = message.id to "reaction failed"
-                delay(VOICE_ERROR_DISMISS_MS)
-                if (reactionError.value?.first == message.id) reactionError.value = null
+                showRowError(reactionError, message.id, "reaction failed")
             }
         }
     }
@@ -911,9 +916,7 @@ class ThreadViewModel(
             }
             if (!ok) {
                 own.forEach { revertReactionOverlay(message.id, it) }
-                reactionError.value = message.id to "reaction failed"
-                delay(VOICE_ERROR_DISMISS_MS)
-                if (reactionError.value?.first == message.id) reactionError.value = null
+                showRowError(reactionError, message.id, "reaction failed")
             }
         }
     }
@@ -966,9 +969,7 @@ class ThreadViewModel(
             val ok = ChatClient.unsendMessage(room.id, message.id)
             if (!ok) {
                 unsentOverlays.value = unsentOverlays.value - message.id
-                reactionError.value = message.id to "unsend failed"
-                delay(VOICE_ERROR_DISMISS_MS)
-                if (reactionError.value?.first == message.id) reactionError.value = null
+                showRowError(reactionError, message.id, "unsend failed")
             }
         }
     }
@@ -1487,8 +1488,7 @@ class ThreadScreen(
                         // Tap-away dismiss buzzes like every other panel
                         // dismissal, gated by the
                         // same LocalHapticsEnabled the rows read.
-                        val scrimHaptic = LocalHapticFeedback.current
-                        val scrimHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
+                        val scrimBuzz = rememberHapticBuzz()
                         Box(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
@@ -1497,9 +1497,7 @@ class ThreadScreen(
                                 .padding(top = 3f.gridUnitsAsDp())
                                 .pointerInput(Unit) {
                                     detectTapGestures(onTap = {
-                                        if (scrimHapticsEnabled) {
-                                            scrimHaptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        }
+                                        scrimBuzz()
                                         contextMessage = null
                                     })
                                 },
@@ -1994,9 +1992,8 @@ private fun MessageRow(
                         // the same LocalHapticsEnabled the SDK's lightClickable
                         // reads; the SDK's context-based haptic helper is
                         // plugin-banned in tool code, so this goes through
-                        // Compose's haptic API instead.
-                        val haptic = LocalHapticFeedback.current
-                        val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
+                        // Compose's haptic API instead (see [rememberHapticBuzz]).
+                        val buzz = rememberHapticBuzz()
                         Modifier
                             .pointerInput(message.id) {
                                 val doubleTapMs = viewConfiguration.doubleTapTimeoutMillis
@@ -2005,13 +2002,7 @@ private fun MessageRow(
                                     // The like guards isMine itself (own rows never
                                     // react) — one gesture block serves both sides.
                                     onTap = {
-                                        if (currentHapticsEnabled) {
-                                            // LongPress-type buzz (the app's
-                                            // standard click feel) — the old
-                                            // TextHandleMove tick was
-                                            // imperceptible on the LP3.
-                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        }
+                                        buzz()
                                         val now = System.currentTimeMillis()
                                         if (now - lastTapMs < doubleTapMs) {
                                             lastTapMs = 0L
@@ -2021,9 +2012,7 @@ private fun MessageRow(
                                         }
                                     },
                                     onLongPress = {
-                                        if (currentHapticsEnabled) {
-                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        }
+                                        buzz()
                                         onOpenContext(gestureMessage)
                                     },
                                 )
@@ -2323,8 +2312,7 @@ private fun ImageMessageContent(
     // so without this the captured lambdas kept the first-composed snapshot.
     val currentOnOpenImage by rememberUpdatedState(onOpenImage)
     val currentOnOpenContext by rememberUpdatedState(onOpenContext)
-    val haptic = LocalHapticFeedback.current
-    val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
+    val buzz = rememberHapticBuzz()
     if (bytes == null || image == null) {
         // Still loading, or the media can't be fetched/decoded (e.g.
         // still-encrypted): fall back to the row text ("[Photo]" or the file
@@ -2369,9 +2357,7 @@ private fun ImageMessageContent(
                     onTap = { currentOnOpenImage(bytes) },
                     // A long-press consumes the gesture — no viewer open.
                     onLongPress = {
-                        if (currentHapticsEnabled) {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        }
+                        buzz()
                         currentOnOpenContext?.invoke()
                     },
                 )
@@ -2441,8 +2427,7 @@ private fun AudioMessageContent(
     }
     val currentOnTogglePlay by rememberUpdatedState(onTogglePlay)
     val currentOnOpenContext by rememberUpdatedState(onOpenContext)
-    val haptic = LocalHapticFeedback.current
-    val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
+    val buzz = rememberHapticBuzz()
     Row(
         modifier = Modifier
             // Tap toggles playback; long-press opens the context window — detectTapGestures consumes the long-press
@@ -2453,9 +2438,7 @@ private fun AudioMessageContent(
                 detectTapGestures(
                     onTap = { currentOnTogglePlay() },
                     onLongPress = {
-                        if (currentHapticsEnabled) {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        }
+                        buzz()
                         currentOnOpenContext?.invoke()
                     },
                 )
