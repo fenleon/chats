@@ -42,14 +42,13 @@ import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 /**
  * Tool settings: the account panel (login setup + verification) lives behind
- * the Account row, the sync toggle pauses the companion's loop, and toggles
- * control the "seen" marker + data-saver media downloads. The
+ * the Account row, Battery Saver turns off background notifications, and
+ * toggles control the "seen" marker + data-saver media downloads. The
  * status-heavy content — account state, sync progress, encryption — moved to
  * [AccountScreen].
  */
@@ -57,9 +56,6 @@ class SettingsViewModel : LightViewModel<Unit>() {
 
     val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
     val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
-
-    /** True between the user turning sync on and the companion reporting "syncing". */
-    val startingSync = MutableStateFlow(false)
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
@@ -72,37 +68,13 @@ class SettingsViewModel : LightViewModel<Unit>() {
         viewModelScope.launch {
             account.value = ChatClient.accountState()
             connection.value = ChatClient.connectionState()
-            if (connection.value?.state == "syncing") startingSync.value = false
         }
     }
 
-    /** Toggles the companion's sync loop (audit 2026-08-14 — battery escape hatch). */
+    /** Toggles Battery Saver on the companion (audit 2026-08-14 — battery
+     *  escape hatch; semantics 2026-09-07: stops background sync only). */
     fun setSyncEnabled(value: Boolean) {
         viewModelScope.launch {
-            if (value && connection.value?.syncEnabled != true) {
-                startingSync.value = true
-                // Safety net: clear even if "syncing" never arrives (offline…).
-                launch {
-                    delay(STARTING_SYNC_TIMEOUT_MS)
-                    startingSync.value = false
-                }
-                // Wake half: the companion bumps the status revision the instant
-                // the connection state commits — clear the starting state as
-                // soon as "syncing" lands instead of riding out the window.
-                launch {
-                    var last = 0L
-                    while (startingSync.value) {
-                        val revision = ChatClient.waitForStatusChange(last)
-                        if (revision == last) break
-                        last = revision
-                        connection.value = ChatClient.connectionState()
-                        if (connection.value?.state == "syncing") {
-                            startingSync.value = false
-                            break
-                        }
-                    }
-                }
-            }
             ChatClient.setSyncEnabled(value)
             refresh()
         }
@@ -121,10 +93,6 @@ class SettingsViewModel : LightViewModel<Unit>() {
             ChatSettings.setDownloadOverMobile(lightContext, value)
         }
     }
-
-    private companion object {
-        const val STARTING_SYNC_TIMEOUT_MS = 10_000L
-    }
 }
 
 class SettingsScreen(sealedActivity: SealedLightActivity) :
@@ -139,7 +107,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
     override fun Content() {
         val account by viewModel.account.collectAsState()
         val connection by viewModel.connection.collectAsState()
-        val startingSync by viewModel.startingSync.collectAsState()
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
@@ -175,25 +142,23 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                 } ?: "…",
                                 onClick = { navigateTo(screenFactory = { AccountScreen(it) }) },
                             )
+                            // Battery Saver: on = no sync while the screen is
+                            // dark; messages arrive whenever the screen is on.
                             val syncEnabled = connection?.syncEnabled ?: true
-                            ToggleRow(
-                                checked = syncEnabled,
-                                title = "Background Sync",
-                                subtitle = when {
-                                    !syncEnabled -> "Paused"
-                                    startingSync -> "Initializing..."
-                                    else -> "Syncing"
-                                },
-                                onToggle = {
-                                    viewModel.setSyncEnabled(!syncEnabled)
-                                },
-                            )
                             ToggleRow(
                                 checked = showReadStatus,
                                 title = "Seen Status",
                                 subtitle = "visible under your messages",
                                 onToggle = {
                                     viewModel.setShowReadStatus(lightContext, !showReadStatus)
+                                },
+                            )
+                            ToggleRow(
+                                checked = !syncEnabled,
+                                title = "Battery Saver",
+                                subtitle = "Pause background notifications",
+                                onToggle = {
+                                    viewModel.setSyncEnabled(!syncEnabled)
                                 },
                             )
                             ToggleRow(

@@ -60,18 +60,14 @@ private val REACTION_ROWS = listOf(
  * half of the screen for the long-pressed message — the Phone tool's overlay
  * panel presentation (measured from the LP3, 1080x1240 @ 480 dpi). Top level
  * stacks the action rows; REACT / EDIT REACTION open the 3x8 emoji grid; a
- * tap sets that reaction. Every completing action dismisses the panel —
- * except SAVE, whose dismissal waits for the confirmation (the caller clears
- * the target when the fullscreen confirm lands, so the panel never vanishes
- * before it). The
+ * tap sets that reaction. Every completing action dismisses the panel. The
  * wide thin chevron at the very bottom center dismisses (any level).
  * One own reaction at a time (replace semantics) on a RECEIVED message: no
  * own reaction shows LIKE + REACT; an existing one shows EDIT
  * REACTION + REMOVE REACTION. Own messages show
  * EDIT / UNSEND instead — each only when the row still allows it
  * ([LightServiceMethod.GetMessages.Message.canEdit] / `canUnsend`, the
- * bridge's capability gate). Image rows add SAVE
- * — the fullscreen viewer's save flow — on the received paths.
+ * bridge's capability gate).
  * Raw black/white + fixed sizes are deliberate: this replicates a system
  * overlay panel (see [com.lightphone.chats.VolumePanelOverlay]), not themed
  * app UI. The panel covers the bottom bar while open — the Phone tool's does
@@ -86,8 +82,6 @@ fun ContextWindowOverlay(
     onRemoveReaction: () -> Unit,
     onEdit: () -> Unit,
     onUnsend: () -> Unit,
-    /** Non-null on image rows: the SAVE row (the viewer's save flow). */
-    onSave: (() -> Unit)? = null,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -134,18 +128,10 @@ fun ContextWindowOverlay(
                     ownReaction == null -> buildList {
                         add("LIKE" to { onLike(); onDismiss() })
                         add("REACT" to { level = ContextLevel.Reactions })
-                        // Image rows carry SAVE. The
-                        // panel does NOT dismiss here — it stays up until the
-                        // save confirmation appears (the caller clears the
-                        // target then), so the confirm never chases a vanished
-                        // panel.
-                        onSave?.let { save -> add("SAVE" to { save() }) }
                     }
                     else -> buildList {
                         add("EDIT REACTION" to { level = ContextLevel.Reactions })
                         add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
-                        // Same deferred dismissal as the no-reaction SAVE row.
-                        onSave?.let { save -> add("SAVE" to { save() }) }
                     }
                 }
                 Column(

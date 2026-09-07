@@ -1163,15 +1163,15 @@ private const val LIKE_KEY = "❤️"
 
 /**
  * How the server tags the user's own reactions — the overlay strings must
- * match the served format exactly ("You reacted with $key").
+ * match the served format exactly ("You reacted $key").
  */
-private const val OWN_REACTION_TAG_PREFIX = "You reacted with "
+private const val OWN_REACTION_TAG_PREFIX = "You reacted "
 
 /**
  * The signed-in user's own reaction keys on [message], read from the served
  * tags (which already carry the optimistic overlay). Ceiling: the server's
- * collapseReactionTags can fold the own tag into an "X and others reacted
- * with …" merge, where this misses it — the same ceiling as the Phase A
+ * collapseReactionTags can fold the own tag into an "X and others
+ * reacted …" merge, where this misses it — the same ceiling as the Phase A
  * toggle.
  */
 private fun ownReactionKeys(message: LightServiceMethod.GetMessages.Message): List<String> =
@@ -1225,10 +1225,6 @@ class ThreadScreen(
         // target here for the confirm panel.
         var contextMessage by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
         var unsendConfirm by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
-        // SAVE from the context window (image rows):
-        // the same save + confirm flow as the fullscreen viewer's bottom bar.
-        val contextScope = rememberCoroutineScope()
-        var saveConfirm by remember { mutableStateOf<Boolean?>(null) }
         // The panel's target resolved against the freshest polled snapshot (so
         // own-reaction detection never runs on a stale page) — declared here,
         // before the list, because the in-list dismiss scrim gates on it.
@@ -1537,39 +1533,9 @@ class ThreadScreen(
                 onRemoveReaction = { contextTarget?.let { viewModel.removeReaction(it) } },
                 onEdit = { contextTarget?.let { openComposer(it) } },
                 onUnsend = { contextTarget?.let { unsendConfirm = it } },
-                // SAVE (image rows only — the context window's image addition,
-                // addition): the same server-side save the
-                // fullscreen viewer's SAVE PHOTO runs, confirming with the
-                // same panel (below).
-                onSave = contextTarget
-                    ?.takeIf { it.contentType == "image" }
-                    ?.let { target ->
-                        {
-                            contextScope.launch {
-                                // The panel stays up while the save round-trips; the
-                                // confirm replaces it, and clearing the target
-                                // then drops the panel behind the modal.
-                                saveConfirm = ChatClient.saveMessageImage(room.id, target.id)
-                                contextMessage = null
-                            }
-                        }
-                    },
                 onDismiss = { contextMessage = null },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
-            }
-            // The save confirmation: the same
-            // fullscreen-panel grammar as the viewer's, auto-dismissing after
-            // 2 s so a tap isn't needed.
-            saveConfirm?.let { ok ->
-                LaunchedEffect(ok) {
-                    delay(2_000)
-                    saveConfirm = null
-                }
-                LightFullscreenModal(
-                    message = if (ok) "Photo saved" else "Couldn't save photo",
-                    onClose = { saveConfirm = null },
-                )
             }
             // Unsend confirmation: one accidental
             // long-press must not nuke a message — the same fullscreen-panel
@@ -2182,7 +2148,7 @@ private fun MessageRow(
                 }
             // Reactions, as a quiet tag under the message (same
             // grammar as the "not delivered" marker). Each entry reads
-            // "Name reacted with ❤️" (or "You reacted with …" for own) —
+            // "Name reacted ❤️" (or "You reacted …" for own) —
             if (message.reactions.isNotEmpty()) {
                 LightText(
                     text = message.reactions.joinToString(" · "),

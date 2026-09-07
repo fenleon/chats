@@ -34,11 +34,12 @@ class ChatSyncService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Settings → Sync pause: never start the loop or
-        // hold the FGS while paused — a sticky restart must not defeat the
-        // user's choice.
-        if (!MatrixRepository.isSyncEnabled) {
-            Log.d(TAG, "sync disabled by user — not starting")
+        // Battery saver: never start the loop or
+        // hold the FGS while the screen is dark — a sticky restart must not
+        // defeat the user's choice. With the screen on, foreground sync runs
+        // even under battery saver.
+        if (!MatrixRepository.isSyncEnabled && !MatrixRepository.isScreenOn) {
+            Log.d(TAG, "battery saver — not starting")
             stopSelf()
             return START_NOT_STICKY
         }

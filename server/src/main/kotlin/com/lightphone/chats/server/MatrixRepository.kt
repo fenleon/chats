@@ -759,12 +759,12 @@ object MatrixRepository {
             scope.launch {
                 runCatching { c.stopSync() }
                 android.util.Log.d(TAG, "network back after loss — resetting sync loop")
-                if (isScreenInteractive() && syncEnabled) {
+                if (isScreenInteractive()) {
                     // Re-arm through the shared entry point (the stopSync above
                     // un-armed the slot, so [startSyncLoop] must re-arm it). A
-                    // dark screen must NOT start a long-poll and a paused sync
-                    // must stay paused: that branch goes through the shared
-                    // screen → cadence entry point (both gates live in it).
+                    // dark screen must NOT start a long-poll: that branch goes
+                    // through the shared screen → cadence entry point (the
+                    // battery-saver and slow-sync gates live in it).
                     inProcessSyncRunning = false
                     startSyncLoop(appContext ?: return@launch)
                 } else {
@@ -816,36 +816,29 @@ object MatrixRepository {
             // Restore the session regardless of the sync toggle. GetAccountState
             // reads the live client, so a paused companion that skips the restore
             // makes the tool report "Not signed in" while the session is fine.
-            // Only the sync loop (and
-            // its FGS) is gated on the toggle; the restored client's observers
-            // stay dormant without sync (room flows never emit).
             if (ensureClient() != null) {
-                if (syncEnabled) {
-                    // Screen-state-aware start: a
-                    // session restore that lands while the screen is dark must
-                    // NOT long-poll — the boot-time sample above races the
-                    // restore, and a SCREEN_OFF broadcast that fired before the
-                    // receiver registered is gone. The shared entry point
-                    // applies the cadence the screen actually calls for.
-                    applySyncModeForScreenState()
-                    // Push wake-up channel: register the Matrix
-                    // HTTP pusher + hold the SSE subscription so idle sync has
-                    // zero latency — see PushChannel.
-                    PushChannel.start(app, client!!)
-                } else {
-                    setConnectionState(ChatConnectionState.Offline("sync paused"))
-                    android.util.Log.d(TAG, "sync disabled by preference — session restored, no sync loop")
-                }
+                // Screen-state-aware start: a
+                // session restore that lands while the screen is dark must
+                // NOT long-poll — the boot-time sample above races the
+                // restore, and a SCREEN_OFF broadcast that fired before the
+                // receiver registered is gone. The shared entry point
+                // applies the cadence the screen actually calls for (battery
+                // saver: nothing while dark, full sync while on).
+                applySyncModeForScreenState()
+                // Push wake-up channel: register the Matrix
+                // HTTP pusher + hold the SSE subscription so idle sync has
+                // zero latency — see PushChannel. It is background keep-alive,
+                // so battery saver never starts it.
+                if (syncEnabled) PushChannel.start(app, client!!)
             }
         }
     }
 
     /**
-     * Pauses/resumes the Matrix sync loop + foreground service (Settings → Sync).
-     * Pausing stops all background sync work; the notification watcher and
-     * room-list resolver go dormant on their own (without sync the room flows
-     * never emit). Re-enabling restores the session if needed and restarts the
-     * loop. Persisted, so it survives reboots.
+     * Toggles Battery Saver (Settings): when on, all sync machinery stops
+     * while the screen is dark — messages arrive only while the screen is
+     * on. Re-enabling restores the session if needed and restarts the loop.
+     * Persisted, so it survives reboots.
      */
     suspend fun setSyncEnabled(enabled: Boolean) {
         val ctx = appContext ?: return
@@ -853,24 +846,23 @@ object MatrixRepository {
             .edit().putBoolean(KEY_SYNC_ENABLED, enabled).apply()
         syncEnabled = enabled
         val c = client
-        // Tear down the background sync machinery in both branches (pausing
-        // stops it all; re-enabling restarts it below).
+        // Cancel the dark-screen schedules in both branches (battery saver
+        // stops them; re-enabling restarts them below).
         slowSyncJob?.cancel()
         slowSyncJob = null
         screenOffJob?.cancel()
         screenOffJob = null
         syncMode = SyncMode.ACTIVE
         if (!enabled) {
-            runCatching { c?.stopSync() }
-            inProcessSyncJob?.cancel()
-            inProcessSyncJob = null
-            inProcessSyncRunning = false
-            activeRoomRefreshJob?.cancel()
-            activeRoomRefreshJob = null
-            PushChannel.stop()
-            ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
-            setConnectionState(ChatConnectionState.Offline("sync paused"))
-            android.util.Log.d(TAG, "sync paused by user")
+            if (isScreenInteractive()) {
+                // Foreground sync keeps running while the screen is on — the
+                // dark-screen teardown happens on the next SCREEN_OFF.
+                PushChannel.stop()
+            } else {
+                stopBackgroundSync()
+                setConnectionState(ChatConnectionState.Offline("battery saver"))
+            }
+            android.util.Log.d(TAG, "battery saver on")
         } else {
             if (c == null) {
                 if (ensureClient() != null) startSyncLoop(ctx)
@@ -883,18 +875,38 @@ object MatrixRepository {
     }
 
     /**
+     * Stops every piece of sync machinery (battery saver with a dark screen):
+     * the long-poll, slow-sync rounds, the push channel and the FGS. The
+     * notification watcher and room-list resolver go dormant on their own
+     * (without sync the room flows never emit).
+     */
+    private suspend fun stopBackgroundSync() {
+        val ctx = appContext ?: return
+        runCatching { client?.stopSync() }
+        inProcessSyncJob?.cancel()
+        inProcessSyncJob = null
+        inProcessSyncRunning = false
+        activeRoomRefreshJob?.cancel()
+        activeRoomRefreshJob = null
+        PushChannel.stop()
+        ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
+    }
+
+    /**
      * Single entry point for the screen-state → sync-cadence decision.
      * Called from [init] after the client is ready, the SCREEN_ON/OFF
      * receiver, and [ChatSyncService] before it starts a long-poll, so a sync
      * loop never runs while the screen is dark. Screen on → active long-poll;
-     * dark → slow sync after the grace.
+     * dark → slow sync after the grace, or nothing at all under battery saver.
      */
     fun applySyncModeForScreenState() {
-        if (!syncEnabled) return
         if (isScreenInteractive()) {
             scope.launch { enterActiveSync() }
-        } else {
+        } else if (syncEnabled) {
             scheduleSlowSync()
+        } else {
+            // Battery saver: nothing runs while the screen is dark.
+            scope.launch { stopBackgroundSync() }
         }
     }
 
@@ -902,7 +914,7 @@ object MatrixRepository {
      * Drops to the slow cadence once the screen has been dark for the grace
      * period: stop the long-poll and run periodic [MatrixClient.syncOnce]
      * rounds instead. The FGS stays (it keeps the process alive for the slow
-     * loop); the manual Settings → Sync toggle is the fully-off control.
+     * loop); battery saver (the toggle off) runs nothing at all while dark.
      */
     private fun scheduleSlowSync() {
         screenOffJob?.cancel()
@@ -1045,7 +1057,6 @@ object MatrixRepository {
         // would leave a fresh screen-on start with no sync at all.
         if (syncMode == SyncMode.ACTIVE && (inProcessSyncRunning || ChatSyncService.isRunning)) return
         syncMode = SyncMode.ACTIVE
-        if (!syncEnabled) return
         val ctx = appContext ?: return
         if (client != null) {
             startSyncLoop(ctx)
@@ -1260,6 +1271,9 @@ object MatrixRepository {
         // interval converges within one tick of the system allowing it).
         scope.launch {
             while (isActive && client === c && !ChatSyncService.isRunning) {
+                // Battery saver tore sync down with the screen dark — don't
+                // resurrect the FGS behind the teardown's back.
+                if (!syncEnabled && !isScreenInteractive()) return@launch
                 if (ChatSyncService.tryStart(context)) break
                 delay(FGS_PROMOTE_INTERVAL_MS)
             }
@@ -1483,7 +1497,8 @@ object MatrixRepository {
         screenOffJob = null
         syncMode = SyncMode.ACTIVE
         startSyncLoop(ctx)
-        PushChannel.start(ctx, newClient)
+        // Background keep-alive — battery saver never starts it.
+        if (syncEnabled) PushChannel.start(ctx, newClient)
         // Verification is part of login (Beeper's model) — but only when there
         // is something to verify against: the account has cross-signing keys
         // uploaded and this fresh session isn't trusted yet. The request goes
@@ -1696,7 +1711,7 @@ object MatrixRepository {
         // Restart the loop through the shared cadence entry points (same shape
         // as the network-recovery reset): a dark screen must not start a
         // long-poll — it goes through the screen → cadence decision instead.
-        if (isScreenInteractive() && syncEnabled) {
+        if (isScreenInteractive()) {
             startSyncLoop(appContext ?: error("companion not initialized"))
         } else {
             applySyncModeForScreenState()
@@ -2981,7 +2996,7 @@ object MatrixRepository {
     }
 
     /**
-     * Recomputes a cached newest page's reaction tags ("Name reacted with ❤️")
+     * Recomputes a cached newest page's reaction tags ("Name reacted ❤️")
      * over the cached chain window — the same newest-page-only scope the full
      * rebuild tags from, so the patch stays consistent with what the page
      * holds. The reason this exists: an encrypted m.reaction (bridge reactions
@@ -4412,7 +4427,7 @@ object MatrixRepository {
     /**
      * Reaction tags per target message id from a list of timeline events (the
      * newest window, or the sync delta). Each entry is a display string —
-     * "Name reacted with ❤️" (own reactions read "You reacted with ❤️") —
+     * "Name reacted ❤️" (own reactions read "You reacted ❤️") —
      * deduped per SENDER (one reaction per person per message, Beeper
      * semantics — LP3: fire then heart showed both), the
      * person's newest reaction kept, ordered chronologically so the first tag
@@ -4452,7 +4467,7 @@ object MatrixRepository {
             result.getOrPut(targetId) { mutableListOf() }.add(entry)
         }
         return result.mapValues { (_, entries) ->
-            entries.sortedBy { it.timestampMs }.map { "${it.who} reacted with ${it.key}" }
+            entries.sortedBy { it.timestampMs }.map { "${it.who} reacted ${it.key}" }
         }
     }
 
@@ -4460,23 +4475,23 @@ object MatrixRepository {
      *  (the person's latest reaction survives dedupe). */
     private class ReactionEntry(var timestampMs: Long, val who: String, var key: String)
 
-    /** Keeps a message's reaction tags ("Name reacted with ❤️") to at most two
+    /** Keeps a message's reaction tags ("Name reacted ❤️") to at most two
      *  lines: two or fewer stay as-is; more collapse into one compact summary
      *  — the FIRST (earliest) reactor by name, everyone else folded into "and
      *  others", the distinct emoji listed once each, space-separated:
-     *  "Sophie and others reacted with ❤️ 😂". One person stacking several emoji isn't a crowd, so it
+     *  "Sophie and others reacted ❤️ 😂". One person stacking several emoji isn't a crowd, so it
      *  keeps the per-reaction lines. Tags never exceed two after this, so the
      *  tool renders the list unchanged. */
     private fun collapseReactionTags(tags: List<String>): List<String> {
         if (tags.size <= 2) return tags
         val reactions = tags.map { tag ->
-            val at = tag.indexOf(" reacted with ")
+            val at = tag.indexOf(" reacted ")
             if (at <= 0) return tags // not our label shape — leave untouched
-            tag.substring(0, at) to tag.substring(at + " reacted with ".length)
+            tag.substring(0, at) to tag.substring(at + " reacted ".length)
         }
         if (reactions.map { it.first }.distinct().size < 2) return tags
         val emojis = reactions.map { it.second }.distinct()
-        return listOf("${reactions.first().first} and others reacted with ${emojis.joinToString(" ")}")
+        return listOf("${reactions.first().first} and others reacted ${emojis.joinToString(" ")}")
     }
 
     /**
@@ -4484,18 +4499,18 @@ object MatrixRepository {
      * reactor replaces their cached one. [reactionTagsForEvents] dedupes per
      * sender within one event window, but the incremental patch only sees the
      * delta — the replaced reaction's tag still sits in the cached page. The tag
-     * label's shape ("Who reacted with …") carries the reactor name; a
+     * label's shape ("Who reacted …") carries the reactor name; a
      * collapsed "X and others" cached line only matches on its exact prefix,
      * the same ceiling [ownReactionKeys] on the tool side lives with.
      */
     private fun mergeReactionTags(cached: List<String>, added: List<String>): List<String> {
         if (added.isEmpty()) return cached
         val replaced = added.mapNotNull { tag ->
-            val at = tag.indexOf(" reacted with ")
+            val at = tag.indexOf(" reacted ")
             if (at <= 0) null else tag.substring(0, at)
         }.toSet()
         return cached.filterNot { tag ->
-            val at = tag.indexOf(" reacted with ")
+            val at = tag.indexOf(" reacted ")
             at > 0 && tag.substring(0, at) in replaced
         } + added
     }
@@ -4911,7 +4926,9 @@ object MatrixRepository {
             publishRoomList()
         }
         val c = client ?: return
-        if (!syncEnabled) return
+        // Battery saver skips only the dark-screen wake — a send with the
+        // screen on is foreground work and gets its catch-up sync.
+        if (!syncEnabled && !isScreenInteractive()) return
         slowSyncJob?.cancel()
         slowSyncJob = null
         scope.launch {
@@ -9620,11 +9637,13 @@ object MatrixRepository {
                             // periodic syncOnce rounds — that's still "syncing",
                             // not an outage.
                             isSlowSyncing -> ChatConnectionState.Syncing
-                            // The sync toggle is the source of truth while paused —
-                            // the restored client reports STOPPED until resumed, and
-                            // that must read as "paused", not "stopped" (or, worse,
-                            // the race with init's explicit assignment).
-                            !syncEnabled -> ChatConnectionState.Offline("sync paused")
+                            // Battery saver is the source of truth while it
+                            // has sync stopped — the restored client reports
+                            // STOPPED until the screen comes back on, and
+                            // that must read as "battery saver", not
+                            // "stopped" (or, worse, the race with init's
+                            // explicit assignment).
+                            !syncEnabled -> ChatConnectionState.Offline("battery saver")
                             c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> ChatConnectionState.Offline("sync stopped")
                             sessionExpired -> ChatConnectionState.Offline("session expired — sign in again")
                             else -> ChatConnectionState.LoggedOut
@@ -10320,7 +10339,7 @@ object MatrixRepository {
     // Disk cache.
     // Versioned so a stale pre-ghost-filter cache (pages/lists polluted by the
     // bridge re-import) is never served after an upgrade.
-    private const val DISK_CACHE_DIR = "chats_cache_v2"
+    private const val DISK_CACHE_DIR = "chats_cache_v3"
     private const val DISK_ROOM_LIST_FILE = "room_list.json"
     /** How many rooms keep an on-disk message page (the re-open surface). */
     private const val DISK_CACHE_MAX_PAGES = 100

@@ -799,15 +799,15 @@ private fun AccountStatus(
         connection?.let { state ->
             val allSynced = state.state == "syncing" &&
                 state.roomsTotal > 0 && state.roomsResolved >= state.roomsTotal
-            // The status line reads plainly — "sync
-            // paused" when the toggle is off, "offline" when there's simply
-            // no connection. The thread count shares the same line:
+            // The status line reads plainly — "battery
+            // saver" when background sync is off, "offline" when there's
+            // simply no connection. The thread count shares the same line:
             // "Syncing 34 of 52 threads" (no separator dot). Same Fine
             // size as the restore line below.
             val statusText = when {
                 allSynced -> "Synced"
                 state.state == "syncing" -> "Syncing"
-                !state.syncEnabled -> "sync paused"
+                !state.syncEnabled -> "battery saver"
                 state.state == "offline" -> "offline"
                 state.state == "connecting" -> "connecting"
                 else -> state.state.replaceFirstChar { it.uppercase() }
