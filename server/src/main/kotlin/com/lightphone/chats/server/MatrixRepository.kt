@@ -5496,6 +5496,79 @@ object MatrixRepository {
 
     // --- Voice notes ---------------------------------------------
 
+    /** The [EncryptedFile, mxc url] fetch source for file-based message
+     *  content, or null when the event carries no fetchable media uri (the
+     *  common failure mode: a client posts an m.image with an empty url). */
+    private fun mediaSourceOf(
+        content: RoomMessageEventContent.FileBased,
+    ): Pair<EncryptedFile?, String?>? {
+        val file = content.file?.takeIf { !it.url.isNullOrBlank() }
+        val url = content.url?.takeIf { it.isNotBlank() }
+        return if (file == null && url == null) null else file to url
+    }
+
+    /** The shared single-shot media fetch (encrypted when the timeline
+     *  carries an [EncryptedFile], plain otherwise), bounded by
+     *  [MEDIA_BUDGET_MS]; a failure is logged under [logLabel]. */
+    private suspend fun fetchMedia(
+        c: MatrixClient,
+        file: EncryptedFile?,
+        url: String?,
+        saveToCache: Boolean,
+        logLabel: String,
+        eventId: String,
+    ): ByteArray? = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+        val mediaService = c.di.get<MediaService>(MediaService::class)
+        val result = when {
+            file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = saveToCache)
+            url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = saveToCache)
+            else -> return@withTimeoutOrNull null
+        }
+        if (result.isFailure) {
+            android.util.Log.w(TAG, "$logLabel: fetch failed for $eventId", result.exceptionOrNull())
+        }
+        result.getOrNull()?.toByteArray()
+    }
+
+    /** [playVoiceNote]/[downloadVoiceNoteToCache]'s two-attempt fetch with the
+     *  wedge self-heal hooks ([noteMediaFetchTimeout]/[noteMediaFetchSuccess]);
+     *  the per-attempt logging stays at the call sites. Null bytes when both
+     *  attempts fail. */
+    private suspend fun fetchMediaRetrying(
+        c: MatrixClient,
+        file: EncryptedFile?,
+        url: String?,
+        eventId: String,
+        timeoutLog: (attempt: Int) -> Unit = {},
+        failureLog: (attempt: Int, exception: Throwable?) -> Unit,
+    ): ByteArray? {
+        val mediaService = c.di.get<MediaService>(MediaService::class)
+        var download: Result<de.connect2x.trixnity.client.media.PlatformMedia>? = null
+        for (attempt in 1..2) {
+            val result = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+                when {
+                    file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = false)
+                    url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = false)
+                    else -> return@withTimeoutOrNull null
+                }
+            }
+            if (result == null) {
+                timeoutLog(attempt)
+                noteMediaFetchTimeout()
+                continue
+            }
+            if (result.isFailure) {
+                failureLog(attempt, result.exceptionOrNull())
+                noteMediaFetchSuccess()
+                continue
+            }
+            noteMediaFetchSuccess()
+            download = result
+            break
+        }
+        return download?.getOrNull()?.toByteArray()?.takeIf { it.isNotEmpty() }
+    }
+
     /**
      * Toggles playback of an m.audio message: stops any current playback and
      * plays [eventId], or stops it if it is already the one playing. Downloads
@@ -5615,23 +5688,13 @@ object MatrixRepository {
             )
             return false to "not an audio message"
         }
-        val file = content.file?.takeIf { !it.url.isNullOrBlank() }
-        val url = content.url?.takeIf { it.isNotBlank() }
-        if (file == null && url == null) return false to "no audio file"
-        val mediaService = c.di.get<MediaService>(MediaService::class)
+        val (file, url) = mediaSourceOf(content) ?: return false to "no audio file"
         // One retry: a single flaky fetch failing once shouldn't fail playback
         // outright — the first attempt can hit a slow window.
         // Each attempt is logged separately so a silent tap maps to one cause.
-        var download: Result<de.connect2x.trixnity.client.media.PlatformMedia>? = null
-        for (attempt in 1..2) {
-            val result = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-                when {
-                    file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = false)
-                    url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = false)
-                    else -> return@withTimeoutOrNull null
-                }
-            }
-            if (result == null) {
+        val bytes = fetchMediaRetrying(
+            c, file, url, eventId,
+            timeoutLog = { attempt ->
                 // withTimeoutOrNull fired — the fetch itself exceeded the
                 // budget (MEDIA_BUDGET_MS). Kept separate from the failure log
                 // so a silent tap maps to exactly one cause.
@@ -5643,10 +5706,8 @@ object MatrixRepository {
                 // A timeout is the wedge signature: count it and
                 // self-heal once consecutive stalls + a healthy network say the
                 // shared HTTP engine is stuck (see [noteMediaFetchTimeout]).
-                noteMediaFetchTimeout()
-                continue
-            }
-            if (result.isFailure) {
+            },
+            failureLog = { attempt, exception ->
                 // Diagnosis hook for the LP3: this stage was silent — the common failure (the
                 // media fetch) must log what actually went wrong (network
                 // error, missing sha256 on the EncryptedFile →
@@ -5655,18 +5716,11 @@ object MatrixRepository {
                     TAG,
                     "playVoiceNote: download failed for $eventId (attempt $attempt/2, encrypted=${file != null}, " +
                         "url=${url ?: "null"}, size=${content.info?.size})",
-                    result.exceptionOrNull(),
+                    exception,
                 )
                 // A fast failure proves the engine answers — not a wedge.
-                noteMediaFetchSuccess()
-                continue
-            }
-            noteMediaFetchSuccess()
-            download = result
-            break
-        }
-        val bytes = (download?.getOrNull()?.toByteArray()?.takeIf { it.isNotEmpty() })
-            ?: return false to "audio download failed"
+            },
+        ) ?: return false to "audio download failed"
         // The temp file must carry the ACTUAL format: MediaPlayer's file-source
         // path uses the extension as an extractor hint, and Beeper/WhatsApp
         // audio files (ogg/opus, mp3, aac…) mislabeled ".m4a" fail to prepare.
@@ -5965,8 +6019,8 @@ object MatrixRepository {
 
     /**
      * Downloads [eventId]'s audio into the on-disk cache and returns the
-     * cached file. Mirrors [playVoiceNote]'s fetch/repair tail so both the
-     * prefetch and the first-tap path share it.
+     * cached file. Shares [playVoiceNote]'s fetch tail via
+     * [fetchMediaRetrying] so the prefetch and the first-tap path match.
      */
     private suspend fun downloadVoiceNoteToCache(
         c: MatrixClient,
@@ -5975,38 +6029,17 @@ object MatrixRepository {
         content: RoomMessageEventContent.FileBased.Audio,
     ): java.io.File? {
         val ctx = appContext ?: return null
-        val file = content.file?.takeIf { !it.url.isNullOrBlank() }
-        val url = content.url?.takeIf { it.isNotBlank() }
-        if (file == null && url == null) return null
-        val mediaService = c.di.get<MediaService>(MediaService::class)
-        var download: Result<de.connect2x.trixnity.client.media.PlatformMedia>? = null
-        for (attempt in 1..2) {
-            val result = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-                when {
-                    file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = false)
-                    url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = false)
-                    else -> return@withTimeoutOrNull null
-                }
-            }
-            if (result == null) {
-                noteMediaFetchTimeout()
-                continue
-            }
-            if (result.isFailure) {
-                noteMediaFetchSuccess()
+        val (file, url) = mediaSourceOf(content) ?: return null
+        val bytes = fetchMediaRetrying(
+            c, file, url, eventId,
+            failureLog = { attempt, exception ->
                 android.util.Log.w(
                     TAG,
                     "voice download failed for $eventId (attempt $attempt/2)",
-                    result.exceptionOrNull(),
+                    exception,
                 )
-                continue
-            }
-            noteMediaFetchSuccess()
-            download = result
-            break
-        }
-        val bytes = (download?.getOrNull()?.toByteArray()?.takeIf { it.isNotEmpty() })
-            ?: return null
+            },
+        ) ?: return null
         val repaired = repairOgg(bytes)
         val dir = voiceCacheDir() ?: return null
         val ext = sniffAudioExtension(repaired, content.info?.mimeType?.lowercase().orEmpty())
@@ -6331,12 +6364,16 @@ object MatrixRepository {
         // uri here keeps the fetch branch below from calling
         // MediaService.getMedia("") (IllegalArgumentException, which used to
         // fail the whole row instead of falling back to its text).
-        val file = content.file?.takeIf { !it.url.isNullOrBlank() }
-        val url = content.url?.takeIf { it.isNotBlank() }
-        if (file == null && url == null) {
-            android.util.Log.d(TAG, "getMessageMedia: $eventId has no media uri (url=$url) — unfetchable")
+        val source = mediaSourceOf(content)
+        if (source == null) {
+            android.util.Log.d(
+                TAG,
+                "getMessageMedia: $eventId has no media uri " +
+                    "(url=${content.url?.takeIf { it.isNotBlank() }}) — unfetchable",
+            )
             return null
         }
+        val (file, url) = source
         // Media this device already has (sent from here, or previously
         // downloaded) renders on any connection — the mobile-data gate only
         // blocks downloads that would hit the network.
@@ -6349,18 +6386,12 @@ object MatrixRepository {
             android.util.Log.d(TAG, "getMessageMedia: $eventId skipped (mobile data, allow=$allowMobileData)")
             return null
         }
-        val mediaService = c.di.get<MediaService>(MediaService::class)
-        val bytes = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-            val result = when {
-                file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = true)
-                url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = true)
-                else -> return@withTimeoutOrNull null
-            }
-            if (result.isFailure) {
-                android.util.Log.w(TAG, "getMessageMedia: fetch failed for $eventId", result.exceptionOrNull())
-            }
-            result.getOrNull()?.toByteArray()
-        }?.takeIf { it.isNotEmpty() } ?: return null
+        val bytes = fetchMedia(
+            c, file, url,
+            saveToCache = true,
+            logLabel = "getMessageMedia",
+            eventId = eventId,
+        )?.takeIf { it.isNotEmpty() } ?: return null
         val jpeg = compressImage(bytes, DISPLAY_MAX_DIMENSION, DISPLAY_JPEG_QUALITY) ?: return null
         mediaCache[cacheKey] = jpeg
         return jpeg
@@ -6385,20 +6416,13 @@ object MatrixRepository {
                 if (raw.info?.mimeType?.startsWith("image/", ignoreCase = true) == true) raw else null
             else -> null
         } ?: return false
-        val file = content.file?.takeIf { !it.url.isNullOrBlank() }
-        val url = content.url?.takeIf { it.isNotBlank() }
-        if (file == null && url == null) return false
-        val mediaService = c.di.get<MediaService>(MediaService::class)
-        val bytes = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-            val result = when {
-                file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = true)
-                else -> mediaService.getMedia(url!!, maxSize = null, saveToCache = true)
-            }
-            if (result.isFailure) {
-                android.util.Log.w(TAG, "saveMessageImage: fetch failed for $eventId", result.exceptionOrNull())
-            }
-            result.getOrNull()?.toByteArray()
-        }?.takeIf { it.isNotEmpty() } ?: return false
+        val (file, url) = mediaSourceOf(content) ?: return false
+        val bytes = fetchMedia(
+            c, file, url,
+            saveToCache = true,
+            logLabel = "saveMessageImage",
+            eventId = eventId,
+        )?.takeIf { it.isNotEmpty() } ?: return false
 
         val mime = content.info?.mimeType ?: "image/jpeg"
         val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: "jpg"
