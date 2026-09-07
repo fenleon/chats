@@ -2,6 +2,8 @@ package com.lightphone.chats.screens
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +23,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
@@ -98,7 +101,24 @@ fun ContextWindowOverlay(
         modifier = modifier
             .fillMaxWidth()
             .fillMaxHeight(0.5f)
-            .background(Color.Black),
+            .background(Color.Black)
+            // The panel is an overlay over the thread list, and Compose
+            // dispatches pointer events to everything under the finger — a
+            // background alone consumes nothing, so taps in the panel's empty
+            // regions fell through to rows beneath (a voice-note play button
+            // under LIKE, LP3 feedback 2026-09-07). Swallow every event in
+            // the panel's area; the action rows and the chevron are children
+            // and see each pass first, so they keep working.
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false).consume()
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        event.changes.forEach { it.consume() }
+                        if (event.changes.none { it.pressed }) break
+                    }
+                }
+            },
     ) {
         when (level) {
             // LP3 feedback 2026-09-03: the action rows read like bottom-bar

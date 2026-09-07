@@ -2004,22 +2004,30 @@ private fun MessageRow(
                         // sends more hearts").
                         val gestureMessage by rememberUpdatedState(message)
                         // LP3 feedback 2026-09-03 (the Phone tool's native
-                        // half-panel grammar): NO vibration on finger-down — the
-                        // haptic fires only when the gesture actually triggers,
-                        // the long press that opens the context window and the
-                        // second tap of a like. Gated by the same
-                        // LocalHapticsEnabled the SDK's lightClickable reads;
-                        // the SDK's context-based haptic helper is plugin-banned
-                        // in tool code, so this goes through Compose's haptic
-                        // API instead.
+                        // half-panel grammar): NO vibration on finger-down —
+                        // the haptic fires on actual gestures. 2026-09-07: a
+                        // like double-tap buzzes on BOTH taps, so every clean
+                        // tap buzzes (the same feel as the chat list's
+                        // lightClickable) and the second tap inside the system
+                        // double-tap window toggles the like. Compose's
+                        // onDoubleTap swallows the first tap's haptic — hence
+                        // the manual count. detectTapGestures reports taps only
+                        // on a clean up (no movement past the touch slop), so
+                        // scrolling never buzzes, same as the list. Gated by
+                        // the same LocalHapticsEnabled the SDK's lightClickable
+                        // reads; the SDK's context-based haptic helper is
+                        // plugin-banned in tool code, so this goes through
+                        // Compose's haptic API instead.
                         val haptic = LocalHapticFeedback.current
                         val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
                         Modifier
                             .pointerInput(message.id) {
+                                val doubleTapMs = viewConfiguration.doubleTapTimeoutMillis
+                                var lastTapMs = 0L
                                 detectTapGestures(
                                     // The like guards isMine itself (own rows never
                                     // react) — one gesture block serves both sides.
-                                    onDoubleTap = {
+                                    onTap = {
                                         if (currentHapticsEnabled) {
                                             // LongPress-type buzz (the app's
                                             // standard click feel) — the old
@@ -2028,7 +2036,13 @@ private fun MessageRow(
                                             // (LP3 feedback 2026-09-03).
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                         }
-                                        onToggleLike(gestureMessage)
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastTapMs < doubleTapMs) {
+                                            lastTapMs = 0L
+                                            onToggleLike(gestureMessage)
+                                        } else {
+                                            lastTapMs = now
+                                        }
                                     },
                                     onLongPress = {
                                         if (currentHapticsEnabled) {
@@ -2074,15 +2088,16 @@ private fun MessageRow(
             }
             // A forwarded message carries a small "forwarded" tag — the
             // bridge's WhatsApp forward marker, lifted out of the body by the
-            // companion and served as this flag. Incoming TEXT rows lead with
-            // the ↷ glyph (Subtitle) left of the body and put the word under
-            // the text, in the same spot as the "edited" tag (below); media
-            // and outgoing rows keep the glyph + word together above the
-            // content. Tight, lowercase, consistent with the other tags
+            // companion and served as this flag. Outgoing TEXT rows lead with
+            // the ↷ glyph (Subtitle) above the body with the word under it;
+            // incoming text and MEDIA rows put the glyph beside the content
+            // with the word under it (feedback 2026-09-07: a forwarded photo
+            // used to sit under the tag row, reading disconnected from the
+            // glyph). Tight, lowercase, consistent with the other tags
             // (feedback 2026-09-02: the marker used to sit in the body at
             // full size with a blank line after it, reading like a separate
             // message).
-            if (message.forwarded && (message.contentType != "text" || message.isMine)) {
+            if (message.forwarded && message.contentType == "text" && message.isMine) {
                 Row(
                     modifier = Modifier.padding(top = 1.dp, bottom = 1.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -2106,20 +2121,24 @@ private fun MessageRow(
                 { onOpenContext(message) }
             } else null
             if (message.contentType == "image") {
-                ImageMessageContent(message, mediaBytes, allowMobile, onEnsureMedia, onOpenImage, contextGesture)
+                ForwardedMediaRow(message) {
+                    ImageMessageContent(message, mediaBytes, allowMobile, onEnsureMedia, onOpenImage, contextGesture)
+                }
             } else if (message.contentType == "audio") {
-                AudioMessageContent(
-                    message = message,
-                    playing = playing,
-                    playingPositionMs = playingPositionMs,
-                    playingPositionAtMs = playingPositionAtMs,
-                    counterPending = counterPending,
-                    paused = paused,
-                    pausedPositionMs = pausedPositionMs,
-                    error = voiceError?.takeIf { it.first == message.id }?.second,
-                    onTogglePlay = { onPlayVoiceNote(message.id) },
-                    onOpenContext = contextGesture,
-                )
+                ForwardedMediaRow(message) {
+                    AudioMessageContent(
+                        message = message,
+                        playing = playing,
+                        playingPositionMs = playingPositionMs,
+                        playingPositionAtMs = playingPositionAtMs,
+                        counterPending = counterPending,
+                        paused = paused,
+                        pausedPositionMs = pausedPositionMs,
+                        error = voiceError?.takeIf { it.first == message.id }?.second,
+                        onTogglePlay = { onPlayVoiceNote(message.id) },
+                        onOpenContext = contextGesture,
+                    )
+                }
             } else {
                 if (message.isMine) {
                     // Outgoing: block sized to the first line so the top line's
@@ -2138,27 +2157,7 @@ private fun MessageRow(
                     // at the message's left edge under both.
                     Column(modifier = Modifier.padding(top = 1.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            LightText(
-                                text = "\u21B7",
-                                variant = LightTextVariant.Paragraph,
-                                // The ↷ falls back to Noto Sans Symbols, whose
-                                // run sits low in the Paragraph line box — a
-                                // plain center-scale pushed the ink below the
-                                // box into the "forwarded" tag. Pivoting the
-                                // scale ~0.72 down the box keeps the arrow's
-                                // ink centered on the text line; the equal
-                                // padding (a) re-absorbs the scaled ink, which
-                                // is wider than the glyph advance, and (b)
-                                // squares the glyph's footprint (feedback
-                                // 2026-09-02).
-                                modifier = Modifier
-                                    .graphicsLayer {
-                                        scaleX = 2.1f
-                                        scaleY = 2.1f
-                                        transformOrigin = TransformOrigin(0.5f, 0.72f)
-                                    }
-                                    .padding(2.5.dp),
-                            )
+                            ForwardedArrowGlyph()
                             LightText(
                                 text = message.body,
                                 variant = LightTextVariant.Paragraph,
@@ -2211,14 +2210,23 @@ private fun MessageRow(
                 }
             }
             // An edited message shows a quiet "edited" tag under the body
-            // (feedback 2026-08-27) — same grammar as the delivery labels.
-            if (message.edited) {
-                LightText(
-                    text = "edited",
-                    variant = LightTextVariant.Superfine,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
-            }
+            // (feedback 2026-08-27) — and since 2026-09-07 it shares one line
+            // with the delivery/status tag ("edited · delivered"), same
+            // grammar as the reactions separator; either alone renders as
+            // before.
+            listOfNotNull(
+                "edited".takeIf { message.edited },
+                statusTag,
+            ).joinToString(" · ")
+                .takeIf { it.isNotEmpty() }
+                ?.let { footer ->
+                    LightText(
+                        text = footer,
+                        variant = LightTextVariant.Superfine,
+                        // Solid white like the timestamps (feedback 2026-08-21).
+                        modifier = Modifier.padding(top = 1.dp),
+                    )
+                }
             // Phase 14: reactions, as a quiet tag under the message (same
             // grammar as the "not delivered" marker). Each entry reads
             // "Name reacted with ❤️" (or "You reacted with …" for own) —
@@ -2265,24 +2273,54 @@ private fun MessageRow(
                     // 2026-08-21).
                     modifier = Modifier.padding(top = 1.dp),
                 )
-            } else if (message.isMine && statusTag != null) {
-                // Phase 13, reshaped 2026-09-03; "delivered" rejoined 2026-09-06:
-                // the tag sits under the newest outgoing message the status
-                // evidence covers — "seen" needs the other party's m.read
-                // receipt (or a Beeper READ status), "delivered" needs a real
-                // bridge DELIVERED status (SUCCESS + delivered_to_users); it
-                // is never synthesized from a stopped SENDING spinner (the
-                // lie that dropped it 2026-08-30). [statusTag]'s picker
-                // owns placement + the Show-read-status gate (setting only
-                // gates "seen"); no evidence anywhere → no tag.
-                LightText(
-                    text = statusTag,
-                    variant = LightTextVariant.Superfine,
-                    // Solid white like the timestamps (feedback 2026-08-21).
-                    modifier = Modifier.padding(top = 1.dp),
-                )
             }
         }
+    }
+}
+
+/** The ↷ forward glyph beside media/text content: Paragraph variant scaled
+ *  ~2.1x (≈ the Subtitle ink size) about a pivot 0.72 down the line box —
+ *  the ↷ falls back to Noto Sans Symbols, whose run sits low in the
+ *  Paragraph line box; the pivot keeps the ink centered and the equal
+ *  padding re-absorbs the scaled ink (feedback 2026-09-02). */
+@Composable
+private fun ForwardedArrowGlyph() {
+    LightText(
+        text = "\u21B7",
+        variant = LightTextVariant.Paragraph,
+        modifier = Modifier
+            .graphicsLayer {
+                scaleX = 2.1f
+                scaleY = 2.1f
+                transformOrigin = TransformOrigin(0.5f, 0.72f)
+            }
+            .padding(2.5.dp),
+    )
+}
+
+/** Forwarded MEDIA rows (feedback 2026-09-07: the photo used to sit under
+ *  the tag row, reading disconnected from the glyph): the ↷ glyph beside the
+ *  content, the small "forwarded" word under it — the same grammar as
+ *  forwarded incoming text. */
+@Composable
+private fun ForwardedMediaRow(
+    message: LightServiceMethod.GetMessages.Message,
+    content: @Composable () -> Unit,
+) {
+    if (!message.forwarded) {
+        content()
+        return
+    }
+    Column(modifier = Modifier.padding(top = 1.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ForwardedArrowGlyph()
+            content()
+        }
+        LightText(
+            text = "forwarded",
+            variant = LightTextVariant.Superfine,
+            modifier = Modifier.padding(top = 1.dp),
+        )
     }
 }
 
