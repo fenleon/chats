@@ -7742,7 +7742,13 @@ object MatrixRepository {
                             "AND json_extract(TimelineEvent.value,'$.event.type') " +
                             "  IN ('m.room.message','m.room.encrypted') " +
                             "AND json_extract(TimelineEvent.value,'$.event.sender') != ? " +
-                            "AND json_extract(TimelineEvent.value,'$.event.origin_server_ts') > ? " +
+                            // CAST: query() binds selection args as TEXT, and an
+                            // INTEGER column never compares greater than a TEXT
+                            // value in SQLite — the un-cast version silently
+                            // counted 0 for every room (LP3: Jasmine/Rose
+                            // genuinely-unread badges vanished).
+                            "AND json_extract(TimelineEvent.value,'$.event.origin_server_ts') " +
+                            "  > CAST(? AS INTEGER) " +
                             "LIMIT 99)",
                         arrayOf(roomId, c.userId.full, own.toString()),
                     ).use { cur -> if (cur.moveToFirst()) cur.getLong(0) else 0L }

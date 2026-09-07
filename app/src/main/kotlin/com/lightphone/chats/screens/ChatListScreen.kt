@@ -417,10 +417,15 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         // room set stays in the ViewModel. Archived rooms hide unless
         // pinned (pinned wins); pinned rooms sort to the top —
         // stable, so server recency holds within the pinned group.
+        // Rooms with no stampable message (ts 0: bridge integration
+        // rooms, notice/state-only rooms the resolver parked) hide
+        // like Beeper's inbox — they carry no chat content, only
+        // Contacts/Search still list them.
         val filteredRooms = remember(rooms, networkFilter) {
             rooms.filter { room ->
                 (networkFilter == null || room.network == networkFilter) &&
-                    !(room.archived && !room.pinned) // archived hidden unless pinned wins
+                    !(room.archived && !room.pinned) && // archived hidden unless pinned wins
+                    !(!room.pinned && room.lastTimestampMs == 0L)
             }.sortedByDescending { it.pinned } // stable — server recency holds within groups
         }
         // Network labels for the Networks panel, from the rooms the companion
