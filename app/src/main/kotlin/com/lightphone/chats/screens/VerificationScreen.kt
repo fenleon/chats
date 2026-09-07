@@ -514,15 +514,15 @@ private fun TerminalPanel(
             }
         }
     }
-}/** The accept/start panel (2026-08-29): centered question, ACCEPT as a button
- *  bottom-anchored above the bottom bar; the X cancel stays in the bar. */
+}/** The accept/start panel (2026-08-29): question centered like the other
+ *  full-area panels (2026-09-06 — the half-split grammar made it jump up from
+ *  the waiting text's position), ACCEPT anchored above the bottom bar; the X
+ *  cancel stays in the bar. */
 @Composable
 private fun AcceptPanel(onAccept: () -> Unit) {
-    Column(modifier = Modifier.fillMaxSize()) {
+    Box(modifier = Modifier.fillMaxSize()) {
         Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
+            modifier = Modifier.matchParentSize(),
             contentAlignment = Alignment.Center,
         ) {
             LightText(
@@ -532,13 +532,10 @@ private fun AcceptPanel(onAccept: () -> Unit) {
                 modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
             )
         }
-        // ACCEPT centered between the question and the bottom CANCEL bar
-        // (feedback 2026-09-06), matching the terminal panel.
         Box(
             modifier = Modifier
-                .weight(1f)
+                .align(Alignment.BottomCenter)
                 .fillMaxWidth(),
-            contentAlignment = Alignment.Center,
         ) {
             PanelActionButton("ACCEPT", onClick = onAccept)
         }

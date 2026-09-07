@@ -80,7 +80,9 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
 import de.connect2x.trixnity.clientserverapi.model.push.SetPushRule
 import de.connect2x.trixnity.clientserverapi.model.user.Filters
+import de.connect2x.trixnity.core.ClientEventEmitter
 import de.connect2x.trixnity.core.MatrixServerException
+import de.connect2x.trixnity.core.subscribeAsFlow
 import de.connect2x.trixnity.core.model.events.MessageEventContent
 import de.connect2x.trixnity.core.model.events.RoomAccountDataEventContent
 import de.connect2x.trixnity.core.model.events.m.PushRulesEventContent
@@ -99,6 +101,7 @@ import de.connect2x.trixnity.client.MatrixClient
 import de.connect2x.trixnity.clientserverapi.client.ClassicMatrixClientAuthProviderData
 import de.connect2x.trixnity.clientserverapi.client.MatrixClientAuthProviderData
 import de.connect2x.trixnity.client.MatrixClientConfiguration
+import de.connect2x.trixnity.client.MatrixClientConfiguration.DeleteRooms
 import de.connect2x.trixnity.client.MediaStoreModule
 import de.connect2x.trixnity.client.RepositoriesModule
 import de.connect2x.trixnity.client.create
@@ -123,6 +126,8 @@ import de.connect2x.trixnity.client.room.message.reply
 import de.connect2x.trixnity.client.room.message.replace
 import de.connect2x.trixnity.client.room.message.text
 import de.connect2x.trixnity.client.serverDiscovery
+import de.connect2x.trixnity.client.store.Account
+import de.connect2x.trixnity.client.store.AccountStore
 import de.connect2x.trixnity.client.store.GlobalAccountDataStore
 import de.connect2x.trixnity.client.store.KeyStore
 import de.connect2x.trixnity.client.store.OlmCryptoStore
@@ -510,6 +515,33 @@ object MatrixRepository {
      *  group member's reads POST one push, and each syncOnce costs ~30-50 s of
      *  CPU on this account (battery 2026-08-17 audit). */
     private var lastPushWakeSyncAtMs = 0L
+
+    // --- Verification-first sync (LP3 2026-09-06) ----------------------------
+
+    /**
+     * True between a fresh login and the device-verification outcome: while
+     * set, [clientConfiguration] hands the client the ultra-slim
+     * [verificationSyncFilters] so the initial sync ingests ~300 room-list
+     * bones instead of 6902 events (~180 s of serialized emit on the LP3) —
+     * the SAS emoji round-trips must not be stuck behind it. Set by the login
+     * paths before the client is built (the configuration is read at build
+     * time; [finishLogin] runs too late), cleared by [swapToFullSync] and on
+     * teardown paths. Stale-true degrades to a slim-rooms session, never a
+     * broken one (the next login re-arms the full swap).
+     */
+    @Volatile
+    private var pendingVerificationPhase = false
+
+    /** The MatrixClientConfiguration captured while the current client was
+     *  built ([clientConfiguration]'s receiver). Its filter properties are
+     *  `var` (MatrixClientConfiguration.kt, Trixnity 5.8), so [swapToFullSync]
+     *  mutates it in place instead of rebuilding the client. Cleared with the
+     *  session, re-captured on every client build. */
+    @Volatile
+    private var activeClientConfig: MatrixClientConfiguration? = null
+
+    /** Guards [swapToFullSync] — one swap per login (reset by the login paths). */
+    private val verificationSyncSwapped = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** The default network dropped — the next [networkCallback] onAvailable
      *  resets the sync loop (Beeper's `networkChanged`/`resetNetworkConnections`,
@@ -1285,6 +1317,11 @@ object MatrixRepository {
             // The raw ktor client (used for Beeper's provision API, see
             // [bridgeContacts]) does not attach the bearer — persist it here.
             val accessToken = (authProviderData as? ClassicMatrixClientAuthProviderData)?.accessToken
+            // Verification-first sync: the configuration lambda is read at
+            // client build time, so the phase flag must be armed BEFORE
+            // create (finishLogin runs too late — see [pendingVerificationPhase]).
+            pendingVerificationPhase = true
+            verificationSyncSwapped.set(false)
             val loginResult = authProviderData
                 .let { authProviderData ->
                     MatrixClient.create(
@@ -1293,7 +1330,7 @@ object MatrixRepository {
                         cryptoDriverModule = CryptoDriverModule.libOlm(),
                         authProviderData = authProviderData,
                         configuration = clientConfiguration("chats"),
-                    ).getOrThrow()
+                    ).onFailure { pendingVerificationPhase = false }.getOrThrow()
                 }
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit()
@@ -1393,6 +1430,9 @@ object MatrixRepository {
                 initialDeviceDisplayName = "Chats (Light Phone)",
             ).getOrThrow()
             val accessToken = (authProviderData as? ClassicMatrixClientAuthProviderData)?.accessToken
+            // Verification-first sync — see the homeserver [login] path.
+            pendingVerificationPhase = true
+            verificationSyncSwapped.set(false)
             val loginResult = authProviderData
                 .let { authProviderData ->
                     MatrixClient.create(
@@ -1401,7 +1441,7 @@ object MatrixRepository {
                         cryptoDriverModule = CryptoDriverModule.libOlm(),
                         authProviderData = authProviderData,
                         configuration = clientConfiguration("chats-beeper"),
-                    ).getOrThrow()
+                    ).onFailure { pendingVerificationPhase = false }.getOrThrow()
                 }
             prefs.edit()
                 .putString(KEY_HOMESERVER, BEEPER_HOMESERVER)
@@ -1447,8 +1487,33 @@ object MatrixRepository {
         if (lastLoginNeedsVerification) {
             runCatching { startDeviceVerification() }
                 .onFailure { android.util.Log.w(TAG, "post-login verification auto-start failed: ${it.message}") }
+        } else {
+            // Nothing to verify (fresh account / no other device / already
+            // trusted) — leave the verification-phase slim sync immediately.
+            swapToFullSync()
         }
         return newClient
+    }
+
+    /** Restore-path counterpart of [finishLogin]'s E2EE wiring: a verified
+     *  restored session kicks the key-backup crawl (its own cooldown guards
+     *  the cost); an unverified one flows into device verification like a
+     *  fresh login — [postLoginNeedsVerification]'s false-bail behavior
+     *  (cross-signing absent / no other devices) keeps this a no-op for
+     *  accounts with nothing to verify. */
+    private suspend fun armRestoreVerification(c: MatrixClient) {
+        if (isDeviceVerified(c)) {
+            if (!restoreAttempted) {
+                restoreAttempted = true
+                restoreMegolmSessions()
+            }
+        } else {
+            lastLoginNeedsVerification = postLoginNeedsVerification(c)
+            if (lastLoginNeedsVerification) {
+                runCatching { startDeviceVerification() }
+                    .onFailure { android.util.Log.w(TAG, "post-restore verification auto-start failed: ${it.message}") }
+            }
+        }
     }
 
     /** Whether the most recent login ended with device verification pending —
@@ -1534,6 +1599,132 @@ object MatrixRepository {
             android.util.Log.w(TAG, "sync-filter migration failed: ${e.message}")
         }
     }
+
+    /**
+     * Ends the verification-phase slim sync (see [pendingVerificationPhase]):
+     * swaps the captured configuration's filters to the full set, re-uploads
+     * them, stores the fresh ids in the Account row, and restarts the sync
+     * loop so the long-poll picks up the full sync filter (background
+     * syncOnce rounds read the stored id per round). Called from the
+     * verification Done branch, its timeout branch, and [finishLogin] when no
+     * verification is needed. Idempotent — one swap per login, one retry.
+     *
+     * Trixnity 5.8 uploads filters exactly once, in the client's init
+     * coroutine (MatrixClient.kt: the `filter == null || eventTypesHash
+     * changed` gate); startSync/syncOnce only read the STORED ids — so the
+     * [migrateSyncFilterIfNeeded] trick (clear the ids, restart) cannot work
+     * on a live client: startSync checkNotNulls the stored syncFilterId and
+     * the upload never re-runs. The swap therefore uploads the full filters
+     * itself — replicating the private MatrixClient.applyDefaultFilter merge
+     * over the CLIENT's own [EventContentSerializerMappings] — and writes the
+     * ids through the client's AccountStore (raw SQL would desync its
+     * in-memory cache). The upload+store happens AFTER the client's `started`
+     * flag flips (the init coroutine's last act, after it stores its own ids),
+     * so the swap always wins over the init store even when they race
+     * (emulator 2026-09-06: a swap before `started` left the slim ids stored).
+     */
+    private suspend fun swapToFullSync() {
+        if (!verificationSyncSwapped.compareAndSet(false, true)) return
+        pendingVerificationPhase = false
+        android.util.Log.i(TAG, "sync: verification phase done — swapping to full sync filter, restarting loop")
+        swapOnceToFullSync()
+            .onFailure { e ->
+                android.util.Log.w(TAG, "full-sync swap failed (${e.message}) — retrying once in ${SYNC_SWAP_RETRY_MS / 1000} s")
+                delay(SYNC_SWAP_RETRY_MS)
+                swapOnceToFullSync().onFailure {
+                    android.util.Log.w(TAG, "full-sync swap retry failed: ${it.message} — session stays on the slim verification filters until re-login")
+                }
+            }
+    }
+
+    private suspend fun swapOnceToFullSync(): Result<Unit> = runCatching {
+        val c = client ?: error("client gone")
+        val config = activeClientConfig ?: error("no captured client configuration")
+        config.syncFilter = fullSyncFilters
+        config.syncOnceFilter = fullSyncOnceFilters
+        // The init upload reads the config BEFORE its network calls and stores
+        // the ids after — a swap racing it could otherwise read filter==null,
+        // skip, and let the init store the SLIM ids right after (measured on
+        // the emulator 2026-09-06). `started` flips only AFTER the init store,
+        // so waiting for it makes the stored ids final; we then overwrite them
+        // with the full pair. Bounded: an init that never completes (dead
+        // network) degrades to uploading with an empty eventTypesHash, which
+        // simply forces a re-upload on the next client start.
+        withTimeoutOrNull(SYNC_SWAP_INIT_WAIT_MS) { c.started.first { it } }
+        // Stop the slim loop BEFORE nulling the batch token: the old loop's
+        // in-flight round writes its token on completion, and a token landing
+        // after our null turns the restarted loop into incremental rounds —
+        // the state-bearing initial sync never runs (LP3 2026-09-06: rooms
+        // "Chat" forever AND megolm decrypt refuses on the missing
+        // m.room.encryption state, so history stays [Encrypted] despite a
+        // successful backup-key restore).
+        runCatching { c.stopSync() }
+        inProcessSyncRunning = false
+        val accountStore = c.di.get<AccountStore>()
+        val mappings = c.di.get<EventContentSerializerMappings>()
+        val storedHash = accountStore.getAccount()?.filter?.eventTypesHash
+        val syncFilterId = c.api.user.setFilter(c.userId, fullSyncFilters.applyDefaultFilter(mappings, config)).getOrThrow()
+        val syncOnceFilterId = c.api.user.setFilter(c.userId, fullSyncOnceFilters.applyDefaultFilter(mappings, config)).getOrThrow()
+        c.di.get<StoreTransactionManager>().writeTransaction {
+            accountStore.updateAccount {
+                // syncBatchToken = null is essential: the slim verification
+                // phase ADVANCED the batch token past all room state/timeline
+                // (limit 1, state notTypes="*"), and an incremental restart
+                // never re-delivers what the token passed — rooms render
+                // nameless ("Chat…") and history stays "Encrypted" forever
+                // (LP3 2026-09-06). Nulling the token makes the restarted loop
+                // do a true full initial sync under the full filter — same
+                // reasoning as sync-filter migration v4 (2026-08-28).
+                it?.copy(
+                    filter = Account.Filter(syncFilterId, syncOnceFilterId, storedHash ?: ""),
+                    syncBatchToken = null,
+                )
+            }
+        }
+        // Restart the loop through the shared cadence entry points (same shape
+        // as the network-recovery reset): a dark screen must not start a
+        // long-poll — it goes through the screen → cadence decision instead.
+        if (isScreenInteractive() && syncEnabled) {
+            startSyncLoop(appContext ?: error("companion not initialized"))
+        } else {
+            applySyncModeForScreenState()
+        }
+    }
+
+    /**
+     * Replica of Trixnity's private `MatrixClientImpl.Filters.applyDefaultFilter`
+     * (5.8) — it merges Trixnity's type whitelists (from the CLIENT's [mappings])
+     * over [this], keeping `notTypes`, and enables lazy member loading.
+     * [swapToFullSync] uploads with it; if Trixnity's version changes, this
+     * must follow, or the swapped-in filter silently diverges from what the
+     * init upload would have stored (verified against MatrixClient.kt 5.8.0).
+     */
+    private fun Filters.applyDefaultFilter(mappings: EventContentSerializerMappings, config: MatrixClientConfiguration): Filters =
+        copy(
+            accountData =
+                (accountData ?: Filters.EventFilter()).copy(types = mappings.globalAccountData.map { it.type }.toSet()),
+            room =
+                (room ?: Filters.RoomFilter()).copy(
+                    accountData =
+                        (room?.accountData ?: Filters.RoomFilter.RoomEventFilter()).copy(
+                            types = mappings.roomAccountData.map { it.type }.toSet()
+                        ),
+                    ephemeral =
+                        (room?.ephemeral ?: Filters.RoomFilter.RoomEventFilter()).copy(
+                            types = mappings.ephemeral.map { it.type }.toSet()
+                        ),
+                    state =
+                        (room?.state ?: Filters.RoomFilter.RoomEventFilter()).copy(
+                            lazyLoadMembers = true,
+                            types = mappings.state.map { it.type }.toSet(),
+                        ),
+                    timeline =
+                        (room?.timeline ?: Filters.RoomFilter.RoomEventFilter()).copy(
+                            types = (mappings.message + mappings.state).map { it.type }.toSet()
+                        ),
+                    includeLeave = config.deleteRooms !is DeleteRooms.OnLeave,
+                ),
+        )
 
     /**
      * Verifies this device non-interactively with the account's recovery key
@@ -1721,6 +1912,7 @@ object MatrixRepository {
                 runCatching { request.cancel() }
                 verificationCollectJob?.cancel()
                 setVerificationUi(VerificationUi.Error("Verification timed out — try your recovery key"))
+                swapToFullSync() // verification-first sync — see [pendingVerificationPhase]
             }
         }
     }
@@ -1822,13 +2014,22 @@ object MatrixRepository {
                 // key arrived ~2s later, restore skipped by the stale cooldown).
                 scope.launch {
                     val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return@launch
-                    repeat(3) { attempt ->
-                        delay(10_000L * (attempt + 1))
+                    // The backup secret's arrival is out of our control: another
+                    // device answers the secret request whenever it does — 25 s
+                    // in the working run, never (5+ min) in the two failing
+                    // logins (LP3 2026-09-06/07). The old 3-try/90 s ladder
+                    // gave up before late answers could land. Each attempt
+                    // re-requests the missing secrets internally (see
+                    // [restoreMegolmSessions]); a success stamps the cooldown
+                    // and later attempts no-op cheaply.
+                    listOf(10L, 30L, 60L, 120L, 300L, 600L, 1200L).forEach { delayS ->
+                        delay(delayS * 1000)
                         prefs.edit().remove(KEY_RESTORE_LAST_RUN_MS).apply()
                         restoreMegolmSessions()
                     }
                 }
                 markRoomListDirty() // newly verified device → unread counts recompute
+                scope.launch { swapToFullSync() } // verification-first sync — see [pendingVerificationPhase]
                 VerificationUi.Done
             }
             else -> {
@@ -1908,6 +2109,17 @@ object MatrixRepository {
      */
     private suspend fun reRequestMissingSecrets(c: MatrixClient): Boolean = runCatching {
         val keyStore = c.di.get<KeyStore>(KeyStore::class)
+        val tm = c.di.get<StoreTransactionManager>(StoreTransactionManager::class)
+        // An unanswered request must not block the retry ladder (2026-09-07:
+        // Trixnity only drops pending requests after 1 day, so without this the
+        // 10s/30s/60s… ladder re-sent nothing after the first attempt). Purge
+        // pending requests and re-send — a late answer still matches by request
+        // id at accept time, so purging is safe.
+        keyStore.getAllSecretKeyRequests().forEach { req ->
+            req.content.requestId?.let { id ->
+                tm.writeTransaction { keyStore.deleteSecretKeyRequest(id) }
+            }
+        }
         val missing = SecretType.entries.filter { it.cacheable }
             .subtract(keyStore.getSecrets().keys)
             .subtract(
@@ -1916,19 +2128,33 @@ object MatrixRepository {
                     .toSet()
             )
         if (missing.isEmpty()) return@runCatching false
-        // Answers only come back Olm-encrypted from devices that have the
-        // secret — i.e. our own verified devices.
-        val receivers = keyStore.getDeviceKeys(c.userId).first().orEmpty()
-            .filter {
-                it.value.trustLevel.isVerified &&
-                    it.value.value.signed.deviceId != c.deviceId
+        // The local device-key store only knows devices a previous flow happened
+        // to fetch — after repeated logout/logins that's mostly our own dead
+        // past sessions, while the live Beeper clients (which hold the secrets)
+        // were never asked (2026-09-07, the history-stays-encrypted bug).
+        // mautrix/Beeper requests from ALL own devices ("*" semantics). Refresh
+        // own keys from the server first: OutdatedKeysHandler fetches /keys/query
+        // and computes trust for every current device when the user is marked
+        // outdated — poll briefly for new devices to land, then ask them all.
+        val knownBefore = keyStore.getDeviceKeys(c.userId).first().orEmpty().keys
+        c.di.get<StoreTransactionManager>(StoreTransactionManager::class).writeTransaction {
+            keyStore.updateOutdatedKeys { it + c.userId }
+        }
+        withTimeoutOrNull(15_000) {
+            while (keyStore.getDeviceKeys(c.userId).first().orEmpty().keys.size <= knownBefore.size) {
+                delay(500)
             }
-            .map { it.value.value.signed.deviceId }
-            .toSet()
-        if (receivers.isEmpty()) {
-            android.util.Log.w(TAG, "restore: no verified device to re-request secrets from")
+        }
+        val receiverDevices = keyStore.getDeviceKeys(c.userId).first().orEmpty()
+            .filterKeys { it != c.deviceId }
+        if (receiverDevices.isEmpty()) {
+            android.util.Log.w(TAG, "restore: no own device to re-request secrets from")
             return@runCatching false
         }
+        receiverDevices.forEach { (id, dk) ->
+            android.util.Log.i(TAG, "restore: secret-request receiver $id trust=${dk.trustLevel}")
+        }
+        val receivers = receiverDevices.keys
         missing.forEach { secret ->
             val request = SecretKeyRequestEventContent(
                 name = secret.id,
@@ -1939,10 +2165,10 @@ object MatrixRepository {
             c.api.user
                 .sendToDevice(mapOf(c.userId to receivers.associateWith { request }))
                 .getOrThrow()
-            c.di.get<StoreTransactionManager>(StoreTransactionManager::class).writeTransaction {
+            tm.writeTransaction {
                 keyStore.addSecretKeyRequest(StoredSecretKeyRequest(request, receivers, Clock.System.now()))
             }
-            android.util.Log.i(TAG, "restore: re-requested secret ${secret.id} from $receivers")
+            android.util.Log.i(TAG, "restore: re-requested secret ${secret.id} from ${receivers.size} devices")
         }
         true
     }.onFailure {
@@ -1992,8 +2218,6 @@ object MatrixRepository {
             }
             android.util.Log.w(TAG, "restore: cooldown active but backup secret missing — re-running to re-request it")
         }
-        // Written on START: even a scan that dies mid-run won't re-run for a day.
-        prefs.edit().putLong(KEY_RESTORE_LAST_RUN_MS, now).apply()
         // Trixnity's version flow emits its current value immediately — null
         // until the service has actually fetched /room_keys/version. A process
         // restart before that fetch reads as "no backup configured" and stuck
@@ -2039,10 +2263,11 @@ object MatrixRepository {
                 if (scanned % 200 == 0) {
                     android.util.Log.d(TAG, "restore: $scanned/${rooms.size} rooms scanned, $roomsTouched with encrypted content")
                 }
-                // Parked rooms stay parked until the 4h park expires (the
-                // preview/ghost paths re-check them then) — no point re-scanning
-                // them on the daily crawl too (battery 2026-08-17 audit).
-                if (inDecryptRestoreCooldown(roomId)) continue
+                // The futile-restore cooldown no longer skips the room here
+                // (2026-09-07): parked rooms are exactly the ones with stuck
+                // rows, and restoreRoomSessions' local-first re-decrypt is
+                // free (no backup round-trip) — the cooldown gates only the
+                // backup part inside it, so parking stays effective.
                 val events = collectNewestEvents(c, roomId, { maxSize = RESTORE_ROOM_EVENTS }, RESTORE_ROOM_BUDGET_MS)
                     ?: continue
                 val hasEncrypted = events.any {
@@ -2064,6 +2289,12 @@ object MatrixRepository {
             _restoreProgress.value = _restoreProgress.value.copy(scanning = false)
         }
         android.util.Log.d(TAG, "restore: done — $roomsTouched rooms with encrypted content")
+        // Written on COMPLETION: a crawl killed mid-run (update install,
+        // process death) must be able to re-run — stamping at start stranded
+        // a 21:20 crawl killed by the 21:26 update behind the 24h cooldown
+        // (LP3 2026-09-06). The scan is idempotent; re-running costs the
+        // skipped-room re-reads only.
+        prefs.edit().putLong(KEY_RESTORE_LAST_RUN_MS, System.currentTimeMillis()).apply()
         _restoreProgress.value = RestoreProgress(scanned = scanned, roomsTotal = rooms.size, completed = true)
         // Persist (2026-09-01): the in-memory flag dies with the process and
         // the 24h gate keeps the next crawl a no-op, so without this the
@@ -2087,6 +2318,11 @@ object MatrixRepository {
             syncMode = SyncMode.ACTIVE
             inProcessSyncRunning = false
             observedClient = null
+            // Verification-first sync: a torn-down session must not leak the
+            // slim phase into the next one (the next login re-arms it anyway).
+            pendingVerificationPhase = false
+            activeClientConfig = null
+            verificationSyncSwapped.set(false)
             resetVerification()
             e2eeStateCache = null // logged out — no stale verified state
             activeRoomId = null
@@ -2104,6 +2340,13 @@ object MatrixRepository {
             old?.let { runCatching { PushChannel.unregister(ctx, it) } }
             ChatNotifier.clearAll(ctx)
             runCatching { old?.logout() } // API logout + clears Trixnity's store
+                .onFailure {
+                    // A skipped/failed API logout leaks the device server-side
+                    // (2026-09-07: 5 stale "Chats (Light Phone)" devices, one per
+                    // force-killed/expired session — they poisoned the secret-
+                    // request receiver list). Make the leak visible.
+                    android.util.Log.w(TAG, "logout: API logout failed — device stays registered: ${it.message}")
+                }
             runCatching { old?.closeSuspending() }
             ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
             ctx.deleteDatabase(DB_NAME)
@@ -2142,6 +2385,12 @@ object MatrixRepository {
             return if (restored != null) {
                 client = restored
                 observeClient(restored)
+                // Restore path (process restart / update install) mirrors
+                // finishLogin's E2EE wiring: login-only wiring left updated
+                // installs with no verification and no key-backup crawl
+                // (LP3 2026-09-06: the 21:26 update killed the 21:20 crawl
+                // mid-run and nothing on this path ever re-triggered it).
+                scope.launch { armRestoreVerification(restored) }
                 // Show the last-known chats immediately while the resolver's
                 // first pass warms the store (Phase 14 disk cache).
                 if (_roomList.value.isEmpty()) preloadRoomListFromDisk()
@@ -2564,7 +2813,7 @@ object MatrixRepository {
                 RoomListEntry(
                     room = room,
                     nameResolved = room.name != ROOM_NAME_PLACEHOLDER && room.name.isNotBlank() &&
-                        !nameIsGhostLocalpart,
+                        room.name != ROOM_NAME_FALLBACK && !nameIsGhostLocalpart,
                     previewResolved = room.lastMessage.isNotBlank() &&
                         !room.lastMessage.startsWith("[Encrypted"),
                     previewRetryAtMs = 0L,
@@ -3607,7 +3856,10 @@ object MatrixRepository {
             // Restore only when the page still has undecryptable events — an
             // all-decrypted room needs no priming, so skip the parse entirely
             // (battery 2026-08-17: the seed restore ran on every page read).
-            if (seed.any { it.content?.isFailure == true } && !inDecryptRestoreCooldown(matrixRoomId)) {
+            // The futile-restore cooldown now guards only the backup round-trip
+            // inside [restoreRoomSessions] — the local-first re-decrypt of
+            // already-held sessions must run regardless (2026-09-07).
+            if (seed.any { it.content?.isFailure == true }) {
                 // Park genuinely undecryptable pages too — the same futility signal
                 // as the page-build path, so opening a doomed room doesn't re-seed
                 // a restore on every read (battery 2026-08-17 audit).
@@ -4531,7 +4783,31 @@ object MatrixRepository {
         val encryptionService = c.di.get<RoomEventEncryptionService>(
             org.koin.core.qualifier.named<MegolmRoomEventEncryptionService>(),
         )
-        sessionIds.forEach { sessionId ->
+        // Local-first pass (2026-09-07): a row whose megolm session is already
+        // in the olm store but whose stored content is a cached failure only
+        // needs a re-decrypt — getTimelineEvent never retries (drive 5), and
+        // the futile-restore cooldown was parking exactly these rooms (Fen and
+        // Friends: messageIndex 2 of a session holding indexes 0,1,3 — key
+        // present, row stuck). Free and local: no backup round-trip, no
+        // cooldown. The cooldown keeps guarding the network part below.
+        val olmStore = c.di.get<OlmCryptoStore>(OlmCryptoStore::class)
+        var resolvedLocal = 0
+        val backupSessionIds = sessionIds.filter { sessionId ->
+            if (olmStore.getInboundMegolmSession(sessionId, matrixRoomId).firstOrNull() != null) {
+                resolvedLocal += reDecryptSessionEvents(
+                    matrixRoomId, sessionId, stuckRowsForSession(c, matrixRoomId, sessionId)
+                        .ifEmpty { sessionToEvents[sessionId].orEmpty() },
+                    timelineStore, tm, encryptionService,
+                )
+                false
+            } else true
+        }
+        if (backupSessionIds.isEmpty()) {
+            android.util.Log.d(TAG, "restoreRoomSessions: $matrixRoomId — all ${sessionIds.size} session(s) local, re-decrypted $resolvedLocal event(s), no backup needed")
+            return resolvedLocal
+        }
+        if (inDecryptRestoreCooldown(matrixRoomId)) return resolvedLocal
+        backupSessionIds.forEach { sessionId ->
             try {
                 val ok = withTimeoutOrNull(KEY_BACKUP_LOAD_TIMEOUT_MS) {
                     keyBackup.loadMegolmSession(matrixRoomId, sessionId)
@@ -4541,25 +4817,15 @@ object MatrixRepository {
                     // Re-decrypt + re-persist: getTimelineEvent only reads the
                     // store's cached result, so a freshly loaded session never
                     // reaches the stored rows through it (drive 5, 2026-09-06:
-                    // loaded 1/1, then 49/50 events still stuck). Run the megolm
-                    // service directly and write the result back.
-                    var resolved = 0
-                    val sessionEvents = sessionToEvents[sessionId].orEmpty()
-                    sessionEvents.forEach { te ->
-                        val messageEvent = te.event as? ClientEvent.RoomEvent.MessageEvent<*>
-                        if (messageEvent == null) return@forEach
-                        val decrypted = runCatching { encryptionService.decrypt(messageEvent) }
-                            .getOrNull()?.getOrNull() ?: return@forEach
-                        tm.writeTransaction {
-                            timelineStore.update(te.event.id, matrixRoomId) { old ->
-                                old?.copy(content = Result.success(decrypted))
-                            }
-                        }
-                        resolved++
-                    }
+                    // loaded 1/1, then 49/50 events still stuck).
+                    resolvedLocal += reDecryptSessionEvents(
+                        matrixRoomId, sessionId, stuckRowsForSession(c, matrixRoomId, sessionId)
+                            .ifEmpty { sessionToEvents[sessionId].orEmpty() },
+                        timelineStore, tm, encryptionService,
+                    )
                     android.util.Log.d(
                         TAG,
-                        "restoreRoomSessions: re-decrypted $resolved/${sessionEvents.size} events for $matrixRoomId / $sessionId",
+                        "restoreRoomSessions: loaded session $sessionId for $matrixRoomId (${sessionToEvents[sessionId]?.size ?: 0} event(s))",
                     )
                 } else {
                     android.util.Log.w(TAG, "restoreRoomSessions: loadMegolmSession timed out for $matrixRoomId / $sessionId")
@@ -4569,7 +4835,73 @@ object MatrixRepository {
             }
         }
         android.util.Log.d(TAG, "restoreRoomSessions: loaded $loaded/${sessionIds.size} sessions for $matrixRoomId")
-        return loaded
+        return resolvedLocal
+    }
+
+    /** All timeline rows of [matrixRoomId] encrypted with [sessionId] whose
+     *  stored content is still unresolved (null or failure). The re-decrypt
+     *  passes used to cover only the collected page window, so the older rows
+     *  of an already-loaded session stayed stuck after a fresh login (the
+     *  room's oldest messages, 2026-09-07). Plain LIKE scan — bounded by the
+     *  room's row count, only runs while unresolved rows exist. */
+    private suspend fun stuckRowsForSession(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        sessionId: String,
+    ): List<TimelineEvent> {
+        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            ?: return emptyList()
+        val json = runCatching { c.di.get<Json>() }.getOrNull() ?: return emptyList()
+        return chainDbSemaphore.withPermit {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    db.openHelper.writableDatabase.query(
+                        "SELECT value FROM TimelineEvent WHERE roomId = ? AND value LIKE ?",
+                        arrayOf<Any>(matrixRoomId.full, "%$sessionId%"),
+                    ).use { cursor ->
+                        buildList {
+                            while (cursor.moveToNext()) {
+                                val value = cursor.getString(0) ?: continue
+                                val te = runCatching { json.decodeFromString<TimelineEvent>(value) }.getOrNull() ?: continue
+                                val content = te.event.content as? EncryptedMessageEventContent.MegolmEncryptedMessageEventContent
+                                if (content?.sessionId != sessionId) continue
+                                if (te.content?.getOrNull() != null) continue // already resolved
+                                add(te)
+                            }
+                        }
+                    }
+                }.getOrDefault(emptyList())
+            }
+        }
+    }
+
+    /** Re-decrypts [events] with the megolm service and persists the plaintext
+     *  back into the timeline store — the shared tail of the local-first and
+     *  backup-restored passes of [restoreRoomSessions]. Returns the count of
+     *  events that decrypted. */
+    private suspend fun reDecryptSessionEvents(
+        matrixRoomId: RoomId,
+        sessionId: String,
+        sessionEvents: List<TimelineEvent>,
+        timelineStore: RoomTimelineStore,
+        tm: StoreTransactionManager,
+        encryptionService: RoomEventEncryptionService,
+    ): Int {
+        var resolved = 0
+        sessionEvents.forEach { te ->
+            val messageEvent = te.event as? ClientEvent.RoomEvent.MessageEvent<*>
+            if (messageEvent == null) return@forEach
+            val decrypted = runCatching { encryptionService.decrypt(messageEvent) }
+                .getOrNull()?.getOrNull() ?: return@forEach
+            tm.writeTransaction {
+                timelineStore.update(te.event.id, matrixRoomId) { old ->
+                    old?.copy(content = Result.success(decrypted))
+                }
+            }
+            resolved++
+        }
+        android.util.Log.d(TAG, "restoreRoomSessions: re-decrypted $resolved/${sessionEvents.size} events for $matrixRoomId / $sessionId")
+        return resolved
     }
 
     /** Asks our own other devices for the megolm sessions of undecryptable
@@ -6657,6 +6989,31 @@ object MatrixRepository {
                     android.util.Log.w(TAG, "notification watcher: sync-state collector ended: ${e.message}")
                 }
             }.also { notificationWatcherJobs.add(it) }
+            // Server unread counts (2026-09-07): the sync response carries the
+            // server-computed per-room unread_notifications.notification_count —
+            // the same account-wide unread truth the Beeper clients show. Trixnity
+            // only stores it as an unencrypted-room cap (and its own badge state
+            // machine dies on fresh logins — see [localReceiptUnread]), so collect
+            // it directly here. Incremental syncs only include changed rooms, which
+            // is exactly when a count can move.
+            scope.launch {
+                try {
+                    c.api.sync.subscribeAsFlow().collect { syncEvents ->
+                        val join = syncEvents.syncResponse.room?.join ?: return@collect
+                        var changed = false
+                        for ((roomId, joinedRoom) in join) {
+                            val count = joinedRoom.unreadNotifications?.notificationCount?.toInt() ?: 0
+                            if (serverUnreadCounts[roomId.full] != count) {
+                                serverUnreadCounts[roomId.full] = count
+                                changed = true
+                            }
+                        }
+                        if (changed) markRoomListDirty()
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "server-unread collector ended: ${e.message}")
+                }
+            }.also { notificationWatcherJobs.add(it) }
             try {
                 // roomId.full -> last relevant event id seen so far ("" = none yet).
                 val seen = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -6949,7 +7306,11 @@ object MatrixRepository {
             ) null else senderNameOf(c, roomId, te.event.sender),
             preview = preview,
             direct = room.isDirect,
-            unreadCount = unreadCounts[roomId.full]?.toLong() ?: 0L,
+            unreadCount = maxOf(
+                unreadCounts[roomId.full]?.toLong() ?: 0L,
+                serverUnreadCounts[roomId.full]?.toLong() ?: 0L,
+                localReceiptUnread(c, roomId.full),
+            ),
         )
         // Persist "alerted this event" so a later watcher registration (new
         // process) doesn't re-alert it — the registration-time notify gate.
@@ -7347,6 +7708,15 @@ object MatrixRepository {
     private val unreadCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     /**
+     * Server-computed per-room unread notification counts, captured straight
+     * from the sync response (see the collector in [observeNotifications]).
+     * Trixnity's own badge pipeline is empty after a fresh login, so this —
+     * the account-wide truth every other Beeper client shows — is the primary
+     * badge source; the local receipt comparison is the last fallback.
+     */
+    private val serverUnreadCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /**
      * Unread count to show in the list. While a MarkRead is pending (the
      * store hasn't echoed it yet — see [pendingReadClear]) the count reads 0;
      * the suppression lifts when the echo confirms (notification count 0) or
@@ -7373,12 +7743,55 @@ object MatrixRepository {
         }
     }
 
+    /**
+     * Local unread fallback (2026-09-07): Trixnity's notification count is
+     * dead after a fresh login — its state machine defaults rooms to "read"
+     * when the last message isn't in the local timeline (our battery-thin
+     * sync leaves most rooms with 0-1 timeline rows) and only re-checks when
+     * a NEW event lands, so the badge never appears for exactly the rooms
+     * with unread history. Fallback: compare the account's own read receipt
+     * against the newest receipt from other members (the bridge posts each
+     * sender's receipt at their own last event, so max(other ts) tracks the
+     * newest non-self activity). Ours older → something unread. Fully local,
+     * one indexed lookup; the badge is boolean, so the count is 1.
+     * ponytail: heuristic — non-bridged rooms where senders never post
+     * receipts can under-report; upgrade to a bounded chain walk if seen.
+     */
+    private suspend fun localReceiptUnread(c: MatrixClient, roomId: String): Long {
+        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            ?: return 0L
+        return chainDbSemaphore.withPermit {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    db.openHelper.writableDatabase.query(
+                        "SELECT userId, MAX(je.value) FROM RoomUserReceipts, " +
+                            "json_tree(RoomUserReceipts.value) je " +
+                            "WHERE RoomUserReceipts.roomId=? AND je.key='ts' AND je.type='integer' " +
+                            "GROUP BY userId",
+                        arrayOf(roomId),
+                    ).use { cur ->
+                        var own = -1L
+                        var othersMax = -1L
+                        while (cur.moveToNext()) {
+                            if (cur.isNull(1)) continue
+                            val ts = cur.getLong(1)
+                            if (cur.getString(0) == c.userId.full) own = maxOf(own, ts)
+                            else othersMax = maxOf(othersMax, ts)
+                        }
+                        if (own >= 0 && othersMax > own) 1L else 0L
+                    }
+                }.getOrDefault(0L)
+            }
+        }
+    }
+
     private fun resetRoomList() {
         roomListCache.clear()
         roomSigSeen.clear()
         bridgeBotByRoom.clear()
         pendingReadClear.clear()
         unreadCounts.clear()
+        serverUnreadCounts.clear()
         effectiveLastCache.clear()
         ghostResolveInFlight.clear()
         _roomList.value = emptyList()
@@ -7807,8 +8220,17 @@ object MatrixRepository {
             null -> ts
         }
         // An unverified device can't decrypt — suppress unread for encrypted
-        // rooms only; unencrypted ones stay readable.
-        val storeUnread = if (verified || !room.encrypted) (unreadCounts[key]?.toLong() ?: 0L) else 0
+        // rooms only; unencrypted ones stay readable. Local receipt fallback
+        // (2026-09-07): Trixnity's notification count is empty after a fresh
+        // login (its state machine marks timeline-less rooms read) — the
+        // own-receipt-vs-others comparison catches those.
+        val storeUnread = if (verified || !room.encrypted) {
+            maxOf(
+                unreadCounts[key]?.toLong() ?: 0L,
+                serverUnreadCounts[key]?.toLong() ?: 0L,
+                localReceiptUnread(c, key),
+            )
+        } else 0
         val cleared = pendingReadClear[key]
         val unread = servedUnread(
             key,
@@ -7828,10 +8250,21 @@ object MatrixRepository {
         val newMessageArrived = lastEventId != null && lastEventId != prev?.room?.lastEventId
 
         val nameResolved = prev?.nameResolved == true && !stateChanged
-        val name = if (nameResolved) {
+        val freshName = if (nameResolved) {
             prev.room.name
         } else {
             resolveRoomName(c, roomId, room, nameMemo)
+        }
+        // Flash guard (2026-09-07): on a cold start the first passes run before
+        // the sync has delivered member state — resolveRoomName falls through
+        // to the "Chat" placeholder, and publishing it overwrote the disk
+        // cache's previously resolved names (the user-visible name flash when
+        // the list opens). Keep the previous resolved name and stay unresolved;
+        // a later pass with real heroes replaces it.
+        val name = if (freshName == ROOM_NAME_FALLBACK && prev?.nameResolved == true) {
+            prev.room.name
+        } else {
+            freshName
         }
 
         val preview: String
@@ -7917,7 +8350,10 @@ object MatrixRepository {
                 pinned = flags[key]?.pinned ?: false,
                 muted = flags[key]?.muted ?: false,
             ),
-            nameResolved = true,
+            // The fallback isn't a resolution: heroes may still be on their way
+            // (the full initial sync lands after the slim-phase rooms did) —
+            // keep re-resolving so the row upgrades when they arrive.
+            nameResolved = name != ROOM_NAME_FALLBACK,
             previewResolved = previewResolved,
             previewRetryAtMs = previewRetryAtMs,
         )
@@ -8196,7 +8632,7 @@ object MatrixRepository {
             }.filter { it.isNotBlank() }
             if (names.isNotEmpty()) return names.joinToString(", ")
         }
-        return "Chat"
+        return ROOM_NAME_FALLBACK
     }
 
     /** A hero's display name, or its localpart when the user lookup times out. */
@@ -9076,6 +9512,73 @@ object MatrixRepository {
         addInterceptor(claimFailuresFixInterceptor)
     }.also { android.util.Log.d(TAG, "HTTP-TRAFFIC: generic engine armed") }
 
+    // Steady-state sync filters. Sync payload slimming (PLAN §8.1,
+    // 2026-08-28): the default filter ships every presence update + a huge
+    // per-room timeline on the 1284-room account (30-50 s CPU per /sync).
+    // Presence is never displayed — set_presence=offline only stops OUR
+    // updates, this filter stops receiving theirs — and the timeline limit
+    // bounds each room's per-sync window. Trixnity's applyDefaultFilter()
+    // merges over it, keeping lazy-load members + the event-type whitelists.
+    //
+    // Ephemeral slimming (2026-08-31): applyDefaultFilter REPLACES types with
+    // its own whitelist, so narrowing must go through notTypes, which
+    // survives the merge. Nothing renders incoming typing (the composer only
+    // sends it), and it is the noisiest per-sync element in active rooms —
+    // both filters drop m.typing. The syncOnce filter (background rounds +
+    // push wakes) also drops m.receipt: seen/delivered only matter while the
+    // tool is open, and the long-poll (syncFilter) delivers them fresh the
+    // moment it is.
+    private val fullSyncFilters = Filters(
+        presence = Filters.EventFilter(notTypes = setOf("*")),
+        room = Filters.RoomFilter(
+            timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT),
+            ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing")),
+        ),
+    )
+
+    // SYNC-PERF-SPEC §Phase 1 lever 3, partially reverted (LP3 2026-09-06):
+    // this filter once stripped room state (`state = notTypes="*"`). That is
+    // only safe while the DB already holds state from an earlier initial
+    // sync — but the initial sync can run under THIS filter: the
+    // verification-phase swap nulls the batch token, and a slow-sync round /
+    // push wake can win the queue and consume the one-shot initial sync
+    // (measured: 302 rooms × 20-timeline stored, zero m.room.name/create/
+    // power_levels → every room "Chat" forever, LP3 2026-09-06). State
+    // DELTAS in background rounds are rare (name/membership changes) — keep
+    // state here so an initial sync is always correct. The ephemeral
+    // slimming (m.typing/m.receipt) stays. Invites are unaffected:
+    // rooms.invite carries stripped invite_state.
+    private val fullSyncOnceFilters = Filters(
+        presence = Filters.EventFilter(notTypes = setOf("*")),
+        room = Filters.RoomFilter(
+            timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT_BACKGROUND),
+            ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing", "m.receipt")),
+        ),
+    )
+
+    /**
+     * Verification-phase variant of both sync filters (verification-first
+     * sync, LP3 2026-09-06): a fresh login that will run device verification
+     * must not let the initial sync outrun the SAS emoji round-trips. Under
+     * the full background filter the initial sync ingests 6902 events (301
+     * rooms × 20 timeline + state) over ~180 s of serialized emit, and the
+     * partner's accept — a to-device event — only lands on the sync round
+     * AFTER the initial sync, so the emoji screen appeared ~3 min late.
+     * Timeline limit 1 + no state/ephemeral/presence shrinks the same sync to
+     * ~300 room-list bones; to-device events (the whole verification chain)
+     * and the room-list bones still flow. [swapToFullSync] restores
+     * [fullSyncFilters]/[fullSyncOnceFilters] once verification completes, is
+     * skipped, or times out.
+     */
+    private val verificationSyncFilters = Filters(
+        presence = Filters.EventFilter(notTypes = setOf("*")),
+        room = Filters.RoomFilter(
+            timeline = Filters.RoomFilter.RoomEventFilter(limit = 1L),
+            ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("*")),
+            state = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("*")),
+        ),
+    )
+
     /** Client configuration, differing only in the client name (the Beeper
      *  profile identifies as "chats-beeper" so its device appears distinctly).
      *  Qualified `httpClientEngine`: inside the receiver lambda, the
@@ -9083,51 +9586,20 @@ object MatrixRepository {
      *  a silent no-op that left the client on Ktor's default engine (no
      *  logging/claim interceptors). */
     private fun clientConfiguration(name: String): MatrixClientConfiguration.() -> Unit = {
+        // Capture the configuration being built — its filter properties are
+        // `var`, so [swapToFullSync] can switch them without a client rebuild.
+        activeClientConfig = this
         this.name = name
         httpClientEngine = this@MatrixRepository.httpClientEngine
         modulesFactories = createTrixnityDefaultModuleFactories() + ::plaintextVerificationModule + ::archiveMappingsModule + ::permissiveKeyRequestModule
-        // Sync payload slimming (PLAN §8.1, 2026-08-28): the default filter
-        // ships every presence update + a huge per-room timeline on the
-        // 1284-room account (30-50 s CPU per /sync). Presence is never
-        // displayed — set_presence=offline only stops OUR updates, this filter
-        // stops receiving theirs — and the timeline limit bounds each room's
-        // per-sync window. Trixnity's applyDefaultFilter() merges over it,
-        // keeping lazy-load members + the event-type whitelists.
-        //
-        // Ephemeral slimming (2026-08-31): applyDefaultFilter REPLACES types
-        // with its own whitelist, so narrowing must go through notTypes, which
-        // survives the merge. Nothing renders incoming typing (the composer
-        // only sends it), and it is the noisiest per-sync element in active
-        // rooms — both filters drop m.typing. The syncOnce filter (background
-        // rounds + push wakes) also drops m.receipt: seen/delivered only matter
-        // while the tool is open, and the long-poll (syncFilter) delivers them
-        // fresh the moment it is.
-        syncFilter = Filters(
-            presence = Filters.EventFilter(notTypes = setOf("*")),
-            room = Filters.RoomFilter(
-                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT),
-                ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing")),
-            ),
-        )
-        syncOnceFilter = Filters(
-            presence = Filters.EventFilter(notTypes = setOf("*")),
-            room = Filters.RoomFilter(
-                timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT_BACKGROUND),
-                ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing", "m.receipt")),
-                // SYNC-PERF-SPEC §Phase 1 lever 3: state deltas are pure
-                // overhead in background rounds — the UI reads the local store,
-                // and the active long-poll (syncFilter keeps state) catches up
-                // names/membership the moment the screen is on. notTypes="*"
-                // survives applyDefaultFilter's merge (same mechanism as the
-                // ephemeral slimming above — Trixnity replaces `types`, not
-                // `notTypes`). Invites are unaffected: rooms.invite carries
-                // stripped invite_state, which the state filter doesn't govern.
-                // Gap-fill trade-off: a `limited` background timeline no longer
-                // carries the gap's state delta (member events in a >20 burst
-                // gap arrive on the next active round instead).
-                state = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("*")),
-            ),
-        )
+        // Verification-first sync: a login that will verify (see
+        // [pendingVerificationPhase]) builds with the slim filters on BOTH the
+        // long-poll and the background/initial filter — measured 6902-event /
+        // 180 s initial ingest on a fresh install (LP3 2026-09-06), with the
+        // SAS emoji stuck behind it. The swap back to the full set happens in
+        // [swapToFullSync] once the verification outcome is known.
+        syncFilter = if (pendingVerificationPhase) verificationSyncFilters else fullSyncFilters
+        syncOnceFilter = if (pendingVerificationPhase) verificationSyncFilters else fullSyncOnceFilters
         // Room "last relevant event" = actual messages only (reference-messenger
         // shape): m.replace edits (Beeper's re-import wall) and reactions no
         // longer advance lastRelevantEventId — so they don't wake the
@@ -9362,22 +9834,6 @@ object MatrixRepository {
                 ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
             }
         }, SYNC_STOP_DELAY_MS)
-    }
-
-    private suspend fun roomDisplayName(c: MatrixClient, roomId: RoomId, room: MatrixRoom): String {
-        room.name?.explicitName?.takeIf { it.isNotBlank() }?.let { return it }
-        val heroes = titleHeroesOf(c, roomId, room)
-        if (heroes.isNotEmpty()) {
-            val names = heroes.mapNotNull { hero ->
-                withTimeoutOrNull(ROOM_BUDGET_MS) {
-                    c.user.getById(roomId, hero).firstOrNull()?.name
-                }?.takeIf { it.isNotBlank() }
-                    ?: bridgeContactNameOf(hero)
-                    ?: hero.localpart
-            }.filter { it.isNotBlank() }
-            if (names.isNotEmpty()) return names.joinToString(", ")
-        }
-        return "Chat"
     }
 
     /** True for m.replace edit events — Beeper re-imports old media as edits
@@ -9810,6 +10266,11 @@ object MatrixRepository {
 
     // Room-list resolver (Phase 5).
     private const val ROOM_NAME_PLACEHOLDER = "…"
+    /** [resolveRoomName]'s dead-end fallback — a row showing this is NOT a
+     *  resolved name and must be re-resolved on a later pass (heroes land
+     *  with the full initial sync, after the slim-phase pass stamped "Chat"
+     *  as resolved forever, LP3 2026-09-06). */
+    private const val ROOM_NAME_FALLBACK = "Chat"
     /** Per-pass time budget; the resolver loops until the list is settled. */
     private const val ROOM_LIST_PASS_BUDGET_MS = 12_000L
     /** Breather between passes; a settled pass itself takes milliseconds. */
@@ -9852,6 +10313,14 @@ object MatrixRepository {
      *  timer cancels it (Trixnity's own timeout events are not surfaced — see
      *  onVerificationState). */
     private const val VERIFICATION_TIMEOUT_MS = 10 * 60_000L
+
+    /** Verification-first sync: delay before the single [swapToFullSync] retry. */
+    private const val SYNC_SWAP_RETRY_MS = 5_000L
+
+    /** Verification-first sync: how long [swapToFullSync] waits for the client
+     *  init coroutine to finish its one-time filter upload (`started` flag). */
+    private const val SYNC_SWAP_INIT_WAIT_MS = 30_000L
+
     /** Grace window after their SAS start in which an m.unexpected_message
      *  cancel is read as a fan-out collision (two devices answered at once),
      *  not a real cancel — see the Cancel branch in onVerificationState. */

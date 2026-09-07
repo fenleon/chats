@@ -383,17 +383,16 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 // The Enter code entry appears once a code has
                                 // been requested (feedback 2026-08-19: the
                                 // request-code overlay dismisses back here).
-                                // The removed "Code sent to…" status line's
-                                // info lives in the label now (feedback
-                                // 2026-09-06).
+                                // No email in the label/title — privacy on
+                                // shared screens (feedback 2026-09-06).
                                 if (codeStatus != null || beeperCode.isNotEmpty()) {
                                     FormField(
-                                        label = "Enter code sent to $beeperEmail",
+                                        label = "Enter code sent to your email",
                                         value = beeperCode,
                                         placeholder = "6-digit code",
                                         onClick = {
                                             editField(
-                                                title = "Enter code sent to $beeperEmail",
+                                                title = "Enter Beeper code",
                                                 field = viewModel.beeperCode,
                                                 // The code editor submits (was
                                                 // SAVE — feedback 2026-08-19).
