@@ -78,7 +78,7 @@ fun dayOf(timestampMs: Long): LocalDate =
  * 1 (US/Canada, 1 + 10), 2 (Germany/France/…, 2 + 9..11), else 3. Non-phone
  * strings pass through unchanged.
  */
-fun formatBridgePhone(raw: String): String {
+private fun formatBridgePhone(raw: String): String {
     val digits = raw.trim().removePrefix("+").filter { it.isDigit() }
     if (digits.length < 10) return raw
     val ccLen = when {
