@@ -1,7 +1,6 @@
 package com.lightphone.chats.screens
 
 import android.graphics.BitmapFactory
-import android.util.Log
 import android.text.format.DateUtils
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -545,7 +544,6 @@ class ThreadViewModel(
                 // reflects, then ride the rest on top — the heart (dis)appears
                 // instantly after a toggle instead of waiting on this poll.
                 var fetched = page?.messages.orEmpty()
-                Log.d("ChatsDebug", "loadNewest: page=${page != null} size=${fetched.size} overlays=${reactionOverlays.value.size}")
                 dropReflectedOverlays(fetched)
                 fetched = applyReactionOverlays(fetched)
                 loaded = fetched
@@ -793,7 +791,6 @@ class ThreadViewModel(
      * never react (nothing to like back — restraint).
      */
     fun toggleLike(message: LightServiceMethod.GetMessages.Message) {
-        Log.d("ChatsDebug", "toggleLike: id=${message.id} isMine=${message.isMine} type=${message.contentType} own=${effectiveOwnKeys(message)} haptics gate ok")
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         if (LIKE_KEY in effectiveOwnKeys(message)) removeReaction(message)
         else setReaction(message, LIKE_KEY)
@@ -867,7 +864,6 @@ class ThreadViewModel(
         val updates = own.associateWith { false } + (key to true)
         reactionOverlays.value = reactionOverlays.value +
             (message.id to ((reactionOverlays.value[message.id] ?: emptyMap()) + updates))
-        Log.d("ChatsDebug", "setReaction: id=${message.id} overlay=$updates")
         messages.value = applyReactionOverlays(messages.value)
         loadNewest(quiet = true)
         viewModelScope.launch {
@@ -879,7 +875,6 @@ class ThreadViewModel(
                 ChatClient.unsendReaction(room.id, message.id, old)
             }
             val ok = ChatClient.sendReaction(room.id, message.id, key)
-            Log.d("ChatsDebug", "setReaction RPC: ok=$ok")
             if (!ok) {
                 // Only the new key reverts — the old keys' removal entries
                 // self-heal when a served page reflects them.
@@ -983,7 +978,6 @@ class ThreadViewModel(
     ): List<LightServiceMethod.GetMessages.Message> {
         val overlays = reactionOverlays.value
         if (overlays.isEmpty()) return page
-        Log.d("ChatsDebug", "applyReactionOverlays: ${overlays.keys}")
         return page.map { m ->
             val keys = overlays[m.id] ?: return@map m
             var reactions = m.reactions

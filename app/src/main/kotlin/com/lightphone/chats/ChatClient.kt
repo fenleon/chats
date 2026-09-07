@@ -1,7 +1,6 @@
 package com.lightphone.chats
 
 import com.thelightphone.sdk.callRemoteServiceMethod
-import android.util.Log
 import com.thelightphone.sdk.shared.LightResult
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.error
@@ -14,10 +13,6 @@ import com.thelightphone.sdk.shared.getOrNull
  * binder.
  */
 object ChatClient {
-
-    /** Round-trips a binder call to the companion; true when the call succeeds. */
-    suspend fun ping(): Boolean =
-        callRemoteServiceMethod(LightServiceMethod.ChatPing, Unit) is LightResult.Success
 
     suspend fun setAccount(
         homeserver: String,
@@ -156,20 +151,11 @@ object ChatClient {
     suspend fun sendMessage(
         roomId: String,
         body: String,
-        replyToEventId: String? = null,
-    ): LightServiceMethod.SendMessage.Response? {
-        // Send-RPC timing (2026-09-03), tool-side half of the server dispatch line.
-        val t0 = android.os.SystemClock.elapsedRealtime()
-        return callRemoteServiceMethod(
+    ): LightServiceMethod.SendMessage.Response? =
+        callRemoteServiceMethod(
             LightServiceMethod.SendMessage,
-            LightServiceMethod.SendMessage.Request(roomId, body, replyToEventId),
-        ).getOrNull().also {
-            android.util.Log.d(
-                "ChatClient",
-                "sendMessage RPC took ${android.os.SystemClock.elapsedRealtime() - t0}ms",
-            )
-        }
-    }
+            LightServiceMethod.SendMessage.Request(roomId, body),
+        ).getOrNull()
 
     /**
      * Re-sends a locally-failed message: the companion clears the outbox error
@@ -223,13 +209,10 @@ object ChatClient {
         ) is LightResult.Success
 
     suspend fun markRead(roomId: String, eventId: String) {
-        val result = callRemoteServiceMethod(
+        callRemoteServiceMethod(
             LightServiceMethod.MarkRead,
             LightServiceMethod.MarkRead.Request(roomId, eventId),
         )
-        if (result !is LightResult.Success) {
-            Log.d("ChatsDebug", "markRead: FAILED room=$roomId at=$eventId result=$result")
-        }
     }
 
     suspend fun setTyping(roomId: String, active: Boolean) {
