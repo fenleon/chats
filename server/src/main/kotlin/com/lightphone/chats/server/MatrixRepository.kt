@@ -1266,6 +1266,62 @@ object MatrixRepository {
         }
     }
 
+    /**
+     * Login-path session teardown: stops the old client's sync loop and clears
+     * the stale in-process-sync state (a stale flag would silently kill the
+     * new session's sync — re-login after restore/expiry). Runs inside
+     * [initMutex] BEFORE the new credentials are exchanged, so a failed
+     * exchange leaves the old session stopped.
+     */
+    private suspend fun stopPreviousSession() {
+        client?.let { old ->
+            runCatching { old.stopSync() }
+            client = null
+        }
+        inProcessSyncJob?.cancel()
+        inProcessSyncJob = null
+        inProcessSyncRunning = false
+        setConnectionState(ChatConnectionState.Connecting)
+    }
+
+    /**
+     * The client build + session-prefs tail shared by [login] and
+     * [beeperLogin]. The verification-first sync configuration is read at
+     * client build time, so the phase flag must be armed BEFORE create
+     * (finishLogin runs too late — see [pendingVerificationPhase]).
+     * Call after [stopPreviousSession], inside [initMutex].
+     */
+    private suspend fun createAndStoreClient(
+        ctx: Context,
+        authProviderData: MatrixClientAuthProviderData,
+        configName: String,
+        baseUrl: String,
+        loginMode: String,
+        removeKeys: List<String> = emptyList(),
+    ): MatrixClient {
+        // The raw ktor client (used for Beeper's provision API, see
+        // [bridgeContacts]) does not attach the bearer — persist it here.
+        val accessToken = (authProviderData as? ClassicMatrixClientAuthProviderData)?.accessToken
+        pendingVerificationPhase = true
+        verificationSyncSwapped.set(false)
+        val loginResult = MatrixClient.create(
+            repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+            mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
+            cryptoDriverModule = CryptoDriverModule.libOlm(),
+            authProviderData = authProviderData,
+            configuration = clientConfiguration(configName),
+        ).onFailure { pendingVerificationPhase = false }.getOrThrow()
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_HOMESERVER, baseUrl)
+            .putString(KEY_USER_ID, loginResult.userId.full)
+            .putString(KEY_ACCESS_TOKEN, accessToken)
+            .putString(KEY_LOGIN_MODE, loginMode)
+            .also { editor -> removeKeys.forEach { key -> editor.remove(key) } }
+            .apply()
+        return loginResult
+    }
+
     suspend fun login(
         homeserver: String,
         user: String,
@@ -1274,16 +1330,7 @@ object MatrixRepository {
     ): Result<MatrixClient> = runCatching {
         val ctx = appContext ?: error("companion not initialized")
         initMutex.withLock {
-            client?.let { old ->
-                runCatching { old.stopSync() }
-                client = null
-            }
-            // The old client's loop is stopped; a stale flag would silently
-            // kill the new session's sync (re-login after restore/expiry).
-            inProcessSyncJob?.cancel()
-            inProcessSyncJob = null
-            inProcessSyncRunning = false
-            setConnectionState(ChatConnectionState.Connecting)
+            stopPreviousSession()
 
             // Accept a bare domain ("matrix.org") or a full URL; .well-known
             // discovery runs when the host serves one, else the URL is used as-is.
@@ -1297,31 +1344,12 @@ object MatrixRepository {
                 loginType = if (tokenLogin) LoginType.Token() else LoginType.Password,
                 initialDeviceDisplayName = "Chats (Light Phone)",
             ).getOrThrow()
-            // The raw ktor client (used for Beeper's provision API, see
-            // [bridgeContacts]) does not attach the bearer — persist it here.
-            val accessToken = (authProviderData as? ClassicMatrixClientAuthProviderData)?.accessToken
-            // Verification-first sync: the configuration lambda is read at
-            // client build time, so the phase flag must be armed BEFORE
-            // create (finishLogin runs too late — see [pendingVerificationPhase]).
-            pendingVerificationPhase = true
-            verificationSyncSwapped.set(false)
-            val loginResult = authProviderData
-                .let { authProviderData ->
-                    MatrixClient.create(
-                        repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
-                        mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
-                        cryptoDriverModule = CryptoDriverModule.libOlm(),
-                        authProviderData = authProviderData,
-                        configuration = clientConfiguration("chats"),
-                    ).onFailure { pendingVerificationPhase = false }.getOrThrow()
-                }
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit()
-                .putString(KEY_HOMESERVER, baseUrl.toString())
-                .putString(KEY_USER_ID, loginResult.userId.full)
-                .putString(KEY_ACCESS_TOKEN, accessToken)
-                .putString(KEY_LOGIN_MODE, "homeserver")
-                .apply()
+            val loginResult = createAndStoreClient(
+                ctx, authProviderData,
+                configName = "chats",
+                baseUrl = baseUrl.toString(),
+                loginMode = "homeserver",
+            )
             finishLogin(ctx, loginResult)
         }
     }
@@ -1387,14 +1415,7 @@ object MatrixRepository {
     suspend fun beeperLogin(email: String, code: String): Result<MatrixClient> = runCatching {
         val ctx = appContext ?: error("companion not initialized")
         initMutex.withLock {
-            client?.let { old ->
-                runCatching { old.stopSync() }
-                client = null
-            }
-            inProcessSyncJob?.cancel()
-            inProcessSyncJob = null
-            inProcessSyncRunning = false
-            setConnectionState(ChatConnectionState.Connecting)
+            stopPreviousSession()
 
             val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val requestId = prefs.getString(KEY_BEEPER_REQUEST_ID, null)
@@ -1428,27 +1449,13 @@ object MatrixRepository {
                 loginType = LoginType.Unknown("org.matrix.login.jwt", buildJsonObject {}),
                 initialDeviceDisplayName = "Chats (Light Phone)",
             ).getOrThrow()
-            val accessToken = (authProviderData as? ClassicMatrixClientAuthProviderData)?.accessToken
-            // Verification-first sync — see the homeserver [login] path.
-            pendingVerificationPhase = true
-            verificationSyncSwapped.set(false)
-            val loginResult = authProviderData
-                .let { authProviderData ->
-                    MatrixClient.create(
-                        repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
-                        mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
-                        cryptoDriverModule = CryptoDriverModule.libOlm(),
-                        authProviderData = authProviderData,
-                        configuration = clientConfiguration("chats-beeper"),
-                    ).onFailure { pendingVerificationPhase = false }.getOrThrow()
-                }
-            prefs.edit()
-                .putString(KEY_HOMESERVER, BEEPER_HOMESERVER)
-                .putString(KEY_USER_ID, loginResult.userId.full)
-                .putString(KEY_ACCESS_TOKEN, accessToken)
-                .putString(KEY_LOGIN_MODE, "beeper")
-                .remove(KEY_BEEPER_REQUEST_ID)
-                .apply()
+            val loginResult = createAndStoreClient(
+                ctx, authProviderData,
+                configName = "chats-beeper",
+                baseUrl = BEEPER_HOMESERVER,
+                loginMode = "beeper",
+                removeKeys = listOf(KEY_BEEPER_REQUEST_ID),
+            )
             finishLogin(ctx, loginResult)
         }
     }
