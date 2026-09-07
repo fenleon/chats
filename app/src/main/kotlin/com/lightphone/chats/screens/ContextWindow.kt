@@ -45,7 +45,7 @@ private enum class ContextLevel {
 
 /**
  * The reaction keys, in the LP3 emoji panel's exact layout (3 rows x 8,
- * captured from the Phone tool's emoji panel 2026-09-03): row 1 faces, row 2
+ * captured from the Phone tool's emoji panel): row 1 faces, row 2
  * hands, row 3 symbols. The string is the Matrix reaction key — it must stay
  * byte-identical everywhere (send + unsend + the served tag match).
  */
@@ -56,7 +56,7 @@ private val REACTION_ROWS = listOf(
 )
 
 /**
- * The context window (Phase B, 2026-09-03): a black panel over the bottom
+ * The context window: a black panel over the bottom
  * half of the screen for the long-pressed message — the Phone tool's overlay
  * panel presentation (measured from the LP3, 1080x1240 @ 480 dpi). Top level
  * stacks the action rows; REACT / EDIT REACTION open the 3x8 emoji grid; a
@@ -65,15 +65,13 @@ private val REACTION_ROWS = listOf(
  * the target when the fullscreen confirm lands, so the panel never vanishes
  * before it). The
  * wide thin chevron at the very bottom center dismisses (any level).
- *
  * One own reaction at a time (replace semantics) on a RECEIVED message: no
  * own reaction shows LIKE + REACT; an existing one shows EDIT
- * REACTION + REMOVE REACTION. Own messages (Phase C, 2026-09-03) show
+ * REACTION + REMOVE REACTION. Own messages show
  * EDIT / UNSEND instead — each only when the row still allows it
  * ([LightServiceMethod.GetMessages.Message.canEdit] / `canUnsend`, the
- * bridge's capability gate). Image rows (LP3 feedback 2026-09-03) add SAVE
+ * bridge's capability gate). Image rows add SAVE
  * — the fullscreen viewer's save flow — on the received paths.
- *
  * Raw black/white + fixed sizes are deliberate: this replicates a system
  * overlay panel (see [com.lightphone.chats.VolumePanelOverlay]), not themed
  * app UI. The panel covers the bottom bar while open — the Phone tool's does
@@ -106,7 +104,7 @@ fun ContextWindowOverlay(
             // dispatches pointer events to everything under the finger — a
             // background alone consumes nothing, so taps in the panel's empty
             // regions fell through to rows beneath (a voice-note play button
-            // under LIKE, LP3 feedback 2026-09-07). Swallow every event in
+            // under LIKE). Swallow every event in
             // the panel's area; the action rows and the chevron are children
             // and see each pass first, so they keep working.
             .pointerInput(Unit) {
@@ -121,7 +119,7 @@ fun ContextWindowOverlay(
             },
     ) {
         when (level) {
-            // LP3 feedback 2026-09-03: the action rows read like bottom-bar
+            // The action rows read like bottom-bar
             // text buttons — the [LightTextVariant.Button] label, centered in
             // the row, rows sharing the panel height (centered vertically),
             // instead of the left-aligned Heading list rows.
@@ -136,11 +134,11 @@ fun ContextWindowOverlay(
                     ownReaction == null -> buildList {
                         add("LIKE" to { onLike(); onDismiss() })
                         add("REACT" to { level = ContextLevel.Reactions })
-                        // Image rows carry SAVE (LP3 feedback 2026-09-03). The
+                        // Image rows carry SAVE. The
                         // panel does NOT dismiss here — it stays up until the
                         // save confirmation appears (the caller clears the
                         // target then), so the confirm never chases a vanished
-                        // panel (LP3 feedback 2026-09-03).
+                        // panel.
                         onSave?.let { save -> add("SAVE" to { save() }) }
                     }
                     else -> buildList {
@@ -157,8 +155,7 @@ fun ContextWindowOverlay(
                         // never sits under it.
                         .padding(bottom = ChevronZone),
                     // Bottom-bar-height rows, grouped at the panel's center —
-                    // full-height weight(1f) rows sat too far apart (LP3
-                    // feedback 2026-09-03).
+                    // full-height weight(1f) rows sat too far apart.
                     verticalArrangement = Arrangement.Center,
                 ) {
                     rows.forEach { (label, action) ->
@@ -227,6 +224,5 @@ private val EmojiCell = 46.dp
  *  2026-09-03) — one size down. */
 private val EmojiFontSize = 24.sp
 /** The chevron's tap zone at the panel's bottom edge; action rows keep clear
- *  of it. The chevron itself touches the bottom edge (LP3 feedback
- *  2026-09-03) — no float above it. */
+ *  of it. The chevron itself touches the bottom edge — no float above it. */
 private val ChevronZone = 38.dp

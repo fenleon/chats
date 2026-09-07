@@ -77,9 +77,8 @@ class RecoveryKeyEditorScreen(
                 // small centered text, lines growing upward. The typography
                 // tokens carry no color, so copy the active content color —
                 // without it BasicText falls back to black-on-black on the dark
-                // theme and the key is unreadable. Copy-sized (was paragraph) —
-                // feedback 2026-08-19: slightly bigger, the 3-line key still
-                // fits above the keyboard.
+                // theme and the key is unreadable. Copy-sized — slightly bigger
+                // than paragraph, so the 3-line key still fits above the keyboard.
                 inputTextStyle = LightThemeTokens.typography.copy
                     .copy(color = themeColors.content, textAlign = TextAlign.Center)
                     .scaledForScreenHeight(),

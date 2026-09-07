@@ -97,7 +97,7 @@ private const val MEDIA_PREFETCH_COUNT = 4
 /**
  * Process-wide display-JPEG cache, shared by every ThreadViewModel: a photo
  * fetched once renders instantly in later opens (same or other room) with no
- * re-fetch RPC (feedback 2026-08-23). Keyed by event id, which is globally
+ * re-fetch RPC. Keyed by event id, which is globally
  * unique.
  */
 private val chatsMediaCache = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
@@ -107,7 +107,7 @@ private val chatsMediaCache = MutableStateFlow<Map<String, ByteArray>>(emptyMap(
  * [chatsMediaCache] and survive navigation; the decode does not — returning
  * from the fullscreen viewer re-enters the row's composition, and the
  * re-decode started from a null frame, flashing the "[Photo]" fallback before
- * the image popped back in (LP3 2026-08-23). Bounded: full-res photos decode
+ * the image popped back in. Bounded: full-res photos decode
  * to tens of MB, so only the most recent few are kept (eviction is
  * insertion-order, fine for a handful of photos; ponytail: LRU if the count
  * ever matters).
@@ -130,8 +130,8 @@ internal object chatsBitmapCache {
  * Loaded message pages + last scroll position per room id. The thread's
  * [ThreadViewModel] is recreated on every open, so paged-in history and the
  * scroll position were lost on exit — re-opening re-fetched the newest page
- * and re-paged from the server ("exit and come back, it has to load again",
- * LP3 2026-08-23). Kept process-wide (like [chatsMediaCache]) so a re-open
+ * and re-paged from the server ("exit and come back, it has to load again").
+ * Kept process-wide (like [chatsMediaCache]) so a re-open
  * renders the already-loaded history instantly and restores the position.
  * Room ids are server-scoped, so a different account can't collide.
  */
@@ -151,7 +151,7 @@ internal object threadStateCache {
 }
 
 /**
- * Process-wide optimistic edit/unsend overlays (2026-09-07): survives the
+ * Process-wide optimistic edit/unsend overlays: survives the
  * thread's ViewModel so an exit + re-enter inside the page-cache refresh
  * window keeps showing the edited body (see [ThreadViewModel]'s overlay doc).
  */
@@ -161,7 +161,7 @@ internal object editEchoCache {
 }
 
 /**
- * Resend-attempt counter per message id (2026-08-23): "not delivered. tap to
+ * Resend-attempt counter per message id: "not delivered. tap to
  * resend" caps at [MAX_RESEND_ATTEMPTS] — each tap sends the body as a NEW
  * message, so an endless loop would spam duplicates. The count propagates to
  * the resend's new row (the chain shares one number), so tapping the original
@@ -190,7 +190,7 @@ class ThreadViewModel(
     /**
      * Oldest-first page of messages; older pages are prepended by [loadOlder].
      * Process-wide per room ([threadStateCache]) — re-opening the thread keeps
-     * the already-loaded history instead of re-fetching it (2026-08-23).
+     * the already-loaded history instead of re-fetching it.
      */
     val messages = threadStateCache.messagesFlow(room.id)
     val loading = MutableStateFlow(true)
@@ -204,7 +204,7 @@ class ThreadViewModel(
     val roomEncrypted = MutableStateFlow(false)
 
     /**
-     * Mute state for the contact panel (2026-08-23): starts from the room
+     * Mute state for the contact panel: starts from the room
      * list's value and updates locally on toggle — the list re-fetch keeps the
      * server copy in sync, this keeps the panel honest within the session.
      */
@@ -218,7 +218,7 @@ class ThreadViewModel(
     }
 
     /**
-     * Pin state for the contact panel (2026-08-28): starts from the room
+     * Pin state for the contact panel: starts from the room
      * list's value and updates locally on toggle — same honest-within-session
      * pattern as [muted].
      */
@@ -232,7 +232,7 @@ class ThreadViewModel(
     }
 
     /**
-     * Archive state for the contact panel (2026-08-28): starts from the room
+     * Archive state for the contact panel: starts from the room
      * list's value and updates locally on toggle — same honest-within-session
      * pattern as [muted]. Archived rooms hide from the main list and go
      * silent, reachable only via search VIEW ALL.
@@ -247,9 +247,8 @@ class ThreadViewModel(
     }
 
     /**
-     * Keeps the contact panel honest with OTHER devices (LP3 feedback
-     * 2026-08-28): collects the repository's roomFlags flow for this room
-     * (NO-SEAM, 2026-09-07 — replaces the flags-revision wait + refetch),
+     * Keeps the contact panel honest with OTHER devices: collects the repository's roomFlags flow for this room
+     * (NO-SEAM — replaces the flags-revision wait + refetch),
      * updating [muted]/[pinned]/[archived] live (items 1/5). Runs while the
      * thread — and the contact panel over it — is on screen (started on
      * [onScreenShow], NOT stopped on [onScreenHide]); stops when the app
@@ -279,7 +278,7 @@ class ThreadViewModel(
     }
 
     /**
-     * Display JPEG bytes per image-message event id (Phase 13). This is a view
+     * Display JPEG bytes per image-message event id. This is a view
      * of the process-wide [chatsMediaCache] (event ids are globally unique), so
      * a photo already fetched in any thread renders instantly on re-open — no
      * re-fetch RPC — and each thread's poll just adds the new arrivals.
@@ -299,7 +298,7 @@ class ThreadViewModel(
     val pendingVoiceComponent = MutableStateFlow<String?>(null)
 
     /**
-     * Event id of the voice note playing in the companion (Phase 14). Fed by
+     * Event id of the voice note playing in the companion. Fed by
      * the poll's `audioPlayingEventId` and the local PlayVoiceNote response,
      * so the audio row shows its playing state without extra RPCs.
      */
@@ -317,14 +316,13 @@ class ThreadViewModel(
      * True until the poll anchors the counter after a play/resume tap: the
      * label holds the seeded position (pause point / 0:00) instead of running
      * on wall clock, which ran AHEAD of the companion while it spun the player
-     * up, then snapped back on the next poll — the "timer goes back" jump
-     * (feedback 2026-08-28). Cleared when the poll reports a live position.
+     * up, then snapped back on the next poll — the "timer goes back" jump.
+     * Cleared when the poll reports a live position.
      */
     val counterPending = MutableStateFlow(true)
 
     /**
-     * Event id + position of a voice note PAUSED in the companion (feedback
-     * 2026-08-27). The paused row keeps showing the pause point instead of the
+     * Event id + position of a voice note PAUSED in the companion. The paused row keeps showing the pause point instead of the
      * full length, and resume starts from it — no 00:00 flash, no bounce back
      * up when the next poll lands. The server holds the real pause state;
      * this is the tool's display mirror.
@@ -334,13 +332,12 @@ class ThreadViewModel(
 
     /**
      * (eventId, message) of a voice-note playback that failed to fetch/play —
-     * the row shows the error briefly instead of a silent no-op (feedback
-     * 2026-08-19). Cleared after a few seconds.
+     * the row shows the error briefly instead of a silent no-op. Cleared after a few seconds.
      */
     val voiceError = MutableStateFlow<Pair<String, String>?>(null)
 
     /**
-     * Phase B (2026-09-03) reactions. Per-event overlay over the served
+     * Phase B reactions. Per-event overlay over the served
      * reaction tags — reaction key → true = own reaction added, false =
      * suppressed — so the tag appears/disappears instantly instead of waiting
      * on the 3 s poll. Entries drop once a served page reflects the action; a
@@ -353,13 +350,13 @@ class ThreadViewModel(
     val reactionError = MutableStateFlow<Pair<String, String>?>(null)
 
     /**
-     * Phase C (2026-09-03) message overlays, same pattern as the reaction
+     * Phase C message overlays, same pattern as the reaction
      * overlays: per-event optimistic edits (eventId → new body) and unsends
      * (eventId set → tombstone), applied after the page maps in so the row
      * reacts instantly instead of waiting on the 3 s poll. Entries drop once
      * a served page reflects the action; unsend failures revert and surface
      * [reactionError] (edit failures keep the composer open instead — the
-     * text survives for a retry). Process-wide (2026-09-07): the page cache
+     * text survives for a retry). Process-wide: the page cache
      * can serve a pre-echo page after the ViewModel died (exit + re-enter),
      * which reverted the row to its unedited body until the rebuild landed —
      * the overlays now survive the round-trip like [threadStateCache].
@@ -369,7 +366,7 @@ class ThreadViewModel(
 
     /**
      * In-app volume panel state (null = hidden), the shared LightOS replica
-     * (feedback 2026-08-30): while a voice note is playing/paused the volume
+     * replica: while a voice note is playing/paused the volume
      * rocker shows this panel instead of LightOS's (which is ringer-only for
      * third-party tools). The bar level is cached and stepped locally; the
      * server adjusts the real media stream (see ServerBootstrapProvider).
@@ -437,9 +434,9 @@ class ThreadViewModel(
     /**
      * Thread scroll position, saved continuously by the screen and restored on
      * show — returning from the fullscreen photo viewer must land where the
-     * photo was, not the newest messages (feedback 2026-08-20). Persisted
+     * photo was, not the newest messages. Persisted
      * process-wide ([threadStateCache]) so a full re-open of the thread also
-     * lands where the user left off (2026-08-23).
+     * lands where the user left off.
      */
     private var savedScrollIndex = threadStateCache.takeScroll(room.id)?.first ?: 0
     private var savedScrollOffset = threadStateCache.takeScroll(room.id)?.second ?: 0
@@ -464,7 +461,7 @@ class ThreadViewModel(
         viewModelScope.launch { ChatClient.setActiveRoom(room.id) }
         // Returning from the fullscreen photo viewer restores the scroll
         // position instead of bouncing to the newest; a fresh open jumps to
-        // the newest as before (feedback 2026-08-20).
+        // the newest as before.
         val restore = if (savedScrollIndex > 0 || savedScrollOffset > 0) {
             savedScrollIndex to savedScrollOffset
         } else null
@@ -487,7 +484,7 @@ class ThreadViewModel(
         super.onScreenHide(screen)
         // Message polling stops when covered (e.g. the contact panel), but the
         // flag sync deliberately keeps running — the panel needs Beeper-side
-        // pin/mute/archive changes live (LP3 feedback 2026-08-28).
+        // pin/mute/archive changes live.
         stopPolling()
     }
 
@@ -502,12 +499,11 @@ class ThreadViewModel(
 
     /**
      * Newest-page updates while the thread stays visible, driven by the
-     * repository (NO-SEAM, 2026-09-07 — the page-revision long-poll is gone):
+     * repository (NO-SEAM — the page-revision long-poll is gone):
      * every server-side page bump (new/edited/unsent events, receipt patches,
      * pending echoes) emits [MatrixRepository.pageChanges] and the collector
      * re-reads the served page in-process. No binder serialization, no poll
      * delay — the merge is the same quiet [loadNewest] path the poll used.
-     *
      * A playing voice note keeps a tick: its position advances without any
      * page change, and only a fetch reads it back.
      */
@@ -541,15 +537,14 @@ class ThreadViewModel(
     fun loadNewest(quiet: Boolean = false, restoreScroll: Boolean = false) {
         // Serialize: rapid sends + the 3 s poll can otherwise interleave
         // read-modify-write merges on [messages] — a cluster showed rows
-        // duplicating and jumping until every send had echoed (feedback
-        // 2026-08-20). A newer call supersedes an in-flight one.
+        // duplicating and jumping until every send had echoed. A newer call supersedes an in-flight one.
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
             if (!quiet) loading.value = true
             var loaded: List<LightServiceMethod.GetMessages.Message>
             try {
                 val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
-                // Reaction overlay (Phase A): drop entries the served page now
+                // Reaction overlay: drop entries the served page now
                 // reflects, then ride the rest on top — the heart (dis)appears
                 // instantly after a toggle instead of waiting on this poll.
                 var fetched = page?.messages.orEmpty()
@@ -577,8 +572,7 @@ class ThreadViewModel(
                 }
             } finally {
                 // A binder exception mid-fetch must not leave the thread stuck on
-                // "Loading messages…" (feedback 2026-08-19: a send + quick exit +
-                // re-enter could wedge it) — the flag always clears.
+                // "Loading messages…" — the flag always clears.
                 if (!quiet) loading.value = false
             }
             if (!quiet && !restoreScroll) {
@@ -586,7 +580,7 @@ class ThreadViewModel(
                 // Opening the thread marks it read up to the newest event; the
                 // room list's unread count drops on its next refresh. Optimistic
                 // "local-…" rows are skipped — a receipt at a fake id never
-                // confirms and leaves the badge logic flapping (LP3 2026-09-07).
+                // confirms and leaves the badge logic flapping.
                 val markEventId = loaded.lastOrNull {
                     !it.id.startsWith(LOCAL_ROW_PREFIX)
                 }?.id ?: room.lastEventId ?: return@launch
@@ -598,7 +592,7 @@ class ThreadViewModel(
             // arriving later (or the page catching up to the store's real
             // newest) would otherwise leave the room list's unread asterisk
             // up. Deduped via [lastMarkedId] — no RPC on ticks where nothing
-            // changed (feedback 2026-08-23). Local rows skipped (see above).
+            // changed. Local rows skipped (see above).
             if (quiet) {
                 val newestId = loaded.lastOrNull {
                     !it.id.startsWith(LOCAL_ROW_PREFIX)
@@ -633,13 +627,12 @@ class ThreadViewModel(
      * haven't echoed yet. A real event replaces its optimistic row by id; a
      * "local-…" row (no event id known at send time) is dropped when a real
      * message with the same body and a close timestamp appears.
-     *
      * The result is deduped by id, then confirmed rows are time-sorted while
      * still-pending rows stay newest in send order, so a cluster of sends
      * stays in order while the echoes land one poll at a time — without it,
      * an echo arriving out of order (or a fast-page → full-page transition
      * leaving a stale optimistic copy at the oldest end) visibly shuffled and
-     * duplicated the rows until every send had echoed (feedback 2026-08-20).
+     * duplicated the rows until every send had echoed.
      */
     private fun mergeWithPending(loaded: List<LightServiceMethod.GetMessages.Message>):
         List<LightServiceMethod.GetMessages.Message> {
@@ -669,7 +662,7 @@ class ThreadViewModel(
         // Pending rows (still in [pendingMessages]) keep their send order and
         // stay newest: their timestamps are device-clock, while the confirmed
         // echoes carry server-clock stamps — mixing them sorted the first
-        // message of a burst below its own echoes (feedback 2026-08-23).
+        // message of a burst below its own echoes.
         // "local-…" rows are always pending; a fast-acked optimistic row with
         // a real event id is too, until the served page replaces it. The
         // confirmed sort is stable, so equal timestamps keep their order.
@@ -719,19 +712,17 @@ class ThreadViewModel(
     }
 
     /**
-     * Toggles playback of a voice note in the companion (Phase 14). The local
+     * Toggles playback of a voice note in the companion. The local
      * state flips immediately so the row reacts; the response and the poll's
      * `audioPlayingEventId` keep it accurate as playback finishes. A fetch or
-     * playback failure surfaces on the row instead of a silent no-op
-     * (feedback 2026-08-19).
+     * playback failure surfaces on the row instead of a silent no-op.
      */
     fun playVoiceNote(eventId: String) {
         val toggling = playingEventId.value == eventId
         val resuming = !toggling && pausedEventId.value == eventId
         when {
             // Tap the playing row → PAUSE: hold the interpolated position so
-            // the row shows the pause point while paused, not the full length
-            // (feedback 2026-08-27).
+            // the row shows the pause point while paused, not the full length.
             toggling -> {
                 pausedEventId.value = eventId
                 // While the counter is unanchored (player still spinning up),
@@ -750,8 +741,7 @@ class ThreadViewModel(
             // bounces when the next poll reports the real position. The
             // counter stays FROZEN at the seed until the poll anchors it —
             // counting on wall clock before the companion's player is up runs
-            // ahead, and the poll then jumps the label BACK (feedback
-            // 2026-08-28: "the timer goes back 2 seconds").
+            // ahead, and the poll then jumps the label BACK.
             resuming -> {
                 val resumeFrom = pausedPositionMs.value
                 pausedEventId.value = null
@@ -764,7 +754,7 @@ class ThreadViewModel(
             // A NEW note starts at 0:00 — the position state still holds the
             // previous note's last polled value, which otherwise showed a
             // stale "random" position for a beat until the first poll landed
-            // and snapped it to 0 (feedback 2026-08-23). Frozen at 0:00 until
+            // and snapped it to 0. Frozen at 0:00 until
             // the poll anchors, like resume.
             else -> {
                 pausedEventId.value = null
@@ -800,9 +790,9 @@ class ThreadViewModel(
     }
 
     /**
-     * Double-tap like (Phase A, 2026-09-03): Beeper semantics — double-tap
+     * Double-tap like: Beeper semantics — double-tap
      * REPLACES the user's current reaction with the ❤️ (not add alongside,
-     * LP3 feedback 2026-09-03); a second double-tap removes it. Own rows
+     * it); a second double-tap removes it. Own rows
      * never react (nothing to like back — restraint).
      */
     fun toggleLike(message: LightServiceMethod.GetMessages.Message) {
@@ -813,7 +803,7 @@ class ThreadViewModel(
 
     /**
      * Toggles the signed-in user's [key] reaction on a RECEIVED message
-     * (Phase B, 2026-09-03 — the context window's emoji grid): send when
+     * (Phase B — the context window's emoji grid): send when
      * absent, unsend when present. The optimistic overlay flips the tag
      * immediately (the 3 s poll is too slow); a failed RPC reverts it and
      * shows the quiet row error (the voice-note error pattern). Own rows
@@ -823,7 +813,7 @@ class ThreadViewModel(
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         // The toggle must see its own optimistic overlay: a quick re-tap before
         // the poll catches up reads the overlay's target state, not the stale
-        // served page (LP3 feedback 2026-09-03: re-tapping kept SENDING hearts).
+        // served page.
         val overlayKeys = reactionOverlays.value[message.id]
         val ownPresent = if (overlayKeys != null && key in overlayKeys) {
             overlayKeys.getValue(key)
@@ -863,7 +853,7 @@ class ThreadViewModel(
 
     /**
      * Sets the signed-in user's sole reaction on a RECEIVED message to [key]
-     * (Phase B, 2026-09-03 — the context window's LIKE MESSAGE / REACT /
+     * (Phase B — the context window's LIKE MESSAGE / REACT /
      * EDIT REACTION rows, one own reaction at a time, replace semantics):
      * unsends any existing own reaction(s) and sends [key]. Optimistic
      * overlay for both directions; only a failed SEND rolls the new key back
@@ -948,7 +938,7 @@ class ThreadViewModel(
     }
 
     /**
-     * Applies a completed edit optimistically (Phase C, 2026-09-03): the row
+     * Applies a completed edit optimistically: the row
      * shows the new body at once, the "edited" tag arrives with the echo. The
      * overlay drops when a served page carries the edited body
      * ([dropReflectedOverlays]). An edit RPC that fails never reaches here —
@@ -960,7 +950,7 @@ class ThreadViewModel(
     }
 
     /**
-     * Unsends an own message (Phase C, 2026-09-03 — the context window's
+     * Unsends an own message (Phase C — the context window's
      * UNSEND row, behind the confirm panel): the row becomes the
      * tombstone instantly via the overlay; a failed RPC reverts it and
      * surfaces the quiet row error (the reaction pattern). The overlay drops
@@ -1070,12 +1060,11 @@ class ThreadViewModel(
 
     /**
      * Re-sends a bridge-reported delivery failure as a NEW message (tap on a
-     * "not delivered. tap to resend" row, 2026-08-23): the event already left
+     * "not delivered. tap to resend" row): the event already left
      * the device, so there's no txn to retry — the same body goes out through
      * the normal send path (like the composer) and the poll swaps in the echo.
      * Capped at [MAX_RESEND_ATTEMPTS] per chain — each resend is a new
-     * message, so an endless loop would spam duplicates (feedback 2026-08-23:
-     * "only try twice, then just show 'failed to deliver'").
+     * message, so an endless loop would spam duplicates.
      */
     fun resendAsNew(message: LightServiceMethod.GetMessages.Message) {
         if (message.body.isBlank()) return
@@ -1133,21 +1122,17 @@ class ThreadViewModel(
                     // No sort here — pagination cursors and merge boundaries are
                     // position-based, and in rooms with non-monotonic timestamps
                     // (re-import batches) a ts-sort moved the oldest row off the
-                    // chain edge, dead-ending older-page fetches (feedback
-                    // 2026-08-23: "scroll up doesn't refresh, nothing older").
+                    // chain edge, dead-ending older-page fetches.
                     // Overlays ride on the merged list too — a reaction tapped
                     // on a row that only exists in paged history must flip the
-                    // tag here, not only on the newest page (LP3 2026-09-04:
-                    // reacting to an older message looked like a no-op).
+                    // tag here, not only on the newest page.
                     val merged = (older + messages.value).distinctBy { it.id }
                     dropReflectedOverlays(merged)
                     messages.value = applyMessageOverlays(applyReactionOverlays(merged))
                 }
                 hasMore.value = page?.hasMore ?: hasMore.value
             } finally {
-                // A binder failure must not wedge pagination (feedback
-                // 2026-08-19: an exception here left loadingMore stuck, so
-                // older messages never loaded again).
+                // A binder failure must not wedge pagination.
                 loadingMore.value = false
             }
         }
@@ -1203,7 +1188,7 @@ private fun ownReactionKeys(message: LightServiceMethod.GetMessages.Message): Li
         .map { it.removePrefix(OWN_REACTION_TAG_PREFIX) }
 
 /**
- * Max tap-to-resend attempts per message chain (2026-08-23): each resend is a
+ * Max tap-to-resend attempts per message chain: each resend is a
  * NEW message, so past this the row shows a static "failed to deliver" instead
  * of offering another duplicate.
  */
@@ -1211,7 +1196,7 @@ private const val MAX_RESEND_ATTEMPTS = 2
 
 /**
  * Failed messages older than this show a static "failed to deliver" — a stale
- * bridge FAIL isn't worth another duplicate send (feedback 2026-08-23: 4 h).
+ * bridge FAIL isn't worth another duplicate send.
  */
 private const val RESEND_MAX_AGE_MS = 4L * 60 * 60 * 1000
 
@@ -1243,12 +1228,12 @@ class ThreadScreen(
         val pausedPositionMs by viewModel.pausedPositionMs.collectAsState()
         val voiceError by viewModel.voiceError.collectAsState()
         val reactionError by viewModel.reactionError.collectAsState()
-        // Context window (Phase B, 2026-09-03): the long-pressed message
-        // (null = the panel is hidden). Phase C adds the own-message path:
-        // UNSEND parks its target here for the confirm panel.
+        // Context window: the long-pressed message
+        // (null = the panel is hidden). Own rows (EDIT / UNSEND) park their
+        // target here for the confirm panel.
         var contextMessage by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
         var unsendConfirm by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
-        // SAVE from the context window (LP3 feedback 2026-09-03, image rows):
+        // SAVE from the context window (image rows):
         // the same save + confirm flow as the fullscreen viewer's bottom bar.
         val contextScope = rememberCoroutineScope()
         var saveConfirm by remember { mutableStateOf<Boolean?>(null) }
@@ -1265,8 +1250,7 @@ class ThreadScreen(
         // Restore the saved position at FIRST composition (the initial-params
         // overload): returning from the fullscreen photo viewer otherwise
         // created the list at the bottom and the post-composition scroll
-        // landed a frame late, flashing the newest messages first (feedback
-        // 2026-08-23). takeScrollToRestore is consume-once, so the restore
+        // landed a frame late, flashing the newest messages first. takeScrollToRestore is consume-once, so the restore
         // effect below no-ops on this path; a fresh open (0,0) keeps the
         // jump-to-bottom behavior.
         val initialRestore = viewModel.takeScrollToRestore()
@@ -1306,26 +1290,21 @@ class ThreadScreen(
 
         // An empty page in an encrypted room means the stored events couldn't
         // be decrypted — unverified device, or a fresh login whose key requests
-        // haven't landed (LP3 2026-08-29: threads that were full before a
-        // logout/login read "No messages yet." — the server flags the page via
-        // MessagesPage.encrypted when an encrypted room's events all stayed
-        // undecryptable). Say so instead of lying about being empty.
+        // haven't landed. Say so instead of lying about being empty.
         val needsDecryptionNotice = roomEncrypted && messages.isEmpty()
 
-        // Status tag under our newest send (2026-09-06): "seen" under the
+        // Status tag under our newest send: "seen" under the
         // newest outgoing message the other party actually read (m.read
         // receipt or Beeper READ status), "delivered" under our newest send
         // carrying a real DELIVERED status (bridge SUCCESS +
         // delivered_to_users — MatrixRepository maps it; no synthetic
-        // "delivered" off a stopped SENDING spinner, the lie that got the tag
-        // dropped 2026-08-30). The tag tracks the LATEST message: delivered
+        // "delivered" off a stopped SENDING spinner). The tag tracks the LATEST message: delivered
         // there, flipped to "seen" once the read position reaches it. When
         // the read position is still behind the newest send, delivered wins —
-        // the seen-behind position marker (2026-09-03) only survives as the
+        // the seen-behind position marker only survives as the
         // fallback when there's no delivery evidence (plain Matrix rooms).
         // The list is oldest-first, so the last match is the newest.
-        // Placement rules (2026-09-03 feedback, tag only earns its place when
-        // it adds information): the contact's reply being the thread's newest
+        // Placement rules: the contact's reply being the thread's newest
         // drops both tags — a reply itself says "read everything" — except
         // "seen" stays when the read position is behind our newest send
         // (marks how far they got). No evidence → no tag. Groups get no tag
@@ -1346,7 +1325,7 @@ class ThreadScreen(
         // Infinite scroll + scroll-bar metrics, polled rather than
         // snapshotFlow-driven: in this Compose version reads of
         // LazyListState.layoutInfo don't invalidate snapshotFlow/derivedStateOf
-        // on every scroll (verified 2026-08-15), so a snapshotFlow trigger
+        // on every scroll, so a snapshotFlow trigger
         // never fired — the list sat at its top with older messages one page
         // away and "older messages don't load". The poll reads the real layout
         // info each tick; the loadOlder condition is index-exact (the topmost
@@ -1379,14 +1358,14 @@ class ThreadScreen(
                         icon = LightIcons.BACK,
                         // Pop with a Unit result so the caller's navigateTo
                         // callback fires — a thread opened via search then
-                        // closes the search on back, landing on the main list
-                        // (feedback 2026-08-22). Callers without a callback
+                        // closes the search on back, landing on the main list.
+                        // Callers without a callback
                         // are no-ops.
                         onClick = { goBack(Unit) },
                         contentDescription = "Back to chats",
                     ),
                     // Tapping the room name opens the contact overlay
-                    // (feedback 2026-08-21) — in a 1:1 it's the other party's
+                    // in a 1:1 it's the other party's
                     // identifier (their Matrix ID localpart = the bridge UID:
                     // a phone number on WhatsApp, a username on Instagram).
                     center = LightTopBarCenter.Text(
@@ -1412,7 +1391,7 @@ class ThreadScreen(
                             )
                             // Messages grouped by time gap / sender / day (the
                             // day tag lives on the group-start timestamp —
-                            // feedback 2026-08-21: the centered day dividers
+                            // the centered day dividers
                             // were removed); display order is newest-first
                             // because reverseLayout puts index 0 at the bottom.
                             val rows = remember(messages) { buildThreadRows(messages) }
@@ -1499,16 +1478,14 @@ class ThreadScreen(
                         }
                     }
                     // A tap on the free area between the top bar and the panel
-                    // dismisses it (LP3 feedback 2026-09-03) — an invisible
+                    // dismisses it — an invisible
                     // scrim over that band only (last child of this Box, drawn
                     // over the rows): top-padded clear of the top bar (back +
                     // room name stay tappable) and ending at the panel's top
-                    // edge, so taps on the panel itself never dismiss (LP3
-                    // feedback 2026-09-03 — the panel background doesn't
-                    // consume taps, a fullscreen scrim caught them).
+                    // edge, so taps on the panel itself never dismiss.
                     if (contextTarget != null) {
                         // Tap-away dismiss buzzes like every other panel
-                        // dismissal (LP3 feedback 2026-09-03), gated by the
+                        // dismissal, gated by the
                         // same LocalHapticsEnabled the rows read.
                         val scrimHaptic = LocalHapticFeedback.current
                         val scrimHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
@@ -1533,7 +1510,7 @@ class ThreadScreen(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
                         // Record a voice note — bottom left, like the built-in
-                        // Messages app's layout (Phase 14). Opens the
+                        // Messages app's layout. Opens the
                         // companion's recording activity.
                         LightBarButton.LightIcon(
                             icon = LightIcons.MICROPHONE,
@@ -1542,7 +1519,7 @@ class ThreadScreen(
                         ),
                         // Attach a photo — bottom middle, like the built-in
                         // Messages app's add slot. Opens the system photo
-                        // picker via the companion (Phase 13).
+                        // picker via the companion.
                         LightBarButton.LightIcon(
                             icon = LightIcons.ADD,
                             onClick = { viewModel.attachPhoto() },
@@ -1556,10 +1533,10 @@ class ThreadScreen(
                     ),
                 )
             }
-            // Context window (Phase B, 2026-09-03): the long-pressed message's
+            // Context window: the long-pressed message's
             // panel over the bottom half — received rows get LIKE MESSAGE /
             // REACT (+ EDIT/REMOVE REACTION once a reaction exists); own rows
-            // get EDIT / UNSEND (Phase C, gated per row by
+            // get EDIT / UNSEND (gated per row by
             // the bridge caps). Actions act on the freshest polled snapshot
             // so own-reaction detection never runs on a stale page. Rendered
             // before the volume panel so the volume panel stays on top of
@@ -1573,7 +1550,7 @@ class ThreadScreen(
                 onEdit = { contextTarget?.let { openComposer(it) } },
                 onUnsend = { contextTarget?.let { unsendConfirm = it } },
                 // SAVE (image rows only — the context window's image addition,
-                // LP3 feedback 2026-09-03): the same server-side save the
+                // addition): the same server-side save the
                 // fullscreen viewer's SAVE PHOTO runs, confirming with the
                 // same panel (below).
                 onSave = contextTarget
@@ -1581,9 +1558,7 @@ class ThreadScreen(
                     ?.let { target ->
                         {
                             contextScope.launch {
-                                // The panel stays up while the save round-trips
-                                // (LP3 feedback 2026-09-03: it used to vanish
-                                // first, then the confirmation appeared); the
+                                // The panel stays up while the save round-trips; the
                                 // confirm replaces it, and clearing the target
                                 // then drops the panel behind the modal.
                                 saveConfirm = ChatClient.saveMessageImage(room.id, target.id)
@@ -1595,7 +1570,7 @@ class ThreadScreen(
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
             }
-            // The save confirmation (LP3 feedback 2026-09-03): the same
+            // The save confirmation: the same
             // fullscreen-panel grammar as the viewer's, auto-dismissing after
             // 2 s so a tap isn't needed.
             saveConfirm?.let { ok ->
@@ -1608,7 +1583,7 @@ class ThreadScreen(
                     onClose = { saveConfirm = null },
                 )
             }
-            // Unsend confirmation (Phase C, 2026-09-03): one accidental
+            // Unsend confirmation: one accidental
             // long-press must not nuke a message — the same fullscreen-panel
             // grammar as the photo viewer's save confirm.
             unsendConfirm?.let { target ->
@@ -1635,8 +1610,7 @@ class ThreadScreen(
         // from the fullscreen photo viewer restores the position at first
         // composition (the list state's initial params above) — the
         // takeScrollToRestore here is the consume-once guard, so that path
-        // never re-scrolls or jumps to the bottom (feedback 2026-08-20/
-        // 2026-08-23); the jumpToBottom key keeps the effect re-firing when
+        // never re-scrolls or jumps to the bottom; the jumpToBottom key keeps the effect re-firing when
         // the flag flips after the load.
         LaunchedEffect(jumpToBottom, messages.size) {
             if (messages.isEmpty()) return@LaunchedEffect
@@ -1684,7 +1658,7 @@ class ThreadScreen(
                         ),
                     )
                 } else {
-                    // Phase C edit: the row shows the new body instantly via
+                    // Edit: the row shows the new body instantly via
                     // the overlay; the poll's served page drops it once the
                     // edit echo lands.
                     viewModel.applyEditEcho(result.id, result.body)
@@ -1695,7 +1669,7 @@ class ThreadScreen(
     }
 
     /**
-     * The contact overlay (feedback 2026-08-21): the identifier line is the
+     * The contact overlay: the identifier line is the
      * bridge UID when it IS the number/username — see [contactIdentifier].
      */
     private fun openContact() {
@@ -1729,7 +1703,7 @@ private const val DECRYPTION_NOTICE_KEYS_PENDING =
     "Encrypted — history can't be read yet, keys from your other devices are pending (Settings → Account → Verify Device)"
 
 /**
- * The unsend confirmation (Phase C, 2026-09-03). LP3 feedback 2026-09-03: the
+ * The unsend confirmation. LP3: the
  * question reads big, the message previews under it (3 lines, ellipsized), the
  * destructive action sits alone in the bottom bar, and back (<, top left)
  * cancels — the composer's navigation grammar, not a modal.
@@ -1798,13 +1772,12 @@ private fun DecryptionNotice(text: String) {
     )
 }
 
-/** One row of the thread: a message (Phase 9). [showTime]: whether this
+/** One row of the thread: a message. [showTime]: whether this
  *  message starts a group (a new day, a different sender, or a gap of
  *  [GROUP_WINDOW_MS] from the previous message) — the only messages that
- *  carry a timestamp (feedback pass). The timestamp itself carries the day tag
+ *  carry a timestamp. The timestamp itself carries the day tag
  *  ("Yesterday", weekday, "Aug 12") when the message isn't from today
- *  (feedback 2026-08-21: day tags on the message timestamps replaced the
- *  centered day dividers). */
+ */
 private data class ThreadRow(
     val message: LightServiceMethod.GetMessages.Message,
     val showTime: Boolean,
@@ -1849,10 +1822,8 @@ private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
  * line (measured without a width cap, then clipped to the message column's
  * max width), so the block hugs the text instead of the full column — a long
  * unbreakable word (a URL, an email address) no longer collapses the block to
- * the width of the short line before it (feedback 2026-08-22: "But CC in
- * hello@berlinscenelab.com" rendered as a narrow column because line 1 broke
- * at the long word). The block never exceeds the column cap, so no line spans
- * edge to edge (feedback 2026-08-17).
+ * the width of the short line before it. The block never exceeds the column cap, so no line spans
+ * edge to edge.
  */
 @Composable
 private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
@@ -1875,7 +1846,7 @@ private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
         }
         // Round UP: the box must be at least as wide as a line's last word —
         // a sub-pixel shortfall flips the wrap and drops the word to line 2,
-        // leaving the gap on the top line (verified on-device 2026-08-17).
+        // leaving the gap on the top line.
         val w = minOf(ceil(widestPx), maxWidthPx.toFloat())
         with(density) { w.toFloat().toDp() }
     }
@@ -1912,7 +1883,7 @@ private fun MessageRow(
     onOpenContext: (LightServiceMethod.GetMessages.Message) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
 ) {
-    // Phase 13: a buffer keeps message text off the far screen edge. Outgoing
+    // A buffer keeps message text off the far screen edge. Outgoing
     // messages sit on the right and incoming on the left — the built-in Phone
     // app's layout — each capped at ~7/8 of the row width so long text never
     // spans edge to edge.
@@ -1933,9 +1904,8 @@ private fun MessageRow(
     ) {
         // Bridge system messages (m.notice: "Turned off disappearing
         // messages", timer-set notices, …) are a quiet centered small line —
-        // not a normal message from the contact (2026-08-22). Solid white,
-        // like the timestamps/labels: hierarchy from size, not dimming
-        // (feedback 2026-08-22: "no grey in the chats tool").
+        // not a normal message from the contact. Solid white,
+        // like the timestamps/labels: hierarchy from size, not dimming.
         if (message.contentType == "notice") {
             LightText(
                 text = message.body,
@@ -1945,15 +1915,15 @@ private fun MessageRow(
             )
             return@BoxWithConstraints
         }
-        // Tombstones (Phase C, 2026-09-03): the message was unsent (redacted).
+        // Tombstones: the message was unsent (redacted).
         // Rendered like a normal text row — same size and sender alignment,
         // "[Message unsent]" body, no reactions/status/gestures (the event is
         // gone for everyone). The old centered Superfine placeholder read as
-        // transient and out of place (LP3 feedback 2026-09-03). The gesture
+        // transient and out of place. The gesture
         // gate below requires contentType == "text", so tombstones stay inert.
         // The outgoing body's column cap (0.875 × the row content width):
         // outgoing text is measured against it so the block never spans the
-        // full row (feedback 2026-08-17); the block width itself comes from
+        // full row; the block width itself comes from
         // [OutgoingBodyText] (the widest line, capped here).
         val bodyMaxWidthPx = with(LocalDensity.current) {
             (maxWidth * MESSAGE_WIDTH_FRACTION).toPx().roundToInt()
@@ -1962,12 +1932,12 @@ private fun MessageRow(
         val failed = message.sendStatus?.startsWith("FAIL_") == true
         // Locally-failed rows (the outbox recorded a send error, txn still
         // pending) are tappable — tap re-sends the same transaction
-        // (2026-08-22). Bridge-reported FAIL_* text rows (real event id, no
+        // Bridge-reported FAIL_* text rows (real event id, no
         // txn to retry) re-send the same body as a NEW message instead
-        // (2026-08-23); non-text bridge failures stay a plain marker.
+        // Non-text bridge failures stay a plain marker.
         val retryable = failed && message.sendStatus == "FAIL_LOCAL_SEND" && inFlight
         val retryableNew = failed && !inFlight && message.contentType == "text" && message.body.isNotBlank()
-        // Resend budget per message chain (2026-08-23): after
+        // Resend budget per message chain: after
         // [MAX_RESEND_ATTEMPTS] — or once the message is older than
         // [RESEND_MAX_AGE_MS] — the row turns static "failed to deliver":
         // no more duplicate sends.
@@ -1980,7 +1950,7 @@ private fun MessageRow(
             modifier = Modifier
                 .fillMaxWidth(MESSAGE_WIDTH_FRACTION)
                 .align(if (message.isMine) Alignment.CenterEnd else Alignment.CenterStart)
-                // A locally-failed send re-sends when tapped (2026-08-22); the
+                // A locally-failed send re-sends when tapped; the
                 // tap target is the row's bubble area, like the image/audio
                 // rows' own clickables.
                 .then(
@@ -1990,15 +1960,15 @@ private fun MessageRow(
                         else -> Modifier
                     },
                 )
-                // Phase A (2026-09-03): double-tap a received TEXT row to like/
-                // unlike it; Phase B (2026-09-03): long-press opens the context
-                // window over the bottom half; Phase C (2026-09-03): OWN text
+                // Double-tap a received TEXT row to like/
+                // unlike it; long-press opens the context
+                // window over the bottom half; OWN text
                 // rows open it too (EDIT / UNSEND), when the
                 // bridge caps still allow either. `combinedClickable`/
                 // `lightClickable` can't do double-tap. Media rows carry their
                 // own gestures inside their content composables (image tap =
-                // viewer, voice-note tap = play, long-press = context window
-                // since LP3 feedback 2026-09-03) — the text gate stays text-
+                // viewer, voice-note tap = play, long-press = context window)
+                // — the text gate stays text-
                 // only; failed / in-flight rows keep their retry tap.
                 .then(
                     if (!failed && !inFlight && message.contentType == "text" &&
@@ -2008,13 +1978,11 @@ private fun MessageRow(
                         // key (the stable event id) doesn't change — without
                         // rememberUpdatedState the callbacks captured the
                         // first-composed row snapshot, so a toggle computed
-                        // against stale reactions re-SENT the like every time
-                        // (LP3 feedback 2026-09-03: double-tap unsend "just
-                        // sends more hearts").
+                        // against stale reactions re-SENT the like every time.
                         val gestureMessage by rememberUpdatedState(message)
-                        // LP3 feedback 2026-09-03 (the Phone tool's native
+                        // (the Phone tool's native
                         // half-panel grammar): NO vibration on finger-down —
-                        // the haptic fires on actual gestures. 2026-09-07: a
+                        // the haptic fires on actual gestures. A
                         // like double-tap buzzes on BOTH taps, so every clean
                         // tap buzzes (the same feel as the chat list's
                         // lightClickable) and the second tap inside the system
@@ -2041,8 +2009,7 @@ private fun MessageRow(
                                             // LongPress-type buzz (the app's
                                             // standard click feel) — the old
                                             // TextHandleMove tick was
-                                            // imperceptible on the LP3
-                                            // (LP3 feedback 2026-09-03).
+                                            // imperceptible on the LP3.
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                         }
                                         val now = System.currentTimeMillis()
@@ -2073,12 +2040,12 @@ private fun MessageRow(
                     variant = LightTextVariant.Detail,
                 )
             }
-            // Feedback pass: only the first message of a group carries the time —
+            // Only the first message of a group carries the time —
             // consecutive same-sender messages within 15 minutes are combined
             // visually, while the sender/alignment stays on every message.
             // An IN-FLIGHT row shows "SENDING" even inside a group — the group
             // would otherwise hide the slot entirely, and the just-sent
-            // message must still be visibly pending (feedback 2026-08-17).
+            // message must still be visibly pending.
             // When the server confirms it, the served page swaps in the real
             // row: grouped → it merges under the shared timestamp; otherwise
             // it carries its own. A failed send shows its time, not SENDING.
@@ -2100,12 +2067,7 @@ private fun MessageRow(
             // companion and served as this flag. Outgoing TEXT rows lead with
             // the ↷ glyph (Subtitle) above the body with the word under it;
             // incoming text and MEDIA rows put the glyph beside the content
-            // with the word under it (feedback 2026-09-07: a forwarded photo
-            // used to sit under the tag row, reading disconnected from the
-            // glyph). Tight, lowercase, consistent with the other tags
-            // (feedback 2026-09-02: the marker used to sit in the body at
-            // full size with a blank line after it, reading like a separate
-            // message).
+            // with the word under it. Tight, lowercase, consistent with the other tags.
             if (message.forwarded && message.contentType == "text" && message.isMine) {
                 Row(
                     modifier = Modifier.padding(top = 1.dp, bottom = 1.dp),
@@ -2122,8 +2084,7 @@ private fun MessageRow(
                     )
                 }
             }
-            // Media rows open the context window on long-press (LP3 feedback
-            // 2026-09-03) — received rows always (LIKE/REACT [+ SAVE on
+            // Media rows open the context window on long-press — received rows always (LIKE/REACT [+ SAVE on
             // images]), own rows only while the bridge still allows an unsend
             // (canEdit never applies to media; otherwise no panel at all).
             val contextGesture = if (!message.isMine || message.canUnsend) {
@@ -2162,7 +2123,7 @@ private fun MessageRow(
                     // ink size) about the box center, which keeps the arrow
                     // centered on the body line: Subtitle's far taller line
                     // box carried the ink low and opened gaps above/below
-                    // (feedback 2026-09-02). The small "forwarded" word sits
+                    // The small "forwarded" word sits
                     // at the message's left edge under both.
                     Column(modifier = Modifier.padding(top = 1.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2183,8 +2144,7 @@ private fun MessageRow(
                     // Bridged call notices ("Incoming call. Use the WhatsApp
                     // app to answer." — Beeper's bridges can't relay calls, so
                     // the contact's ghost posts a plain m.text; the phone icon
-                    // marks the row as a call, like the built-in Phone tool
-                    // (feedback 2026-09-01).
+                    // marks the row as a call, like the built-in Phone tool.
                     Row(
                         modifier = Modifier.padding(top = 1.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -2208,8 +2168,7 @@ private fun MessageRow(
                     )
                 }
                 // A video row carries its caption under the "[Video]" marker —
-                // the marker keeps the media context, the caption the content
-                // (feedback 2026-09-01).
+                // the marker keeps the media context, the caption the content.
                 message.caption?.let { caption ->
                     LightText(
                         text = caption,
@@ -2219,7 +2178,7 @@ private fun MessageRow(
                 }
             }
             // An edited message shows a quiet "edited" tag under the body
-            // (feedback 2026-08-27) — and since 2026-09-07 it shares one line
+            // and it shares one line
             // with the delivery/status tag ("edited · delivered"), same
             // grammar as the reactions separator; either alone renders as
             // before.
@@ -2236,10 +2195,9 @@ private fun MessageRow(
                         modifier = Modifier.padding(top = 1.dp),
                     )
                 }
-            // Phase 14: reactions, as a quiet tag under the message (same
+            // Reactions, as a quiet tag under the message (same
             // grammar as the "not delivered" marker). Each entry reads
             // "Name reacted with ❤️" (or "You reacted with …" for own) —
-            // feedback 2026-08-14.
             if (message.reactions.isNotEmpty()) {
                 LightText(
                     text = message.reactions.joinToString(" · "),
@@ -2249,9 +2207,9 @@ private fun MessageRow(
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }
-            // Phase A: a reaction toggle that failed server-side reverted the
+            // A reaction toggle that failed server-side reverted the
             // optimistic tag — the quiet row error says so (same grammar as the
-            // voice-note error, feedback 2026-08-19).
+            // voice-note error).
             reactionError?.takeIf { it.first == message.id }?.let { error ->
                 LightText(
                     text = error.second,
@@ -2260,7 +2218,7 @@ private fun MessageRow(
                 )
             }
             // Beeper reports failed deliveries with a com.beeper.message_send_status
-            // event (Phase 10) — a quiet label beats a silent stall. The
+            // event — a quiet label beats a silent stall. The
             // thread poll surfaces it within seconds, no new send needed. It
             // shows on any message, old or new.
             if (message.isMine && failed) {
@@ -2268,8 +2226,8 @@ private fun MessageRow(
                     // A locally-failed row re-sends the same transaction when
                     // tapped; a bridge-reported text failure re-sends the body
                     // as a new message; non-text bridge failures have no resend
-                    // path (2026-08-23). A chain past [MAX_RESEND_ATTEMPTS]
-                    // turns static "failed to deliver" (feedback 2026-08-23).
+                    // path. A chain past [MAX_RESEND_ATTEMPTS]
+                    // turns static "failed to deliver".
                     text = when {
                         retryable -> "failed to send. tap to resend"
                         retryableNew && !resendExhausted -> "not delivered. tap to resend"
@@ -2278,8 +2236,7 @@ private fun MessageRow(
                     },
                     variant = LightTextVariant.Superfine,
                     // Solid white like the timestamps — the delivery labels
-                    // read like the rest of the message, not dimmed (feedback
-                    // 2026-08-21).
+                    // read like the rest of the message, not dimmed.
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }
@@ -2291,7 +2248,7 @@ private fun MessageRow(
  *  ~2.1x (≈ the Subtitle ink size) about a pivot 0.72 down the line box —
  *  the ↷ falls back to Noto Sans Symbols, whose run sits low in the
  *  Paragraph line box; the pivot keeps the ink centered and the equal
- *  padding re-absorbs the scaled ink (feedback 2026-09-02). */
+ *  padding re-absorbs the scaled ink. */
 @Composable
 private fun ForwardedArrowGlyph() {
     LightText(
@@ -2307,8 +2264,7 @@ private fun ForwardedArrowGlyph() {
     )
 }
 
-/** Forwarded MEDIA rows (feedback 2026-09-07: the photo used to sit under
- *  the tag row, reading disconnected from the glyph): the ↷ glyph beside the
+/** Forwarded MEDIA rows: the ↷ glyph beside the
  *  content, the small "forwarded" word under it — the same grammar as
  *  forwarded incoming text. */
 @Composable
@@ -2349,11 +2305,11 @@ private fun ImageMessageContent(
     LaunchedEffect(message.id, allowMobile) { onEnsureMedia(message.id, allowMobile) }
     val bytes = mediaBytes[message.id]
     // Decode off the main thread: the in-composition decode blocked the UI
-    // thread's first paint for every visible photo (feedback 2026-08-23).
+    // thread's first paint for every visible photo.
     // The text fallback below renders until the bitmap lands. Seeded from the
     // process-wide [chatsBitmapCache]: returning from the fullscreen viewer
     // re-enters this composition, and re-decoding started from a null frame
-    // (a "[Photo]" flash before the image popped back in, LP3 2026-08-23).
+    // (a "[Photo]" flash before the image popped back in).
     val bitmap by produceState<ImageBitmap?>(chatsBitmapCache.get(message.id), bytes) {
         if (bytes != null && value == null) {
             value = withContext(Dispatchers.Default) {
@@ -2373,8 +2329,7 @@ private fun ImageMessageContent(
         // Still loading, or the media can't be fetched/decoded (e.g.
         // still-encrypted): fall back to the row text ("[Photo]" or the file
         // name). A failed/skipped fetch (no bytes) is worth one more tap —
-        // re-run it without leaving the thread (feedback 2026-09-01: RCS
-        // attachments time out). Decode failures (bytes but no bitmap) stay
+        // re-run it without leaving the thread. Decode failures (bytes but no bitmap) stay
         // dead text; re-fetching would not help.
         val bodyModifier =
             if (bytes == null) Modifier.lightClickable(onClick = { onEnsureMedia(message.id, allowMobile) })
@@ -2403,14 +2358,12 @@ private fun ImageMessageContent(
             // Sized to the photo's own aspect rather than stretched to the row
             // width: a tall photo caps at MAX_IMAGE_HEIGHT_DP and hugs the
             // sender's edge via the row's End/Start alignment — no centered
-            // side-bars beside portrait shots (feedback 2026-09-01).
+            // side-bars beside portrait shots.
             .heightIn(max = MAX_IMAGE_HEIGHT_DP)
             .padding(top = 1.dp)
-            // Tap opens the viewer; long-press opens the context window (LP3
-            // feedback 2026-09-03) — the old lightClickable tap-only target
+            // Tap opens the viewer; long-press opens the context window — the old lightClickable tap-only target
             // can't carry the long-press. The haptic fires on the trigger, not
-            // on finger-down (the Phone tool's half-panel grammar, LP3
-            // feedback 2026-09-03).
+            // on finger-down (the Phone tool's half-panel grammar).
             .pointerInput(Unit) {
                 detectTapGestures(
                     onTap = { currentOnOpenImage(bytes) },
@@ -2437,10 +2390,10 @@ private fun ImageMessageContent(
 }
 
 /** A voice-note row: a play/pause icon + label, tapped to toggle playback in
- *  the companion (Phase 14). The playing row shows its state via the poll's
+ *  the companion. The playing row shows its state via the poll's
  *  `audioPlayingEventId`, so the highlight survives message-list refreshes.
  *  A fetch/playback failure ([error]) shows briefly under the label instead of
- *  a silent no-op (feedback 2026-08-19). */
+ *  a silent no-op. */
 @Composable
 private fun AudioMessageContent(
     message: LightServiceMethod.GetMessages.Message,
@@ -2458,9 +2411,7 @@ private fun AudioMessageContent(
 ) {
     // While playing, refresh the interpolated position counter every second:
     // the position polls arrive every few seconds, and the label interpolates
-    // between them. (2026-08-22: the old `tick++` was never READ in
-    // composition, so the write never triggered recomposition — the label
-    // only advanced on each poll, i.e. in multi-second jumps.)
+    // between them.
     var nowMs by remember { mutableStateOf(android.os.SystemClock.elapsedRealtime()) }
     LaunchedEffect(playing) {
         while (playing) {
@@ -2476,7 +2427,7 @@ private fun AudioMessageContent(
             // position — the pause point on resume, 0:00 on a new note — until
             // the poll confirms the companion's real position. Counting on
             // wall clock here ran ahead of the companion and the next poll
-            // jumped the label BACK (feedback 2026-08-28).
+            // jumped the label BACK.
             val pos = if (counterPending) base else base + (nowMs - playingPositionAtMs)
             // Just the running position while playing (the row already showed
             // its length when idle).
@@ -2494,11 +2445,10 @@ private fun AudioMessageContent(
     val currentHapticsEnabled by rememberUpdatedState(LocalHapticsEnabled.current)
     Row(
         modifier = Modifier
-            // Tap toggles playback; long-press opens the context window (LP3
-            // feedback 2026-09-03) — detectTapGestures consumes the long-press
+            // Tap toggles playback; long-press opens the context window — detectTapGestures consumes the long-press
             // so it never falls through to a play. The haptic fires on the
             // trigger, not on finger-down (the Phone tool's half-panel
-            // grammar, LP3 feedback 2026-09-03).
+            // grammar).
             .pointerInput(Unit) {
                 detectTapGestures(
                     onTap = { currentOnTogglePlay() },
@@ -2543,7 +2493,7 @@ private fun formatDuration(ms: Long): String =
 
 /** Cap for the message block — long text never spans the full row width.
  *  The far-side buffer (the empty band on the message's outer side) is half
- *  of what it was: 25 % → 12.5 % (feedback 2026-08-17). Incoming text fills
+ *  of what it was: 25 % → 12.5 %. Incoming text fills
  *  this width; outgoing text is measured against it and blocks can be
  *  narrower — sized to the first line so the top line touches the right. */
 private const val MESSAGE_WIDTH_FRACTION = 0.875f

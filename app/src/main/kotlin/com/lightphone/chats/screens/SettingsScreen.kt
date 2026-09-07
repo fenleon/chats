@@ -246,7 +246,7 @@ private fun SettingsRow(
                     // Value-row main text — Heading. Pulled up into the label's
                     // descender space so the two sit almost touching (the emulator
                     // letterboxes ~0.66×, so the ink gap renders ~1.5× on the
-                    // LP3 — feedback 2026-08-19).
+                    // LP3).
                     variant = LightTextVariant.Heading,
                     modifier = Modifier.offset(y = (-3).dp),
                 )
@@ -270,8 +270,7 @@ private fun ToggleRow(
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
         // The toggle sits immediately left of its action label, the row
         // top-aligned so it lines up with the main label — not centered
-        // between the label and the caption (same as Audiobooks Settings,
-        // feedback 2026-08-17).
+        // between the label and the caption (same as Audiobooks Settings).
         verticalAlignment = Alignment.Top,
     ) {
         Box(

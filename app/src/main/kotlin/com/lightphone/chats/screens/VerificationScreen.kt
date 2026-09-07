@@ -52,8 +52,7 @@ private const val WAITING_TEXT = "Waiting for your other device to accept..."
  * account's other device (e.g. the Beeper app), which unlocks encrypted
  * message keys. The state machine runs in the companion (Trixnity); this
  * screen polls it over the binder and forwards the user's choices.
- *
- * The flow renders as full-screen panels (feedback 2026-08-19): a local
+ * The flow renders as full-screen panels: a local
  * confirmation panel before the request is sent, then the server's states —
  * waiting / accept / compare / terminal (cancelled / error) — each with the
  * X-cancel affordance in the bottom bar.
@@ -70,8 +69,8 @@ class VerificationViewModel : LightViewModel<Unit>() {
     val confirmOpen = MutableStateFlow(false)
 
     /** True between Continue and the server reporting a non-idle verification
-     *  state — the waiting panel shows immediately, no main-panel flash
-     *  (feedback 2026-08-19). */
+     *  state — the waiting panel shows immediately, no main-panel flash.
+     */
     val starting = MutableStateFlow(false)
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
@@ -81,7 +80,7 @@ class VerificationViewModel : LightViewModel<Unit>() {
         // machine commits) — the screen never polls. The e2ee read includes a
         // server round-trip, so it rides the wait's dead-man window and the
         // Done transition; the recovery/accept actions refresh it directly
-        // anyway (feedback 2026-08-23).
+        // anyway.
         viewModelScope.launch {
             state.value = ChatClient.verificationState()
             e2ee.value = ChatClient.e2eeState()
@@ -239,8 +238,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
                 }
 
                 // Cancelled/failed: no top bar at all — no back navigation, no
-                // title; Try Again / Use Recovery Key are the only ways out
-                // (feedback 2026-09-06).
+                // title; Try Again / Use Recovery Key are the only ways out.
                 if (state?.state != "cancelled" && state?.state != "error") {
                     LightTopBar(
                         leftButton = if (confirmOpen) {
@@ -268,7 +266,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
 
                         // Between Continue and the server's first non-idle
                         // state, show the waiting panel directly — no flash of
-                        // the main panel (feedback 2026-08-19).
+                        // the main panel.
                         starting && state?.state == "none" -> CenteredPanel(WAITING_TEXT)
 
                         else -> when (state?.state) {
@@ -328,10 +326,7 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
         }
     }
 
-    /** The bottom-bar action set for the current panel (feedback 2026-08-19:
-     *  X dismiss/cancel; the panel's action; the compare page has no X, the
-     *  waiting and cancelled panels' X sits centered — 2026-08-29: accept/start
-     *  and compare put their actions in the content area, X centered). */
+    /** The bottom-bar action set for the current panel. */
     private fun bottomBarItems(
         confirmOpen: Boolean,
         state: String?,
@@ -359,8 +354,8 @@ class VerificationScreen(sealedActivity: SealedLightActivity) :
             state == "accept" || state == "start" -> listOf(
                 // Both panels route through "accept" — the server prefers the
                 // pending SAS-accept over starting the SAS itself (the states
-                // churn fast, LP3 2026-08-19). ACCEPT moved into the content
-                // area above the bar (2026-08-29); the X cancels, centered.
+                // churn fast). ACCEPT moved into the content
+                // area above the bar; the X cancels, centered.
                 null,
                 cancelButton(),
                 null,
@@ -515,8 +510,7 @@ private fun TerminalPanel(
         }
     }
 }/** The accept/start panel (2026-08-29): question centered like the other
- *  full-area panels (2026-09-06 — the half-split grammar made it jump up from
- *  the waiting text's position), ACCEPT anchored above the bottom bar; the X
+ *  full-area panels, ACCEPT anchored above the bottom bar; the X
  *  cancel stays in the bar. */
 @Composable
 private fun AcceptPanel(onAccept: () -> Unit) {
@@ -558,9 +552,8 @@ private fun PanelActionButton(label: String, onClick: () -> Unit) {
 }
 
 /** The emoji-comparison panel: the SAS emojis with the confirmation line
- *  centred (feedback 2026-08-19); THEY MATCH / THEY DON'T MATCH stacked as
- *  buttons above the bottom bar (2026-08-29 — previously THEY MATCH sat in
- *  the bar). */
+ *  centred; THEY MATCH / THEY DON'T MATCH stacked as
+ *  buttons above the bottom bar. */
 @Composable
 private fun ComparePanel(
     emojis: List<String>,

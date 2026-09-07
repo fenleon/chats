@@ -57,13 +57,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Dev toggle for the companion's verbose logging (Trixnity FINE +
         // HTTP-TRAFFIC): `--es debugLog 1` persists the flag before init, so
-        // it applies from the very first log call. Default off (efficiency
-        // audit 2026-08-14 — both were always-on and burned standby CPU).
+        // it applies from the very first log call. Default off — both were
+        // always-on and burned standby CPU.
         intent?.getStringExtra("debugLog")?.let {
             getSharedPreferences("chats_account", MODE_PRIVATE).edit()
                 .putBoolean("debug_logging", it == "1" || it.equals("true", ignoreCase = true)).apply()
         }
-        // Dev-only push channel overrides (2026-08-16, chats/push/README.md):
+        // Dev-only push channel overrides:
         // --es pushsse <url>    the SSE subscription URL (from the phone's side)
         // --es pushnotify <url> the pusher data.url (from the homeserver's side)
         // --es pushkey <url>    the pusher pushkey — ntfy routing needs it to

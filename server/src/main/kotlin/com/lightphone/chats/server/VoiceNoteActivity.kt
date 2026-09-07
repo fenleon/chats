@@ -52,12 +52,12 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * The "record a voice note" screen (Phase 14). The tool runtime forbids
+ * The "record a voice note" screen. The tool runtime forbids
  * startActivity and the companion can't launch activities from the background,
  * so the tool calls `StartVoiceNoteSend` (which records the room) and then
  * starts this activity via `SimpleLightScreen.startServerActivity` — the same
  * pattern as [PhotoSendActivity]. Recording starts as soon as the panel opens
- * (feedback 2026-08-30: no idle "tap to record" step) — Opus in an ogg
+ * — Opus in an ogg
  * container (the MSC3245 canonical voice-message format, ~2-3× smaller than
  * the old AAC/m4a at speech bitrates); tap to stop; the recording is
  * uploaded to Matrix as an m.audio message and sent in the recorded room.
@@ -74,9 +74,7 @@ class VoiceNoteActivity : ComponentActivity() {
      *  podcasts) for the take (feedback 2026-08-20). */
     private var recordFocusRequest: android.media.AudioFocusRequest? = null
     /** Audio focus held while the pre-send preview plays — the preview must
-     *  pause background audio the same way the recording does (feedback
-     *  2026-08-21: the recorder got transient focus but the preview player
-     *  didn't). */
+     *  pause background audio the same way the recording does. */
     private var previewFocusRequest: android.media.AudioFocusRequest? = null
 
     // Activity-level state so the recording functions can flip the UI (a
@@ -92,21 +90,17 @@ class VoiceNoteActivity : ComponentActivity() {
     private var elapsedSeconds by mutableStateOf(0)
     /**
      * Recorded length (seconds) — the timer slot keeps showing it after the
-     * take stops, and the preview ticks through it while playing (feedback
-     * 2026-08-27: "show the final length where it was counting, count through
-     * it on playback").
+     * take stops, and the preview ticks through it while playing.
      */
     private var finalDurationSeconds by mutableStateOf(0)
-    /** RECORD_AUDIO was denied — show why, with a retry (2026-08-19 feedback
-     *  round: "the phone doesn't ask for the permission" — a denial must not
-     *  silently drop the screen). */
+    /** RECORD_AUDIO was denied — show why, with a retry. */
     private var micDenied by mutableStateOf(false)
     /** The last send failed — keep the take + SEND so the user can retry
      *  instead of a silent drop (2026-08-19 feedback round). */
     private var sendFailed by mutableStateOf(false)
     /**
-     * In-app volume panel state (null = hidden) — the shared LightOS replica
-     * (feedback 2026-08-30): while a take exists to preview, the volume rocker
+     * In-app volume panel state (null = hidden) — the shared LightOS replica:
+     * while a take exists to preview, the volume rocker
      * shows this panel and adjusts the media stream, instead of LightOS's
      * ringer-only panel.
      */
@@ -131,8 +125,8 @@ class VoiceNoteActivity : ComponentActivity() {
             return
         }
         // Start the take BEFORE the first frame renders, so the panel opens
-        // already in the recording state — the idle mic icon must not flash
-        // (feedback 2026-08-31). A missing RECORD_AUDIO grant asks first; the
+        // already in the recording state — the idle mic icon must not flash.
+        // A missing RECORD_AUDIO grant asks first; the
         // launcher callback starts the recording (or shows the mic-denied
         // retry) once the user answers.
         ensureMicThenRecord()
@@ -141,8 +135,7 @@ class VoiceNoteActivity : ComponentActivity() {
             // Haptics on the recording screen follow the real LightOS setting,
             // like the main tool: LightActivity provides LocalHapticsEnabled
             // from GetUserPreferences, but this plain activity never did —
-            // lightClickable silently skipped the vibration (feedback
-            // 2026-08-22: "the recording panel does not have haptics").
+            // lightClickable silently skipped the vibration.
             val hapticsEnabled by rememberHapticsEnabled().collectAsState()
 
             CompositionLocalProvider(LocalHapticsEnabled provides hapticsEnabled) {
@@ -150,7 +143,7 @@ class VoiceNoteActivity : ComponentActivity() {
                 // Height of the timer slot under the icon — also reserved
                 // above the icon, so the icon (not the icon+timer block) sits
                 // on the panel's vertical center with the timer hanging below
-                // it (feedback 2026-08-30).
+                // it.
                 val timerSlotHeight = 3f.gridUnitsAsDp()
                 // m:ss ticker while recording (MediaRecorder has no position
                 // query — the elapsed time comes from the wall clock).
@@ -187,16 +180,11 @@ class VoiceNoteActivity : ComponentActivity() {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             // The timer slot's height is reserved above the
                             // icon too, so the ICON sits on the panel's
-                            // vertical center — the timer hangs below it
-                            // (feedback 2026-08-30: "the icons should be
-                            // lower so that they are centred").
+                            // vertical center — the timer hangs below it.
                             Spacer(modifier = Modifier.height(timerSlotHeight))
                             // Record → tap to stop → play the take back → SEND
-                            // in the bottom bar (RETRY, X, SEND — feedback
-                            // 2026-08-27). Icons carry the states (feedback
-                            // 2026-08-30: no text labels for the control flow —
-                            // mic to open, stop while recording, play when
-                            // stopped); only the permission-denied and sending
+                            // in the bottom bar (RETRY, X, SEND).
+                            // Icons carry the states; only the permission-denied and sending
                             // states keep words. A mic denial shows a message +
                             // ALLOW instead of a silent drop.
                             Box(
@@ -228,8 +216,7 @@ class VoiceNoteActivity : ComponentActivity() {
                             }
                             // Only the states that NEED words show any: the
                             // mic denial and the send progress. The control
-                            // states are purely icon + timer (feedback
-                            // 2026-08-30).
+                            // states are purely icon + timer.
                             when {
                                 micDenied -> LightText(
                                     text = "Microphone permission is needed to record.",
@@ -243,11 +230,9 @@ class VoiceNoteActivity : ComponentActivity() {
                                 )
                             }
                             // Fixed-height slot: the timer appears/disappears
-                            // without shifting the icon above it (feedback
-                            // 2026-08-27: "the icon and text move up when you
-                            // press record"). 3 grid units — tall enough for
+                            // without shifting the icon above it. 3 grid units — tall enough for
                             // the Fine line; the old 2-unit slot clipped the
-                            // text vertically (feedback 2026-08-30).
+                            // text vertically.
                             Box(
                                 modifier = Modifier.height(timerSlotHeight),
                                 contentAlignment = Alignment.Center,
@@ -263,7 +248,7 @@ class VoiceNoteActivity : ComponentActivity() {
                                         text = timerText,
                                         // One step up from the old Superfine —
                                         // the counting time reads bigger under
-                                        // the icon (feedback 2026-08-30).
+                                        // the icon.
                                         variant = LightTextVariant.Fine,
                                         // Solid white like the thread's
                                         // timestamps (feedback 2026-08-27).
@@ -284,8 +269,7 @@ class VoiceNoteActivity : ComponentActivity() {
                         modifier = Modifier.navigationBarsPadding(),
                         items = listOf(
                             // RETRY: delete the take and start a fresh
-                            // recording (feedback 2026-08-30: no tap-to-record
-                            // step).
+                            // recording.
                             if ((previewing || sendFailed) && !sending) {
                                 LightBarButton.Text(
                                     text = "RETRY",
@@ -295,9 +279,9 @@ class VoiceNoteActivity : ComponentActivity() {
                                 null
                             },
                             // X in the middle dismisses the panel — no top-bar
-                            // back (feedback 2026-08-27). finish() only, so a
+                            // back. finish only, so a
                             // recorded take never flashes the idle panel on the
-                            // way out (feedback 2026-08-27); onStop cleans up.
+                            // way out; onStop cleans up.
                             LightBarButton.LightIcon(
                                 icon = LightIcons.CLOSE,
                                 onClick = { finish() },
@@ -330,13 +314,11 @@ class VoiceNoteActivity : ComponentActivity() {
      * main tool: volume rocker → LightOS's volume panel, scroll wheel →
      * brightness, camera button etc. The tool's screens get this via the SDK
      * server's onDeviceKeyEvent (LightOS forwards to the tool), but this plain
-     * activity sits outside that path (feedback 2026-08-22: "the recording
-     * panel does not have volume / brightness").
-     *
+     * activity sits outside that path.
      * While a take exists ([previewing]) the volume rocker is consumed here
      * instead: it adjusts the media stream (the take plays over it) and shows
      * the in-app volume panel replica — the native LightOS panel is ringer-only
-     * for third-party tools (feedback 2026-08-30).
+     * for third-party tools.
      */
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
         val volumeKey = event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
@@ -408,9 +390,8 @@ class VoiceNoteActivity : ComponentActivity() {
     }
 
     /**
-     * RETRY (feedback 2026-08-27): deletes the take and starts a fresh
-     * recording — there is no idle "tap to record" step anymore (feedback
-     * 2026-08-30), so the new take begins immediately.
+     * RETRY: deletes the take and starts a fresh
+     * recording — there is no idle "tap to record" step anymore, so the new take begins immediately.
      */
     private fun retryRecording() {
         runCatching { previewPlayer?.release() }
@@ -452,8 +433,7 @@ class VoiceNoteActivity : ComponentActivity() {
         recordingStartedAt = SystemClock.elapsedRealtime()
         elapsedSeconds = 0
         // Pause whatever is playing in the background (music, a podcast, a
-        // voice note) for the take — transient focus, released on stop
-        // (feedback 2026-08-20: "background audio should pause").
+        // voice note) for the take — transient focus, released on stop.
         recordFocus()
         recording = true
     }

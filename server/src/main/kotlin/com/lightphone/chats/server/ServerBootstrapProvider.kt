@@ -25,15 +25,15 @@ private const val LIGHTSDK_DEV_CERT_SHA256 =
 
 private const val TAG = "ServerBootstrap"
 
-// VAPID public key from the mollysocket link LightOS returned for this device
-// (2026-08-21 probe): mollysocket://link?vapid=...&url=...&type=webserver. The
+// VAPID public key from the mollysocket link LightOS returned for this device:
+// mollysocket://link?vapid=...&url=...&type=webserver. The
 // UP connector's own generated key fails its regex (3.3.2), so pass an
 // explicit format-valid key. Removed with the probe.
 private const val MOLLYSOCKET_VAPID =
     "BJpWPefLMOy_hvZsejTdQpRfvjoirNwVjhdjPo1nNPdcwQQnoANsHQlQdg_vSBqsvHY-4t_KqyFDzsuYACNuGTw"
 
 /**
- * Single-APK build (2026-08-19): the former companion's `ServerApplication`
+ * Single-APK build: the former companion's `ServerApplication`
  * wiring runs here, inside the merged tool APK. A ContentProvider is the only
  * app-start hook with a real [Context] that is not part of the tool-plugin
  * scanned module — it wires the SDK server (settings, cert check, chat
@@ -58,7 +58,7 @@ class ServerBootstrapProvider : ContentProvider() {
             // rocker adjusts the media stream here (one step per press) — the
             // tool's in-app volume panel replica mirrors it, and the native
             // LightOS panel is ringer-only for third-party tools, so volume
-            // must NOT be relayed then (feedback 2026-08-30). Otherwise every
+            // must NOT be relayed then. Otherwise every
             // event goes to LightOS (volume panel, brightness wheel, camera).
             onDeviceKeyEvent = { _, event ->
                 val volumeKeyDown = event.action == KeyEvent.ACTION_DOWN &&
@@ -86,10 +86,8 @@ class ServerBootstrapProvider : ContentProvider() {
                     // LightActivity forwards ALL actions (DOWN/UP/MULTIPLE) for
                     // mapped keys — incl. the shutter (27/80) — with
                     // componentToRelaunch, and LightOS is the handler. The
-                    // 2026-08-23 "relay shutter DOWN only" experiment deviated
-                    // from that contract and LP3-tested unchanged (2026-08-30:
-                    // camera still opened hidden, colour flipped, stale camera
-                    // on tool exit) — removed to match the SDK flow exactly.
+                    // "relay shutter DOWN only" experiment deviated
+                    // from that contract and LP3-tested unchanged — removed to match the SDK flow exactly.
                     PlatformRelay.sendDeviceKeyEvent(event)
                     // Camera key: the relay opens LightOS's camera, but a
                     // relayed event never foregrounds com.lightos (the real key
@@ -98,7 +96,7 @@ class ServerBootstrapProvider : ContentProvider() {
                     // relayed one mounts the camera hidden and flips greyscale
                     // with nothing on screen). Launch HOME so com.lightos (the
                     // home app) comes to front with the camera screen already
-                    // open, matching the toolbox-key behaviour (LP3 2026-08-30).
+                    // open, matching the toolbox-key behaviour.
                     if (event.keyCode == KeyEvent.KEYCODE_CAMERA &&
                         event.action == KeyEvent.ACTION_DOWN && (event.repeatCount ?: 0) == 0
                     ) {
@@ -109,7 +107,7 @@ class ServerBootstrapProvider : ContentProvider() {
                     }
                 }
             }
-            // Runtime permission flow (audit 2026-08-23): the tool requests
+            // Runtime permission flow: the tool requests
             // POST_NOTIFICATIONS through the SDK flow; this APK hosts the AOSP
             // dialog activity (ChatsPermissionActivity) and adds the
             // notification permission to the grantable set.

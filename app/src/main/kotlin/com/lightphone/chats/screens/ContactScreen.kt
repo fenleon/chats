@@ -31,19 +31,18 @@ import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 /**
- * The contact overlay (feedback 2026-08-21): tapping the thread's top-bar
+ * The contact overlay: tapping the thread's top-bar
  * room name opens a minimal contact page — Name, the other party's
- * identifier (same size as the name, second line; 2026-09-01), and the
+ * identifier (same size as the name, second line), and the
  * network underneath as the small subtext (WhatsApp / Instagram). No top
  * bar; the bottom bar carries only an X in the middle to dismiss. The
  * identity block sits near the screen's vertical center; the PIN / MUTE /
  * ARCHIVE toggles sit centred between the network tag and the bottom bar's
- * X (LP3 feedback 2026-08-28 + 2026-09-03).
- *
+ * X.
  * Data source: the identifier is the contact's real number/username,
  * resolved by the companion from the bridge's contact API when the room
- * data doesn't carry it (WhatsApp LID heroes, Instagram usernames —
- * 2026-09-01); the room-data localpart heuristic is the fallback. The user
+ * data doesn't carry it (WhatsApp LID heroes, Instagram usernames);
+ * the room-data localpart heuristic is the fallback. The user
  * offered the LP3's phone contact panel as a design reference; revisit the
  * layout when it's shared.
  */
@@ -55,8 +54,7 @@ class ContactScreen(
     /**
      * For rooms inside a bridged community (WhatsApp community groups): the
      * community's own name. Renders as the second Heading line when the room
-     * has no identifier — the group fills the slot the id occupies for 1:1s
-     * (feedback 2026-09-01).
+     * has no identifier — the group fills the slot the id occupies for 1:1s.
      */
     private val community: String? = null,
     private val identifier: String?,
@@ -70,16 +68,16 @@ class ContactScreen(
      */
     private val phone: String? = null,
     /**
-     * Mute state (2026-08-23): the MUTE button under the network line reads
+     * Mute state: the MUTE button under the network line reads
      * MUTE / UNMUTE; muting stops notifications for the room while the unread
      * badge stays. A StateFlow — the thread keeps it in sync with other
-     * devices while the panel is open (LP3 feedback 2026-08-28).
+     * devices while the panel is open.
      */
     private val muted: StateFlow<Boolean> = MutableStateFlow(false),
     /** Flips the room's mute server-side; the panel mirrors the new state locally. */
     private val onToggleMute: () -> Unit = {},
     /**
-     * Pin state (2026-08-28): the PIN button reads PIN / UNPIN; pinned chats
+     * Pin state: the PIN button reads PIN / UNPIN; pinned chats
      * sort to the top of the room list and their rows drop the latest
      * timestamp. StateFlow like [muted].
      */
@@ -87,7 +85,7 @@ class ContactScreen(
     /** Flips the room's pin server-side (m.favourite tag); the panel mirrors locally. */
     private val onTogglePin: () -> Unit = {},
     /**
-     * Archive state (2026-08-28): the ARCHIVE button reads ARCHIVE /
+     * Archive state: the ARCHIVE button reads ARCHIVE /
      * UNARCHIVE; archived rooms hide from the main list and go silent,
      * reachable only via search VIEW ALL. StateFlow like [muted].
      */
@@ -124,11 +122,8 @@ class ContactScreen(
                     .background(LightThemeTokens.colors.background),
             ) {
                 // Identity block, then the toggles, with three weighted
-                // spacers setting the gaps independently (LP3 feedback
-                // 2026-09-03: the weight-split layout coupled them — moving
-                // the name down pushed the buttons down with it). 21 : 3 : 8
-                // (measured on the 1080x1240 @ 480 grid): both old gaps
-                // halved — name→UNPIN ~86px, ARCHIVE→X ~239px — and the name
+                // spacers setting the gaps independently. 21: 3: 8
+                // (measured on the 1080x1240 @ 480 grid), keeping the name
                 // block centering near the screen's vertical middle.
                 Spacer(modifier = Modifier.weight(21f))
                 Column(
@@ -144,12 +139,9 @@ class ContactScreen(
                         )
                         // The id (number/username) as the second line, the same
                         // size as the name; the network tag stays small
-                        // underneath (feedback 2026-09-01: the id came back off
-                        // the network line onto its own Heading line, the
-                        // network stays the Detail subtext). Groups with no id
+                        // underneath. Groups with no id
                         // show the community name in this slot — except the
-                        // community's own room, where the community IS the name
-                        // (LP3 2026-09-01).
+                        // community's own room, where the community IS the name.
                         (identifier ?: phone ?: community?.takeUnless {
                             it.equals(name, ignoreCase = true)
                         })?.takeIf { it.isNotBlank() }?.let {
@@ -167,8 +159,7 @@ class ContactScreen(
                                 text = it,
                                 variant = LightTextVariant.Detail,
                                 // Solid white — the network line reads like the
-                                // name above it, not dimmed (feedback
-                                // 2026-08-27).
+                                // name above it, not dimmed.
                                 align = TextAlign.Center,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
@@ -178,9 +169,8 @@ class ContactScreen(
                     }
                 // Gap: name block → buttons. Equal to the gap below the
                 // buttons, so the toggle block sits centred between the
-                // {network} tag and the X (LP3 feedback 2026-09-03). 21 : 5.5
-                // : 5.5 keeps the same total and the same name-block position
-                // the 2026-09-03 tuning set (21/32 of the free space).
+                // {network} tag and the X. 21: 5.5
+                // (21/32 of the free space).
                 Spacer(modifier = Modifier.weight(5.5f))
                 // Toggle block (LP3 feedback 2026-08-28): three full-width
                 // buttons stacked with a tight 0.25gu gap.
@@ -202,7 +192,7 @@ class ContactScreen(
                             icon = LightIcons.CLOSE,
                             // Pop with a Unit result so the caller's navigateTo
                             // callback fires — the room list's panel stops its
-                            // flag poll on dismissal (ThreadScreen pattern, 2026-08-29).
+                            // flag poll on dismissal (ThreadScreen pattern).
                             onClick = { goBack(Unit) },
                             contentDescription = "Close contact",
                         ),
