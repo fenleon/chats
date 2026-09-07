@@ -52,7 +52,6 @@ import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -9079,26 +9078,20 @@ object MatrixRepository {
             )
             return null to 0L
         }
-        // Suspicious (dropped by the dedup, or inside a flood): resolve in the
-        // background with a session restore (the copies' originals are old
-        // messages whose keys load from the backup — slow, so not on the
-        // resolver's critical path). Keep the server's values until it lands.
+        // Suspicious (dropped by the dedup, or inside a flood): keep the
+        // last-known-good (or the raw head — only reachable for renderable
+        // heads now that the park above runs first) until the background
+        // walk lands. The walk is skipped while a futile-restore park is
+        // active (the originals' sessions are gone — it can't resolve);
+        // the retry then aligns with the park's end instead of the default
+        // GHOST_WALK_RETRY_MS.
         if (decryptRestoreCooldown.allowed(matrixRoomId.full)) {
-            // Parked room (futile restore): a ghost walk can't resolve it
-            // either — the originals' sessions are gone, so the dedup can't
-            // identify the real event. Retry at the park's end, not in 2
-            // minutes.
-            effectiveLastCache[key] = EffectiveLast(
-                serverLastId, prev?.effectiveEventId ?: serverLastId, prev?.effectiveTs ?: serverTs,
-                retryAtMs = decryptRestoreCooldown.until(key).takeIf { it > 0L }
-                    ?: (now + GHOST_WALK_RETRY_MS),
-            )
-            return (prev?.effectiveEventId ?: serverLastId) to (prev?.effectiveTs ?: serverTs)
+            enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
         }
-        enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
         effectiveLastCache[key] = EffectiveLast(
             serverLastId, prev?.effectiveEventId ?: serverLastId, prev?.effectiveTs ?: serverTs,
-            retryAtMs = now + GHOST_WALK_RETRY_MS,
+            retryAtMs = decryptRestoreCooldown.until(key).takeIf { it > 0L }
+                ?: (now + GHOST_WALK_RETRY_MS),
         )
         return (prev?.effectiveEventId ?: serverLastId) to (prev?.effectiveTs ?: serverTs)
     }
