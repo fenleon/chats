@@ -6953,11 +6953,11 @@ object MatrixRepository {
                 }
             }
             // Server unread counts: the sync response carries the
-            // server-computed per-room unread_notifications.notification_count —
-            // the same account-wide unread truth the Beeper clients show. Trixnity
-            // only stores it as an unencrypted-room cap (and its own badge state
-            // machine dies on fresh logins — see [localReceiptUnread]), so collect
-            // it directly here. Incremental syncs only include changed rooms, which
+            // server-computed per-room unread_notifications.notification_count.
+            // It's the fallback badge while a room's own receipt hasn't synced
+            // yet ([receiptCursorUnread] is primary) — it counts non-message
+            // classes our client never renders, so it must not override the
+            // cursor. Incremental syncs only include changed rooms, which
             // is exactly when a count can move.
             watch("server-unread collector ended") {
                 c.api.sync.subscribeAsFlow().collect { syncEvents ->
@@ -6993,23 +6993,7 @@ object MatrixRepository {
                         if (!registered.add(key)) continue
                         val job = scope.launch {
                             try {
-                                // The v5 badge feed: room.unreadMessageCount is
-                                // gone, so the notification service's per-room
-                                // notification count drives the list badge. Its
-                                // first emission is a cache read; changes mark
-                                // the resolver dirty (skip-gate).
-                                // Tied to this job via coroutineScope so a room
-                                // collector ending (or failing) drops both.
-                                coroutineScope {
-                                    launch {
-                                        c.notification.getCount(roomId).collect { count ->
-                                            if (unreadCounts[key] != count) {
-                                                unreadCounts[key] = count
-                                                markRoomListDirty()
-                                            }
-                                        }
-                                    }
-                                    // First-message ping drop:
+                                // First-message ping drop:
                                     // a room whose newest message is ALREADY in the
                                     // store when its collector starts — the room was
                                     // created by that first message (bridge/RCS first
@@ -7131,7 +7115,6 @@ object MatrixRepository {
                                             notifyForEvent(c, roomId, lastId, updated)
                                         }
                                     }
-                                }
                             } catch (e: Exception) {
                                 android.util.Log.w(TAG, "notification watcher: room collector ended for $key: ${e.message}")
                             }
@@ -7268,11 +7251,8 @@ object MatrixRepository {
             ) null else senderNameOf(c, roomId, te.event.sender),
             preview = preview,
             direct = room.isDirect,
-            unreadCount = maxOf(
-                unreadCounts[roomId.full]?.toLong() ?: 0L,
-                serverUnreadCounts[roomId.full]?.toLong() ?: 0L,
-                localReceiptUnread(c, roomId.full),
-            ),
+            unreadCount = receiptCursorUnread(c, roomId.full)
+                ?: (serverUnreadCounts[roomId.full]?.toLong() ?: 0L),
         )
         // Persist "alerted this event" so a later watcher registration (new
         // process) doesn't re-alert it — the registration-time notify gate.
@@ -7688,15 +7668,6 @@ object MatrixRepository {
     )
 
     /**
-     * Per-room unread badge source (v5: `room.unreadMessageCount` is gone).
-     * Fed by `c.notification.getCount(roomId)` — the v5 NotificationService's
-     * per-room notification count (not a message count; badge semantics are
-     * boolean/notification-count from here on). The collector runs in
-     * [observeNotifications] per joined room.
-     */
-    private val unreadCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
-
-    /**
      * Server-computed per-room unread notification counts, captured straight
      * from the sync response (see the collector in [observeNotifications]).
      * Trixnity's own badge pipeline is empty after a fresh login, so this —
@@ -7736,52 +7707,46 @@ object MatrixRepository {
     }
 
     /**
-     * Local unread fallback: Trixnity's notification count is
-     * dead after a fresh login — its state machine defaults rooms to "read"
-     * when the last message isn't in the local timeline (our battery-thin
-     * sync leaves most rooms with 0-1 timeline rows) and only re-checks when
-     * a NEW event lands, so the badge never appears for exactly the rooms
-     * with unread history. Fallback: compare the account's own read receipt
-     * against the newest receipt from other members (the bridge posts each
-     * sender's receipt at their own last event, so max(other ts) tracks the
-     * newest non-self activity). Ours older → something unread. Fully local,
-     * one indexed lookup; the badge is boolean, so the count is 1.
-     * ponytail: heuristic — non-bridged rooms where senders never post
-     * receipts can under-report; upgrade to a bounded chain walk if seen.
+     * Cursor-based unread (the Beeper app's model — replaces the old own-vs-
+     * others receipt comparison): the cursor is the account's own m.read
+     * receipt (synced account-wide — a read on any device moves it), and
+     * unread = COUNT(message-class, not-ours timeline events strictly after
+     * it). Never compared against the server's notification_count, whose
+     * non-message accounting (reactions, member churn, send-status echoes our
+     * client never renders) flags fully-read rooms (LP3: 1€ Doc Chat, JobV,
+     * +16315652210, +4917668998995).
+     * Null when no own receipt has synced yet — callers fall back to the
+     * server count.
+     * ponytail: ts cursor over the thin-sync timeline — same-second boundary
+     * events and still-encrypted member copies can skew the count; the row
+     * badge renders boolean, so only the false-positive direction matters.
+     * Stored per-event position (Beeper's Messages.order) if that ever bites.
      */
-    private suspend fun localReceiptUnread(c: MatrixClient, roomId: String): Long {
+    private suspend fun receiptCursorUnread(c: MatrixClient, roomId: String): Long? {
         val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
-            ?: return 0L
+            ?: return null
         return chainDbSemaphore.withPermit {
             withContext(Dispatchers.IO) {
-                runCatching {
-                    db.openHelper.writableDatabase.query(
-                        "SELECT userId, MAX(je.value) FROM RoomUserReceipts, " +
+                runCatching<Long?> {
+                    val own = db.openHelper.writableDatabase.query(
+                        "SELECT MAX(je.value) FROM RoomUserReceipts, " +
                             "json_tree(RoomUserReceipts.value) je " +
-                            "WHERE RoomUserReceipts.roomId=? AND je.key='ts' AND je.type='integer' " +
-                            // Bridge bot accounts (@whatsappbot, @telegrambot, …)
-                            // "read" their own delivery-status events instantly,
-                            // so their receipt is always the newest in an active
-                            // room and this fallback read every busy bridged room
-                            // as unread.
-                            // ponytail: localpart-suffix heuristic — a human
-                            // literally named "…bot" would be excluded; switch
-                            // to a rendered-message join if that bites.
-                            "AND RoomUserReceipts.userId NOT LIKE '%bot:%' " +
-                            "GROUP BY userId",
-                        arrayOf(roomId),
-                    ).use { cur ->
-                        var own = -1L
-                        var othersMax = -1L
-                        while (cur.moveToNext()) {
-                            if (cur.isNull(1)) continue
-                            val ts = cur.getLong(1)
-                            if (cur.getString(0) == c.userId.full) own = maxOf(own, ts)
-                            else othersMax = maxOf(othersMax, ts)
-                        }
-                        if (own >= 0 && othersMax > own) 1L else 0L
-                    }
-                }.getOrDefault(0L)
+                            "WHERE RoomUserReceipts.roomId=? AND RoomUserReceipts.userId=? " +
+                            "AND je.key='ts' AND je.type='integer'",
+                        arrayOf(roomId, c.userId.full),
+                    ).use { cur -> if (cur.moveToFirst() && !cur.isNull(0)) cur.getLong(0) else -1L }
+                    if (own < 0) return@runCatching null
+                    db.openHelper.writableDatabase.query(
+                        "SELECT COUNT(*) FROM (SELECT 1 FROM TimelineEvent " +
+                            "WHERE TimelineEvent.roomId=? " +
+                            "AND json_extract(TimelineEvent.value,'$.event.type') " +
+                            "  IN ('m.room.message','m.room.encrypted') " +
+                            "AND json_extract(TimelineEvent.value,'$.event.sender') != ? " +
+                            "AND json_extract(TimelineEvent.value,'$.event.origin_server_ts') > ? " +
+                            "LIMIT 99)",
+                        arrayOf(roomId, c.userId.full, own.toString()),
+                    ).use { cur -> if (cur.moveToFirst()) cur.getLong(0) else 0L }
+                }.getOrNull()
             }
         }
     }
@@ -7791,7 +7756,6 @@ object MatrixRepository {
         roomSigSeen.clear()
         bridgeBotByRoom.clear()
         pendingReadClear.clear()
-        unreadCounts.clear()
         serverUnreadCounts.clear()
         effectiveLastCache.clear()
         ghostResolveInFlight.clear()
@@ -8064,7 +8028,7 @@ object MatrixRepository {
                         key,
                         cleared?.second,
                         room.lastRelevantEventTimestamp?.toEpochMilliseconds(),
-                        if (verified || !room.encrypted) (unreadCounts[key]?.toLong() ?: 0L) else 0,
+                        if (verified || !room.encrypted) (serverUnreadCounts[key]?.toLong() ?: 0L) else 0,
                     ),
                     lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
                     lastEventId = room.lastRelevantEventId?.full,
@@ -8204,17 +8168,12 @@ object MatrixRepository {
             is PendingImageSend -> maxOf(ts, p.timestampMs)
             null -> ts
         }
-        // An unverified device can't decrypt — suppress unread for encrypted
-        // rooms only; unencrypted ones stay readable. Local receipt fallback:
-        // Trixnity's notification count is empty after a fresh
-        // login (its state machine marks timeline-less rooms read) — the
-        // own-receipt-vs-others comparison catches those.
+        // Cursor-based unread (receiptCursorUnread): message-class events after
+        // the own read receipt; server notification_count only until the first
+        // receipt syncs (it counts non-message classes our client never
+        // renders — false flags on fully-read rooms).
         val storeUnread = if (verified || !room.encrypted) {
-            maxOf(
-                unreadCounts[key]?.toLong() ?: 0L,
-                serverUnreadCounts[key]?.toLong() ?: 0L,
-                localReceiptUnread(c, key),
-            )
+            receiptCursorUnread(c, key) ?: (serverUnreadCounts[key]?.toLong() ?: 0L)
         } else 0
         val cleared = pendingReadClear[key]
         val unread = servedUnread(
@@ -9073,7 +9032,20 @@ object MatrixRepository {
         // below still runs so the preview heals once content resolves; member
         // -join/ack heads keep the no-fake-time park.
         if (serverLast != null && isMessageClassHead(serverLast) && !inFlood) {
-            effectiveLastCache[key] = EffectiveLast(serverLastId, serverLastId, serverTs)
+            // A RESOLVED message head (plaintext or decrypted payload) is real
+            // activity — pin permanently. An encryption-FAILED head (isFailure)
+            // is only ASSUMED to be a message: it may never decrypt, or decrypt
+            // to member/state churn (bridges push megolm member joins — LP3:
+            // the empty "Josh Schiff" room was stamped by its own join event
+            // and stuck at the list top). So failed heads pin tentatively and
+            // re-classify after the retry window; a genuine message keeps the
+            // bump across retries.
+            val headResolved = serverLast.content?.getOrNull() != null
+            if (!headResolved) enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
+            effectiveLastCache[key] = EffectiveLast(
+                serverLastId, serverLastId, serverTs,
+                retryAtMs = if (headResolved) 0L else now + GHOST_WALK_RETRY_MS,
+            )
             return serverLastId to serverTs
         }
         // The server's newest event renders as nothing — a dropped edit, a
