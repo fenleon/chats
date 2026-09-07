@@ -1360,7 +1360,7 @@ object MatrixRepository {
                 contentType(ContentType.Application.Json)
             }
             if (init.status.value !in 200..299) error("Beeper login init failed (HTTP ${init.status.value})")
-            val requestId = Json { ignoreUnknownKeys = true }
+            val requestId = pushQueueJson
                 .parseToJsonElement(init.bodyAsText())
                 .jsonObject["request"]?.jsonPrimitive?.content
                 ?: error("missing request id")
@@ -1412,7 +1412,7 @@ object MatrixRepository {
                 if (resp.status.value !in 200..299) {
                     error("Beeper code verification failed (HTTP ${resp.status.value})")
                 }
-                val json = Json { ignoreUnknownKeys = true }.parseToJsonElement(resp.bodyAsText()).jsonObject
+                val json = pushQueueJson.parseToJsonElement(resp.bodyAsText()).jsonObject
                 val whoami = json["whoami"]?.jsonObject ?: error("missing whoami")
                 val userInfo = whoami["userInfo"]?.jsonObject ?: error("missing userInfo")
                 username = userInfo["username"]?.jsonPrimitive?.content ?: error("missing username")
@@ -6812,7 +6812,7 @@ object MatrixRepository {
             when {
                 status == 200 -> {
                     val obj = runCatching {
-                        Json { ignoreUnknownKeys = true }.parseToJsonElement(resp.bodyAsText()).jsonObject
+                        pushQueueJson.parseToJsonElement(resp.bodyAsText()).jsonObject
                     }.getOrNull()
                     // Content is the body directly (spec); tolerate a wrap.
                     val content = (obj ?: JsonObject(emptyMap())).let {
@@ -7605,7 +7605,6 @@ object MatrixRepository {
                 runCatching {
                     resolveRoomListEntry(
                         c, roomId, room, HashMap(),
-                        resolvePreview = true,
                         verified = isDeviceVerified(c),
                         // The network maps are TTL caches built by the pass over the
                         // FULL room map — never call networkByRoom with a single-room
@@ -7964,7 +7963,6 @@ object MatrixRepository {
                         yieldToSyncIngest()
                         resolveRoomListEntry(
                             c, roomId, room, nameMemo,
-                            resolvePreview = true,
                             verified = verified,
                             networks = networks,
                             communities = communities,
@@ -8117,7 +8115,6 @@ object MatrixRepository {
         roomId: RoomId,
         room: MatrixRoom,
         nameMemo: MutableMap<String, String>,
-        resolvePreview: Boolean,
         verified: Boolean,
         networks: Map<String, String>,
         communities: Map<String, String>,
@@ -8283,13 +8280,6 @@ object MatrixRepository {
                     }
                 }
                 previewResolved = true
-                previewRetryAtMs = 0L
-            }
-            !resolvePreview && prev?.previewResolved != true -> {
-                // Outside the preview window and never resolved: keep the name
-                // row without a preview. Opening the thread fills it in.
-                preview = ""
-                previewResolved = false
                 previewRetryAtMs = 0L
             }
             prev != null && prev.previewResolved && !stateChanged -> {
@@ -8655,19 +8645,6 @@ object MatrixRepository {
             )
         }
         return storeName ?: bridgeName ?: hero.localpart
-    }
-
-    /** The provision contact list's name for a bridge ghost. WhatsApp's
-     *  privacy-LID migration re-keys DM heroes to @whatsapp_lid-… ghosts whose
-     *  member event carries no displayname (the bridge only surfaces the name
-     *  via the provision API — invisible to room data, see [bridgeContacts]),
-     *  and the localpart fallback then titles the room "whatsapp_lid-27358…"
-     *  (pinned active DM, LP3 2026-09-05). Cache read only: the resolver pass
-     *  prefetches each bridge's list (see the [bridgeContacts] loop); a cold
-     *  cache keeps the previous fallback. */
-    private fun bridgeContactNameOf(hero: UserId): String? {
-        val bridgeId = bridgeIdOf(hero.full) ?: return null
-        return bridgeContactsCache[bridgeId]?.get(hero.full)?.name?.takeIf { it.isNotBlank() }
     }
 
     /**
