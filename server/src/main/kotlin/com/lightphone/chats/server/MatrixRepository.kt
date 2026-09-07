@@ -6892,19 +6892,26 @@ object MatrixRepository {
      */
     private fun observeNotifications(c: MatrixClient) {
         android.util.Log.d(TAG, "notification watcher starting for ${c.userId.full}")
+        // The per-collector scaffold: launch, swallow+log the collector's end
+        // (a dead flow must not kill the watcher), register the job.
+        fun watch(name: String, block: suspend () -> Unit) {
+            scope.launch {
+                try {
+                    block()
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "$name: ${e.message}")
+                }
+            }.also { notificationWatcherJobs.add(it) }
+        }
         val watcher = scope.launch {
             // Flag-change watcher: a global push-rule
             // change (any device toggled mute) re-reads the flags cache so the
             // room list / contact panel reflect it within seconds instead of on
             // the next TTL rebuild. The first emission is the baseline.
-            scope.launch {
-                try {
-                    c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
-                        .get(PushRulesEventContent::class).collect { invalidateAllRoomFlags() }
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "flag watcher: push-rule collector ended: ${e.message}")
-                }
-            }.also { notificationWatcherJobs.add(it) }
+            watch("flag watcher: push-rule collector ended") {
+                c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
+                    .get(PushRulesEventContent::class).collect { invalidateAllRoomFlags() }
+            }
             // Settle flags (first-message ping drop fix): a room whose
             // newest message is already unread when its collector starts — or whose
             // first message arrives right after (it registered empty) — may notify
@@ -6918,20 +6925,16 @@ object MatrixRepository {
             // per-room collectors below on other threads.
             val seenInitialSync = java.util.concurrent.atomic.AtomicBoolean(false)
             val settled = java.util.concurrent.atomic.AtomicBoolean(false)
-            scope.launch {
-                try {
-                    c.syncState.collect { state ->
-                        when (state) {
-                            SyncState.INITIAL_SYNC -> seenInitialSync.set(true)
-                            SyncState.RUNNING -> settled.set(true)
-                            SyncState.STARTED -> if (!seenInitialSync.get()) settled.set(true)
-                            else -> {}
-                        }
+            watch("notification watcher: sync-state collector ended") {
+                c.syncState.collect { state ->
+                    when (state) {
+                        SyncState.INITIAL_SYNC -> seenInitialSync.set(true)
+                        SyncState.RUNNING -> settled.set(true)
+                        SyncState.STARTED -> if (!seenInitialSync.get()) settled.set(true)
+                        else -> {}
                     }
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "notification watcher: sync-state collector ended: ${e.message}")
                 }
-            }.also { notificationWatcherJobs.add(it) }
+            }
             // Server unread counts: the sync response carries the
             // server-computed per-room unread_notifications.notification_count —
             // the same account-wide unread truth the Beeper clients show. Trixnity
@@ -6939,24 +6942,20 @@ object MatrixRepository {
             // machine dies on fresh logins — see [localReceiptUnread]), so collect
             // it directly here. Incremental syncs only include changed rooms, which
             // is exactly when a count can move.
-            scope.launch {
-                try {
-                    c.api.sync.subscribeAsFlow().collect { syncEvents ->
-                        val join = syncEvents.syncResponse.room?.join ?: return@collect
-                        var changed = false
-                        for ((roomId, joinedRoom) in join) {
-                            val count = joinedRoom.unreadNotifications?.notificationCount?.toInt() ?: 0
-                            if (serverUnreadCounts[roomId.full] != count) {
-                                serverUnreadCounts[roomId.full] = count
-                                changed = true
-                            }
+            watch("server-unread collector ended") {
+                c.api.sync.subscribeAsFlow().collect { syncEvents ->
+                    val join = syncEvents.syncResponse.room?.join ?: return@collect
+                    var changed = false
+                    for ((roomId, joinedRoom) in join) {
+                        val count = joinedRoom.unreadNotifications?.notificationCount?.toInt() ?: 0
+                        if (serverUnreadCounts[roomId.full] != count) {
+                            serverUnreadCounts[roomId.full] = count
+                            changed = true
                         }
-                        if (changed) markRoomListDirty()
                     }
-                } catch (e: Exception) {
-                    android.util.Log.w(TAG, "server-unread collector ended: ${e.message}")
+                    if (changed) markRoomListDirty()
                 }
-            }.also { notificationWatcherJobs.add(it) }
+            }
             try {
                 // roomId.full -> last relevant event id seen so far ("" = none yet).
                 val seen = java.util.concurrent.ConcurrentHashMap<String, String>()
