@@ -208,11 +208,8 @@ class ThreadViewModel(
     val muted = MutableStateFlow(room.muted)
 
     /** Toggles [muted] locally and persists it server-side (notifications only). */
-    fun toggleMuted() {
-        val next = !muted.value
-        muted.value = next
-        viewModelScope.launch { ChatClient.setRoomMuted(room.id, next) }
-    }
+    fun toggleMuted() =
+        viewModelScope.toggleAndPersist(muted, { room.id }, ChatClient::setRoomMuted)
 
     /**
      * Pin state for the contact panel: starts from the room
@@ -222,11 +219,8 @@ class ThreadViewModel(
     val pinned = MutableStateFlow(room.pinned)
 
     /** Toggles [pinned] locally and persists it server-side (m.favourite tag). */
-    fun togglePinned() {
-        val next = !pinned.value
-        pinned.value = next
-        viewModelScope.launch { ChatClient.setRoomPinned(room.id, next) }
-    }
+    fun togglePinned() =
+        viewModelScope.toggleAndPersist(pinned, { room.id }, ChatClient::setRoomPinned)
 
     /**
      * Archive state for the contact panel: starts from the room
@@ -237,11 +231,8 @@ class ThreadViewModel(
     val archived = MutableStateFlow(room.archived)
 
     /** Toggles [archived] locally and persists it server-side (Beeper inbox.done). */
-    fun toggleArchived() {
-        val next = !archived.value
-        archived.value = next
-        viewModelScope.launch { ChatClient.setRoomArchived(room.id, next) }
-    }
+    fun toggleArchived() =
+        viewModelScope.toggleAndPersist(archived, { room.id }, ChatClient::setRoomArchived)
 
     /**
      * Keeps the contact panel honest with OTHER devices: collects the repository's roomFlags flow for this room

@@ -163,23 +163,14 @@ class ChatListViewModel : LightViewModel<Unit>() {
         panelRoomId = null
     }
 
-    fun togglePanelMuted() {
-        val next = !panelMuted.value
-        panelMuted.value = next
-        panelRoomId?.let { viewModelScope.launch { ChatClient.setRoomMuted(it, next) } }
-    }
+    fun togglePanelMuted() =
+        viewModelScope.toggleAndPersist(panelMuted, { panelRoomId }, ChatClient::setRoomMuted)
 
-    fun togglePanelPinned() {
-        val next = !panelPinned.value
-        panelPinned.value = next
-        panelRoomId?.let { viewModelScope.launch { ChatClient.setRoomPinned(it, next) } }
-    }
+    fun togglePanelPinned() =
+        viewModelScope.toggleAndPersist(panelPinned, { panelRoomId }, ChatClient::setRoomPinned)
 
-    fun togglePanelArchived() {
-        val next = !panelArchived.value
-        panelArchived.value = next
-        panelRoomId?.let { viewModelScope.launch { ChatClient.setRoomArchived(it, next) } }
-    }
+    fun togglePanelArchived() =
+        viewModelScope.toggleAndPersist(panelArchived, { panelRoomId }, ChatClient::setRoomArchived)
 
     /**
      * One-shot launch request for the companion's POST_NOTIFICATIONS

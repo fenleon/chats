@@ -48,3 +48,18 @@ fun collectRoomCensus(
             ?.let { rooms.value = it }
     }
 }
+
+/**
+ * The contact-panel flag toggle shared by both screens: flips [flow] locally
+ * and persists the new value server-side. [roomId] is re-read per toggle
+ * (the chat list's panel room changes); a null room skips the persist.
+ */
+fun CoroutineScope.toggleAndPersist(
+    flow: MutableStateFlow<Boolean>,
+    roomId: () -> String?,
+    persist: suspend (String, Boolean) -> Unit,
+) {
+    val next = !flow.value
+    flow.value = next
+    roomId()?.let { id -> launch { persist(id, next) } }
+}
