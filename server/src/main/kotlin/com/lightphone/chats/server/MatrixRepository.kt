@@ -7085,26 +7085,6 @@ object MatrixRepository {
                                         }
                                         if (prev != lastId) {
                                             seen[key] = lastId
-                                            // Recency bump: a new event means the
-                                            // room is active — refresh its cache timestamp NOW
-                                            // so the next publish reorders it to the top.
-                                            // Without this the row's time only changed when the
-                                            // budget-bound resolver pass happened to re-resolve
-                                            // the room; on a big account rooms past the pass
-                                            // budget kept stale times and dropped out of the
-                                            // main list's 200-room window while still recent
-                                            // ("Jeff" missing). The sig block
-                                            // above already marked the resolver dirty; the wake
-                                            // makes a sleeping resolver run the pass now.
-                                            updated.lastRelevantEventTimestamp?.toEpochMilliseconds()?.let { ts ->
-                                                val entry = roomListCache[key]
-                                                if (entry != null && ts > entry.room.lastTimestampMs) {
-                                                    roomListCache[key] = entry.copy(
-                                                        room = entry.room.copy(lastTimestampMs = ts),
-                                                    )
-                                                }
-                                            }
-                                            wakeRoomList()
                                             // NO-SEAM: the open thread no longer
                                             // long-polls the page revision — it rides the
                                             // pageChanges signal, so an arrival in the ACTIVE
@@ -7737,19 +7717,31 @@ object MatrixRepository {
                     ).use { cur -> if (cur.moveToFirst() && !cur.isNull(0)) cur.getLong(0) else -1L }
                     if (own < 0) return@runCatching null
                     db.openHelper.writableDatabase.query(
-                        "SELECT COUNT(*) FROM (SELECT 1 FROM TimelineEvent " +
+                        // Bridge re-import floods re-deliver a whole read batch as
+                        // "new" undecryptable events sharing one origin ts (LP3:
+                        // à bientôt — 35 copies stamped 08-23 07:08:24 across 3
+                        // senders). Count same-ts groups of ≤6 only: a genuine
+                        // burst never lands >6 messages in the same millisecond.
+                        // ponytail: real history re-imports of NEW messages would
+                        // under-count; Beeper dedups equivalents at ingestion.
+                        "SELECT MIN(99, SUM(n)) FROM (" +
+                            "SELECT n FROM (" +
+                            "SELECT json_extract(value,'$.event.origin_server_ts') AS ets, " +
+                            "COUNT(*) AS n " +
+                            "FROM TimelineEvent " +
                             "WHERE TimelineEvent.roomId=? " +
-                            "AND json_extract(TimelineEvent.value,'$.event.type') " +
+                            "AND json_extract(value,'$.event.type') " +
                             "  IN ('m.room.message','m.room.encrypted') " +
-                            "AND json_extract(TimelineEvent.value,'$.event.sender') != ? " +
+                            "AND json_extract(value,'$.event.sender') != ? " +
                             // CAST: query() binds selection args as TEXT, and an
                             // INTEGER column never compares greater than a TEXT
                             // value in SQLite — the un-cast version silently
                             // counted 0 for every room (LP3: Jasmine/Rose
                             // genuinely-unread badges vanished).
-                            "AND json_extract(TimelineEvent.value,'$.event.origin_server_ts') " +
+                            "AND json_extract(value,'$.event.origin_server_ts') " +
                             "  > CAST(? AS INTEGER) " +
-                            "LIMIT 99)",
+                            "GROUP BY ets" +
+                            ") WHERE n <= 6)",
                         arrayOf(roomId, c.userId.full, own.toString()),
                     ).use { cur -> if (cur.moveToFirst()) cur.getLong(0) else 0L }
                 }.getOrNull()
@@ -9068,6 +9060,25 @@ object MatrixRepository {
             effectiveLastCache[key] = EffectiveLast(serverLastId, firstReal.event.id.full, realTs)
             return firstReal.event.id.full to realTs
         }
+        // A room whose newest event is pure state (member join, reaction,
+        // bridge ack) and which has NEVER resolved a real message (prev ==
+        // null) has nothing to stamp: the server's head time is a state
+        // re-delivery, not activity, and surfacing it as fresh fakes a
+        // timestamp. Park the row at the bottom (ts 0, no preview) until the
+        // ghost walk finds real content or a real message arrives — the fast
+        // path re-checks on every server-last change, so a genuine arrival
+        // still surfaces. (LP3: this check MUST sit before the
+        // decrypt-restore branch below — with the cooldown inactive that
+        // branch serves the raw head (member id + ts) and re-stamps parked
+        // rows: Josh Schiff / WhatsApp (+49…) bounced between park and the
+        // top of the list on every cooldown expiry.)
+        if (prev == null && serverLast?.let { !isRenderableRow(it) } == true) {
+            enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
+            effectiveLastCache[key] = EffectiveLast(
+                serverLastId, null, 0L, retryAtMs = now + GHOST_WALK_RETRY_MS,
+            )
+            return null to 0L
+        }
         // Suspicious (dropped by the dedup, or inside a flood): resolve in the
         // background with a session restore (the copies' originals are old
         // messages whose keys load from the backup — slow, so not on the
@@ -9083,21 +9094,6 @@ object MatrixRepository {
                     ?: (now + GHOST_WALK_RETRY_MS),
             )
             return (prev?.effectiveEventId ?: serverLastId) to (prev?.effectiveTs ?: serverTs)
-        }
-        // A room whose newest event is pure state (member join, reaction,
-        // bridge ack) and which has NEVER resolved a real message (prev ==
-        // null) has nothing to stamp: the server's head time is a state
-        // re-delivery, not activity, and surfacing it as fresh fakes a
-        // timestamp. Park the row at
-        // the bottom (ts 0, no preview) until the ghost walk finds real
-        // content or a real message arrives — the fast path re-checks on
-        // every server-last change, so a genuine arrival still surfaces.
-        if (prev == null && serverLast?.let { !isRenderableRow(it) } == true) {
-            enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
-            effectiveLastCache[key] = EffectiveLast(
-                serverLastId, null, 0L, retryAtMs = now + GHOST_WALK_RETRY_MS,
-            )
-            return null to 0L
         }
         enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
         effectiveLastCache[key] = EffectiveLast(
