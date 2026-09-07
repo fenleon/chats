@@ -3361,16 +3361,10 @@ object MatrixRepository {
     private fun isFloodGhost(c: MatrixClient, te: TimelineEvent, context: List<TimelineEvent>): Boolean {
         if (txnIdOf(te) == null) return false
         val ts = te.event.originTimestamp
-        var nearby = 0
-        for (other in context) {
-            if (other.event.id == te.event.id) continue
-            if (txnIdOf(other) == null) continue
-            if (kotlin.math.abs(other.event.originTimestamp - ts) < GHOST_BURST_WINDOW_MS) {
-                nearby++
-                if (nearby >= GHOST_FLOOD_THRESHOLD) return true
-            }
-        }
-        return false
+        return context.count { other ->
+            other.event.id != te.event.id && txnIdOf(other) != null &&
+                kotlin.math.abs(other.event.originTimestamp - ts) < GHOST_BURST_WINDOW_MS
+        } >= GHOST_FLOOD_THRESHOLD
     }
 
     /**
@@ -3536,14 +3530,8 @@ object MatrixRepository {
     /** First occurrence of each content signature in [raw] (chain order,
      *  newest first). Events without readable content fall back to their
      *  event id, so they pass through untouched. */
-    private fun dedupeChain(c: MatrixClient, raw: List<TimelineEvent>): List<TimelineEvent> {
-        val seen = HashSet<String>()
-        val out = ArrayList<TimelineEvent>(raw.size)
-        for (te in raw) {
-            if (seen.add(contentSignature(c, te) ?: te.event.id.full)) out += te
-        }
-        return out
-    }
+    private fun dedupeChain(c: MatrixClient, raw: List<TimelineEvent>): List<TimelineEvent> =
+        raw.distinctBy { contentSignature(c, it) ?: it.event.id.full }
 
     /** Bounds concurrent [readTimelineChainFromDb] walks — see the comment there. */
     private val chainDbSemaphore = Semaphore(permits = 2)
@@ -6002,11 +5990,8 @@ object MatrixRepository {
 
     /** Drops the oldest cached notes past [VOICE_CACHE_MAX_FILES]. */
     private fun trimVoiceCache(dir: java.io.File) {
-        val files = dir.listFiles()?.toMutableList() ?: return
-        files.sortBy { it.lastModified() }
-        while (files.size > VOICE_CACHE_MAX_FILES) {
-            runCatching { files.removeAt(0).delete() }
-        }
+        dir.listFiles()?.sortedBy { it.lastModified() }?.dropLast(VOICE_CACHE_MAX_FILES)
+            ?.forEach { runCatching { it.delete() } }
     }
 
     /**
@@ -7820,13 +7805,8 @@ object MatrixRepository {
      */
     private fun hasPendingResolveWork(): Boolean {
         val now = android.os.SystemClock.elapsedRealtime()
-        for (e in roomListCache.values) {
-            if (!e.previewResolved && now >= e.previewRetryAtMs) return true
-        }
-        for (e in effectiveLastCache.values) {
-            if (e.retryAtMs > 0L && now >= e.retryAtMs) return true
-        }
-        return false
+        return roomListCache.values.any { !it.previewResolved && now >= it.previewRetryAtMs } ||
+            effectiveLastCache.values.any { it.retryAtMs > 0L && now >= it.retryAtMs }
     }
 
     private fun startRoomListResolver(c: MatrixClient) {
@@ -8374,19 +8354,20 @@ object MatrixRepository {
         withTimeoutOrNull(NETWORK_MAP_BUDGET_MS) {
             // Every space id (account spaces AND community/group spaces): an
             // account space's child that is itself a space is a sub-space
-            // whose own children still belong to the same network.
+            // whose own children still belong to the same network. The single
+            // pass below also collects the spaces for the labeling pass.
             val spaceIds = HashSet<String>()
             val spaceNameBySpaceId = HashMap<String, String>()
+            val spaces = ArrayList<Pair<RoomId, MatrixRoom>>()
             for ((spaceId, spaceFlow) in rooms) {
                 val space = spaceFlow.filterNotNull().firstOrNull() ?: continue
                 if (space.createEventContent?.type is CreateEventContent.RoomType.Space) {
                     spaceIds += spaceId.full
                     spaceNameBySpaceId[spaceId.full] = space.name?.explicitName.orEmpty()
+                    spaces += spaceId to space
                 }
             }
-            for ((spaceId, spaceFlow) in rooms) {
-                val space = spaceFlow.filterNotNull().firstOrNull() ?: continue
-                if (space.createEventContent?.type !is CreateEventContent.RoomType.Space) continue
+            for ((spaceId, space) in spaces) {
                 val spaceName = space.name?.explicitName.orEmpty()
                 if (!isAccountSpace(spaceName, space.name?.heroes.orEmpty())) continue
                 val label = networkLabelOf(spaceName)
