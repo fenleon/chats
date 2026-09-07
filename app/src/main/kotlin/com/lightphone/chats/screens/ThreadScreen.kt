@@ -2059,26 +2059,11 @@ private fun MessageRow(
             }
             // A forwarded message carries a small "forwarded" tag — the
             // bridge's WhatsApp forward marker, lifted out of the body by the
-            // companion and served as this flag. Outgoing TEXT rows lead with
-            // the ↷ glyph (Subtitle) above the body with the word under it;
-            // incoming text and MEDIA rows put the glyph beside the content
-            // with the word under it. Tight, lowercase, consistent with the other tags.
-            if (message.forwarded && message.contentType == "text" && message.isMine) {
-                Row(
-                    modifier = Modifier.padding(top = 1.dp, bottom = 1.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    LightText(
-                        text = "\u21B7",
-                        variant = LightTextVariant.Subtitle,
-                    )
-                    LightText(
-                        text = "forwarded",
-                        variant = LightTextVariant.Superfine,
-                        modifier = Modifier.padding(start = 0.25f.gridUnitsAsDp()),
-                    )
-                }
-            }
+            // companion and served as this flag. Every forwarded row shares
+            // one grammar, incoming or own: the ↷ glyph trails the content at
+            // the far right, centred vertically on it, and the lowercase
+            // "forwarded" word sits under the whole block — same spot as the
+            // other tags. Tight, lowercase, consistent with the other tags.
             // Media rows open the context window on long-press — received rows always (LIKE/REACT [+ SAVE on
             // images]), own rows only while the bridge still allows an unsend
             // (canEdit never applies to media; otherwise no panel at all).
@@ -2086,11 +2071,11 @@ private fun MessageRow(
                 { onOpenContext(message) }
             } else null
             if (message.contentType == "image") {
-                ForwardedMediaRow(message) {
+                ForwardedMediaRow(message, caption = message.caption) {
                     ImageMessageContent(message, media, onOpenImage, contextGesture)
                 }
             } else if (message.contentType == "audio") {
-                ForwardedMediaRow(message) {
+                ForwardedMediaRow(message, caption = message.caption) {
                     AudioMessageContent(
                         message = message,
                         playing = message.id == voice.playingEventId,
@@ -2105,27 +2090,27 @@ private fun MessageRow(
                     )
                 }
             } else {
-                if (message.isMine) {
-                    // Outgoing: block sized to the first line so the top line's
-                    // last word always touches the right edge (see
-                    // [OutgoingBodyText]).
-                    OutgoingBodyText(message.body, bodyMaxWidthPx)
-                } else if (message.forwarded) {
-                    // Forwarded incoming text: the ↷ glyph anchors the left,
-                    // beside the body like the call notices' phone icon. It
-                    // renders at Paragraph — same line box as the body, so
-                    // the row hugs the text — scaled ~2.1x (≈ the Subtitle
-                    // ink size) about the box center, which keeps the arrow
-                    // centered on the body line: Subtitle's far taller line
-                    // box carried the ink low and opened gaps above/below
-                    // The small "forwarded" word sits
-                    // at the message's left edge under both.
+                if (message.forwarded) {
+                    // Forwarded text — incoming and own share the grammar: the
+                    // ↷ glyph trails the body at the far right, centred
+                    // vertically on it ([ForwardedArrowGlyph]: Paragraph
+                    // scaled ~2.1x about a low pivot keeps the ink centered on
+                    // the body's line box), the lowercase "forwarded" word
+                    // under the whole block.
                     Column(modifier = Modifier.padding(top = 1.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            ForwardedArrowGlyph()
-                            LightText(
-                                text = message.body,
-                                variant = LightTextVariant.Paragraph,
+                            if (message.isMine) {
+                                // Outgoing: block sized to the first line so
+                                // the top line's last word touches the right
+                                // edge (see [OutgoingBodyText]).
+                                OutgoingBodyText(message.body, bodyMaxWidthPx)
+                            } else {
+                                LightText(
+                                    text = message.body,
+                                    variant = LightTextVariant.Paragraph,
+                                )
+                            }
+                            ForwardedArrowGlyph(
                                 modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
                             )
                         }
@@ -2135,6 +2120,11 @@ private fun MessageRow(
                             modifier = Modifier.padding(top = 1.dp),
                         )
                     }
+                } else if (message.isMine) {
+                    // Outgoing: block sized to the first line so the top line's
+                    // last word always touches the right edge (see
+                    // [OutgoingBodyText]).
+                    OutgoingBodyText(message.body, bodyMaxWidthPx)
                 } else if (message.body.startsWith("Incoming call")) {
                     // Bridged call notices ("Incoming call. Use the WhatsApp
                     // app to answer." — Beeper's bridges can't relay calls, so
@@ -2245,7 +2235,7 @@ private fun MessageRow(
  *  Paragraph line box; the pivot keeps the ink centered and the equal
  *  padding re-absorbs the scaled ink. */
 @Composable
-private fun ForwardedArrowGlyph() {
+private fun ForwardedArrowGlyph(modifier: Modifier = Modifier) {
     LightText(
         text = "\u21B7",
         variant = LightTextVariant.Paragraph,
@@ -2255,26 +2245,38 @@ private fun ForwardedArrowGlyph() {
                 scaleY = 2.1f
                 transformOrigin = TransformOrigin(0.5f, 0.72f)
             }
-            .padding(2.5.dp),
+            .padding(2.5.dp)
+            .then(modifier),
     )
 }
 
-/** Forwarded MEDIA rows: the ↷ glyph beside the
- *  content, the small "forwarded" word under it — the same grammar as
- *  forwarded incoming text. */
+/** Forwarded MEDIA rows: the ↷ glyph trails the media at the far right
+ *  (spaced off it — it used to hug the photo), any caption moves UNDER the
+ *  media instead of beside it, and the small "forwarded" word sits under the
+ *  whole block — the same grammar as forwarded text. */
 @Composable
 private fun ForwardedMediaRow(
     message: LightServiceMethod.GetMessages.Message,
+    caption: String?,
     content: @Composable () -> Unit,
 ) {
     if (!message.forwarded) {
         content()
+        caption?.let {
+            LightText(
+                text = it,
+                variant = LightTextVariant.Paragraph,
+                modifier = Modifier.padding(top = 1.dp),
+            )
+        }
         return
     }
     Column(modifier = Modifier.padding(top = 1.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            ForwardedArrowGlyph()
             content()
+            ForwardedArrowGlyph(
+                modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
+            )
         }
         LightText(
             text = "forwarded",
@@ -2331,15 +2333,6 @@ private fun ImageMessageContent(
             variant = LightTextVariant.Paragraph,
             modifier = bodyModifier.padding(top = 1.dp),
         )
-        // The caption still shows under the placeholder — the text row is all
-        // the context there is (feedback 2026-09-01).
-        message.caption?.let { caption ->
-            LightText(
-                text = caption,
-                variant = LightTextVariant.Paragraph,
-                modifier = Modifier.padding(top = 1.dp),
-            )
-        }
         return
     }
     Image(
@@ -2367,16 +2360,6 @@ private fun ImageMessageContent(
                 )
             },
     )
-    // Feedback round 2026-08-19: received photos with a caption (the m.image
-    // body) show it under the thumbnail, like native messaging apps.
-    val caption = message.caption
-    if (caption != null) {
-        LightText(
-            text = caption,
-            variant = LightTextVariant.Paragraph,
-            modifier = Modifier.padding(top = 1.dp),
-        )
-    }
 }
 
 /** A voice-note row: a play/pause icon + label, tapped to toggle playback in
