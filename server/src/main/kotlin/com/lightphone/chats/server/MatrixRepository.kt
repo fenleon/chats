@@ -2508,6 +2508,21 @@ object MatrixRepository {
         val encrypted: Boolean = false,
     )
 
+    /**
+     * The patch tail shared by the quiet-page patches ([patchReadReceipts],
+     * [patchSendStatuses], [patchReactionTags]): maps this page's messages
+     * through [f] — return a copy to change a row, null to keep it. Null
+     * when no row changed, so the caller keeps the cache and disk as-is.
+     */
+    private fun MessagesPage.patchedWith(
+        f: (LightServiceMethod.GetMessages.Message) -> LightServiceMethod.GetMessages.Message?,
+    ): MessagesPage? {
+        var changed = false
+        val patched = messages.map { m -> f(m)?.also { changed = true } ?: m }
+        if (!changed) return null
+        return MessagesPage(patched, hasMore, encrypted)
+    }
+
     /** One cached newest page: the page plus when it was computed. */
     private data class MessagePageEntry(
         val page: MessagesPage,
@@ -2914,15 +2929,9 @@ object MatrixRepository {
         if (chain.isEmpty()) return null
         val readEventIds = readReceiptsByEvent(c, RoomId(roomId), chain)
         if (readEventIds.isEmpty()) return null
-        var changed = false
-        val patched = cached.page.messages.map { m ->
-            if (!m.read && m.id in readEventIds) {
-                changed = true
-                m.copy(read = true)
-            } else m
+        return cached.page.patchedWith { m ->
+            if (!m.read && m.id in readEventIds) m.copy(read = true) else null
         }
-        if (!changed) return null
-        return MessagesPage(patched, cached.page.hasMore, cached.page.encrypted)
     }
 
     /**
@@ -2966,12 +2975,9 @@ object MatrixRepository {
     ): MessagesPage? {
         val sendStatuses = sendStatusesByEventIdCached(c, RoomId(roomId))
         if (sendStatuses.isEmpty()) return null
-        var changed = false
-        val patched = cached.page.messages.map { m ->
-            sendStatuses[m.id]?.takeIf { it != m.sendStatus }?.let { changed = true; m.copy(sendStatus = it) } ?: m
+        return cached.page.patchedWith { m ->
+            sendStatuses[m.id]?.takeIf { it != m.sendStatus }?.let { m.copy(sendStatus = it) }
         }
-        if (!changed) return null
-        return MessagesPage(patched, cached.page.hasMore, cached.page.encrypted)
     }
 
     /**
@@ -3022,17 +3028,10 @@ object MatrixRepository {
         }
         val tags = reactionTagsForEvents(c, matrixRoomId, chain + resolved)
         if (tags.isEmpty()) return null
-        var changed = false
-        val patched = cached.page.messages.map { m ->
-            val fresh = tags[m.id] ?: return@map m
-            val collapsed = collapseReactionTags(fresh)
-            if (collapsed != m.reactions) {
-                changed = true
-                m.copy(reactions = collapsed)
-            } else m
+        return cached.page.patchedWith { m ->
+            val collapsed = tags[m.id]?.let(::collapseReactionTags) ?: return@patchedWith null
+            if (collapsed != m.reactions) m.copy(reactions = collapsed) else null
         }
-        if (!changed) return null
-        return MessagesPage(patched, cached.page.hasMore, cached.page.encrypted)
     }
 
     /**
