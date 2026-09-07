@@ -55,6 +55,7 @@ import com.lightphone.chats.VolumePanelState
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
+import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -82,6 +83,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
@@ -145,6 +148,16 @@ internal object threadStateCache {
     }
 
     fun takeScroll(roomId: String): Pair<Int, Int>? = scroll[roomId]
+}
+
+/**
+ * Process-wide optimistic edit/unsend overlays (2026-09-07): survives the
+ * thread's ViewModel so an exit + re-enter inside the page-cache refresh
+ * window keeps showing the edited body (see [ThreadViewModel]'s overlay doc).
+ */
+internal object editEchoCache {
+    val edits = MutableStateFlow<Map<String, String>>(emptyMap())
+    val unsent = MutableStateFlow<Set<String>>(emptySet())
 }
 
 /**
@@ -235,29 +248,28 @@ class ThreadViewModel(
 
     /**
      * Keeps the contact panel honest with OTHER devices (LP3 feedback
-     * 2026-08-28): waits on the companion's flags revision (bumped wherever a
-     * flag fact commits — own toggles, Beeper-side sync) and refetches the
-     * synced flags on movement, updating [muted]/[pinned]/[archived] live
-     * (items 1/5). Runs while the thread — and the contact panel over it — is
-     * on screen (started on [onScreenShow], NOT stopped on [onScreenHide]);
-     * stops when the app backgrounds and dies with the ViewModel on
-     * back-navigation.
+     * 2026-08-28): collects the repository's roomFlags flow for this room
+     * (NO-SEAM, 2026-09-07 — replaces the flags-revision wait + refetch),
+     * updating [muted]/[pinned]/[archived] live (items 1/5). Runs while the
+     * thread — and the contact panel over it — is on screen (started on
+     * [onScreenShow], NOT stopped on [onScreenHide]); stops when the app
+     * backgrounds and dies with the ViewModel on back-navigation.
      */
     private var flagSyncJob: Job? = null
 
     fun startFlagSync() {
         if (flagSyncJob?.isActive == true) return
         flagSyncJob = viewModelScope.launch {
-            var lastFlags = 0L
-            while (true) {
-                val revision = ChatClient.waitForFlagChange(lastFlags)
-                if (revision == lastFlags) continue
-                lastFlags = revision
-                val flags = ChatClient.getRoomFlags(room.id) ?: continue
-                muted.value = flags.muted
-                pinned.value = flags.pinned
-                archived.value = flags.archived
-            }
+            MatrixRepository.roomFlags
+                .map { it[room.id] }
+                .distinctUntilChanged()
+                .collect { flags ->
+                    if (flags != null) {
+                        muted.value = flags.muted
+                        pinned.value = flags.pinned
+                        archived.value = flags.archived
+                    }
+                }
         }
     }
 
@@ -347,10 +359,13 @@ class ThreadViewModel(
      * reacts instantly instead of waiting on the 3 s poll. Entries drop once
      * a served page reflects the action; unsend failures revert and surface
      * [reactionError] (edit failures keep the composer open instead — the
-     * text survives for a retry).
+     * text survives for a retry). Process-wide (2026-09-07): the page cache
+     * can serve a pre-echo page after the ViewModel died (exit + re-enter),
+     * which reverted the row to its unedited body until the rebuild landed —
+     * the overlays now survive the round-trip like [threadStateCache].
      */
-    private val editOverlays = MutableStateFlow<Map<String, String>>(emptyMap())
-    private val unsentOverlays = MutableStateFlow<Set<String>>(emptySet())
+    private val editOverlays get() = editEchoCache.edits
+    private val unsentOverlays get() = editEchoCache.unsent
 
     /**
      * In-app volume panel state (null = hidden), the shared LightOS replica
@@ -486,39 +501,33 @@ class ThreadViewModel(
     }
 
     /**
-     * Quietly re-fetches the newest page while the thread stays visible
-     * (feedback pass): picks up the send echo and Beeper send-status events
-     * within a few seconds, with no spinner and no scroll jump. The server
-     * serves the cached newest page for the active room, so each poll is cheap.
+     * Newest-page updates while the thread stays visible, driven by the
+     * repository (NO-SEAM, 2026-09-07 — the page-revision long-poll is gone):
+     * every server-side page bump (new/edited/unsent events, receipt patches,
+     * pending echoes) emits [MatrixRepository.pageChanges] and the collector
+     * re-reads the served page in-process. No binder serialization, no poll
+     * delay — the merge is the same quiet [loadNewest] path the poll used.
      *
-     * Revision gate (2026-09-01, the Beeper comparison): the poll first asks
-     * the page's cheap revision and skips the [GetMessages] round trip while
-     * it hasn't moved — an open thread on a quiet room costs one tiny binder
-     * read every 3 s instead of a full page transfer. A playing voice note
-     * keeps the poll alive regardless: its position advances without any page
-     * change, and only a poll reads it back.
+     * A playing voice note keeps a tick: its position advances without any
+     * page change, and only a fetch reads it back.
      */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
-            // Seed with the revision the initial load reflected, so the first
-            // poll skips a page that hasn't moved since. The wait holds the
-            // binder call until the page revision moves or the window elapses
-            // (2026-09-06: replaced the fixed 1.5 s tick). A playing voice
-            // note keeps the short tick: its position advances without any
-            // page change, and only a poll reads it back.
-            var lastRevision = ChatClient.messagePageRevision(room.id)
-            while (true) {
-                if (playingEventId.value != null) {
-                    delay(THREAD_POLL_MS)
-                    lastRevision = ChatClient.messagePageRevision(room.id)
-                    loadNewest(quiet = true)
-                    continue
+            launch {
+                MatrixRepository.pageChanges.collect { roomId ->
+                    if (roomId == room.id) loadNewest(quiet = true)
                 }
-                val revision = ChatClient.waitForPageChange(room.id, lastRevision)
-                if (revision != lastRevision) {
-                    lastRevision = revision
-                    loadNewest(quiet = true)
+            }
+            launch {
+                while (true) {
+                    playingEventId.first { it != null } // wait for playback to start
+                    while (playingEventId.value != null) {
+                        delay(THREAD_POLL_MS)
+                        loadNewest(quiet = true)
+                    }
+                    // The fetch that cleared playingEventId already synced the
+                    // ended state; loop back to waiting.
                 }
             }
         }
@@ -575,8 +584,12 @@ class ThreadViewModel(
             if (!quiet && !restoreScroll) {
                 jumpToBottom.value = true
                 // Opening the thread marks it read up to the newest event; the
-                // room list's unread count drops on its next refresh.
-                val markEventId = loaded.lastOrNull()?.id ?: room.lastEventId ?: return@launch
+                // room list's unread count drops on its next refresh. Optimistic
+                // "local-…" rows are skipped — a receipt at a fake id never
+                // confirms and leaves the badge logic flapping (LP3 2026-09-07).
+                val markEventId = loaded.lastOrNull {
+                    !it.id.startsWith(LOCAL_ROW_PREFIX)
+                }?.id ?: room.lastEventId ?: return@launch
                 ChatClient.markRead(room.id, markEventId)
                 lastMarkedId = markEventId
             }
@@ -585,9 +598,11 @@ class ThreadViewModel(
             // arriving later (or the page catching up to the store's real
             // newest) would otherwise leave the room list's unread asterisk
             // up. Deduped via [lastMarkedId] — no RPC on ticks where nothing
-            // changed (feedback 2026-08-23).
+            // changed (feedback 2026-08-23). Local rows skipped (see above).
             if (quiet) {
-                val newestId = loaded.lastOrNull()?.id
+                val newestId = loaded.lastOrNull {
+                    !it.id.startsWith(LOCAL_ROW_PREFIX)
+                }?.id
                 if (newestId != null && newestId != lastMarkedId) {
                     lastMarkedId = newestId
                     ChatClient.markRead(room.id, newestId)

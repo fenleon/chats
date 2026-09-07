@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.roomMatchesQuery
+import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -81,9 +82,6 @@ class SearchViewModel(
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
-        // Refresh the room set (also on return from a thread — a new chat may
-        // have arrived); the results list keeps its current rows meanwhile.
-        refreshRooms()
         startPolling()
     }
 
@@ -92,19 +90,17 @@ class SearchViewModel(
         stopPolling()
     }
 
-    /** Re-fetches the census while the screen stays open (a cold process can
-     *  answer the first call with an empty list while the companion's
-     *  resolver seeds — the first publish bumps the room-list revision, which
-     *  wakes this wait and fills the results in, same as the main list). */
+    /** The live census (NO-SEAM, 2026-09-07 — the revision-wait poll is
+     *  gone): the repository's roomList flow fills and keeps the results
+     *  current while the screen is open. The trimmed row shape matches the
+     *  old GetAllRooms reply (no preview/unread on search rows). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
-            var lastRevision = 0L
-            while (true) {
-                val revision = ChatClient.waitForRoomListChange(lastRevision)
-                if (revision == lastRevision) continue
-                lastRevision = revision
-                refreshRooms()
+            MatrixRepository.roomList.collect { census ->
+                census.map { it.copy(lastMessage = "", unreadCount = 0, lastEventId = null) }
+                    .takeIf { it.isNotEmpty() || rooms.value.isEmpty() }
+                    ?.let { rooms.value = it }
             }
         }
     }
@@ -112,10 +108,6 @@ class SearchViewModel(
     private fun stopPolling() {
         pollJob?.cancel()
         pollJob = null
-    }
-
-    private fun refreshRooms() {
-        viewModelScope.launch { rooms.value = ChatClient.getAllRooms() }
     }
 
     fun updateQuery(newQuery: String) {

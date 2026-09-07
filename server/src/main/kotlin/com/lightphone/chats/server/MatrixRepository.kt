@@ -43,6 +43,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filterNotNull
@@ -1385,6 +1386,22 @@ object MatrixRepository {
      * on [BEEPER_HOMESERVER] — WhatsApp via Beeper's own bridges. Requires a
      * prior [beeperRequestCode] call (its request id is consumed here).
      */
+    /**
+     * Login wrappers projecting to [Result]`<Unit>` (NO-SEAM, 2026-09-07):
+     * the tool module can't see Trixnity's MatrixClient (:server hides its
+     * deps), so the direct caller maps the response from
+     * [lastLoginUserId]/[lastLoginDeviceId]/[lastLoginNeedsVerification].
+     */
+    suspend fun loginAsUnit(
+        homeserver: String,
+        user: String,
+        passwordOrToken: String,
+        tokenLogin: Boolean,
+    ): Result<Unit> = login(homeserver, user, passwordOrToken, tokenLogin).map { }
+
+    suspend fun beeperLoginAsUnit(email: String, code: String): Result<Unit> =
+        beeperLogin(email, code).map { }
+
     suspend fun beeperLogin(email: String, code: String): Result<MatrixClient> = runCatching {
         val ctx = appContext ?: error("companion not initialized")
         initMutex.withLock {
@@ -1492,6 +1509,11 @@ object MatrixRepository {
             // trusted) — leave the verification-phase slim sync immediately.
             swapToFullSync()
         }
+        // Identity the tool's login responses project (NO-SEAM: the tool module
+        // can't see Trixnity's MatrixClient — :server hides its deps — so the
+        // direct ChatClient mapping reads these instead of the client object).
+        lastLoginUserId = newClient.userId.full
+        lastLoginDeviceId = newClient.deviceId
         return newClient
     }
 
@@ -1521,6 +1543,16 @@ object MatrixRepository {
      *  `needsVerification` to the SetAccount/SetBeeperAccount responses. */
     @Volatile
     var lastLoginNeedsVerification: Boolean = false
+        private set
+
+    /** The last finished login's identity (see the NO-SEAM note in
+     *  [finishLogin]) — null until a login completes in this process. */
+    @Volatile
+    var lastLoginUserId: String? = null
+        private set
+
+    @Volatile
+    var lastLoginDeviceId: String? = null
         private set
 
     /**
@@ -5179,6 +5211,28 @@ object MatrixRepository {
         // "Loading messages…" because the send had dropped the cache).
         // Fetch the echo + refresh the panel even in slow-sync mode (screen off).
         wakeAfterSend(matrixRoomId.full)
+        // NO-SEAM (2026-09-07): the thread no longer polls — it reacts to page
+        // bumps. The send-time bump fires BEFORE the homeserver ack, so the row
+        // sat "SENDING" until the sync echo's page rebuild landed — starved for
+        // ~95 s under the post-attach crawl (LP3 2026-09-07 probe: send at
+        // 13:12:09, echo served 13:13:44). Watch the outbox row and bump at the
+        // ack: the serve-time [pendingEchoRow] then renders the real event id
+        // (sent) from the SAME cached page — no rebuild needed.
+        scope.launch {
+            var lastAcked = false
+            repeat(120) {
+                delay(250)
+                val om = runCatching {
+                    c.room.getOutbox(matrixRoomId, txnId).first()
+                }.getOrNull() ?: return@launch
+                val acked = om.eventId != null || om.sendError != null
+                if (acked != lastAcked) {
+                    lastAcked = acked
+                    bumpMessagePageRevision(matrixRoomId.full)
+                }
+                if (acked) return@launch
+            }
+        }
         android.util.Log.d(TAG, "SendMessage: room=$roomId txn=$txnId body=$body")
         // No composer hold for the homeserver ack: the thread's pending-row
         // machinery (optimistic injection via bumpMessagePageRevision + the
@@ -6637,10 +6691,11 @@ object MatrixRepository {
             // notification count only drops after the read-marker echo
             // round-trips through sync (a full tick on a big account), which
             // used to leave the badge up long after the thread was opened. The
-            // resolver keeps serving 0 until the echo confirms or a newer
-            // event arrives ([servedUnread]).
-            pendingReadClear[roomId] = markerId to
-                (room?.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L)
+            // resolver keeps serving 0 until GENUINELY newer activity arrives
+            // ([servedUnread]; markedTs = wall clock of this mark — the marker
+            // id may be a snapped unrenderable head the room's relevant head
+            // equals immediately, which disarmed the old id-match check).
+            pendingReadClear[roomId] = markerId to System.currentTimeMillis()
             roomListCache[roomId]?.let { entry ->
                 if (entry.room.unreadCount > 0) {
                     val cleared = entry.copy(room = entry.room.copy(unreadCount = 0))
@@ -6665,16 +6720,28 @@ object MatrixRepository {
         val te = withTimeoutOrNull(ROOM_BUDGET_MS) {
             c.room.getTimelineEvent(matrixRoomId, headId).firstOrNull()
         } ?: return false
-        return when (val content = te.content?.getOrNull()) {
-            is RoomMessageEventContent.TextBased ->
-                stripForwardHeader(stripReplyQuote(content.body)).first.isBlank()
-            null ->
-                isReplaceEdit(te) ||
-                    (te.event.content is EncryptedMessageEventContent &&
-                        System.currentTimeMillis() - te.event.originTimestamp <=
-                        DECRYPT_PENDING_PLACEHOLDER_AFTER_MS)
-            else -> isReplaceEdit(te)
-        }
+        // A JUST-arrived undecrypted message must not be snapped over: its
+        // placeholder clears once it decrypts, and marking it read would hide
+        // a message the user never saw. Older undecryptables fall through to
+        // the render check below.
+        val content = te.content?.getOrNull()
+        if (content == null &&
+            te.event.content is EncryptedMessageEventContent &&
+            System.currentTimeMillis() - te.event.originTimestamp <=
+            DECRYPT_PENDING_PLACEHOLDER_AFTER_MS
+        ) return false
+        // General rule (2026-09-07): a head that produces no rendered row —
+        // bridge delivery-status events, reactions, polls the tool can't
+        // render, edits, blank re-import copies — can never receive the
+        // receipt marker, so the badge stays up forever (LP3: the 1€ FILM
+        // rooms' heads are reactions / an unrenderable poll). Snap the
+        // receipt to the head instead. The sentinel distinguishes "renders
+        // nothing" from a budget timeout (timeout = keep the old marker).
+        val notRendered = Any()
+        val row = runCatching {
+            withTimeoutOrNull(ROOM_BUDGET_MS) { messageFrom(c, matrixRoomId, te) ?: notRendered }
+        }.getOrNull()
+        return row === notRendered
     }
 
     suspend fun setTyping(roomId: String, active: Boolean) {
@@ -7162,6 +7229,13 @@ object MatrixRepository {
                                                 }
                                             }
                                             wakeRoomList()
+                                            // NO-SEAM (2026-09-07): the open thread no longer
+                                            // long-polls the page revision — it rides the
+                                            // pageChanges signal, so an arrival in the ACTIVE
+                                            // room must refresh its page cache NOW (notifyForEvent
+                                            // skips the active room; the active-room tick is only
+                                            // a 30 s backstop). Cheap when nothing changed.
+                                            if (activeRoomId == key) refreshMessagePage(key)
                                             notifyForEvent(c, roomId, lastId, updated)
                                         }
                                     }
@@ -7399,6 +7473,14 @@ object MatrixRepository {
     private val _roomList = MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>(emptyList())
 
     /**
+     * The live room census (newest-first) as a flow (NO-SEAM, 2026-09-07):
+     * the tool's list/search/contacts collect this instead of polling the
+     * binder. Same truth [getRooms]/[getAllRooms] read.
+     */
+    val roomList: StateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>> =
+        _roomList.asStateFlow()
+
+    /**
      * Monotonic revision of the published room list (2026-09-01): bumped on
      * every [publishRoomList] and on [resetRoomList]. The tool polls
      * [roomListRevision] (a Long, cheap) instead of re-fetching the whole
@@ -7439,7 +7521,24 @@ object MatrixRepository {
     private fun bumpMessagePageRevision(roomId: String) {
         messagePageRevision[roomId] = (messagePageRevision[roomId] ?: 0L) + 1
         changeSignal.tryEmit(Unit)
+        pageChangeSignal.tryEmit(roomId)
     }
+
+    /**
+     * Per-room newest-page change signal (NO-SEAM, 2026-09-07): emitted beside
+     * every [bumpMessagePageRevision] so the thread collects it instead of
+     * long-polling the revision. A signal, not a page payload: the served page
+     * shape (pending echoes, audio state — [getMessages]) stays in exactly one
+     * place, and the tool re-reads it on each signal. DROP_OLDEST: a dropped
+     * signal costs one tick, same as the old poll's worst case.
+     */
+    private val pageChangeSignal = MutableSharedFlow<String>(
+        replay = 0, extraBufferCapacity = 64,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+
+    /** The per-room page-change signal the thread collects. */
+    val pageChanges: kotlinx.coroutines.flow.SharedFlow<String> = pageChangeSignal.asSharedFlow()
 
     /**
      * Monotonic revision of the room-flags cache (Phase C, 2026-09-06):
@@ -7451,8 +7550,17 @@ object MatrixRepository {
     @Volatile
     private var roomFlagsRevision = 0L
 
+    /**
+     * The live per-room flags (pinned/muted/archived, optimistic overlay
+     * applied) as a flow (NO-SEAM, 2026-09-07): the thread/contact panels
+     * collect this instead of long-polling the flags revision.
+     */
+    private val _roomFlags = MutableStateFlow<Map<String, RoomFlags>>(emptyMap())
+    val roomFlags: StateFlow<Map<String, RoomFlags>> = _roomFlags.asStateFlow()
+
     private fun bumpRoomFlagsRevision() {
         roomFlagsRevision++
+        _roomFlags.value = roomFlagsCache + roomFlagsOverlay
         changeSignal.tryEmit(Unit)
     }
 
@@ -7725,16 +7833,19 @@ object MatrixRepository {
      */
     private fun servedUnread(
         roomId: String,
-        markedAt: String?,
         markedTs: Long?,
-        newestId: String?,
         newestTs: Long?,
         storeUnread: Long,
     ): Long {
-        if (markedAt == null) return storeUnread
-        return if (storeUnread == 0L || newestId == markedAt ||
-            (newestTs != null && markedTs != null && newestTs > markedTs)
-        ) {
+        if (markedTs == null) return storeUnread
+        // The read receipt's echo takes a sync round trip; until then the
+        // count sources can still carry the pre-read value. Suppress until
+        // GENUINELY newer activity arrives (its count is real) — an event-ts
+        // comparison, not a marker-id match: the marker may be a snapped
+        // unrenderable head (reaction/poll/bridge status), which the room's
+        // relevant head equals immediately and disarmed the old check
+        // mid-flap (LP3 2026-09-07: "disappears then reappears").
+        return if (newestTs != null && newestTs > markedTs) {
             pendingReadClear.remove(roomId)
             storeUnread
         } else {
@@ -7766,6 +7877,15 @@ object MatrixRepository {
                         "SELECT userId, MAX(je.value) FROM RoomUserReceipts, " +
                             "json_tree(RoomUserReceipts.value) je " +
                             "WHERE RoomUserReceipts.roomId=? AND je.key='ts' AND je.type='integer' " +
+                            // Bridge bot accounts (@whatsappbot, @telegrambot, …)
+                            // "read" their own delivery-status events instantly,
+                            // so their receipt is always the newest in an active
+                            // room and this fallback read every busy bridged room
+                            // as unread (LP3 2026-09-07: the 1€ FILM badges).
+                            // ponytail: localpart-suffix heuristic — a human
+                            // literally named "…bot" would be excluded; switch
+                            // to a rendered-message join if that bites.
+                            "AND RoomUserReceipts.userId NOT LIKE '%bot:%' " +
                             "GROUP BY userId",
                         arrayOf(roomId),
                     ).use { cur ->
@@ -8068,9 +8188,7 @@ object MatrixRepository {
                     // encrypted rooms only; unencrypted ones stay readable.
                     unreadCount = servedUnread(
                         key,
-                        cleared?.first,
                         cleared?.second,
-                        room.lastRelevantEventId?.full,
                         room.lastRelevantEventTimestamp?.toEpochMilliseconds(),
                         if (verified || !room.encrypted) (unreadCounts[key]?.toLong() ?: 0L) else 0,
                     ),
@@ -8231,9 +8349,7 @@ object MatrixRepository {
         val cleared = pendingReadClear[key]
         val unread = servedUnread(
             key,
-            cleared?.first,
             cleared?.second,
-            room.lastRelevantEventId?.full,
             room.lastRelevantEventTimestamp?.toEpochMilliseconds(),
             storeUnread,
         )

@@ -35,6 +35,7 @@ import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.formatRelativeTimestamp
+import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.InitialScreen
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -121,52 +122,48 @@ class ChatListViewModel : LightViewModel<Unit>() {
     /**
      * Contact-panel state for the long-press entry (2026-08-29): long-pressing
      * a room row opens the same contact panel as the thread's name, seeded from
-     * the row's flags and refreshed from the companion's flags revision while
-     * the panel is open, so a Beeper-side toggle reaches it live (same pattern
-     * as ThreadViewModel's flag sync).
+     * the row's flags (the repository's fresher roomFlags value wins) and kept
+     * live by the roomFlags flow collector while the panel is open, so a
+     * Beeper-side toggle reaches it (same pattern as ThreadViewModel's flag sync).
      */
     val panelMuted = MutableStateFlow(false)
     val panelPinned = MutableStateFlow(false)
     val panelArchived = MutableStateFlow(false)
     private var panelRoomId: String? = null
-    private var panelFlagSyncJob: Job? = null
 
-    /** Seeds the panel from the row and starts the live flag wait. */
-    fun openContactPanel(room: LightServiceMethod.GetRooms.Room) {
-        // Kill any waiter leaked by an earlier panel before starting this one:
-        // startPanelFlagSync's guard would otherwise keep watching the FIRST
-        // panel's room and clobber this panel's flags with them (2026-08-29:
-        // archive toggles flipped back to ARCHIVE after 3 s for exactly that).
-        panelFlagSyncJob?.cancel()
-        panelFlagSyncJob = null
-        panelRoomId = room.id
-        panelMuted.value = room.muted
-        panelPinned.value = room.pinned
-        panelArchived.value = room.archived
-        startPanelFlagSync(room.id)
-    }
-
-    /** Stops the wait when the panel is dismissed (X pops back to the list). */
-    fun closeContactPanel() {
-        panelFlagSyncJob?.cancel()
-        panelFlagSyncJob = null
-        panelRoomId = null
-    }
-
-    private fun startPanelFlagSync(roomId: String) {
-        if (panelFlagSyncJob?.isActive == true) return
-        panelFlagSyncJob = viewModelScope.launch {
-            var lastFlags = 0L
-            while (true) {
-                val revision = ChatClient.waitForFlagChange(lastFlags)
-                if (revision == lastFlags) continue
-                lastFlags = revision
-                val flags = ChatClient.getRoomFlags(roomId) ?: continue
-                panelMuted.value = flags.muted
-                panelPinned.value = flags.pinned
-                panelArchived.value = flags.archived
+    init {
+        // Panel flags ride the repository's roomFlags flow (NO-SEAM, replaces
+        // the per-panel revision-wait job): keyed on [panelRoomId], so an open
+        // panel tracks exactly its room and a closed one (null) idles.
+        viewModelScope.launch {
+            MatrixRepository.roomFlags.collect { flags ->
+                val id = panelRoomId ?: return@collect
+                flags[id]?.let { f ->
+                    panelMuted.value = f.muted
+                    panelPinned.value = f.pinned
+                    panelArchived.value = f.archived
+                }
             }
         }
+    }
+
+    /** Seeds the panel from the row (the flow's fresher value wins). */
+    fun openContactPanel(room: LightServiceMethod.GetRooms.Room) {
+        panelRoomId = room.id
+        MatrixRepository.roomFlags.value[room.id]?.let { f ->
+            panelMuted.value = f.muted
+            panelPinned.value = f.pinned
+            panelArchived.value = f.archived
+        } ?: run {
+            panelMuted.value = room.muted
+            panelPinned.value = room.pinned
+            panelArchived.value = room.archived
+        }
+    }
+
+    /** Closing the panel (X pops back to the list) idles the collector. */
+    fun closeContactPanel() {
+        panelRoomId = null
     }
 
     fun togglePanelMuted() {
@@ -250,34 +247,27 @@ class ChatListViewModel : LightViewModel<Unit>() {
     }
 
     /**
-     * Re-fetches the list while it stays visible (the companion's room-list
-     * cache fills in placeholders + updates live rooms in the background, so a
-     * periodic quiet refresh keeps the list current without user action).
-     *
-     * Revision gate (2026-09-01, the Beeper comparison): the poll first asks
-     * the list's cheap revision and only fetches the full (400-room) payload
-     * when it moved — an idle list costs one tiny binder read every 5 s, not
-     * the whole [GetRooms] transfer. The connection state still refreshes each
-     * tick so the offline banner stays live.
+     * Live list + connection updates while the screen is visible. The
+     * repository's flows drive them directly (NO-SEAM, 2026-09-07 — the
+     * revision long-poll over the binder is gone): a room-list publish
+     * refetches the list (the [refresh] fetch shape is unchanged), a
+     * connection-state change refreshes the offline banner.
      */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
-            // Seed with the revision the show-time refresh reflected, so the
-            // first poll skips a list that hasn't moved since. The wait holds
-            // the binder call until the revision moves or the window elapses
-            // (2026-09-06: replaced the fixed 2 s tick — a change lands within
-            // milliseconds; an idle list costs one held call per window).
-            var lastRevision = ChatClient.roomListRevision()
-            while (true) {
-                val revision = ChatClient.waitForRoomListChange(lastRevision)
-                if (revision > 0 && revision != lastRevision) {
-                    lastRevision = revision
-                    refresh(quiet = true)
-                } else {
-                    // Window elapsed unchanged — keep the banner live with the
-                    // tiny connection read instead of the full payload.
-                    ChatClient.connectionState()?.let { connection.value = it }
+            var seeded = false
+            launch {
+                MatrixRepository.roomList.collect {
+                    // The collection-start snapshot is skipped: the show-time
+                    // refresh() (with its cold-start retries) owns the first
+                    // fetch; every publish after it refetches quietly.
+                    if (seeded) refresh(quiet = true) else seeded = true
+                }
+            }
+            launch {
+                MatrixRepository.connectionState.collect {
+                    connection.value = MatrixRepository.connectionState()
                 }
             }
         }
