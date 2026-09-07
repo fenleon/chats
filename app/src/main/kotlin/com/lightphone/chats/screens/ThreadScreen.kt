@@ -1239,6 +1239,14 @@ class ThreadScreen(
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
+        // Row-state bundles collected once here instead of a 10-parameter
+        // wall on [MessageRow]: the image fetch state, and the raw voice-note
+        // playback state (the per-row id comparisons happen in [MessageRow]).
+        val media = MediaState(mediaBytes, downloadOverMobile, viewModel::ensureMedia)
+        val voice = VoiceState(
+            playingEventId, playingPositionMs, playingPositionAtMs, counterPending,
+            pausedEventId, pausedPositionMs, voiceError, viewModel::playVoiceNote,
+        )
         // Restore the saved position at FIRST composition (the initial-params
         // overload): returning from the fullscreen photo viewer otherwise
         // created the list at the bottom and the post-composition scroll
@@ -1410,18 +1418,9 @@ class ThreadScreen(
                                                 // "delivered" shows regardless (2026-09-06).
                                                 ?.takeIf { it.second != "seen" || showReadStatus }
                                                 ?.second,
-                                            mediaBytes = mediaBytes,
-                                            allowMobile = downloadOverMobile,
-                                            playing = row.message.id == playingEventId,
-                                            playingPositionMs = playingPositionMs,
-                                            playingPositionAtMs = playingPositionAtMs,
-                                            counterPending = counterPending,
-                                            paused = row.message.id == pausedEventId,
-                                            pausedPositionMs = pausedPositionMs,
-                                            voiceError = voiceError,
+                                            media = media,
+                                            voice = voice,
                                             reactionError = reactionError,
-                                            onEnsureMedia = viewModel::ensureMedia,
-                                            onPlayVoiceNote = viewModel::playVoiceNote,
                                             onRetrySend = viewModel::retrySend,
                                             onResendAsNew = viewModel::resendAsNew,
                                             onToggleLike = viewModel::toggleLike,
@@ -1848,24 +1847,40 @@ private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
     )
 }
 
+/** Image-row state shared by every row: the fetched display bytes by message
+ *  id, the mobile-data download toggle, and the fetch callback (see
+ *  [ImageMessageContent]). One immutable object collected once in
+ *  [ThreadScreen.Content] instead of a parameter trio per row. */
+private data class MediaState(
+    val mediaBytes: Map<String, ByteArray>,
+    val allowMobile: Boolean,
+    val onEnsureMedia: (String, Boolean) -> Unit,
+)
+
+/** Voice-note row state shared by every row: the raw playback state from the
+ *  view model (see [AudioMessageContent]). Collected once in
+ *  [ThreadScreen.Content]; the per-row comparisons (message.id vs the
+ *  playing/paused event id, the per-row error) happen in [MessageRow]. */
+private data class VoiceState(
+    val playingEventId: String?,
+    val playingPositionMs: Long?,
+    val playingPositionAtMs: Long,
+    val counterPending: Boolean,
+    val pausedEventId: String?,
+    val pausedPositionMs: Long?,
+    val error: Pair<String, String>?,
+    val onPlayVoiceNote: (String) -> Unit,
+)
+
 @Composable
 private fun MessageRow(
     message: LightServiceMethod.GetMessages.Message,
     showSender: Boolean,
     showTime: Boolean,
     statusTag: String?,
-    mediaBytes: Map<String, ByteArray>,
-    allowMobile: Boolean,
-    playing: Boolean,
-    playingPositionMs: Long?,
-    playingPositionAtMs: Long,
-    counterPending: Boolean,
-    paused: Boolean,
-    pausedPositionMs: Long?,
-    voiceError: Pair<String, String>?,
+    media: MediaState,
+    voice: VoiceState,
     reactionError: Pair<String, String>?,
-    onEnsureMedia: (String, Boolean) -> Unit,
-    onPlayVoiceNote: (String) -> Unit,
     onRetrySend: (LightServiceMethod.GetMessages.Message) -> Unit,
     onResendAsNew: (LightServiceMethod.GetMessages.Message) -> Unit,
     onToggleLike: (LightServiceMethod.GetMessages.Message) -> Unit,
@@ -2072,20 +2087,20 @@ private fun MessageRow(
             } else null
             if (message.contentType == "image") {
                 ForwardedMediaRow(message) {
-                    ImageMessageContent(message, mediaBytes, allowMobile, onEnsureMedia, onOpenImage, contextGesture)
+                    ImageMessageContent(message, media, onOpenImage, contextGesture)
                 }
             } else if (message.contentType == "audio") {
                 ForwardedMediaRow(message) {
                     AudioMessageContent(
                         message = message,
-                        playing = playing,
-                        playingPositionMs = playingPositionMs,
-                        playingPositionAtMs = playingPositionAtMs,
-                        counterPending = counterPending,
-                        paused = paused,
-                        pausedPositionMs = pausedPositionMs,
-                        error = voiceError?.takeIf { it.first == message.id }?.second,
-                        onTogglePlay = { onPlayVoiceNote(message.id) },
+                        playing = message.id == voice.playingEventId,
+                        playingPositionMs = voice.playingPositionMs,
+                        playingPositionAtMs = voice.playingPositionAtMs,
+                        counterPending = voice.counterPending,
+                        paused = message.id == voice.pausedEventId,
+                        pausedPositionMs = voice.pausedPositionMs,
+                        error = voice.error?.takeIf { it.first == message.id }?.second,
+                        onTogglePlay = { voice.onPlayVoiceNote(message.id) },
                         onOpenContext = contextGesture,
                     )
                 }
@@ -2274,16 +2289,14 @@ private fun ForwardedMediaRow(
 @Composable
 private fun ImageMessageContent(
     message: LightServiceMethod.GetMessages.Message,
-    mediaBytes: Map<String, ByteArray>,
-    allowMobile: Boolean,
-    onEnsureMedia: (String, Boolean) -> Unit,
+    media: MediaState,
     onOpenImage: (ByteArray) -> Unit,
     onOpenContext: (() -> Unit)?,
 ) {
     // The toggle is part of the key: flipping "Mobile data downloads" (or
     // moving off cellular) re-attempts rows that were skipped as Wi-Fi-only.
-    LaunchedEffect(message.id, allowMobile) { onEnsureMedia(message.id, allowMobile) }
-    val bytes = mediaBytes[message.id]
+    LaunchedEffect(message.id, media.allowMobile) { media.onEnsureMedia(message.id, media.allowMobile) }
+    val bytes = media.mediaBytes[message.id]
     // Decode off the main thread: the in-composition decode blocked the UI
     // thread's first paint for every visible photo.
     // The text fallback below renders until the bitmap lands. Seeded from the
@@ -2311,7 +2324,7 @@ private fun ImageMessageContent(
         // re-run it without leaving the thread. Decode failures (bytes but no bitmap) stay
         // dead text; re-fetching would not help.
         val bodyModifier =
-            if (bytes == null) Modifier.lightClickable(onClick = { onEnsureMedia(message.id, allowMobile) })
+            if (bytes == null) Modifier.lightClickable(onClick = { media.onEnsureMedia(message.id, media.allowMobile) })
             else Modifier
         LightText(
             text = message.body,
