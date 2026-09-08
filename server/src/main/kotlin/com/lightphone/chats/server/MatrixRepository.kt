@@ -86,6 +86,7 @@ import de.connect2x.trixnity.core.subscribeAsFlow
 import de.connect2x.trixnity.core.model.events.MessageEventContent
 import de.connect2x.trixnity.core.model.events.RoomAccountDataEventContent
 import de.connect2x.trixnity.core.model.events.m.PushRulesEventContent
+import de.connect2x.trixnity.core.model.events.m.ReceiptEventContent
 import de.connect2x.trixnity.core.model.events.m.TagEventContent
 import de.connect2x.trixnity.core.model.push.PushAction
 import de.connect2x.trixnity.core.model.push.PushRuleKind
@@ -1823,7 +1824,11 @@ object MatrixRepository {
         if (outcome.isSuccess) {
             android.util.Log.d(TAG, "recoverWithKey: recovery-key verification succeeded")
             e2eeStateCache = null // now verified — recompute on next read
-            markRoomListDirty() // verification changes unread suppression — refresh the list
+            // Local-only: flags-only re-stamp, no crawl (INGEST-DERIVED-PLAN
+            // Phase C); unread suppression re-derives per row as rooms change.
+            flagsOnlyWake = true
+            markRoomListDirty()
+            wakeRoomList()
         }
         return outcome
     }
@@ -2049,7 +2054,11 @@ object MatrixRepository {
                         restoreMegolmSessions()
                     }
                 }
-                markRoomListDirty() // newly verified device → unread counts recompute
+                // Local-only: flags-only re-stamp, no crawl (INGEST-DERIVED-PLAN
+                // Phase C); the full-sync swap below re-derives unread reactively.
+                flagsOnlyWake = true
+                markRoomListDirty()
+                wakeRoomList()
                 scope.launch { swapToFullSync() } // verification-first sync — see [pendingVerificationPhase]
                 VerificationUi.Done
             }
@@ -2474,38 +2483,24 @@ object MatrixRepository {
             preloadRoomListFromDisk()
         }
         val rooms = _roomList.value
-        // Binder cap: the whole reply crosses as one transaction (~1 MB hard
-        // limit); the list is sorted newest-first, so the cap drops the stale
-        // tail. The full census stays in _roomList (resolver keeps refreshing
-        // every room); any room that gets a new message sorts back into the
-        // window on the next publish.
-        // Per-network guarantee: a global recency window lets a
-        // quiet network (Signal) and its older rooms drop out entirely — the
-        // Networks panel (derived from the served rooms) lost the label and
-        // the main list lost the chats (LP3). Every network's newest room
-        // gets a slot first; global recency fills the rest, so recents from
-        // ALL networks populate the list.
-        val perNetworkNewest = rooms.groupBy { it.network }.values.mapNotNull { it.firstOrNull() }
-        return (perNetworkNewest + rooms)
-            .distinctBy { it.id }
-            .take(MAX_ROOMS_OVER_BINDER)
-            // The prepend above is about window INCLUSION, not order — restore
-            // the recency order publishRoomList built (pinned, then newest),
-            // except pins order ALPHABETICALLY, not by recency (feedback
-            // 2026-09-08); non-pins stay newest-first.
-            .sortedWith(
-                compareByDescending<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> { it.pinned == true }
-                    .thenBy(String.CASE_INSENSITIVE_ORDER) { if (it.pinned == true) it.name else "" }
-                    .thenByDescending { it.lastTimestampMs }
-            )
+        // Every room is served — the UI path is direct in-process calls, no
+        // ~1 MB binder transaction to cap against (INGEST-DERIVED-PLAN.md
+        // Phase E); the old recency window + per-network prepend dropped
+        // rooms whose row was still derived and is gone. Only the
+        // ChatServiceMethods GetRooms RPC (adb dev control) crosses a real
+        // binder transaction — cap that path only if an account ever grows
+        // past ~1,600 rooms (~1 MB encoded).
+        return rooms.sortedWith(
+            compareByDescending<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> { it.pinned == true }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { if (it.pinned == true) it.name else "" }
+                .thenByDescending { it.lastTimestampMs }
+        )
     }
 
     /**
-     * The full room census for the tool's contacts list + search — every room,
-     * not just the newest [MAX_ROOMS_OVER_BINDER] window (the cap exists for
-     * the preview-laden [getRooms] reply; contacts/search rows don't show
-     * previews, so the whole account crosses the binder trimmed, chats).
-     */
+     * The full room census for the tool's contacts list + search — every
+     * room, trimmed (no previews/unreads; contacts/search rows don't show
+     * previews, so the whole account crosses trimmed, chats). */
     suspend fun getAllRooms(): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
         if (client == null) return emptyList()
         if (_roomList.value.isEmpty()) preloadRoomListFromDisk()
@@ -3734,6 +3729,7 @@ object MatrixRepository {
             c.room.getOutbox().first()
         } ?: return
         var rebuilt = 0
+        val rebuiltRooms = LinkedHashSet<String>()
         for (flow in rows) {
             val om = withTimeoutOrNull(OUTBOX_RECONSTRUCT_BUDGET_MS) { flow.first() } ?: continue
             if (om.isDraft) continue
@@ -4916,8 +4912,8 @@ object MatrixRepository {
      */
     private fun wakeAfterSend(roomId: String) {
         // No roomListDirty here: a pre-echo dirty pass always ran
-        // on STALE data (the echo hadn't landed), and the echo's per-room sig
-        // collectors in [observeNotifications] dirty the list themselves — so
+        // on STALE data (the echo hadn't landed), and the echo's collectors in
+        // [observeNotifications] publish the row themselves — so
         // this cost a second full pass per send on a big account. The resolver
         // wake below is kept for the pending-row bump's immediate publish.
         wakeRoomList()
@@ -6778,11 +6774,24 @@ object MatrixRepository {
             TAG,
             "markRead: room=$matrixRoomId at=$eventId head=${headId?.full} marker=$markerId atHead=$atHead",
         )
-        c.api.room.setReadMarkers(
-            roomId = matrixRoomId,
-            fullyRead = EventId(markerId),
-            read = EventId(markerId),
-        )
+        try {
+            c.api.room.setReadMarkers(
+                roomId = matrixRoomId,
+                fullyRead = EventId(markerId),
+                read = EventId(markerId),
+            )
+        } catch (e: Exception) {
+            // The tool's runCatching would swallow this and the badge would
+            // clear on an echo that never comes — skip the optimistic clear
+            // + [pendingReadClear] so the badge honestly stays up.
+            if (debugLogging()) {
+                android.util.Log.w(
+                    TAG,
+                    "markRead: room=$matrixRoomId — setReadMarkers failed, badge stays up: $e",
+                )
+            }
+            return
+        }
         // Opening the thread makes the room's notification moot.
         appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
         if (atHead) {
@@ -6790,11 +6799,19 @@ object MatrixRepository {
             // notification count only drops after the read-marker echo
             // round-trips through sync (a full tick on a big account), which
             // used to leave the badge up long after the thread was opened. The
-            // resolver keeps serving 0 until GENUINELY newer activity arrives
-            // ([servedUnread]; markedTs = wall clock of this mark — the marker
-            // id may be a snapped unrenderable head the room's relevant head
-            // equals immediately, which disarmed the old id-match check).
-            pendingReadClear[roomId] = markerId to System.currentTimeMillis()
+            // resolver keeps serving 0 until the store's own receipt echoes
+            // ([servedUnread]; the stored marker ts is the marked event's
+            // origin_server_ts — the head in every atHead case — so the
+            // comparison is server-stamp on both ends and device clock skew
+            // can't pin the badge). The marker id may be a snapped
+            // unrenderable head the room's relevant head equals immediately,
+            // which disarmed the old id-match check.
+            // Head unresolved: no event ts exists at all — the wall clock
+            // stays as that corner's best effort (logged above).
+            val markerTs = room?.lastRelevantEventTimestamp?.toEpochMilliseconds()
+                ?.takeIf { headId != null }
+                ?: System.currentTimeMillis()
+            pendingReadClear[roomId] = markerId to markerTs
             roomListCache[roomId]?.let { entry ->
                 if (entry.room.unreadCount > 0) {
                     val cleared = entry.copy(room = entry.room.copy(unreadCount = 0))
@@ -6802,7 +6819,11 @@ object MatrixRepository {
                     _roomList.value = _roomList.value.map { if (it.id == roomId) cleared.room else it }
                 }
             }
-            markRoomListDirty()
+            // Publish the optimistic clear through the choke point so the
+            // tool's revision poll sees it now — the resolver doesn't sweep
+            // (INGEST-DERIVED-PLAN Phase C); the receipt echo's per-row
+            // publish re-derives the row.
+            publishRoomList()
         }
     }
 
@@ -7163,15 +7184,45 @@ object MatrixRepository {
             watch("server-unread collector ended") {
                 c.api.sync.subscribeAsFlow().collect { syncEvents ->
                     val join = syncEvents.syncResponse.room?.join ?: return@collect
-                    var changed = false
                     for ((roomId, joinedRoom) in join) {
                         val count = joinedRoom.unreadNotifications?.notificationCount?.toInt() ?: 0
                         if (serverUnreadCounts[roomId.full] != count) {
                             serverUnreadCounts[roomId.full] = count
-                            changed = true
+                        }
+                        // Own m.read receipt echoed (a markRead's echo, or a
+                        // read on another device): the optimistic clear's job
+                        // is done — release it so the row publish below
+                        // recomputes unread from the moved cursor. Background
+                        // rounds never carry receipts (the thin filter drops
+                        // m.receipt — by design, INGEST-DERIVED-PLAN).
+                        if (ownReceiptEchoed(joinedRoom.ephemeral?.events, c.userId)) {
+                            if (debugLogging() && pendingReadClear.remove(roomId.full) != null) {
+                                android.util.Log.d(
+                                    TAG,
+                                    "pendingReadClear: released on own receipt echo (room=${roomId.full})",
+                                )
+                            }
+                        }
+                        // The join map IS the invalidation list: every room in
+                        // it changed somehow (timeline, state, receipts,
+                        // counts). publishRoomRowNow is burst-deduped, so a
+                        // whole-account round costs one resolve per changed
+                        // room. Ungated on RoomSig — receipt-only changes and
+                        // summary-frozen rooms never move the summary, so only
+                        // this trigger reaches them (the room-flow collector
+                        // keeps its gate). The store reads inside are safe
+                        // post-ingest: subscribeAsFlow runs at DEFAULT
+                        // priority, after the STORE_EVENTS (receipts) /
+                        // ROOM_LIST (summary) / STORE_TIMELINE_EVENTS
+                        // (timeline) subscribers have fully persisted this
+                        // response — no pre-ingest race.
+                        scope.launch {
+                            val room = withTimeoutOrNull(ROOM_BUDGET_MS) {
+                                c.room.getById(roomId).firstOrNull()
+                            } ?: return@launch
+                            publishRoomRowNow(c, roomId, room)
                         }
                     }
-                    if (changed) markRoomListDirty()
                 }
             }
             try {
@@ -7248,12 +7299,13 @@ object MatrixRepository {
                                         }
                                     }
                                     roomFlow.filterNotNull().collect { updated ->
-                                        // Resolver skip-gate signal:
-                                        // any room-state change (message,
-                                        // membership) wakes the room-list resolver
-                                        // instead of its old unconditional 2 s pass
-                                        // loop (unread changes come via the count
-                                        // collector above).
+                                        // Any room-state change (message,
+                                        // membership) publishes the room's row
+                                        // NOW (see [publishRoomRowNow]) — the
+                                        // resolver has no steady-state sweep
+                                        // (INGEST-DERIVED-PLAN Phase C); unread
+                                        // changes come via the count collector
+                                        // above.
                                         val sig = RoomSig(
                                             updated.lastRelevantEventId?.full,
                                             updated.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
@@ -7261,9 +7313,6 @@ object MatrixRepository {
                                         )
                                         if (roomSigSeen[key] != sig) {
                                             roomSigSeen[key] = sig
-                                            markRoomListDirty()
-                                            // The row publishes NOW (see
-                                            // [publishRoomRowNow]) — not one pass late.
                                             publishRoomRowNow(c, roomId, updated)
                                         }
                                         val lastId = updated.lastRelevantEventId?.full ?: return@collect
@@ -7510,13 +7559,15 @@ object MatrixRepository {
 
     private val roomListCache = java.util.concurrent.ConcurrentHashMap<String, RoomListEntry>()
     /** Last-seen room signatures, maintained by [observeNotifications] — a
-     *  difference sets [roomListDirty] (the resolver's skip gate, audit 2026-08-14). */
+     *  difference publishes that room's row ([publishRoomRowNow]; the
+     *  resolver no longer sweeps, INGEST-DERIVED-PLAN Phase C). */
     private val roomSigSeen = java.util.concurrent.ConcurrentHashMap<String, RoomSig>()
     /** Room ids the user has opened (MarkRead fired) → (event id marked read,
-     *  its timestamp). The notification count only drops after the
+     *  its origin_server_ts). The notification count only drops after the
      *  read-marker echo round-trips through sync (a full tick on a big
-     *  account), so the served list shows 0 until the echo confirms or a
-     *  message NEWER than the marked one arrives. */
+     *  account), so the served list shows 0 until the store's own receipt
+     *  reaches the marker ([servedUnread]) — released early by the echo
+     *  detection in the server-unread collector. */
     private val pendingReadClear = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
     private val _roomList = MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>(emptyList())
 
@@ -7666,11 +7717,11 @@ object MatrixRepository {
     @Volatile
     private var roomListJob: Job? = null
 
-    /** Dirty flag for the room-list resolver (efficiency ):
-     *  a full pass runs only when [observeNotifications] saw a room-state change
-     *  or a parked resolution retry came due — previously every 2 s, 24/7 (the
-     *  overnight CPU/IO drain).
-     */
+    /** Wake flag for the resolver's FLAGS-ONLY pass (local PIN/MUTE/ARCHIVE
+     *  writes, verification-state changes): that pass re-stamps cached rows
+     *  with fresh flags and publishes without a crawl. Sync-derived changes
+     *  never set it — they publish their own row ([publishRoomRowNow];
+     *  INGEST-DERIVED-PLAN Phase C). */
     @Volatile
     private var roomListDirty = true
 
@@ -7745,14 +7796,15 @@ object MatrixRepository {
     /**
      * Per the SYNC-PERF-SPEC: resolve and publish ONE room's row
      * immediately when its notification-watcher collector sees a change, instead
-     * of waiting for the next budgeted resolver pass — the dominant measured
-     * tail. Uses the
-     * same bounded per-room reads the pass does; the full pass still runs
-     * ([markRoomListDirty] fired) for reordering + crawl work. Skipped during
-     * the initial crawl — the back-to-back startup passes already publish, and
-     * one single-room resolve per room there would double the crawl's work.
+     * of waiting for a resolver pass — the dominant measured tail. Uses the
+     * same bounded per-room reads the pass does; this IS the row's refresh
+     * path in steady state — the resolver has no sweep (Phase C). Skipped
+     * during the initial crawl — the back-to-back startup passes already
+     * publish, and one single-room resolve per room there would double the
+     * crawl's work.
      */
     private fun publishRoomRowNow(c: MatrixClient, roomId: RoomId, room: MatrixRoom) {
+        if (roomListDirtyAt == 0L) roomListDirtyAt = android.os.SystemClock.elapsedRealtime()
         if (!initialRoomCrawlDone) return
         val key = roomId.full
         if (!singleRoomPublishInFlight.add(key)) return
@@ -7822,11 +7874,10 @@ object MatrixRepository {
      *  full account gets seeded even with no incoming messages. */
     private var initialRoomCrawlDone = false
 
-    /** Set when a PIN/MUTE/ARCHIVE write lands locally ([updateRoomFlagsLocal]):
-     *  the resolver re-stamps the cached rows with the fresh flags and
-     *  publishes immediately instead of waiting for the full pass's room
-     *  collect + preview budget. The full pass still runs — the write set
-     *  [roomListDirty] — it just no longer gates the flag change. */
+    /** Set when a PIN/MUTE/ARCHIVE write lands locally ([updateRoomFlagsLocal],
+     *  also verification-state changes): the resolver re-stamps the cached
+     *  rows with the fresh flags and publishes immediately, then stops —
+     *  no crawl follows (INGEST-DERIVED-PLAN Phase C). */
     @Volatile
     private var flagsOnlyWake = false
 
@@ -7860,32 +7911,66 @@ object MatrixRepository {
     /**
      * Unread count to show in the list. While a MarkRead is pending (the
      * store hasn't echoed it yet — see [pendingReadClear]) the count reads 0;
-     * the suppression lifts when the echo confirms (notification count 0) or
-     * a message NEWER than the one marked read arrives (real unread again —
-     * compared by timestamp, so a lagging summary can't undo the clear for
-     * events the page simply didn't carry).
+     * the suppression lifts when the room's own m.read receipt in the store
+     * reaches the marked event's ts — the same cursor [receiptCursorUnread]
+     * reads, server-stamped on both ends, so device clock skew can no longer
+     * pin the badge (the old wall-clock comparison could).
      */
-    private fun servedUnread(
+    private suspend fun servedUnread(
+        c: MatrixClient,
         roomId: String,
         markedTs: Long?,
-        newestTs: Long?,
         storeUnread: Long,
     ): Long {
         if (markedTs == null) return storeUnread
-        // The read receipt's echo takes a sync round trip; until then the
-        // count sources can still carry the pre-read value. Suppress until
-        // GENUINELY newer activity arrives (its count is real) — an event-ts
-        // comparison, not a marker-id match: the marker may be a snapped
-        // unrenderable head (reaction/poll/bridge status), which the room's
-        // relevant head equals immediately and disarmed the old check
-        // mid-flap.
-        return if (newestTs != null && newestTs > markedTs) {
-            pendingReadClear.remove(roomId)
+        val receiptTs = ownReceiptTs(c, roomId)
+        return if (receiptTs != null && receiptTs >= markedTs) {
+            if (debugLogging() && pendingReadClear.remove(roomId) != null) {
+                android.util.Log.d(
+                    TAG,
+                    "pendingReadClear: released on stored receipt ts=$receiptTs >= marker ts=$markedTs (room=$roomId)",
+                )
+            }
             storeUnread
         } else {
             0
         }
     }
+
+    /** The ts of the account's own latest m.read receipt, read from the store
+     *  (the same RoomUserReceipts query [receiptCursorUnread] takes its cursor
+     *  from). Null when no receipt has synced yet or the store is unreadable.
+     *  Used by [servedUnread] to release the optimistic badge clear on the
+     *  receipt echo itself instead of the device wall clock. */
+    private suspend fun ownReceiptTs(c: MatrixClient, roomId: String): Long? {
+        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            ?: return null
+        return chainDbSemaphore.withPermit {
+            withContext(Dispatchers.IO) {
+                runCatching<Long?> {
+                    db.openHelper.writableDatabase.query(
+                        "SELECT MAX(je.value) FROM RoomUserReceipts, " +
+                            "json_tree(RoomUserReceipts.value) je " +
+                            "WHERE RoomUserReceipts.roomId=? AND RoomUserReceipts.userId=? " +
+                            "AND je.key='ts' AND je.type='integer'",
+                        arrayOf(roomId, c.userId.full),
+                    ).use { cur -> if (cur.moveToFirst() && !cur.isNull(0)) cur.getLong(0) else null }
+                }.getOrNull()
+            }
+        }
+    }
+
+    /** True when [events] (a sync response's ephemeral block) carries an own
+     *  m.read receipt for the room it belongs to — our markRead's echo or a
+     *  read on another device landed or moved. Background rounds never carry
+     *  receipts (the thin sync filter drops m.receipt — by design). */
+    private fun ownReceiptEchoed(
+        events: List<ClientEvent.EphemeralEvent<*>>?,
+        own: UserId,
+    ): Boolean = events?.any { event ->
+        (event.content as? ReceiptEventContent)?.events?.values
+            ?.any { it[ReceiptType.Read]?.containsKey(own) == true } == true
+    } == true
 
     /**
      * Cursor-based unread (the Beeper app's model — replaces the old own-vs-
@@ -7967,18 +8052,24 @@ object MatrixRepository {
         activeRoomRefreshJob = null
         flagsOnlyWake = false
         lastRoomsMap = null
+        // A new account needs its own initial crawl (see [startRoomListResolver]).
+        roomIterationCursor = 0
+        initialRoomCrawlDone = false
         roomListRevision++ // a reset IS a list change — the tool must re-fetch
         changeSignal.tryEmit(Unit)
     }
 
     /**
-     * Background resolver for the room list. Runs continuously while a client
-     * is attached: seeds every room with a placeholder row first (so the list
-     * shows instantly), then resolves names + previews newest-first within a
-     * per-pass time budget, publishing the snapshot after each pass.
-     * Since a pass runs only when [observeNotifications] observed a
-     * room-state change (see [roomListDirty] / [hasPendingResolveWork]) instead
-     * of every 2 s, 24/7 (the standby CPU/IO drain, efficiency audit).
+     * Background resolver for the room list. COLD-START ONLY
+     * (INGEST-DERIVED-PLAN Phase C): until [initialRoomCrawlDone] it seeds
+     * every room with a placeholder row first (so the list shows instantly),
+     * then resolves names + previews newest-first within a per-pass time
+     * budget, publishing the snapshot after each pass. After the wrap it runs
+     * only for the flags-only re-stamp and pending-resolve retries
+     * ([hasPendingResolveWork]: parked "[Encrypted]" previews, ghost-walk
+     * retry windows) — row facts are derived and published per-room at ingest
+     * ([publishRoomRowNow]); there is NO steady-state sweep. A missed trigger
+     * shows as a stale row and is fixed at the trigger, never swept under.
      */
 
     /**
@@ -8004,12 +8095,11 @@ object MatrixRepository {
             // same hero (WhatsApp DMs reuse the same few profiles).
             val nameMemo = HashMap<String, String>()
             while (true) {
-                // Skip the pass unless the room map moved or a parked
-                // preview/ghost-walk retry came due:
-                // the resolver ran a full pass every 2 s, 24/7.
-                // The initial crawl (see [initialRoomCrawlDone]) overrides the
-                // gate: until the cursor has wrapped, passes keep running so
-                // every room is collected at least once per process start.
+                // Skip the pass unless a local flags write is waiting (the
+                // flags-only fast path), a parked preview/ghost-walk retry
+                // came due, or the initial crawl hasn't wrapped yet (see
+                // [initialRoomCrawlDone]). No steady-state sweep: sync-derived
+                // changes publish their own row ([publishRoomRowNow]).
                 if (!roomListDirty && !hasPendingResolveWork() && initialRoomCrawlDone) {
                     // Idle sleep, interruptible: [wakeRoomList] (screen-on,
                     // push-wake, list re-opened) ends it early so a message
@@ -8021,6 +8111,9 @@ object MatrixRepository {
                     continue
                 }
                 roomListDirty = false
+                if (debugLogging()) {
+                    android.util.Log.d(TAG, "room list resolver pass (flagsOnly=$flagsOnlyWake)")
+                }
                 // Sync-ingest gate: don't crawl the store against a running
                 // sync ingest — the pass's reads stretch the round (SYNC-PERF-
                 // SPEC §Phase 1). Bounded, so a wedged round can't stall us.
@@ -8028,8 +8121,9 @@ object MatrixRepository {
                 // Flags-only fast path: a local PIN/MUTE/ARCHIVE write doesn't
                 // need the full room collect + preview pass (up to 15 s each on
                 // a big account) before the tool sees it — re-stamp the cached
-                // rows with the fresh flags and publish now. The full pass
-                // below still runs (the write set roomListDirty) and confirms.
+                // rows with the fresh flags and publish now. After the initial
+                // crawl the pass STOPS here (no crawl confirms; the flags
+                // overlay already guards rebuilds — INGEST-DERIVED-PLAN C).
                 if (flagsOnlyWake && lastRoomsMap != null && roomListCache.isNotEmpty()) {
                     flagsOnlyWake = false
                     runCatching {
@@ -8046,6 +8140,17 @@ object MatrixRepository {
                         }
                         publishRoomList()
                     }
+                }
+                // After the initial crawl the flags-only re-stamp above is the
+                // whole pass unless a parked preview/ghost-walk retry is due —
+                // no steady-state crawl (INGEST-DERIVED-PLAN Phase C).
+                if (initialRoomCrawlDone && !hasPendingResolveWork()) {
+                    withTimeoutOrNull(
+                        if (isScreenInteractive()) ROOM_LIST_REFRESH_DELAY_MS else SLOW_RESOLVER_DELAY_MS
+                    ) {
+                        roomListWake.receive()
+                    }
+                    continue
                 }
                 try {
                     val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
@@ -8106,7 +8211,7 @@ object MatrixRepository {
                         if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
                         bridgeContacts(c, bridgeId)
                     }
-                    seedRoomList(loaded, verified, networks, communities, flags)
+                    seedRoomList(c, loaded, verified, networks, communities, flags)
                     // Every joined room gets a preview attempt (rooms beyond the
                     // preview window showed no latest message at all).
                     // The per-pass budget + the encrypted-room retry backoff keep
@@ -8203,7 +8308,8 @@ object MatrixRepository {
     }
 
     /** Inserts a placeholder row for every joined room not yet in the cache. */
-    private fun seedRoomList(
+    private suspend fun seedRoomList(
+        c: MatrixClient,
         rooms: List<Pair<RoomId, MatrixRoom>>,
         verified: Boolean,
         networks: Map<String, String>,
@@ -8224,9 +8330,9 @@ object MatrixRepository {
                     // An unverified device can't decrypt — suppress unread for
                     // encrypted rooms only; unencrypted ones stay readable.
                     unreadCount = servedUnread(
+                        c,
                         key,
                         cleared?.second,
-                        room.lastRelevantEventTimestamp?.toEpochMilliseconds(),
                         if (verified || !room.encrypted) (serverUnreadCounts[key]?.toLong() ?: 0L) else 0,
                     ),
                     lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
@@ -8376,9 +8482,9 @@ object MatrixRepository {
         } else 0
         val cleared = pendingReadClear[key]
         val unread = servedUnread(
+            c,
             key,
             cleared?.second,
-            room.lastRelevantEventTimestamp?.toEpochMilliseconds(),
             storeUnread,
         )
         val stateChanged = prev == null ||
@@ -9343,14 +9449,15 @@ object MatrixRepository {
                     // Phase 2.1 heal (SYNC-PERF-SPEC): the walk resolves what the
                     // resolve path couldn't read yet — the room-state flow fires
                     // before the timeline event is queryable in the store, and the
-                    // row parks on last-known-good. Without this wake the healed
-                    // values sit unpublished until the next event or a retry came
-                    // due (probe: row stuck 10 min behind a message the walk had
-                    // resolved 0.8 s after it landed). One dirty pass re-resolves
-                    // from the now-warm cache (cheap) and publishes.
+                    // row parks on last-known-good (probe: row stuck 10 min
+                    // behind a message the walk had resolved 0.8 s after it
+                    // landed). Publish the healed room's row directly — the
+                    // resolver has no sweep to re-resolve it
+                    // (INGEST-DERIVED-PLAN Phase C).
                     if (healed) {
-                        markRoomListDirty()
-                        wakeRoomList()
+                        c.room.getById(matrixRoomId).firstOrNull()?.let {
+                            publishRoomRowNow(c, matrixRoomId, it)
+                        }
                     }
                 } else {
                     // Timed out: the walk can't complete within budget (large or
@@ -10376,12 +10483,6 @@ object MatrixRepository {
     private const val ROOM_LIST_PASS_BUDGET_MS = 12_000L
     /** Breather between passes; a settled pass itself takes milliseconds. */
     private const val ROOM_LIST_REFRESH_DELAY_MS = 2_000L
-    /** Cap on rooms shipped over the binder: the encoded reply is one binder
-     *  transaction, hard-capped at ~1 MB — beyond ~1,600 rooms every GetRooms
-     *  call failed and the list stuck on "loading…". 200 rooms ≈ 200 KB. Rooms
-     *  past the cap are still tracked/refreshed; a new message sorts them back
-     *  into the served window. (Roadmap: search / a cap-raising page flow.) */
-    private const val MAX_ROOMS_OVER_BINDER = 400
     /** Resolver breather while the screen is off: the
      *  live bridged account keeps the list dirty, so the 2s breather meant
      *  near-continuous passes overnight; the list only needs freshness for
