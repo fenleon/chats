@@ -3743,32 +3743,36 @@ object MatrixRepository {
                 is RoomMessageEventContent.TextBased -> if (putPendingIfAbsent(
                         pendingTextEcho, roomKey, om.transactionId,
                         PendingTextSend(om.transactionId, ts, content.body),
-                    )) rebuilt++
+                    )) { rebuilt++; rebuiltRooms.add(roomKey) }
                 is RoomMessageEventContent.FileBased.Image -> if (putPendingIfAbsent(
                         pendingImageEcho, roomKey, om.transactionId,
                         PendingImageSend(om.transactionId, ts, content.body.ifBlank { "Photo" }),
-                    )) rebuilt++
+                    )) { rebuilt++; rebuiltRooms.add(roomKey) }
                 // Voice notes enqueue as an Unknown audio content (hand-built
                 // m.audio + org.matrix.msc3245.voice, see [sendVoiceNote]).
                 is RoomMessageEventContent.FileBased.Audio -> if (putPendingIfAbsent(
                         pendingAudioEcho, roomKey, om.transactionId,
                         PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null, eventId = om.eventId?.full),
-                    )) rebuilt++
+                    )) { rebuilt++; rebuiltRooms.add(roomKey) }
                 is RoomMessageEventContent.Unknown ->
                     if (content.type == RoomMessageEventContent.FileBased.Audio.TYPE &&
                         putPendingIfAbsent(
                             pendingAudioEcho, roomKey, om.transactionId,
                             PendingAudioSend(om.transactionId, ts, durationMs = null, localFile = null, eventId = om.eventId?.full),
                         )
-                    ) rebuilt++
+                    ) { rebuilt++; rebuiltRooms.add(roomKey) }
                 else -> {}
             }
         }
         if (rebuilt > 0) {
             // The resurrected sends' rooms bump to the top with the pending
-            // preview, like [wakeAfterSend] does for a live send.
-            markRoomListDirty()
-            wakeRoomList()
+            // preview, like [wakeAfterSend] does for a live send — per-room
+            // publish, no resolver sweep (INGEST-DERIVED-PLAN Phase C; during
+            // the initial crawl the pass resolve covers the bump).
+            for (roomKey in rebuiltRooms) {
+                val roomId = RoomId(roomKey)
+                c.room.getById(roomId).firstOrNull()?.let { publishRoomRowNow(c, roomId, it) }
+            }
             android.util.Log.d(TAG, "outbox: rebuilt $rebuilt pending echo rows after restart")
         }
     }
@@ -6456,6 +6460,9 @@ object MatrixRepository {
             // mimetype instead of m.image — accept both,
             // or RCS image attachments stay on their text fallback forever.
             is RoomMessageEventContent.FileBased.Image -> raw
+            // Video rows fetch a server-side thumbnail frame ([videoThumbnail] —
+            // there's no playback, the SDK has no video primitive).
+            is RoomMessageEventContent.FileBased.Video -> raw
             is RoomMessageEventContent.FileBased.File ->
                 if (raw.info?.mimeType?.startsWith("image/", ignoreCase = true) == true) raw else null
             else -> null
@@ -6493,9 +6500,23 @@ object MatrixRepository {
             logLabel = "getMessageMedia",
             eventId = eventId,
         )?.takeIf { it.isNotEmpty() } ?: return null
-        val jpeg = compressImage(bytes, DISPLAY_MAX_DIMENSION, DISPLAY_JPEG_QUALITY) ?: return null
-        mediaCache[cacheKey] = jpeg
-        return jpeg
+        val mime = content.info?.mimeType?.lowercase()
+        val display = when {
+            // Videos: WhatsApp GIFs arrive as silent short mp4 loops (mautrix
+            // bridges, no distinguishing flag) — those fetch as a frame
+            // flipbook ([videoFlipbook]) the viewer animates; everything else
+            // fetches as a JPEG thumbnail frame ([videoThumbnail]). The SDK
+            // has no video primitive, so there's no real playback either way.
+            mime?.startsWith("video/") == true -> videoFlipbook(bytes) ?: videoThumbnail(bytes)
+            // GIFs keep their original bytes so the fullscreen viewer can
+            // animate them (ImageDecoder); BitmapFactory renders the first
+            // frame in the thread row. No JPEG recompress — it would freeze
+            // the animation.
+            mime == "image/gif" -> bytes
+            else -> compressImage(bytes, DISPLAY_MAX_DIMENSION, DISPLAY_JPEG_QUALITY)
+        } ?: return null
+        mediaCache[cacheKey] = display
+        return display
     }
 
     /**
@@ -6585,6 +6606,108 @@ object MatrixRepository {
         bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)
         if (!bitmap.isRecycled) bitmap.recycle()
         return output.toByteArray()
+    }
+
+    /**
+     * Frame flipbook for an animated-video attachment: WhatsApp GIFs arrive
+     * as silent short mp4 loops (mautrix bridges) with no distinguishing
+     * flag, so the heuristic is content-shaped — mp4, ≤15 s, no audio track
+     * — and everything else falls back to the static [videoThumbnail].
+     * Extracts ~10fps frames at [FLIPBOOK_MAX_DIMENSION], JPEGs them, and
+     * packs the container the tool's [com.lightphone.chats.screens.chatsFlipbook]
+     * parses: "FLIP" magic, version 0, frame count, ms/frame, then per frame
+     * a 4-byte big-endian length + JPEG bytes.
+     */
+    private fun videoFlipbook(bytes: ByteArray): ByteArray? {
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(mediaDataSourceOf(bytes))
+            val durationMs = retriever
+                .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: return null
+            val hasAudio = retriever
+                .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"
+            if (hasAudio || durationMs !in 1..FLIPBOOK_MAX_DURATION_MS) return null
+            val count = (durationMs / 100).toInt().coerceIn(2, FLIPBOOK_MAX_FRAMES)
+            val frames = ArrayList<ByteArray>(count)
+            val stepUs = durationMs * 1000 / count
+            for (i in 0 until count) {
+                val frame = retriever.getFrameAtTime(
+                    i * stepUs, android.media.MediaMetadataRetriever.OPTION_CLOSEST
+                ) ?: continue
+                frames += scaledJpeg(frame, FLIPBOOK_MAX_DIMENSION)
+            }
+            if (frames.size < 2) return null
+            val out = java.io.ByteArrayOutputStream()
+            out.write("FLIP".toByteArray(Charsets.US_ASCII))
+            out.write(0) // version
+            out.write(frames.size)
+            out.write((durationMs / frames.size).toInt().beBytes())
+            frames.forEach { frame ->
+                out.write(frame.size.beBytes())
+                out.write(frame)
+            }
+            out.toByteArray()
+        } catch (e: Exception) {
+            null
+        } finally {
+            retriever.release()
+        }
+    }
+
+    private fun mediaDataSourceOf(bytes: ByteArray) = object : android.media.MediaDataSource() {
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            if (position >= bytes.size) return -1
+            val n = minOf(size, bytes.size - position.toInt())
+            System.arraycopy(bytes, position.toInt(), buffer, offset, n)
+            return n
+        }
+        override fun getSize(): Long = bytes.size.toLong()
+        override fun close() {}
+    }
+
+    private fun scaledJpeg(bitmap: Bitmap, maxDimension: Int): ByteArray {
+        val maxDim = maxOf(bitmap.width, bitmap.height)
+        val scaled = if (maxDim > maxDimension) Bitmap.createScaledBitmap(
+            bitmap,
+            bitmap.width * maxDimension / maxDim,
+            bitmap.height * maxDimension / maxDim,
+            true,
+        ) else bitmap
+        val output = java.io.ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.JPEG, DISPLAY_JPEG_QUALITY, output)
+        return output.toByteArray()
+    }
+
+    private fun Int.beBytes(): ByteArray = byteArrayOf(
+        (this shr 24).toByte(), (this shr 16).toByte(), (this shr 8).toByte(), this.toByte(),
+    )
+
+    /**
+     * First-frame thumbnail for a video attachment — the SDK has no video
+     * primitive, so videos render as a still. [MediaMetadataRetriever] reads
+     * the (already decrypted) bytes through an in-memory [android.media.MediaDataSource];
+     * the frame downscales + JPEGs on the same [compressImage] budget.
+     */
+    private fun videoThumbnail(bytes: ByteArray): ByteArray? {
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(mediaDataSourceOf(bytes))
+            val frame = retriever.getFrameAtTime(0L) ?: return null
+            val maxDim = maxOf(frame.width, frame.height)
+            var sample = 1
+            while (maxDim / (sample * 2) >= DISPLAY_MAX_DIMENSION) sample *= 2
+            val scaled = if (sample > 1) Bitmap.createScaledBitmap(
+                frame, frame.width / sample, frame.height / sample, true
+            ) else frame
+            val output = java.io.ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, DISPLAY_JPEG_QUALITY, output)
+            output.toByteArray()
+        } catch (e: Exception) {
+            null
+        } finally {
+            retriever.release()
+        }
     }
 
     suspend fun markRead(roomId: String, eventId: String) {
@@ -9923,9 +10046,12 @@ object MatrixRepository {
                 (content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note") to "audio"
             is RoomMessageEventContent.FileBased.Video ->
                 // A video (incl. WhatsApp animated GIFs, which arrive as
-                // m.video) renders as the "[Video]" marker — there's no
-                // playback — with its caption under it via [Message.caption].
-                "[Video]" to "text"
+                // m.video) renders as an image row fed by a server-side
+                // thumbnail frame ([videoThumbnail] via GetMessageMedia — no
+                // playback, the SDK has no video primitive); the tool tags
+                // the thumbnail "[Video]". The fallback label when the
+                // thumbnail can't fetch stays the body below.
+                "[Video]" to "video"
             is RoomMessageEventContent.FileBased.File ->
                 // RCS direct photos arrive as m.file with an image/* mimetype
                 // — render those as image rows so the
@@ -10350,6 +10476,9 @@ object MatrixRepository {
      */
     const val DISPLAY_MAX_DIMENSION = 1024
     const val DISPLAY_JPEG_QUALITY = 78
+    private const val FLIPBOOK_MAX_DURATION_MS = 15_000L
+    private const val FLIPBOOK_MAX_FRAMES = 10
+    private const val FLIPBOOK_MAX_DIMENSION = 640
     /** Longest side (px) of the compressed photo uploaded to the room. */
     const val SENT_PHOTO_MAX_DIMENSION = 2048
     const val SENT_PHOTO_JPEG_QUALITY = 85

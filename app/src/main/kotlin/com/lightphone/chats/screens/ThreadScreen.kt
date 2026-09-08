@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -109,18 +110,73 @@ private val chatsMediaCache = MutableStateFlow<Map<String, ByteArray>>(emptyMap(
  * insertion-order, fine for a handful of photos; ponytail: LRU if the count
  * ever matters).
  */
+internal class DecodedBitmap(val bitmap: ImageBitmap, val fromFlipbook: Boolean)
+
 internal object chatsBitmapCache {
-    private val map = java.util.concurrent.ConcurrentHashMap<String, ImageBitmap>()
+    private val map = java.util.concurrent.ConcurrentHashMap<String, DecodedBitmap>()
     private const val MAX_ENTRIES = 4
 
-    fun get(eventId: String): ImageBitmap? = map[eventId]
+    fun get(eventId: String): DecodedBitmap? = map[eventId]
 
-    fun put(eventId: String, bitmap: ImageBitmap) {
+    fun put(eventId: String, decoded: DecodedBitmap) {
         if (map.size >= MAX_ENTRIES && !map.containsKey(eventId)) {
             map.remove(map.keys.first())
         }
-        map[eventId] = bitmap
+        map[eventId] = decoded
     }
+}
+
+/** Parser for the companion's video-flipbook container ("FLIP" magic — see
+ *  MatrixRepository.videoFlipbook): animated WhatsApp GIFs arrive as silent
+ *  short mp4 loops, and the companion packs ~10fps extracted JPEG frames
+ *  ("FLIP", version 0, frame count, ms/frame, then 4-byte length + JPEG per
+ *  frame). Plain JPEGs / raw gifs parse null — callers fall back to
+ *  BitmapFactory. */
+internal object chatsFlipbook {
+    /** Returns ms/frame, or null when [bytes] isn't a flipbook container. */
+    private fun header(bytes: ByteArray): Int? {
+        if (bytes.size < 14) return null
+        if (bytes[0] != 'F'.code.toByte() || bytes[1] != 'L'.code.toByte() ||
+            bytes[2] != 'I'.code.toByte() || bytes[3] != 'P'.code.toByte() ||
+            bytes[4] != 0.toByte()
+        ) return null
+        val count = bytes[5].toInt() and 0xFF
+        val ms = readInt(bytes, 6)
+        return if (count >= 2 && ms > 0) ms else null
+    }
+
+    /** All frames — the fullscreen viewer animates these. */
+    fun parse(bytes: ByteArray): Pair<List<ImageBitmap>, Int>? {
+        val frameMs = header(bytes) ?: return null
+        val count = bytes[5].toInt() and 0xFF
+        val frames = ArrayList<ImageBitmap>(count)
+        var pos = 10
+        repeat(count) {
+            if (pos + 4 > bytes.size) return null
+            val len = readInt(bytes, pos)
+            pos += 4
+            if (len <= 0 || pos + len > bytes.size) return null
+            BitmapFactory.decodeByteArray(bytes, pos, len)
+                ?.asImageBitmap()?.let { frames.add(it) }
+            pos += len
+        }
+        return if (frames.size >= 2) frames to frameMs else null
+    }
+
+    /** Frame 0 only — the thread row's static still (skips the other frames).
+     *  Flagged `fromFlipbook = true` so callers can treat these as gifs. */
+    fun firstFrame(bytes: ByteArray): DecodedBitmap? {
+        if (header(bytes) == null) return null
+        val len = readInt(bytes, 10)
+        return if (len in 1..bytes.size - 14)
+            BitmapFactory.decodeByteArray(bytes, 14, len)
+                ?.asImageBitmap()?.let { DecodedBitmap(it, true) }
+        else null
+    }
+
+    private fun readInt(b: ByteArray, off: Int) =
+        ((b[off].toInt() and 0xFF) shl 24) or ((b[off + 1].toInt() and 0xFF) shl 16) or
+            ((b[off + 2].toInt() and 0xFF) shl 8) or (b[off + 3].toInt() and 0xFF)
 }
 
 /**
@@ -1263,7 +1319,7 @@ class ThreadScreen(
         // bytes arrive (instead of only when each row composes and fetches).
         LaunchedEffect(messages) {
             messages.asReversed()
-                .filter { it.contentType == "image" }
+                .filter { it.contentType == "image" || it.contentType == "video" }
                 .take(MEDIA_PREFETCH_COUNT)
                 .forEach { viewModel.ensureMedia(it.id, downloadOverMobile) }
         }
@@ -1430,7 +1486,13 @@ class ThreadScreen(
                                             onOpenContext = { contextMessage = it },
                                             onOpenImage = { bytes ->
                                                 navigateTo(screenFactory = {
-                                                    FullscreenImageScreen(it, room.id, row.message.id, bytes)
+                                                    FullscreenImageScreen(
+                                                        it, room.id, row.message.id, bytes,
+                                                        // Videos: the viewer shows the still
+                                                        // thumbnail (no playback, no SAVE —
+                                                        // it would save the thumbnail frame).
+                                                        video = row.message.contentType == "video",
+                                                    )
                                                 })
                                             },
                                         )
@@ -2053,6 +2115,10 @@ private fun MessageRow(
                 ForwardedMediaRow(message, caption = message.caption) {
                     ImageMessageContent(message, media, onOpenImage, contextGesture)
                 }
+            } else if (message.contentType == "video") {
+                ForwardedMediaRow(message, caption = message.caption) {
+                    ImageMessageContent(message, media, onOpenImage, contextGesture)
+                }
             } else if (message.contentType == "audio") {
                 ForwardedMediaRow(message, caption = message.caption) {
                     AudioMessageContent(
@@ -2325,7 +2391,7 @@ private fun ForwardedMediaRow(
 private fun ImageMessageContent(
     message: LightServiceMethod.GetMessages.Message,
     media: MediaState,
-    onOpenImage: (ByteArray) -> Unit,
+    onOpenImage: ((ByteArray) -> Unit)?,
     onOpenContext: (() -> Unit)?,
 ) {
     // The toggle is part of the key: flipping "Mobile data downloads" (or
@@ -2338,14 +2404,20 @@ private fun ImageMessageContent(
     // process-wide [chatsBitmapCache]: returning from the fullscreen viewer
     // re-enters this composition, and re-decoding started from a null frame
     // (a "[Photo]" flash before the image popped back in).
-    val bitmap by produceState<ImageBitmap?>(chatsBitmapCache.get(message.id), bytes) {
+    val bitmap by produceState<DecodedBitmap?>(chatsBitmapCache.get(message.id), bytes) {
         if (bytes != null && value == null) {
             value = withContext(Dispatchers.Default) {
-                bytes.let { BitmapFactory.decodeByteArray(it, 0, it.size).asImageBitmap() }
+                // Flipbook containers (WhatsApp GIFs) render their first
+                // frame here; plain JPEGs/gifs decode whole. The flag drives
+                // the row's [Video] tag (gifs don't carry it).
+                chatsFlipbook.firstFrame(bytes)
+                    ?: BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        ?.asImageBitmap()?.let { DecodedBitmap(it, false) }
             }?.also { chatsBitmapCache.put(message.id, it) }
         }
     }
-    val image = bitmap
+    val decoded = bitmap
+    val image = decoded?.bitmap
     // Gesture callbacks stay fresh across recompositions (the text rows'
     // rememberUpdatedState lesson): the pointerInput keys below never change,
     // so without this the captured lambdas kept the first-composed snapshot.
@@ -2373,18 +2445,24 @@ private fun ImageMessageContent(
         contentDescription = message.body,
         contentScale = ContentScale.Fit,
         modifier = Modifier
-            // Sized to the photo's own aspect rather than stretched to the row
-            // width: a tall photo caps at MAX_IMAGE_HEIGHT_DP and hugs the
-            // sender's edge via the row's End/Start alignment — no centered
-            // side-bars beside portrait shots.
-            .heightIn(max = MAX_IMAGE_HEIGHT_DP)
+            .then(
+                // Videos size to the bitmap's own aspect (capped 240 dp) — a
+                // fixed-width box letterboxed the content and read as
+                // centred; wrap-content hugs the sender's edge like photos.
+                // Photos keep the intrinsic-size + height-cap rule.
+                if (message.contentType == "video") {
+                    val ratio = image.width.toFloat() / image.height.coerceAtLeast(1)
+                    if (ratio >= 1f) Modifier.width(240.dp).height(MAX_IMAGE_HEIGHT_DP / ratio)
+                    else Modifier.width((MAX_IMAGE_HEIGHT_DP * ratio)).height(MAX_IMAGE_HEIGHT_DP)
+                } else Modifier.heightIn(max = MAX_IMAGE_HEIGHT_DP)
+            )
             .padding(top = 1.dp)
             // Tap opens the viewer; long-press opens the context window — the old lightClickable tap-only target
             // can't carry the long-press. The haptic fires on the trigger, not
             // on finger-down (the Phone tool's half-panel grammar).
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = { currentOnOpenImage(bytes) },
+                    onTap = { currentOnOpenImage?.invoke(bytes) },
                     // A long-press consumes the gesture — no viewer open.
                     onLongPress = {
                         buzz()
@@ -2393,6 +2471,17 @@ private fun ImageMessageContent(
                 )
             },
     )
+    // Video rows carry a "[Video]" tag under the content — same grammar as
+    // the caption rows — except flipbook rows (WhatsApp GIFs): they're gifs,
+    // not videos. Tap opens the viewer (the flipbook animates there; no
+    // SAVE — it would save a thumbnail frame).
+    if (message.contentType == "video" && decoded?.fromFlipbook != true) {
+        LightText(
+            text = "[Video]",
+            variant = LightTextVariant.Paragraph,
+            modifier = Modifier.padding(top = 1.dp),
+        )
+    }
 }
 
 /** A voice-note row: a play/pause icon + label, tapped to toggle playback in
