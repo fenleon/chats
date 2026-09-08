@@ -2,7 +2,9 @@ package com.lightphone.chats.server
 
 import com.thelightphone.sdk.shared.LightResult
 import com.thelightphone.sdk.shared.LightServiceMethod
+import com.thelightphone.sdk.shared.lightJson
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.Serializable
 
 /**
  * Implements the Chats methods on the companion's LightSdkService. These are
@@ -273,6 +275,19 @@ object ChatServiceMethods {
                     LightServiceMethod.WaitForChange.Response(revision)
                 }
 
+                // Clipboard (no SDK method — chats-local contract for external
+                // tooling; the tool calls ChatsClipboard directly, NO-SEAM).
+                "Clipboard.Get" -> {
+                    val response = ClipboardGetResponse(ChatsClipboard.getText())
+                    LightResult.Success(lightJson.encodeToString(ClipboardGetResponse.serializer(), response))
+                }
+
+                "Clipboard.Set" -> {
+                    val request = lightJson.decodeFromString(ClipboardSetRequest.serializer(), payload!!)
+                    ChatsClipboard.setText(request.text)
+                    LightResult.Success("{}")
+                }
+
                 else -> LightResult.Error(
                     LightResult.ErrorCode.Unknown,
                     "unknown method: $methodId",
@@ -347,3 +362,9 @@ object ChatServiceMethods {
         )
     }
 }
+
+@Serializable
+private data class ClipboardGetResponse(val text: String? = null)
+
+@Serializable
+private data class ClipboardSetRequest(val text: String)

@@ -28,6 +28,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.lightphone.chats.ChatClient
 import com.lightphone.chats.R
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightText
@@ -118,20 +119,32 @@ fun ContextWindowOverlay(
             // the row, rows sharing the panel height (centered vertically),
             // instead of the left-aligned Heading list rows.
             ContextLevel.Actions -> {
-                val rows: List<Pair<String, () -> Unit>> = when {
-                    // Own message: the message controls, each only while the
-                    // row still allows it (bridge caps / window).
-                    message.isMine -> buildList {
-                        if (message.canEdit) add("EDIT" to { onEdit(); onDismiss() })
-                        if (message.canUnsend) add("UNSEND" to { onUnsend(); onDismiss() })
+                // Media rows carry a "[Photo]"/"[Video]" marker in the body,
+                // the real text in the caption (the row renders it under the
+                // media) — copy the caption then, the body otherwise.
+                val copyText = message.caption
+                    ?.takeIf { message.body.startsWith("[") && message.body.endsWith("]") }
+                    ?: message.body
+                val rows: List<Pair<String, () -> Unit>> = buildList {
+                    // COPY first, on any message with text — copies the plain text.
+                    if (copyText.isNotBlank()) {
+                        add("COPY" to { ChatClient.copyToClipboard(copyText); onDismiss() })
                     }
-                    ownReaction == null -> buildList {
-                        add("LIKE" to { onLike(); onDismiss() })
-                        add("REACT" to { level = ContextLevel.Reactions })
-                    }
-                    else -> buildList {
-                        add("EDIT REACTION" to { level = ContextLevel.Reactions })
-                        add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
+                    when {
+                        // Own message: the message controls, each only while the
+                        // row still allows it (bridge caps / window).
+                        message.isMine -> {
+                            if (message.canEdit) add("EDIT" to { onEdit(); onDismiss() })
+                            if (message.canUnsend) add("UNSEND" to { onUnsend(); onDismiss() })
+                        }
+                        ownReaction == null -> {
+                            add("LIKE" to { onLike(); onDismiss() })
+                            add("REACT" to { level = ContextLevel.Reactions })
+                        }
+                        else -> {
+                            add("EDIT REACTION" to { level = ContextLevel.Reactions })
+                            add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
+                        }
                     }
                 }
                 Column(

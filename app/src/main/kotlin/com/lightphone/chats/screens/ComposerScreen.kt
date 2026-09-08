@@ -10,7 +10,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -166,6 +168,13 @@ class ComposerScreen(
             val text = textState.text.toString()
             if (text.isEmpty()) composerDrafts.remove(roomId) else composerDrafts[roomId] = text
         }
+        // Paste offer (v1): the clipboard is read once on entry — never
+        // re-checked on recomposition — and only for an empty draft. The row
+        // hides itself once tapped or once the draft is no longer empty.
+        var pasteText by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(Unit) {
+            if (editTarget == null && textState.text.isEmpty()) pasteText = ChatClient.clipboardText()
+        }
 
         LightTheme(colors = themeColors) {
             Box(modifier = Modifier.fillMaxSize()) {
@@ -193,6 +202,25 @@ class ComposerScreen(
                     topBarSubmitIcon = LightIcons.SEND,
                     initialCaps = true,
                 )
+                // Paste row, above the input (the keyboard reserves the 5-gu
+                // bottom-bar row below the keys; the empty draft's first line
+                // sits at ~2 gu above it). Only while the draft is still empty.
+                pasteText?.let { paste ->
+                    if (textState.text.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .imePadding()
+                                .padding(start = 1f.gridUnitsAsDp(), bottom = 7f.gridUnitsAsDp())
+                                .lightClickable {
+                                    textState.edit { append(paste) }
+                                    pasteText = null
+                                },
+                        ) {
+                            LightText(text = "Paste", variant = LightTextVariant.Superfine)
+                        }
+                    }
+                }
                 // Quiet failure line (same grammar as the thread's row error):
                 // a rejected send/edit shows here instead of reading as an
                 // eternal "sending". Cleared on the next send attempt.

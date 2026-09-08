@@ -1,5 +1,6 @@
 package com.lightphone.chats
 
+import com.lightphone.chats.server.ChatsClipboard
 import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.callRemoteServiceMethod
 import com.thelightphone.sdk.shared.LightServiceMethod
@@ -267,4 +268,13 @@ object ChatClient {
             LightServiceMethod.WaitForChange,
             LightServiceMethod.WaitForChange.Request("status", null, lastSeen, timeoutMs),
         ).getOrNull()?.revision ?: lastSeen
+
+    /** Copies [text] to the Android clipboard (context window COPY row). */
+    fun copyToClipboard(text: String) {
+        runCatching { ChatsClipboard.setText(text) }
+    }
+
+    /** The clipboard's text, or null when it holds no readable text. */
+    fun clipboardText(): String? =
+        runCatching { ChatsClipboard.getText() }.getOrNull()?.takeIf { it.isNotBlank() }
 }

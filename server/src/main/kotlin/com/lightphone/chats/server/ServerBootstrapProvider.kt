@@ -123,6 +123,9 @@ class ServerBootstrapProvider : ContentProvider() {
         }
         // Relay hardware keys + user preferences to LightOS (PLATFORM-RELAY).
         PlatformRelay.bind(context)
+        // Clipboard read/write for the tool's copy/paste (context window COPY,
+        // composer Paste).
+        ChatsClipboard.bind(context)
         // Dev probe: register a UP app instance against LightOS's distributor
         // to capture the standard push endpoint (the "other socket" vs the
         // mollysocket URI). Delayed so it runs after the SDK's Application
