@@ -40,34 +40,33 @@ import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Contacts (2026-08-29): the main list's bottom-middle CONTACTS icon opens
+ * Contacts: the main list's bottom-middle CONTACTS icon opens
  * this — every chat, alphabetically, under Direct/Group tabs styled like the
  * Radio tool's Stations panel (Favourites/Recent). Direct is the default tab:
  * it dedupes by contact id (a person with several threads appears once, as
  * their newest room); Group lists every non-direct room. Archived rooms
  * appear in whichever tab their direct/group flag lands them in. The panel
- * is seeded from the chat list's active network filter (2026-08-30): opened
+ * is seeded from the chat list's active network filter: opened
  * from All it shows every contact (title "All Contacts", network name as each
  * row's subtext — trial feature); opened from WhatsApp only that network's
  * rooms (title "WhatsApp Contacts", no subtext). SEARCH top-right filters the ACTIVE
  * tab's list (an in-panel query, not the room search): the editor title is
  * "Search All Contacts"/"Search {Network} Contacts" with the SEARCH icon, and the panel
- * title shows the searched term in quotes while a query is active
- * (feedback 2026-09-01). Tapping a row
+ * title shows the searched term in quotes while a query is active.
+ * Tapping a row
  * opens that thread; back from the thread pops the contacts list too,
- * landing on the main list (the SearchScreen pattern, feedback 2026-08-22).
+ * landing on the main list (the SearchScreen pattern).
  */
 class ContactsViewModel(
     /** The chat list's active network filter (null = all networks). */
     private val network: String? = null,
     /** The census the panel was opened from — seeds the first frame so the
      *  panel renders instantly instead of flashing the empty state while the
-     *  first GetRooms round-trips (feedback 2026-09-01). */
+     *  first GetRooms round-trips. */
     seedRooms: List<LightServiceMethod.GetRooms.Room> = emptyList(),
 ) : LightViewModel<Unit>() {
 
@@ -90,7 +89,6 @@ class ContactsViewModel(
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
-        refreshRooms()
         startPolling()
     }
 
@@ -99,17 +97,12 @@ class ContactsViewModel(
         stopPolling()
     }
 
-    /** Re-fetches the census while the panel stays open (a cold process can
-     *  answer the first call with an empty list while the companion's
-     *  resolver seeds — the poll fills the panel in, same as the main list). */
+    /** The live census (NO-SEAM — the revision-wait poll is
+     *  gone): the repository's roomList flow fills and keeps the panel
+     *  current while it is open (see [collectRoomCensus]). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
-        pollJob = viewModelScope.launch {
-            while (true) {
-                delay(POLL_INTERVAL_MS)
-                refreshRooms()
-            }
-        }
+        pollJob = collectRoomCensus(viewModelScope, rooms)
     }
 
     private fun stopPolling() {
@@ -117,15 +110,11 @@ class ContactsViewModel(
         pollJob = null
     }
 
-    private fun refreshRooms() {
-        viewModelScope.launch { rooms.value = ChatClient.getAllRooms() }
-    }
-
     /** The active tab's rows, alphabetically: DIRECT dedupes by contact id
      *  (the first room of each group is the newest for that person); GROUP
      *  lists every non-direct room. A non-blank query keeps only matching
      *  names. The network filter (null = all) applies first, so contacts
-     *  opened from WhatsApp show only WhatsApp rooms (2026-08-30). [rooms],
+     *  opened from WhatsApp show only WhatsApp rooms. [rooms],
      *  [tab] and [query] are passed in from the screen's collected state —
      *  reading the flows' .value directly never recomposes when they change. */
     fun entries(
@@ -154,17 +143,14 @@ class ContactsViewModel(
             }
     }
 
-    private companion object {
-        /** Panel refresh cadence — matches the main list's poll. */
-        const val POLL_INTERVAL_MS = 5_000L
-    }
+    private companion object
 }
 
 class ContactsScreen(
     sealedActivity: SealedLightActivity,
     /** The chat list's active network filter (null = all networks) — the
      *  starting point matters: opened from All the panel lists every contact,
-     *  from WhatsApp only WhatsApp rooms (2026-08-30). */
+     *  from WhatsApp only WhatsApp rooms. */
     private val network: String? = null,
     /** The census the panel was opened from — seeds the first frame (see
      *  [ContactsViewModel]). */
@@ -196,11 +182,10 @@ class ContactsScreen(
                         onClick = { goBack() },
                         contentDescription = "Back to chats",
                     ),
-                    // Title grammar (2026-08-30): the active search shows the
-                    // searched term in quotes (feedback 2026-09-01); otherwise
+                    // Title grammar: the active search shows the
+                    // searched term in quotes; otherwise
                     // the network the panel was opened from ("WhatsApp
-                    // Contacts"), or "All Contacts" from All (feedback
-                    // 2026-09-01).
+                    // Contacts"), or "All Contacts" from All.
                     center = LightTopBarCenter.Text(
                         when {
                             query.isNotBlank() -> "'$query'"
@@ -245,9 +230,7 @@ class ContactsScreen(
                             items(entries, key = { it.key }) { contact ->
                                 // The community's own room (announcement room)
                                 // is named after the community — showing the
-                                // community subtag there repeats the name
-                                // (LP3 2026-09-01: "BERLIN SCENE LAB" read
-                                // "WhatsApp · BERLIN SCENE LAB").
+                                // community subtag there repeats the name.
                                 val community = contact.room.community?.takeUnless {
                                     it.equals(contact.room.name, ignoreCase = true)
                                 }
@@ -263,14 +246,13 @@ class ContactsScreen(
                                     ).takeIf { !it.isNullOrBlank() }
                                 ContactRow(
                                     contact = contact,
-                                    // Subtext grammar (2026-09-01): from All the
+                                    // Subtext grammar: from All the
                                     // row reads "{Network} · {id}" (network alone
                                     // when the id hasn't resolved yet); inside a
                                     // network's own panel just the id — the
                                     // network would repeat. Groups with no id
                                     // show their community name in the id slot
-                                    // (WhatsApp community groups, feedback
-                                    // 2026-09-01).
+                                    // (WhatsApp community groups).
                                     subtext = subtext,
                                     onOpen = { openThread(contact) },
                                 )
@@ -292,8 +274,8 @@ class ContactsScreen(
         // The query editor reuses the account screen's field editor: LP3
         // keyboard, no emoji/return/voice, SEARCH submits. Empty clears the
         // filter; backing out without submitting keeps the previous query.
-        // Title grammar (2026-08-30): "Search All Contacts" from All, "Search
-        // {Network} Contacts" inside a network (feedback 2026-09-01); the
+        // Title grammar: "Search All Contacts" from All, "Search
+        // {Network} Contacts" inside a network; the
         // SEARCH button is now the search icon.
         navigateTo(
             screenFactory = {
@@ -366,12 +348,11 @@ private fun identifierOf(contact: ContactsViewModel.Contact): String? =
     contactIdentifier(contact.room.contactId, contact.room.name, contact.room.contactPhone)
 
 /** A contact row: the name, Heading, with the id — and the network when the
- *  panel was opened from All — as a light subtext line (2026-08-30 trial,
- *  extended 2026-09-01: the id joined the network in the subtext). The
+ *  panel was opened from All — as a light subtext line. The
  *  leading inset (1.75 gu) sits the name where the room list's names land —
  *  the contacts rows have no unread-star column, so the 2.75-gu padding the
  *  search rows need to align with the starred list would float the names
- *  clear of the edge (feedback 2026-09-01: too much buffer). */
+ *  clear of the edge. */
 @Composable
 private fun ContactRow(
     contact: ContactsViewModel.Contact,
@@ -396,9 +377,7 @@ private fun ContactRow(
             overflow = TextOverflow.Ellipsis,
         )
         if (subtext != null) {
-            // The id/network line, Superfine — smaller than the room name
-            // (feedback 2026-08-30: subtext was too big; 2026-09-01: Detail
-            // still too big).
+            // The id/network line, Superfine — smaller than the room name.
             LightText(
                 text = subtext,
                 variant = LightTextVariant.Superfine,

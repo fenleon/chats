@@ -45,7 +45,7 @@ private const val MAX_THUMB_FRACTION = 0.85f
 /** Accumulates the heights of every distinct laid-out item so the row-height
  *  average converges to the true mean. The visible-only snapshot is a biased
  *  sample — a too-short estimate made the thumb pin at the top of long
- *  threads and never reflect older pages loading in (feedback 2026-08-17). */
+ *  threads and never reflect older pages loading in. */
 internal class HeightSampler {
     private val seen = HashSet<Int>()
     private var sum = 0.0
@@ -77,9 +77,7 @@ internal class ThreadListMetrics(
     /** Display offset for the reverse-layout track: 0 = the oldest end, max =
      *  the newest end. [scrollPx] is the position from the newest end, so the
      *  thumb sits at the bottom of the track at the newest message and at the
-     *  top at the oldest (feedback 2026-08-17: the old offset-based position
-     *  read viewport-relative values in this Compose version and froze the
-     *  thumb at the track bottom). */
+     *  top at the oldest. */
     val displayScrollPx: Float get() = maxScrollPx - scrollPx
 }
 
@@ -100,8 +98,7 @@ internal fun LazyListState.threadListMetrics(sampler: HeightSampler): ThreadList
     val maxScrollPx = (totalContentPx - viewportHeightPx).coerceAtLeast(0f)
     // Position from the newest end, in items: the lowest visible index (the
     // row at the viewport's bottom edge in reverseLayout). Item `offset` is
-    // viewport-relative in this Compose version (verified 2026-08-17: the
-    // bottom-edge item reads ~0 regardless of scroll depth), so the scroll
+    // viewport-relative in this Compose version, so the scroll
     // position comes from the index, converted to px via the sampled average.
     // Index 0 (newest) visible → 0 → thumb at the track bottom; the oldest
     // end reads ≈ maxScrollPx → thumb at the top.

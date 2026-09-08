@@ -6,6 +6,8 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.time.format.TextStyle
+import java.util.Locale
 
 /**
  * Relative timestamp for room rows: 24-hour time of day for today ("14:02" —
@@ -28,17 +30,11 @@ fun formatRelativeTimestamp(timestampMs: Long): String {
     return when {
         date == today -> dateTime.toLocalTime().format(ROW_TIME_FORMAT)
         date == today.minusDays(1) -> "Yest"
-        date.isAfter(today.minusDays(7)) -> SHORT_DAY_NAMES[date.dayOfWeek.value - 1]
+        date.isAfter(today.minusDays(7)) -> date.dayOfWeek.getDisplayName(TextStyle.SHORT, Locale.US)
         date.year == today.year -> date.format(MONTH_DAY_FORMAT)
         else -> date.format(MONTH_YEAR_FORMAT)
     }
 }
-
-/** Full capitalized weekday names (ISO: Monday=1 … Sunday=7), for thread day tags. */
-private val DAY_NAMES = arrayOf("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-
-/** Short capitalized weekday names (ISO: Monday=1 … Sunday=7), for room rows. */
-private val SHORT_DAY_NAMES = arrayOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 /**
  * Timestamp for a message row in the thread: the time plus a day tag when the
@@ -59,7 +55,7 @@ fun formatMessageTime(timestampMs: Long): String {
     val tag = when {
         date == today -> null
         date == today.minusDays(1) -> "Yesterday"
-        date.isAfter(today.minusDays(7)) -> DAY_NAMES[date.dayOfWeek.value - 1]
+        date.isAfter(today.minusDays(7)) -> date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.US)
         date.year == today.year -> date.format(MONTH_DAY_FORMAT)
         else -> date.format(MONTH_DAY_YEAR_FORMAT)
     }
@@ -78,7 +74,7 @@ fun dayOf(timestampMs: Long): LocalDate =
  * 1 (US/Canada, 1 + 10), 2 (Germany/France/…, 2 + 9..11), else 3. Non-phone
  * strings pass through unchanged.
  */
-fun formatBridgePhone(raw: String): String {
+private fun formatBridgePhone(raw: String): String {
     val digits = raw.trim().removePrefix("+").filter { it.isDigit() }
     if (digits.length < 10) return raw
     val ccLen = when {

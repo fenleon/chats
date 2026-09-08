@@ -24,8 +24,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
- * Push-based wake-up for the companion (2026-08-16, chats/push/README.md).
- *
+ * Push-based wake-up for the companion.
  * The sync loop is the delivery mechanism for notifications, but only as
  * often as it polls. Matrix HTTP pushers fix the latency: the homeserver
  * gets a pusher whose `data.url` is an endpoint that serves the exact path
@@ -39,10 +38,8 @@ import java.util.concurrent.TimeUnit
  * [MatrixRepository.onPushDelivered] — a single syncOnce round while idle,
  * which the existing notification watcher turns into the local
  * notification.
- *
  * No tokens leave the phone: the payload carries no message content or keys —
  * push is a wake-up signal only.
- *
  * Two URLs are stored separately because one side sees the gateway from the
  * phone and the other from the homeserver: the notify URL must be public
  * (Beeper POSTs from their servers), while the SSE URL is whatever the phone
@@ -114,7 +111,7 @@ object PushChannel {
         var notifyUrl = prefs.getString(KEY_NOTIFY_URL, null)
         var key = prefs.getString(KEY_PUSHKEY, null)
         if (sseUrl == null || notifyUrl == null || key == null) {
-            // Auto-provision an ntfy.sh channel (2026-08-17): one random
+            // Auto-provision an ntfy.sh channel: one random
             // topic derives the pushkey (ntfy routes by it), the SSE stream
             // the phone holds, and the notify URL (ntfy's Matrix gateway
             // serves the required path). The topic is a per-install bearer
@@ -278,7 +275,7 @@ object PushChannel {
      * always wake one sync. Counts-only payloads (Beeper's read-receipt /
      * unread-count updates) still wake, but [MatrixRepository.onPushDelivered]
      * rate-limits them — a group chat's read actions must not each run a full
-     * ~30-50 s syncOnce (battery 2026-08-17 audit).
+     * ~30-50 s syncOnce.
      */
     private suspend fun onNotification(json: String) {
         val outer = runCatching { Json { ignoreUnknownKeys = true }.parseToJsonElement(json).jsonObject }

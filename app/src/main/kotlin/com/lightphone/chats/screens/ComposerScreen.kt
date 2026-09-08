@@ -36,7 +36,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Unsent composer drafts, keyed by room id (feedback 2026-08-22): leaving the
+ * Unsent composer drafts, keyed by room id: leaving the
  * composer mid-draft restores the text on return — thread → list → thread —
  * until it's sent or cleared. Process-scoped; a restart starts empty.
  */
@@ -55,7 +55,7 @@ data class ComposerResult(
 
 class ComposerViewModel(
     private val roomId: String,
-    /** When set (Phase C, 2026-09-03), the composer EDITS this message:
+    /** When set, the composer EDITS this message:
      *  SEND routes to [ChatClient.editMessage] and pops back with the edit
      *  result instead of sending a new message. */
     private val editTarget: LightServiceMethod.GetMessages.Message? = null,
@@ -120,7 +120,7 @@ class ComposerViewModel(
             } finally {
                 // A failed/exception RPC must not leave the busy flag set —
                 // every later press would silently return and Send would look
-                // dead (feedback 2026-08-17: "send needs multiple presses").
+                // dead.
                 ChatClient.setTyping(roomId, false)
                 busy.value = false
             }
@@ -148,17 +148,16 @@ class ComposerScreen(
         // The LP3 keyboard's mic key is handled inside the closed light-keyboard
         // library (it needs a speech-recognition service, which LightOS doesn't
         // ship) — it does nothing here. Voice notes have their own button on
-        // the thread (Phase 14), so hide the dead key instead of showing a
-        // control that can't act. The return key stays (feedback 2026-08-20:
-        // it was removed at the send-round, then the user wanted it back) —
+        // the thread, so hide the dead key instead of showing a
+        // control that can't act. The return key stays —
         // it inserts a newline rather than sending (submitOnReturn = false):
         // messages may span lines, and SEND lives in the top bar.
         val keyboardOptionsFlow = remember {
             MutableStateFlow(defaultKeyboardOptions().copy(displayVoice = false, displayReturn = true))
         }
-        // Restore the room's unsent draft (feedback 2026-08-22); the composer
+        // Restore the room's unsent draft; the composer
         // saves every change back to [composerDrafts] so leaving mid-draft
-        // keeps the text until it's sent or cleared. An edit (Phase C)
+        // keeps the text until it's sent or cleared. An edit
         // prefills the row's body instead and never touches the draft — a
         // cancelled edit must not leak into the next normal composer.
         val textState = rememberTextFieldState(editTarget?.body ?: composerDrafts[roomId] ?: "")
@@ -183,12 +182,10 @@ class ComposerScreen(
                     submitIcon = LightIcons.SEND,
                     // Notes-style entry (feedback pass): small wrapping text
                     // anchored at the bottom, growing upward, keyboard flush at
-                    // the bottom; the return key makes newlines, not sends
-                    // (feedback 2026-08-20). Send lives in the top-right bar.
+                    // the bottom; the return key makes newlines, not sends.
+                    // Send lives in the top-right bar.
                     // The keyboard opens in caps mode — a new message starts
-                    // with a capital letter like the native composer
-                    // (feedback 2026-08-20: "compose … ensure the keyboard is
-                    // capitalised mode").
+                    // with a capital letter like the native composer.
                     singleLine = false,
                     submitOnReturn = false,
                     bottomAligned = true,
@@ -198,8 +195,7 @@ class ComposerScreen(
                 )
                 // Quiet failure line (same grammar as the thread's row error):
                 // a rejected send/edit shows here instead of reading as an
-                // eternal "sending" (LP3 2026-09-04: the 403'd edit stalled
-                // silently). Cleared on the next send attempt.
+                // eternal "sending". Cleared on the next send attempt.
                 viewModel.error.collectAsState().value?.let { message ->
                     LightText(
                         text = message,
@@ -210,19 +206,11 @@ class ComposerScreen(
                             .padding(start = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp()),
                     )
                 }
-                // Clear-draft X, bottom-right corner of the screen (feedback
-                // 2026-08-21: the old 218 dp-above-keyboard position overlapped
-                // the draft's last line; the first bottom-right attempt
-                // overlapped the keyboard's bottom row). The composer keyboard
+                // Clear-draft X, bottom-right corner of the screen. The composer keyboard
                 // (submitInTopBar) reserves the 5-gu bottom-bar row below the
                 // keys, so the X sits in that row at the far right, vertically
-                // centered like a native bottom-bar icon (LP3-verified
-                // 2026-08-22: the doubled 1-gu outer + 1-gu inner padding put
-                // the icon 2 gu off the bottom, leaving a big buffer under it;
-                // the inner padding is horizontal-only now, so the icon lands
-                // at y 1120-1200 — the native bar-icon band). Always visible
-                // while the composer is open (feedback 2026-08-21: the X was
-                // gated on text, so it appeared only after typing); with an
+                // centered like a native bottom-bar icon. Always visible
+                // while the composer is open; with an
                 // empty draft it's a harmless no-op.
                 Box(
                     modifier = Modifier

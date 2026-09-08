@@ -42,21 +42,19 @@ import com.thelightphone.sdk.ui.defaultKeyboardOptions
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Chat search (feedback 2026-08-21): replaces the room list's VIEW UNREAD
+ * Chat search: replaces the room list's VIEW UNREAD
  * toggle. Type a query (the LP3 keyboard, no emoji/mic/return rows — the
  * search action lives in the keyboard's bottom zone, DESIGN.md §16), tap the
  * SEARCH icon, and the results view lists matching rooms alphabetically. A
  * 1-character query matches; an empty search lists every chat. Results are
  * DIRECT chats by default — the bottom-middle "VIEW ALL" toggle reveals
- * groups + archived rooms (2026-08-28). The chat list's active network
+ * groups + archived rooms. The chat list's active network
  * filter (all / WhatsApp / Instagram) carries into the search. Selecting a
  * row opens that room's thread.
- *
  * Two views like the radio SearchScreen (radio/.../SearchScreen.kt): a
  * typing view and a results view. [SearchViewModel.showResults] lives in the
  * view model so the results view survives the thread round-trip (the
@@ -82,9 +80,6 @@ class SearchViewModel(
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
-        // Refresh the room set (also on return from a thread — a new chat may
-        // have arrived); the results list keeps its current rows meanwhile.
-        refreshRooms()
         startPolling()
     }
 
@@ -93,26 +88,18 @@ class SearchViewModel(
         stopPolling()
     }
 
-    /** Re-fetches the census while the screen stays open (a cold process can
-     *  answer the first call with an empty list while the companion's
-     *  resolver seeds — the poll fills the results in, same as the main list). */
+    /** The live census (NO-SEAM — the revision-wait poll is
+     *  gone): the repository's roomList flow fills and keeps the results
+     *  current while the screen is open (see [collectRoomCensus]; no
+     *  preview/unread on search rows). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
-        pollJob = viewModelScope.launch {
-            while (true) {
-                delay(POLL_INTERVAL_MS)
-                refreshRooms()
-            }
-        }
+        pollJob = collectRoomCensus(viewModelScope, rooms)
     }
 
     private fun stopPolling() {
         pollJob?.cancel()
         pollJob = null
-    }
-
-    private fun refreshRooms() {
-        viewModelScope.launch { rooms.value = ChatClient.getAllRooms() }
     }
 
     fun updateQuery(newQuery: String) {
@@ -122,10 +109,10 @@ class SearchViewModel(
     /**
      * Matching rooms, alphabetically: a blank query matches everything.
      * VIEW DIRECT by default (direct, non-archived chats); VIEW ALL includes
-     * groups + archived rooms (2026-08-28). The chat list's active network
+     * groups + archived rooms. The chat list's active network
      * filter (all / WhatsApp / Instagram) applies. [rooms] is passed in from
      * the screen's collected state — reading the flow's .value directly
-     * would never recompose when the fetch lands (2026-08-30).
+     * would never recompose when the fetch lands.
      */
     fun matchingRooms(rooms: List<LightServiceMethod.GetRooms.Room>): List<LightServiceMethod.GetRooms.Room> {
         val q = query.value.trim()
@@ -138,10 +125,7 @@ class SearchViewModel(
             .sortedBy { it.name.lowercase() }
     }
 
-    private companion object {
-        /** Results refresh cadence — matches the main list's poll. */
-        const val POLL_INTERVAL_MS = 5_000L
-    }
+    private companion object
 }
 
 class SearchScreen(
@@ -196,7 +180,7 @@ class SearchScreen(
         // Returning from a thread opened via search closes the search: the
         // thread's back pops with a Unit result, so this callback pops the
         // search screen too — back from the thread lands on the MAIN list, not
-        // the search results (feedback 2026-08-22).
+        // the search results.
         navigateTo(screenFactory = { ThreadScreen(it, room) }) { goBack() }
     }
 }
@@ -237,8 +221,7 @@ private fun QueryView(
         submitIcon = LightIcons.SEARCH,
         singleLine = true,
         // The input centers vertically between the top bar and the keyboard —
-        // the same treatment as the login field editors (design standard,
-        // feedback 2026-08-22: the field sat flush under the top bar).
+        // the same treatment as the login field editors (design standard).
         centered = true,
     )
 }
@@ -246,8 +229,7 @@ private fun QueryView(
 /** The results view: matching rooms alphabetically ("no chats found" when
  *  nothing matches), a bottom-middle VIEW DIRECT / VIEW ALL mode switch, and
  *  a back arrow returning to the query. VIEW DIRECT by default. The top bar
- *  shows the searched term in quotes instead of "Search Results" (feedback
- *  2026-09-01). */
+ *  shows the searched term in quotes instead of "Search Results". */
 @Composable
 private fun ColumnScope.ResultsView(
     dmsOnly: Boolean,
@@ -287,7 +269,7 @@ private fun ColumnScope.ResultsView(
         items = listOf(
             // Bottom-middle (single-item bar): exclusive mode switch — direct,
             // non-archived chats by default; "VIEW ALL" swaps in groups +
-            // archived rooms and flips the label (2026-08-28).
+            // archived rooms and flips the label.
             LightBarButton.Text(
                 text = if (dmsOnly) "VIEW ALL" else "VIEW DIRECT",
                 onClick = onToggleDmsOnly,

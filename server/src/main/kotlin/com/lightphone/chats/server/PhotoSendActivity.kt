@@ -7,7 +7,6 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -197,7 +196,7 @@ class PhotoSendActivity : ComponentActivity() {
         } catch (_: Exception) {
             // No DocumentsUI handler — try the Android photo picker below.
         }
-        if (!launched && Build.VERSION.SDK_INT >= 33) {
+        if (!launched) {
             try {
                 pickPhoto.launch(Intent(MediaStore.ACTION_PICK_IMAGES))
                 launched = true

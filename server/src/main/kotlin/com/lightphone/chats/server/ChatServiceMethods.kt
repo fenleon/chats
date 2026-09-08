@@ -23,6 +23,8 @@ object ChatServiceMethods {
 
                 LightServiceMethod.SetAccount.id -> setAccount(payload!!)
 
+                LightServiceMethod.SetBeeperAccount.id -> setBeeperAccount(payload!!)
+
                 LightServiceMethod.BeeperRequestCode.id -> {
                     val request = LightServiceMethod.BeeperRequestCode.decodeRequest(payload!!)
                     val result = runBlocking { MatrixRepository.beeperRequestCode(request.email) }
@@ -39,230 +41,165 @@ object ChatServiceMethods {
                     )
                 }
 
-                LightServiceMethod.SetBeeperAccount.id -> setBeeperAccount(payload!!)
+                LightServiceMethod.GetAccountState.id ->
+                    handleNoRequest(LightServiceMethod.GetAccountState) {
+                        MatrixRepository.accountState()
+                    }
 
-                LightServiceMethod.GetAccountState.id -> {
-                    val response = MatrixRepository.accountState()
-                    LightResult.Success(LightServiceMethod.GetAccountState.encodeResponse(response))
-                }
-
-                LightServiceMethod.Logout.id -> {
+                LightServiceMethod.Logout.id -> handleNoRequest(LightServiceMethod.Logout) {
                     runBlocking { MatrixRepository.logout() }
-                    LightResult.Success(LightServiceMethod.Logout.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.GetRooms.id -> {
-                    val rooms = runBlocking { MatrixRepository.getRooms() }
-                    val response = LightServiceMethod.GetRooms.Response(rooms)
-                    LightResult.Success(LightServiceMethod.GetRooms.encodeResponse(response))
+                LightServiceMethod.GetRooms.id -> handleNoRequest(LightServiceMethod.GetRooms) {
+                    LightServiceMethod.GetRooms.Response(runBlocking { MatrixRepository.getRooms() })
                 }
 
-                LightServiceMethod.GetAllRooms.id -> {
-                    val rooms = runBlocking { MatrixRepository.getAllRooms() }
-                    val response = LightServiceMethod.GetRooms.Response(rooms)
-                    LightResult.Success(LightServiceMethod.GetRooms.encodeResponse(response))
+                LightServiceMethod.GetAllRooms.id -> handleNoRequest(LightServiceMethod.GetAllRooms) {
+                    LightServiceMethod.GetRooms.Response(runBlocking { MatrixRepository.getAllRooms() })
                 }
 
-                LightServiceMethod.GetMessages.id -> {
-                    val request = LightServiceMethod.GetMessages.decodeRequest(payload!!)
+                LightServiceMethod.GetMessages.id -> handle(LightServiceMethod.GetMessages, payload) { request ->
                     val page = runBlocking {
                         MatrixRepository.getMessages(request.roomId, request.beforeEventId, request.limit)
                     }
-                    val response = LightServiceMethod.GetMessages.Response(
+                    LightServiceMethod.GetMessages.Response(
                         messages = page.messages,
                         hasMore = page.hasMore,
                         encrypted = page.encrypted,
                         audioPlayingEventId = MatrixRepository.audioPlayingEventId(),
                         audioPositionMs = MatrixRepository.audioPositionMs(),
                     )
-                    LightResult.Success(LightServiceMethod.GetMessages.encodeResponse(response))
                 }
 
-                LightServiceMethod.SendMessage.id -> {
-                    val request = LightServiceMethod.SendMessage.decodeRequest(payload!!)
-                    // Send-RPC timing (2026-09-03): the LP3 freeze evidence needs
-                    // the server-side send cost on the log; payload contents stay
-                    // out (privacy).
-                    val t0 = android.os.SystemClock.elapsedRealtime()
-                    val response = runBlocking {
+                LightServiceMethod.SendMessage.id -> handle(LightServiceMethod.SendMessage, payload) { request ->
+                    runBlocking {
                         MatrixRepository.sendMessage(request.roomId, request.body, request.replyToEventId)
                     }
-                    android.util.Log.d(
-                        "ChatServiceMethods",
-                        "dispatch SendMessage took ${android.os.SystemClock.elapsedRealtime() - t0}ms",
-                    )
-                    LightResult.Success(LightServiceMethod.SendMessage.encodeResponse(response))
                 }
 
-                LightServiceMethod.SendReaction.id -> {
-                    val request = LightServiceMethod.SendReaction.decodeRequest(payload!!)
+                LightServiceMethod.SendReaction.id -> handle(LightServiceMethod.SendReaction, payload) { request ->
                     runBlocking {
                         MatrixRepository.sendReaction(request.roomId, request.eventId, request.key)
                     }
-                    LightResult.Success(LightServiceMethod.SendReaction.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.UnsendReaction.id -> {
-                    val request = LightServiceMethod.UnsendReaction.decodeRequest(payload!!)
+                LightServiceMethod.UnsendReaction.id -> handle(LightServiceMethod.UnsendReaction, payload) { request ->
                     runBlocking {
                         MatrixRepository.unsendReaction(request.roomId, request.eventId, request.key)
                     }
-                    LightResult.Success(LightServiceMethod.UnsendReaction.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.EditMessage.id -> {
-                    val request = LightServiceMethod.EditMessage.decodeRequest(payload!!)
+                LightServiceMethod.EditMessage.id -> handle(LightServiceMethod.EditMessage, payload) { request ->
                     runBlocking {
                         MatrixRepository.editMessage(request.roomId, request.eventId, request.newBody)
                     }
-                    LightResult.Success(LightServiceMethod.EditMessage.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.UnsendMessage.id -> {
-                    val request = LightServiceMethod.UnsendMessage.decodeRequest(payload!!)
+                LightServiceMethod.UnsendMessage.id -> handle(LightServiceMethod.UnsendMessage, payload) { request ->
                     runBlocking {
                         MatrixRepository.unsendMessage(request.roomId, request.eventId)
                     }
-                    LightResult.Success(LightServiceMethod.UnsendMessage.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.RetrySend.id -> {
-                    val request = LightServiceMethod.RetrySend.decodeRequest(payload!!)
+                LightServiceMethod.RetrySend.id -> handle(LightServiceMethod.RetrySend, payload) { request ->
                     runBlocking {
                         MatrixRepository.retrySend(request.roomId, request.transactionId)
                     }
-                    LightResult.Success(LightServiceMethod.RetrySend.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.MarkRead.id -> {
-                    val request = LightServiceMethod.MarkRead.decodeRequest(payload!!)
+                LightServiceMethod.MarkRead.id -> handle(LightServiceMethod.MarkRead, payload) { request ->
                     runBlocking { MatrixRepository.markRead(request.roomId, request.eventId) }
-                    LightResult.Success(LightServiceMethod.MarkRead.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.SetTyping.id -> {
-                    val request = LightServiceMethod.SetTyping.decodeRequest(payload!!)
+                LightServiceMethod.SetTyping.id -> handle(LightServiceMethod.SetTyping, payload) { request ->
                     runBlocking { MatrixRepository.setTyping(request.roomId, request.active) }
-                    LightResult.Success(LightServiceMethod.SetTyping.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.SetRoomMuted.id -> {
-                    val request = LightServiceMethod.SetRoomMuted.decodeRequest(payload!!)
+                LightServiceMethod.SetRoomMuted.id -> handle(LightServiceMethod.SetRoomMuted, payload) { request ->
                     runBlocking { MatrixRepository.setRoomMuted(request.roomId, request.muted) }
-                    LightResult.Success(LightServiceMethod.SetRoomMuted.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.SetRoomPinned.id -> {
-                    val request = LightServiceMethod.SetRoomPinned.decodeRequest(payload!!)
+                LightServiceMethod.SetRoomPinned.id -> handle(LightServiceMethod.SetRoomPinned, payload) { request ->
                     runBlocking { MatrixRepository.setRoomPinned(request.roomId, request.pinned) }
-                    LightResult.Success(LightServiceMethod.SetRoomPinned.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.GetRoomFlags.id -> {
-                    val request = LightServiceMethod.GetRoomFlags.decodeRequest(payload!!)
+                LightServiceMethod.GetRoomFlags.id -> handle(LightServiceMethod.GetRoomFlags, payload) { request ->
                     val flags = runBlocking { MatrixRepository.getRoomFlags(request.roomId) }
-                    LightResult.Success(
-                        LightServiceMethod.GetRoomFlags.encodeResponse(
-                            LightServiceMethod.GetRoomFlags.Response(
-                                pinned = flags.pinned,
-                                muted = flags.muted,
-                                archived = flags.archived,
-                            ),
-                        ),
+                    LightServiceMethod.GetRoomFlags.Response(
+                        pinned = flags.pinned,
+                        muted = flags.muted,
+                        archived = flags.archived,
                     )
                 }
 
-                LightServiceMethod.SetRoomArchived.id -> {
-                    val request = LightServiceMethod.SetRoomArchived.decodeRequest(payload!!)
+                LightServiceMethod.SetRoomArchived.id -> handle(LightServiceMethod.SetRoomArchived, payload) { request ->
                     runBlocking { MatrixRepository.setRoomArchived(request.roomId, request.archived) }
-                    LightResult.Success(LightServiceMethod.SetRoomArchived.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.GetConnectionState.id -> {
-                    val response = MatrixRepository.connectionState()
-                    LightResult.Success(LightServiceMethod.GetConnectionState.encodeResponse(response))
+                LightServiceMethod.GetConnectionState.id ->
+                    handleNoRequest(LightServiceMethod.GetConnectionState) {
+                        MatrixRepository.connectionState()
+                    }
+
+                LightServiceMethod.GetE2eeState.id -> handleNoRequest(LightServiceMethod.GetE2eeState) {
+                    runBlocking { MatrixRepository.e2eeState() }
                 }
 
-                LightServiceMethod.GetE2eeState.id -> {
-                    val response = runBlocking { MatrixRepository.e2eeState() }
-                    LightResult.Success(LightServiceMethod.GetE2eeState.encodeResponse(response))
-                }
+                LightServiceMethod.StartDeviceVerification.id ->
+                    handleNoRequest(LightServiceMethod.StartDeviceVerification) {
+                        runBlocking { MatrixRepository.startDeviceVerification() }.fold(
+                            onSuccess = {
+                                LightServiceMethod.StartDeviceVerification.Response(started = true)
+                            },
+                            onFailure = { error ->
+                                LightServiceMethod.StartDeviceVerification.Response(
+                                    started = false,
+                                    error = error.message,
+                                )
+                            },
+                        )
+                    }
 
-                LightServiceMethod.StartDeviceVerification.id -> {
-                    val result = runBlocking { MatrixRepository.startDeviceVerification() }
-                    result.fold(
-                        onSuccess = {
-                            LightResult.Success(
-                                LightServiceMethod.StartDeviceVerification.encodeResponse(
-                                    LightServiceMethod.StartDeviceVerification.Response(started = true),
-                                ),
-                            )
-                        },
-                        onFailure = { error ->
-                            LightResult.Success(
-                                LightServiceMethod.StartDeviceVerification.encodeResponse(
-                                    LightServiceMethod.StartDeviceVerification.Response(
-                                        started = false,
-                                        error = error.message,
-                                    ),
-                                ),
-                            )
-                        },
-                    )
-                }
+                LightServiceMethod.GetVerificationState.id ->
+                    handleNoRequest(LightServiceMethod.GetVerificationState) {
+                        MatrixRepository.verificationState()
+                    }
 
-                LightServiceMethod.GetVerificationState.id -> {
-                    val response = MatrixRepository.verificationState()
-                    LightResult.Success(LightServiceMethod.GetVerificationState.encodeResponse(response))
-                }
-
-                LightServiceMethod.SetActiveRoom.id -> {
-                    val request = LightServiceMethod.SetActiveRoom.decodeRequest(payload!!)
+                LightServiceMethod.SetActiveRoom.id -> handle(LightServiceMethod.SetActiveRoom, payload) { request ->
                     MatrixRepository.setActiveRoom(request.roomId)
-                    LightResult.Success(LightServiceMethod.SetActiveRoom.encodeResponse(Unit))
                 }
 
-                LightServiceMethod.TakeNotifyRoom.id -> {
-                    val response = LightServiceMethod.TakeNotifyRoom.Response(
+                LightServiceMethod.TakeNotifyRoom.id -> handleNoRequest(LightServiceMethod.TakeNotifyRoom) {
+                    LightServiceMethod.TakeNotifyRoom.Response(
                         MatrixRepository.takeNotifyRoom(),
                     )
-                    LightResult.Success(LightServiceMethod.TakeNotifyRoom.encodeResponse(response))
                 }
 
-                LightServiceMethod.VerifyAction.id -> {
-                    val request = LightServiceMethod.VerifyAction.decodeRequest(payload!!)
-                    val result = runBlocking { MatrixRepository.verifyAction(request.action) }
-                    val response = result.fold(
+                LightServiceMethod.VerifyAction.id -> handle(LightServiceMethod.VerifyAction, payload) { request ->
+                    runBlocking { MatrixRepository.verifyAction(request.action) }.fold(
                         onSuccess = { LightServiceMethod.VerifyAction.Response(ok = true) },
                         onFailure = { error ->
                             LightServiceMethod.VerifyAction.Response(ok = false, error = error.message)
                         },
                     )
-                    LightResult.Success(LightServiceMethod.VerifyAction.encodeResponse(response))
                 }
 
-                LightServiceMethod.RecoverWithKey.id -> {
-                    val request = LightServiceMethod.RecoverWithKey.decodeRequest(payload!!)
-                    val result = runBlocking { MatrixRepository.recoverWithKey(request.recoveryKey) }
-                    val response = result.fold(
+                LightServiceMethod.RecoverWithKey.id -> handle(LightServiceMethod.RecoverWithKey, payload) { request ->
+                    runBlocking { MatrixRepository.recoverWithKey(request.recoveryKey) }.fold(
                         onSuccess = { LightServiceMethod.RecoverWithKey.Response(ok = true) },
                         onFailure = { error ->
                             LightServiceMethod.RecoverWithKey.Response(ok = false, error = error.message)
                         },
                     )
-                    LightResult.Success(LightServiceMethod.RecoverWithKey.encodeResponse(response))
                 }
 
-                LightServiceMethod.StartPhotoSend.id -> {
-                    val request = LightServiceMethod.StartPhotoSend.decodeRequest(payload!!)
-                    val response = LightServiceMethod.StartPhotoSend.Response(
+                LightServiceMethod.StartPhotoSend.id -> handle(LightServiceMethod.StartPhotoSend, payload) { request ->
+                    LightServiceMethod.StartPhotoSend.Response(
                         MatrixRepository.startPhotoSend(request.roomId),
                     )
-                    LightResult.Success(LightServiceMethod.StartPhotoSend.encodeResponse(response))
                 }
 
-                LightServiceMethod.GetMessageMedia.id -> {
-                    val request = LightServiceMethod.GetMessageMedia.decodeRequest(payload!!)
+                LightServiceMethod.GetMessageMedia.id -> handle(LightServiceMethod.GetMessageMedia, payload) { request ->
                     val bytes = runBlocking {
                         MatrixRepository.getMessageMedia(
                             request.roomId,
@@ -270,44 +207,31 @@ object ChatServiceMethods {
                             request.allowMobileData,
                         )
                     }
-                    LightResult.Success(
-                        LightServiceMethod.GetMessageMedia.encodeResponse(
-                            LightServiceMethod.GetMessageMedia.Response(bytes),
-                        ),
+                    LightServiceMethod.GetMessageMedia.Response(bytes)
+                }
+
+                LightServiceMethod.SaveMessageImage.id -> handle(LightServiceMethod.SaveMessageImage, payload) { request ->
+                    LightServiceMethod.SaveMessageImage.Response(
+                        runBlocking {
+                            MatrixRepository.saveMessageImage(request.roomId, request.eventId)
+                        },
                     )
                 }
 
-                LightServiceMethod.SaveMessageImage.id -> {
-                    val request = LightServiceMethod.SaveMessageImage.decodeRequest(payload!!)
-                    val ok = runBlocking {
-                        MatrixRepository.saveMessageImage(request.roomId, request.eventId)
-                    }
-                    LightResult.Success(
-                        LightServiceMethod.SaveMessageImage.encodeResponse(
-                            LightServiceMethod.SaveMessageImage.Response(ok),
-                        ),
-                    )
-                }
-
-                LightServiceMethod.PlayVoiceNote.id -> {
-                    val request = LightServiceMethod.PlayVoiceNote.decodeRequest(payload!!)
-                    val (playing, error) = runBlocking {
+                LightServiceMethod.PlayVoiceNote.id -> handle(LightServiceMethod.PlayVoiceNote, payload) { request ->
+                    runBlocking {
                         MatrixRepository.playVoiceNote(request.roomId, request.eventId)
+                    }.let { (playing, error) ->
+                        LightServiceMethod.PlayVoiceNote.Response(playing, error)
                     }
-                    LightResult.Success(
-                        LightServiceMethod.PlayVoiceNote.encodeResponse(
-                            LightServiceMethod.PlayVoiceNote.Response(playing, error),
-                        ),
-                    )
                 }
 
-                LightServiceMethod.StartVoiceNoteSend.id -> {
-                    val request = LightServiceMethod.StartVoiceNoteSend.decodeRequest(payload!!)
-                    val response = LightServiceMethod.StartVoiceNoteSend.Response(
-                        MatrixRepository.startVoiceNoteSend(request.roomId),
-                    )
-                    LightResult.Success(LightServiceMethod.StartVoiceNoteSend.encodeResponse(response))
-                }
+                LightServiceMethod.StartVoiceNoteSend.id ->
+                    handle(LightServiceMethod.StartVoiceNoteSend, payload) { request ->
+                        LightServiceMethod.StartVoiceNoteSend.Response(
+                            MatrixRepository.startVoiceNoteSend(request.roomId),
+                        )
+                    }
 
                 // Media volume for the tool's in-app volume panel (feedback
                 // 2026-08-30): the SDK routes GetVolumeLevel here via
@@ -321,43 +245,32 @@ object ChatServiceMethods {
                     }
                 }
 
-                LightServiceMethod.SetSyncEnabled.id -> {
-                    val request = LightServiceMethod.SetSyncEnabled.decodeRequest(payload!!)
+                LightServiceMethod.SetSyncEnabled.id -> handle(LightServiceMethod.SetSyncEnabled, payload) { request ->
                     runBlocking { MatrixRepository.setSyncEnabled(request.enabled) }
-                    LightResult.Success(
-                        LightServiceMethod.SetSyncEnabled.encodeResponse(
-                            LightServiceMethod.SetSyncEnabled.Response(ok = true),
-                        ),
-                    )
+                    LightServiceMethod.SetSyncEnabled.Response(ok = true)
                 }
 
-                LightServiceMethod.GetRoomListRevision.id -> {
-                    val response = LightServiceMethod.GetRoomListRevision.Response(
-                        MatrixRepository.roomListRevision(),
-                    )
-                    LightResult.Success(LightServiceMethod.GetRoomListRevision.encodeResponse(response))
-                }
+                LightServiceMethod.GetRoomListRevision.id ->
+                    handleNoRequest(LightServiceMethod.GetRoomListRevision) {
+                        LightServiceMethod.GetRoomListRevision.Response(
+                            MatrixRepository.roomListRevision(),
+                        )
+                    }
 
-                LightServiceMethod.GetMessagePageRevision.id -> {
-                    val request = LightServiceMethod.GetMessagePageRevision.decodeRequest(payload!!)
-                    val response = LightServiceMethod.GetMessagePageRevision.Response(
-                        MatrixRepository.messagePageRevision(request.roomId),
-                    )
-                    LightResult.Success(LightServiceMethod.GetMessagePageRevision.encodeResponse(response))
-                }
+                LightServiceMethod.GetMessagePageRevision.id ->
+                    handle(LightServiceMethod.GetMessagePageRevision, payload) { request ->
+                        LightServiceMethod.GetMessagePageRevision.Response(
+                            MatrixRepository.messagePageRevision(request.roomId),
+                        )
+                    }
 
-                LightServiceMethod.WaitForChange.id -> {
-                    val request = LightServiceMethod.WaitForChange.decodeRequest(payload!!)
+                LightServiceMethod.WaitForChange.id -> handle(LightServiceMethod.WaitForChange, payload) { request ->
                     val revision = runBlocking {
                         MatrixRepository.waitForChange(
                             request.watch, request.roomId, request.lastSeen, request.timeoutMs,
                         )
                     }
-                    LightResult.Success(
-                        LightServiceMethod.WaitForChange.encodeResponse(
-                            LightServiceMethod.WaitForChange.Response(revision),
-                        )
-                    )
+                    LightServiceMethod.WaitForChange.Response(revision)
                 }
 
                 else -> LightResult.Error(
@@ -369,6 +282,19 @@ object ChatServiceMethods {
             android.util.Log.e("ChatServiceMethods", "dispatch failed for $methodId", e)
             LightResult.Error(LightResult.ErrorCode.Unknown, e.message ?: "error handling $methodId")
         }
+
+    private inline fun <Req : Any, Resp : Any> handle(
+        method: LightServiceMethod<Req, Resp>,
+        payload: String?,
+        block: (Req) -> Resp,
+    ): LightResult<String> =
+        LightResult.Success(method.encodeResponse(block(method.decodeRequest(payload!!))))
+
+    private inline fun <Resp : Any> handleNoRequest(
+        method: LightServiceMethod<Unit, Resp>,
+        block: () -> Resp,
+    ): LightResult<String> =
+        LightResult.Success(method.encodeResponse(block()))
 
     private fun setAccount(payload: String): LightResult<String> {
         val request = LightServiceMethod.SetAccount.decodeRequest(payload)

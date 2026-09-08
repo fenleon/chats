@@ -63,8 +63,6 @@ dependencies {
     implementation(libs.trixnity.media.okio)
     implementation(libs.trixnity.cryptodriver.libolm) // libOlm driver — same pickle format as v4
     implementation(libs.ktor.client.okhttp)
-    implementation(libs.ktor.client.content.negotiation)
-    implementation(libs.ktor.serialization.json)
     // Room runtime for Trixnity's TrixnityRoomDatabase (session + event store).
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)

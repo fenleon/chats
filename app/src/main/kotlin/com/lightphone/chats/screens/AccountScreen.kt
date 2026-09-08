@@ -85,8 +85,7 @@ class AccountViewModel : LightViewModel<Unit>() {
      * Whether the e2ee verdict has settled. The first read on a cold trust
      * store can lag a poll behind the truth, so "Verify Device" only shows
      * after a verified read OR two consecutive unverified reads — until then
-     * the row reads "Checking…" (feedback 2026-08-20: "not verified" flashed
-     * on launch before loading to "verified").
+     * the row reads "Checking…".
      */
     val e2eeSettled = MutableStateFlow(false)
     /** The verification state machine's state string ("none" | "waiting" |
@@ -114,12 +113,18 @@ class AccountViewModel : LightViewModel<Unit>() {
         stopPolling()
     }
 
-    /** Keeps the status fresh while Account is visible (sync state, rooms). */
+    /** Keeps the status fresh while Account is visible (sync state, rooms).
+     *  A long-poll wait on the companion's status revision (bumped wherever a
+     *  connection/verification fact commits) replaces the fixed 5 s tick; the
+     *  wait's timeout window doubles as the dead-man re-check that settles
+     *  the e2ee verdict (two consecutive reads). */
     private fun startPolling() {
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
+            var last = 0L
             while (true) {
-                delay(POLL_INTERVAL_MS)
+                val revision = ChatClient.waitForStatusChange(last)
+                if (revision != last) last = revision
                 refreshStatus()
             }
         }
@@ -165,7 +170,7 @@ class AccountViewModel : LightViewModel<Unit>() {
      *  Runs off-main: the in-process binder executes the server's handler on
      *  the caller's thread, and these are multi-second network calls (the
      *  login also starts the foreground sync service — a main-thread block
-     *  past its 5 s window crashed the app, LP3 2026-08-19). */
+     *  past its 5 s window crashed the app). */
     fun requestCode(onSuccess: (email: String) -> Unit) {
         if (busy.value) return
         val email = beeperEmail.value.trim()
@@ -187,9 +192,7 @@ class AccountViewModel : LightViewModel<Unit>() {
                     onSuccess(email)
                 }
             } finally {
-                // A binder exception must not leave the button dead (feedback
-                // 2026-08-19: the same stuck-flag class as the thread's
-                // loading guard) — busy always clears.
+                // A binder exception must not leave the button dead — busy always clears.
                 busy.value = false
             }
         }
@@ -260,10 +263,6 @@ class AccountViewModel : LightViewModel<Unit>() {
     }
 
     private var pollJob: Job? = null
-
-    private companion object {
-        const val POLL_INTERVAL_MS = 5_000L
-    }
 }
 
 class AccountScreen(sealedActivity: SealedLightActivity) :
@@ -326,15 +325,15 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                     // Settings rows start 0.5 gu below the top bar (its scroll
                     // Column carries vertical 0.5 gu padding) — match it so the
                     // "Server" row sits at the same height as Settings'
-                    // "Account" row (feedback 2026-09-06).
+                    // "Account" row.
                     LightScrollView(
                         modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                     ) {
                         if (account?.loggedIn == true) {
                             // Logged in: just the account status + actions — the
                             // login form (email/code) would be dead weight here.
-                            // The device-verification row leads the panel
-                            // (feedback 2026-09-01); the account name is not
+                            // The device-verification row leads the panel;
+                            // the account name is not
                             // shown, only the sync status.
                             EncryptionRow(
                                 e2ee = e2ee,
@@ -379,19 +378,17 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                     onClick = { editField("Beeper email", viewModel.beeperEmail) },
                                 )
                                 // The Enter code entry appears once a code has
-                                // been requested (feedback 2026-08-19: the
-                                // request-code overlay dismisses back here).
-                                // The removed "Code sent to…" status line's
-                                // info lives in the label now (feedback
-                                // 2026-09-06).
+                                // been requested.
+                                // No email in the label/title — privacy on
+                                // shared screens.
                                 if (codeStatus != null || beeperCode.isNotEmpty()) {
                                     FormField(
-                                        label = "Enter code sent to $beeperEmail",
+                                        label = "Enter code sent to your email",
                                         value = beeperCode,
                                         placeholder = "6-digit code",
                                         onClick = {
                                             editField(
-                                                title = "Enter code sent to $beeperEmail",
+                                                title = "Enter Beeper code",
                                                 field = viewModel.beeperCode,
                                                 // The code editor submits (was
                                                 // SAVE — feedback 2026-08-19).
@@ -429,8 +426,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 )
                             }
                             error?.let { message -> StatusLine(message) }
-                            // "Code sent to…" line removed (feedback
-                            // 2026-09-06) — the Enter code field's label
+                            // "Code sent to…" line removed — the Enter code field's label
                             // carries the email now; codeStatus still gates
                             // the field's appearance.
                         }
@@ -453,8 +449,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                         } else if (beeperMode) {
                             // Beeper flow: the bar's button sends the emailed
                             // code, then an overlay panel confirms it and the
-                            // user enters the code via the Enter code field
-                            // (feedback 2026-08-19).
+                            // user enters the code via the Enter code field.
                             LightBarButton.Text(
                                 text = if (busy) "…" else if (codeRequested) "REQUEST AGAIN" else "REQUEST CODE",
                                 onClick = if (busy) null else {
@@ -485,7 +480,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
      *  replaces the field, an explicit back (no result) keeps the old value.
      *  [onResult] fires with the accepted value (e.g. the beeper login after
      *  the code). [submitLabel] — SAVE for field editors, SUBMIT for the code
-     *  entry (feedback 2026-08-19). */
+     *  entry. */
     private fun editField(
         title: String,
         field: MutableStateFlow<String>,
@@ -543,7 +538,7 @@ private fun TokenToggleRow(
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
         // The toggle sits immediately left of its action label, the row
         // top-aligned so it lines up with the main label (same as Audiobooks
-        // Settings, feedback 2026-08-17).
+        // Settings).
         verticalAlignment = Alignment.Top,
     ) {
         Box(
@@ -581,7 +576,7 @@ private fun TokenToggleRow(
 /** Login path row: a single "Server" entry whose value is the active
  *  selection (Beeper or Matrix homeserver); tapping opens [ServerScreen].
  *  Value-row anatomy — "Server" is the Copy-sized top text, the selection the
- *  Heading-sized main text, flush-left (DESIGN.md §6, feedback 2026-08-19). */
+ *  Heading-sized main text, flush-left (DESIGN.md §6). */
 @Composable
 private fun ServerRow(
     beeperMode: Boolean,
@@ -673,9 +668,9 @@ private fun ServerOptionRow(
     )
 }
 
-/** The request-code confirmation overlay (feedback 2026-08-19): centered
+/** The request-code confirmation overlay: centered
  *  "A code has been sent to <email>." / "Check your email." on separate lines
- *  (2026-08-29) with an X dismiss in the bottom centre; dismissing returns to
+ * with an X dismiss in the bottom centre; dismissing returns to
  *  the account panel, where the Enter code field now appears. */
 class CodeSentPanel(
     sealedActivity: SealedLightActivity,
@@ -740,7 +735,7 @@ class CodeSentPanel(
     }
 }
 
-/** The logout confirmation overlay (feedback 2026-08-19): centered
+/** The logout confirmation overlay: centered
  *  "Do you want to log out of your account?" with the LP3 X (dismiss) and
  *  triangle (confirm) — same panel grammar as the verify confirm. Result:
  *  true = log out. */
@@ -804,16 +799,15 @@ private fun AccountStatus(
         connection?.let { state ->
             val allSynced = state.state == "syncing" &&
                 state.roomsTotal > 0 && state.roomsResolved >= state.roomsTotal
-            // Feedback 2026-08-19: the status line reads plainly — "sync
-            // paused" when the toggle is off, "offline" when there's simply
-            // no connection. The thread count shares the same line
-            // (2026-08-29): "Syncing 34 of 52 threads" (no separator dot —
-            // feedback 2026-09-06). Same Fine size as the restore line below
-            // (feedback 2026-09-06).
+            // The status line reads plainly — "battery
+            // saver" when background sync is off, "offline" when there's
+            // simply no connection. The thread count shares the same line:
+            // "Syncing 34 of 52 threads" (no separator dot). Same Fine
+            // size as the restore line below.
             val statusText = when {
                 allSynced -> "Synced"
                 state.state == "syncing" -> "Syncing"
-                !state.syncEnabled -> "sync paused"
+                !state.syncEnabled -> "battery saver"
                 state.state == "offline" -> "offline"
                 state.state == "connecting" -> "connecting"
                 else -> state.state.replaceFirstChar { it.uppercase() }
@@ -827,7 +821,7 @@ private fun AccountStatus(
                 text = countText?.let { "$statusText $it" } ?: statusText,
                 variant = LightTextVariant.Fine,
             )
-            // Key-backup restore crawl (2026-08-29): "Recovering… x of y
+            // Key-backup restore crawl: "Recovering… x of y
             // rooms" while the daily restore runs; "All messages restored"
             // once it finished AND sync has fully caught up.
             if (state.restoreScanning && state.restoreRoomsTotal > 0) {
@@ -851,11 +845,11 @@ private fun AccountStatus(
 private fun pluralThreads(count: Int): String =
     if (count == 1) "1 thread" else "$count threads"
 
-/** Device-verification row (2026-08-29): the action reads "Verify Device"
+/** Device-verification row: the action reads "Verify Device"
  *  while unverified, and is a status-only row once verified. No toggle — the
  *  state reads "Device Verified" / "Verifying" (mid-verification, so a
  *  back-out keeps the process visible) / "Verify Device". While the verdict
- *  hasn't settled (a cold trust store can lag a poll — feedback 2026-08-20)
+ *  hasn't settled (a cold trust store can lag a poll)
  *  it reads "Checking…" and is not tappable, so launch never claims a false
  *  "Verify Device". The old "Encrypted messages" label is gone. */
 @Composable
@@ -882,12 +876,12 @@ private fun EncryptionRow(
 
 /** The LP3 keyboard editor for a single settings field. Result: the edited
  *  text (trimmed; "" clears the field). The keyboard is stripped — no emoji,
- *  return, or voice keys (the passes code-entry style, feedback 2026-08-19);
+ *  return, or voice keys (the passes code-entry style);
  *  the input centers vertically between the top bar and the keyboard. The
  *  submit label defaults to SAVE (field editors); the code entry passes
- *  SUBMIT (feedback 2026-08-19); an optional [submitIcon] renders the
- *  submit as an icon instead of the label button (contacts search,
- *  2026-08-30). */
+ *  SUBMIT; an optional [submitIcon] renders the
+ *  submit as an icon instead of the label button (contacts search).
+ */
 class FieldEditorScreen(
     sealedActivity: SealedLightActivity,
     private val title: String,

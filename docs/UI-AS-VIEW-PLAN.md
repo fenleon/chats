@@ -1,6 +1,17 @@
 # Chats — UI as a view of a committed fact (branch plan)
 
-**Status: planned, NOT started. This work goes on a NEW BRANCH off main.**
+**Status: DONE on branch `ui-as-view` (2026-09-06), emulator-verified. Phases W
+and S were found already implemented by the SYNC-PERF 2.2 / optimistic-send
+commits that landed on main before this plan was written; the branch's real
+work was Phase C plus verification. Deviations: the two proposed
+WaitRoomListRevision/WaitMessagePageRevision methods were superseded by the
+shipped single `WaitForChange` with a `"rooms"`/`"page"`/`"flags"`/`"status"`
+scope string; `awaitOutboxAck` survives only on the voice-send path (off the
+composer critical path — removal would regress the SENDING-flicker fix).**
+**Phase C kept delays (audited):** animations/auto-dismisses, the voice
+playback-position tick, media-retry ×3 backoff, cold-start retry backoff, and
+the starting-sync dead-man (now plus a status-revision wake that clears
+"starting" the moment "syncing" commits).
 
 Sequencing vs the current line: main first resolves its open work — commit the
 SYNC-PERF Phase 1 ingest gate (implemented, emulator-verified, uncommitted as of

@@ -34,11 +34,12 @@ class ChatSyncService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Settings → Sync pause (audit 2026-08-14): never start the loop or
-        // hold the FGS while paused — a sticky restart must not defeat the
-        // user's choice.
-        if (!MatrixRepository.isSyncEnabled) {
-            Log.d(TAG, "sync disabled by user — not starting")
+        // Battery saver: never start the loop or
+        // hold the FGS while the screen is dark — a sticky restart must not
+        // defeat the user's choice. With the screen on, foreground sync runs
+        // even under battery saver.
+        if (!MatrixRepository.isSyncEnabled && !MatrixRepository.isScreenOn) {
+            Log.d(TAG, "battery saver — not starting")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -46,7 +47,7 @@ class ChatSyncService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification(this))
         serviceScope.launch {
             val c = MatrixRepository.ensureClient() ?: return@launch
-            // Screen-state-aware sync start (battery 2026-08-19 audit): a
+            // Screen-state-aware sync start: a
             // service restart while the screen is dark must not long-poll —
             // apply the screen → cadence decision first, and only start a
             // long-poll here when the screen is actually on (slow-sync grace
@@ -95,8 +96,7 @@ class ChatSyncService : Service() {
         var lastState: SyncState? = null
         c.syncState.collect { state ->
             // One line per state CHANGE (rare — a handful per night), so a
-            // silently dead loop leaves a visible last-state trail (audit
-            // 2026-08-23: long-polls stopped for hours with no logged cause).
+            // silently dead loop leaves a visible last-state trail.
             if (state != lastState) {
                 lastState = state
                 Log.d(
@@ -119,8 +119,7 @@ class ChatSyncService : Service() {
                 return@collect
             }
             if (stuckSinceMs == 0L) stuckSinceMs = now
-            // Never restart the long-poll while the screen is dark (battery
-            // 2026-08-19 audit): slow-sync owns sync then, and a restart would
+            // Never restart the long-poll while the screen is dark: slow-sync owns sync then, and a restart would
             // defeat the whole screen → cadence gate.
             if (syncedClient === c && now - stuckSinceMs >= SYNC_RESTART_AFTER_MS && MatrixRepository.isScreenOn) {
                 Log.w(TAG, "sync stuck in $state for ${SYNC_RESTART_AFTER_MS / 1000}s — restarting sync loop")

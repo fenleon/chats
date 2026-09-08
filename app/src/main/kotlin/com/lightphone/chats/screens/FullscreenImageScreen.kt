@@ -47,10 +47,10 @@ import kotlinx.coroutines.withContext
 /**
  * Fullscreen photo viewer: tapping an image row in the thread opens it here.
  * Shows the display JPEG scaled to fit the screen; the back button (or a tap
- * on the photo) closes. Pinch zooms up to 5x, double-tap toggles 1x/2x
- * (feedback 2026-08-23). The bottom bar saves the photo to the device's
+ * on the photo) closes. Pinch zooms up to 5x, double-tap toggles 1x/2x.
+ * The bottom bar saves the photo to the device's
  * Pictures/Chats album (server-side original, not this display JPEG);
- * the LP3-classic fullscreen panel confirms (2026-09-03).
+ * the LP3-classic fullscreen panel confirms.
  */
 class FullscreenImageScreen(
     sealedActivity: SealedLightActivity,
@@ -64,9 +64,9 @@ class FullscreenImageScreen(
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         // Decode off the main thread; the viewer shows the background until
-        // the bitmap lands (feedback 2026-08-23). Seeded from the shared
+        // the bitmap lands. Seeded from the shared
         // decode cache so the thread row finds the bitmap already decoded
-        // when this viewer closes (LP3 2026-08-23 — re-decode flash).
+        // when this viewer closes.
         val bitmap by produceState<ImageBitmap?>(chatsBitmapCache.get(eventId), bytes) {
             if (value == null) {
                 value = withContext(Dispatchers.Default) {

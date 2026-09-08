@@ -1,22 +1,19 @@
 package com.lightphone.chats
 
+import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.callRemoteServiceMethod
-import com.thelightphone.sdk.shared.LightResult
 import com.thelightphone.sdk.shared.LightServiceMethod
-import com.thelightphone.sdk.shared.error
 import com.thelightphone.sdk.shared.getOrNull
 
 /**
- * Thin RPC client for the Chats companion methods. Everything privileged — the
- * persistent Matrix connection, sync loop, storage, notifications — lives in
- * the companion (:server); the tool only renders state fetched over the SDK
- * binder.
+ * The app-side API over [MatrixRepository]. Chats is single-APK/single-process
+ * (2026-08-19), so the UI calls the repository directly — no binder round
+ * trip, no serialized dispatch (NO-SEAM, 2026-09-07). The [LightServiceMethod]
+ * handlers in :server stay compiled for the vetted-tools contract (MainActivity
+ * adb control, emulator pipeline); only the activity-launching flows and the
+ * SDK-level volume read still ride the binder here.
  */
 object ChatClient {
-
-    /** Round-trips a binder call to the companion; true when the call succeeds. */
-    suspend fun ping(): Boolean =
-        callRemoteServiceMethod(LightServiceMethod.ChatPing, Unit) is LightResult.Success
 
     suspend fun setAccount(
         homeserver: String,
@@ -24,58 +21,47 @@ object ChatClient {
         passwordOrToken: String,
         tokenLogin: Boolean = false,
     ): LightServiceMethod.SetAccount.Response? =
-        callRemoteServiceMethod(
-            LightServiceMethod.SetAccount,
-            LightServiceMethod.SetAccount.Request(homeserver, user, passwordOrToken, tokenLogin),
-        ).getOrNull()
+        runCatching {
+            MatrixRepository.loginAsUnit(homeserver, user, passwordOrToken, tokenLogin).getOrThrow()
+            LightServiceMethod.SetAccount.Response(
+                userId = MatrixRepository.lastLoginUserId ?: "",
+                deviceId = MatrixRepository.lastLoginDeviceId ?: "",
+                needsVerification = MatrixRepository.lastLoginNeedsVerification,
+            )
+        }.getOrNull()
 
-    /** Beeper login, step 1: emails a 6-digit code to [email]. @return null on success, else the companion's error message. */
+    /** Beeper login, step 1: emails a 6-digit code to [email]. @return null on success, else the error message. */
     suspend fun beeperRequestCode(email: String): String? =
-        callRemoteServiceMethod(
-            LightServiceMethod.BeeperRequestCode,
-            LightServiceMethod.BeeperRequestCode.Request(email),
-        ).error?.extra
+        MatrixRepository.beeperRequestCode(email).exceptionOrNull()?.message
 
     /**
      * Beeper login, step 2: completes the login with the emailed [code]. The
      * response carries [LightServiceMethod.SetBeeperAccount.Response.needsVerification].
-     * @return the response on success, else the companion's error message.
+     * @return the response on success, else the error message.
      */
     suspend fun beeperLogin(email: String, code: String): Result<LightServiceMethod.SetBeeperAccount.Response> =
-        when (val result = callRemoteServiceMethod(
-            LightServiceMethod.SetBeeperAccount,
-            LightServiceMethod.SetBeeperAccount.Request(email, code),
-        )) {
-            is LightResult.Success -> Result.success(result.data)
-            is LightResult.Error -> Result.failure(Exception(result.extra ?: "beeper login failed"))
+        MatrixRepository.beeperLoginAsUnit(email, code).mapCatching { _ ->
+            LightServiceMethod.SetBeeperAccount.Response(
+                userId = MatrixRepository.lastLoginUserId ?: "",
+                deviceId = MatrixRepository.lastLoginDeviceId ?: "",
+                needsVerification = MatrixRepository.lastLoginNeedsVerification,
+            )
         }
 
     suspend fun accountState(): LightServiceMethod.GetAccountState.Response? =
-        callRemoteServiceMethod(LightServiceMethod.GetAccountState, Unit).getOrNull()
+        runCatching { MatrixRepository.accountState() }.getOrNull()
 
     suspend fun logout() {
-        callRemoteServiceMethod(LightServiceMethod.Logout, Unit)
+        runCatching { MatrixRepository.logout() }
     }
 
     suspend fun getRooms(): List<LightServiceMethod.GetRooms.Room> =
-        callRemoteServiceMethod(LightServiceMethod.GetRooms, Unit)
-            .getOrNull()?.rooms.orEmpty()
+        MatrixRepository.getRooms()
 
-    /**
-     * The room list's current revision — the list poll's cheap gate: when it
-     * hasn't moved since the last [getRooms], the full 400-room payload stays
-     * on the server (2026-09-01, the Beeper comparison). 0 = nothing published
-     * yet (cold start) — the show-time refresh + retries handle that.
-     */
-    suspend fun roomListRevision(): Long =
-        callRemoteServiceMethod(LightServiceMethod.GetRoomListRevision, Unit)
-            .getOrNull()?.revision ?: 0L
-
-    /** Every room the companion knows (full census, trimmed rows — no preview
+    /** Every room the repository knows (full census, trimmed rows — no preview
      *  or unread). The contacts list + search need any room, old or quiet. */
     suspend fun getAllRooms(): List<LightServiceMethod.GetRooms.Room> =
-        callRemoteServiceMethod(LightServiceMethod.GetAllRooms, Unit)
-            .getOrNull()?.rooms.orEmpty()
+        MatrixRepository.getAllRooms()
 
     /**
      * A page of messages, oldest first; [beforeEventId] pages further back.
@@ -88,40 +74,16 @@ object ChatClient {
         beforeEventId: String? = null,
         limit: Int = 30,
     ): LightServiceMethod.GetMessages.Response? =
-        callRemoteServiceMethod(
-            LightServiceMethod.GetMessages,
-            LightServiceMethod.GetMessages.Request(roomId, beforeEventId, limit),
-        ).getOrNull()
-
-    /**
-     * The room's cached newest-page revision — the thread poll's cheap gate:
-     * when it hasn't moved since the last [getMessages], the page round trip
-     * is skipped (2026-09-01, the Beeper comparison). 0 = page not computed.
-     */
-    suspend fun messagePageRevision(roomId: String): Long =
-        callRemoteServiceMethod(
-            LightServiceMethod.GetMessagePageRevision,
-            LightServiceMethod.GetMessagePageRevision.Request(roomId),
-        ).getOrNull()?.revision ?: 0L
-
-    /**
-     * Long-poll wait for the room-list revision to move past [lastSeen] (the
-     * list poll's fixed tick, deleted 2026-09-06 — the companion holds the
-     * call until the list changes or the window elapses). Returns the current
-     * revision; equals [lastSeen] when the window elapsed unchanged.
-     */
-    suspend fun waitForRoomListChange(lastSeen: Long, timeoutMs: Long = 25_000): Long =
-        callRemoteServiceMethod(
-            LightServiceMethod.WaitForChange,
-            LightServiceMethod.WaitForChange.Request("rooms", null, lastSeen, timeoutMs),
-        ).getOrNull()?.revision ?: lastSeen
-
-    /** [waitForRoomListChange] for a room's newest-page revision (thread poll). */
-    suspend fun waitForPageChange(roomId: String, lastSeen: Long, timeoutMs: Long = 25_000): Long =
-        callRemoteServiceMethod(
-            LightServiceMethod.WaitForChange,
-            LightServiceMethod.WaitForChange.Request("page", roomId, lastSeen, timeoutMs),
-        ).getOrNull()?.revision ?: lastSeen
+        runCatching {
+            val page = MatrixRepository.getMessages(roomId, beforeEventId, limit)
+            LightServiceMethod.GetMessages.Response(
+                messages = page.messages,
+                hasMore = page.hasMore,
+                encrypted = page.encrypted,
+                audioPlayingEventId = MatrixRepository.audioPlayingEventId(),
+                audioPositionMs = MatrixRepository.audioPositionMs(),
+            )
+        }.getOrNull()
 
     /**
      * Sends [body] to [roomId]. The response carries the outbox transaction id
@@ -131,168 +93,113 @@ object ChatClient {
     suspend fun sendMessage(
         roomId: String,
         body: String,
-        replyToEventId: String? = null,
-    ): LightServiceMethod.SendMessage.Response? {
-        // Send-RPC timing (2026-09-03), tool-side half of the server dispatch line.
-        val t0 = android.os.SystemClock.elapsedRealtime()
-        return callRemoteServiceMethod(
-            LightServiceMethod.SendMessage,
-            LightServiceMethod.SendMessage.Request(roomId, body, replyToEventId),
-        ).getOrNull().also {
-            android.util.Log.d(
-                "ChatClient",
-                "sendMessage RPC took ${android.os.SystemClock.elapsedRealtime() - t0}ms",
-            )
-        }
-    }
+    ): LightServiceMethod.SendMessage.Response? =
+        runCatching { MatrixRepository.sendMessage(roomId, body, null) }.getOrNull()
 
     /**
-     * Re-sends a locally-failed message: the companion clears the outbox error
+     * Re-sends a locally-failed message: the repository clears the outbox error
      * on [transactionId] (the txn of the "local-…" row) and Trixnity re-sends
      * the same transaction — idempotent, no duplicate if it already landed.
      */
     suspend fun retrySend(roomId: String, transactionId: String) {
-        callRemoteServiceMethod(
-            LightServiceMethod.RetrySend,
-            LightServiceMethod.RetrySend.Request(roomId, transactionId),
-        )
+        runCatching { MatrixRepository.retrySend(roomId, transactionId) }
     }
 
     /**
      * Sends a reaction (an m.reaction annotation; [key] = the emoji) on a
-     * message (Phase A, 2026-09-03). False when the companion rejected it.
+     * message (Phase A, 2026-09-03). False when the repository rejected it.
      */
     suspend fun sendReaction(roomId: String, eventId: String, key: String): Boolean =
-        callRemoteServiceMethod(
-            LightServiceMethod.SendReaction,
-            LightServiceMethod.SendReaction.Request(roomId, eventId, key),
-        ) is LightResult.Success
+        runCatching { MatrixRepository.sendReaction(roomId, eventId, key) }.isSuccess
 
     /** Unsends (redacts) the signed-in user's reaction with [key] on [eventId]. */
     suspend fun unsendReaction(roomId: String, eventId: String, key: String): Boolean =
-        callRemoteServiceMethod(
-            LightServiceMethod.UnsendReaction,
-            LightServiceMethod.UnsendReaction.Request(roomId, eventId, key),
-        ) is LightResult.Success
+        runCatching { MatrixRepository.unsendReaction(roomId, eventId, key) }.getOrDefault(false)
 
     /**
      * Edits an own text message (Phase C, 2026-09-03). Returns null on
      * success, the failure message otherwise (the composer displays it — a
      * rejected edit must not read as an eternal "sending", LP3 2026-09-04).
      */
-    suspend fun editMessage(roomId: String, eventId: String, newBody: String): String? =
-        when (val result = callRemoteServiceMethod(
-            LightServiceMethod.EditMessage,
-            LightServiceMethod.EditMessage.Request(roomId, eventId, newBody),
-        )) {
-            is LightResult.Error -> result.extra ?: "edit failed"
-            else -> null
-        }
+    suspend fun editMessage(roomId: String, eventId: String, newBody: String): String? {
+        val failure = runCatching { MatrixRepository.editMessage(roomId, eventId, newBody) }
+            .exceptionOrNull() ?: return null
+        return failure.message ?: "edit failed"
+    }
 
     /** Unsends (redacts) an own message — removed for everyone the bridge can
-     *  reach (Phase C, 2026-09-03). False when the companion rejected it. */
+     *  reach (Phase C, 2026-09-03). False when the repository rejected it. */
     suspend fun unsendMessage(roomId: String, eventId: String): Boolean =
-        callRemoteServiceMethod(
-            LightServiceMethod.UnsendMessage,
-            LightServiceMethod.UnsendMessage.Request(roomId, eventId),
-        ) is LightResult.Success
+        runCatching { MatrixRepository.unsendMessage(roomId, eventId) }.isSuccess
 
     suspend fun markRead(roomId: String, eventId: String) {
-        callRemoteServiceMethod(
-            LightServiceMethod.MarkRead,
-            LightServiceMethod.MarkRead.Request(roomId, eventId),
-        )
+        runCatching { MatrixRepository.markRead(roomId, eventId) }
     }
 
     suspend fun setTyping(roomId: String, active: Boolean) {
-        callRemoteServiceMethod(
-            LightServiceMethod.SetTyping,
-            LightServiceMethod.SetTyping.Request(roomId, active),
-        )
+        runCatching { MatrixRepository.setTyping(roomId, active) }
     }
 
     /** Mutes/unmutes [roomId]'s notifications (contact panel, 2026-08-23). */
     suspend fun setRoomMuted(roomId: String, muted: Boolean) {
-        callRemoteServiceMethod(
-            LightServiceMethod.SetRoomMuted,
-            LightServiceMethod.SetRoomMuted.Request(roomId, muted),
-        )
+        runCatching { MatrixRepository.setRoomMuted(roomId, muted) }
     }
 
     /** Pins/unpins [roomId] (m.favourite tag, synced; contact panel, 2026-08-28). */
     suspend fun setRoomPinned(roomId: String, pinned: Boolean) {
-        callRemoteServiceMethod(
-            LightServiceMethod.SetRoomPinned,
-            LightServiceMethod.SetRoomPinned.Request(roomId, pinned),
-        )
+        runCatching { MatrixRepository.setRoomPinned(roomId, pinned) }
     }
-
-    /** The room's current pinned/muted/archived flags (contact panel live poll). */
-    suspend fun getRoomFlags(roomId: String): LightServiceMethod.GetRoomFlags.Response? =
-        callRemoteServiceMethod(
-            LightServiceMethod.GetRoomFlags,
-            LightServiceMethod.GetRoomFlags.Request(roomId),
-        ).getOrNull()
 
     /** Archives/unarchives [roomId] (Beeper inbox.done, synced; contact panel, 2026-08-28). */
     suspend fun setRoomArchived(roomId: String, archived: Boolean) {
-        callRemoteServiceMethod(
-            LightServiceMethod.SetRoomArchived,
-            LightServiceMethod.SetRoomArchived.Request(roomId, archived),
-        )
+        runCatching { MatrixRepository.setRoomArchived(roomId, archived) }
     }
 
-    /** Tells the companion which room is on screen (null = list/settings/background). */
+    /** Tells the repository which room is on screen (null = list/settings/background). */
     suspend fun setActiveRoom(roomId: String?) {
-        callRemoteServiceMethod(
-            LightServiceMethod.SetActiveRoom,
-            LightServiceMethod.SetActiveRoom.Request(roomId),
-        )
+        runCatching { MatrixRepository.setActiveRoom(roomId) }
     }
 
     suspend fun connectionState(): LightServiceMethod.GetConnectionState.Response? =
-        callRemoteServiceMethod(LightServiceMethod.GetConnectionState, Unit).getOrNull()
+        runCatching { MatrixRepository.connectionState() }.getOrNull()
 
-    /** Pauses/resumes the companion's sync loop (Settings → Sync, audit 2026-08-14). */
+    /** Pauses/resumes the sync loop (Settings → Sync, audit 2026-08-14). */
     suspend fun setSyncEnabled(enabled: Boolean): Boolean =
-        callRemoteServiceMethod(
-            LightServiceMethod.SetSyncEnabled,
-            LightServiceMethod.SetSyncEnabled.Request(enabled),
-        ).getOrNull()?.ok == true
+        runCatching { MatrixRepository.setSyncEnabled(enabled) }.isSuccess
 
     suspend fun e2eeState(): LightServiceMethod.GetE2eeState.Response? =
-        callRemoteServiceMethod(LightServiceMethod.GetE2eeState, Unit).getOrNull()
+        runCatching { MatrixRepository.e2eeState() }.getOrNull()
 
     suspend fun startDeviceVerification(): LightServiceMethod.StartDeviceVerification.Response? =
-        callRemoteServiceMethod(LightServiceMethod.StartDeviceVerification, Unit).getOrNull()
+        MatrixRepository.startDeviceVerification().fold(
+            onSuccess = { LightServiceMethod.StartDeviceVerification.Response(started = true) },
+            onFailure = {
+                LightServiceMethod.StartDeviceVerification.Response(started = false, error = it.message)
+            },
+        )
 
     suspend fun verificationState(): LightServiceMethod.GetVerificationState.Response? =
-        callRemoteServiceMethod(LightServiceMethod.GetVerificationState, Unit).getOrNull()
+        runCatching { MatrixRepository.verificationState() }.getOrNull()
 
     suspend fun verifyAction(action: String): String? =
-        when (val r = callRemoteServiceMethod(
-            LightServiceMethod.VerifyAction,
-            LightServiceMethod.VerifyAction.Request(action),
-        )) {
-            is LightResult.Success -> if (r.data.ok) null else r.data.error ?: "verification failed"
-            is LightResult.Error -> r.extra ?: "verification action failed"
-        }
+        MatrixRepository.verifyAction(action).fold(
+            onSuccess = { null },
+            onFailure = { it.message ?: "verification failed" },
+        )
 
     /** Non-interactive verification with the account's recovery key. @return null on success, else the error. */
     suspend fun recoverWithKey(recoveryKey: String): String? =
-        when (val r = callRemoteServiceMethod(
-            LightServiceMethod.RecoverWithKey,
-            LightServiceMethod.RecoverWithKey.Request(recoveryKey),
-        )) {
-            is LightResult.Success -> if (r.data.ok) null else r.data.error ?: "recovery failed"
-            is LightResult.Error -> r.extra ?: "recovery failed"
-        }
+        MatrixRepository.recoverWithKey(recoveryKey).fold(
+            onSuccess = { null },
+            onFailure = { it.message ?: "recovery failed" },
+        )
 
     /**
      * Starts the attach-a-photo flow for [roomId]. @return the flattened
-     * component name of the companion's photo-picker activity, which the tool
+     * component name of the photo-picker activity, which the tool
      * launches via `SimpleLightScreen.startServerActivity` (the tool runtime
-     * forbids startActivity).
+     * forbids startActivity). Stays on the binder: the SDK's server-side
+     * activity flow owns the launch (NO-SEAM keeps this one).
      */
     suspend fun startPhotoSend(roomId: String): String? =
         callRemoteServiceMethod(
@@ -302,47 +209,36 @@ object ChatClient {
 
     /**
      * Display-ready JPEG bytes for an image message, or null when unavailable.
-     * [allowMobileData] false + a cellular connection = the companion skips
-     * the download (Settings → Mobile data downloads).
+     * [allowMobileData] false + a cellular connection = the download is
+     * skipped (Settings → Mobile data downloads).
      */
     suspend fun getMessageMedia(
         roomId: String,
         eventId: String,
         allowMobileData: Boolean,
     ): ByteArray? =
-        callRemoteServiceMethod(
-            LightServiceMethod.GetMessageMedia,
-            LightServiceMethod.GetMessageMedia.Request(roomId, eventId, allowMobileData),
-        ).getOrNull()?.bytes
+        runCatching { MatrixRepository.getMessageMedia(roomId, eventId, allowMobileData) }.getOrNull()
 
     /** Saves an image message to the device's Pictures/Chats album
      *  (photo viewer save button, 2026-09-03). */
     suspend fun saveMessageImage(roomId: String, eventId: String): Boolean =
-        callRemoteServiceMethod(
-            LightServiceMethod.SaveMessageImage,
-            LightServiceMethod.SaveMessageImage.Request(roomId, eventId),
-        ).getOrNull()?.ok == true
+        runCatching { MatrixRepository.saveMessageImage(roomId, eventId) }.getOrDefault(false)
 
     /**
-     * Toggles voice-note playback in the companion: plays [eventId], or stops
+     * Toggles voice-note playback: plays [eventId], or stops
      * it if it is already the one playing. @return (nowPlaying, error) — the
-     * tool surfaces a fetch/playback failure on the row instead of a silent
+     * row surfaces a fetch/playback failure instead of a silent
      * no-op (feedback 2026-08-19).
      */
-    suspend fun playVoiceNote(roomId: String, eventId: String): Pair<Boolean, String?> {
-        val result = callRemoteServiceMethod(
-            LightServiceMethod.PlayVoiceNote,
-            LightServiceMethod.PlayVoiceNote.Request(roomId, eventId),
-        )
-        return when (result) {
-            is LightResult.Success -> result.data.playing to result.data.error
-            is LightResult.Error -> false to (result.extra ?: "playback failed")
-        }
-    }
+    suspend fun playVoiceNote(roomId: String, eventId: String): Pair<Boolean, String?> =
+        runCatching { MatrixRepository.playVoiceNote(roomId, eventId) }
+            .getOrElse { false to (it.message ?: "playback failed") }
 
     /**
      * Media volume (level, max) for the in-app volume panel (feedback
      * 2026-08-30): the SDK server answers GetVolumeLevel from the platform.
+     * Stays on the binder — this is an SDK-level method routed through the
+     * server's customServiceMethodResolver (NO-SEAM keeps this one).
      */
     suspend fun volumeLevel(): Pair<Int, Int>? =
         callRemoteServiceMethod(LightServiceMethod.GetVolumeLevel, Unit)
@@ -350,7 +246,7 @@ object ChatClient {
 
     /**
      * Starts the record-a-voice-note flow for [roomId]. @return the flattened
-     * component name of the companion's recording activity, which the tool
+     * component name of the recording activity, which the tool
      * launches via `SimpleLightScreen.startServerActivity`.
      */
     suspend fun startVoiceNoteSend(roomId: String): String? =
@@ -358,4 +254,17 @@ object ChatClient {
             LightServiceMethod.StartVoiceNoteSend,
             LightServiceMethod.StartVoiceNoteSend.Request(roomId),
         ).getOrNull()?.activityComponent
+
+    /**
+     * Long-poll wait for the status revision (Phase C, 2026-09-06): the
+     * repository bumps it wherever a connection-state or verification-state
+     * fact commits. The Account/Verification/Settings screens refetch their
+     * status on movement instead of polling. (The list/thread/screens' room
+     * and page loops died with the NO-SEAM flows — this is the one wait left.)
+     */
+    suspend fun waitForStatusChange(lastSeen: Long, timeoutMs: Long = 25_000): Long =
+        callRemoteServiceMethod(
+            LightServiceMethod.WaitForChange,
+            LightServiceMethod.WaitForChange.Request("status", null, lastSeen, timeoutMs),
+        ).getOrNull()?.revision ?: lastSeen
 }
