@@ -2283,29 +2283,33 @@ private fun ForwardedMediaRow(
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Incoming rows lead with the glyph, own rows trail it — the
             // same 0.5 buffer either way (matches the forwarded text
-            // grammar and the phone icon on an incoming call).
+            // grammar and the phone icon on an incoming call). The glyph
+            // centers on media + caption together: the caption is content
+            // aligned under the media (like non-forwarded rows), inside the
+            // same Row slot.
             if (!message.isMine) {
                 ForwardedArrowGlyph(
                     modifier = Modifier.padding(end = 0.5f.gridUnitsAsDp()),
                 )
             }
-            content()
+            Column {
+                content()
+                // The server strips the "↷ Forwarded" header out of the
+                // caption, so a captionless forward's caption is empty —
+                // dropped here. (The forwarded branch previously dropped the
+                // caption entirely — feedback 2026-09-08.)
+                caption?.takeIf { it.isNotBlank() }?.let {
+                    LightText(
+                        text = it,
+                        variant = LightTextVariant.Paragraph,
+                    )
+                }
+            }
             if (message.isMine) {
                 ForwardedArrowGlyph(
                     modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
                 )
             }
-        }
-        // The caption is content (under the media, like non-forwarded rows);
-        // the "forwarded" tag is metadata and goes last. The server strips
-        // the "↷ Forwarded" header out of it, so a captionless forward's
-        // caption is empty — dropped here. (The forwarded branch previously
-        // dropped the caption entirely — feedback 2026-09-08.)
-        caption?.takeIf { it.isNotBlank() }?.let {
-            LightText(
-                text = it,
-                variant = LightTextVariant.Paragraph,
-            )
         }
         LightText(
             text = "forwarded",
