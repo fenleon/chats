@@ -1602,8 +1602,9 @@ class ThreadScreen(
                 onLike = { contextTarget?.let { viewModel.setReaction(it, LIKE_KEY) } },
                 onReact = { key -> contextTarget?.let { viewModel.setReaction(it, key) } },
                 onRemoveReaction = { contextTarget?.let { viewModel.removeReaction(it) } },
-                onEdit = { contextTarget?.let { openComposer(it) } },
+                onEdit = { contextTarget?.let { openComposer(edit = it) } },
                 onUnsend = { contextTarget?.let { unsendConfirm = it } },
+                onReply = { contextTarget?.let { openComposer(reply = it) } },
                 onDismiss = { contextMessage = null },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
@@ -1663,8 +1664,11 @@ class ThreadScreen(
         }
     }
 
-    private fun openComposer(edit: LightServiceMethod.GetMessages.Message? = null) {
-        navigateTo(screenFactory = { ComposerScreen(it, room.id, room.name, edit) }) { result ->
+    private fun openComposer(
+        edit: LightServiceMethod.GetMessages.Message? = null,
+        reply: LightServiceMethod.GetMessages.Message? = null,
+    ) {
+        navigateTo(screenFactory = { ComposerScreen(it, room.id, room.name, edit, reply) }) { result ->
             if (result != null) {
                 if (edit == null) {
                     // The message went out — drop the restored draft so the
@@ -1672,6 +1676,9 @@ class ThreadScreen(
                     composerDrafts.remove(room.id)
                     // Show the sent message immediately (optimistic echo); the
                     // poll replaces the row with the real event once sync lands.
+                    // A reply carries its target's excerpt context so the row
+                    // renders its header from the first frame (the sync echo
+                    // re-resolves sender/excerpt server-side).
                     viewModel.addOptimistic(
                         LightServiceMethod.GetMessages.Message(
                             id = result.id,
@@ -1680,6 +1687,9 @@ class ThreadScreen(
                             body = result.body,
                             timestampMs = result.timestampMs,
                             isMine = true,
+                            replyToId = reply?.id,
+                            replyToSender = reply?.senderName?.takeIf { it.isNotBlank() },
+                            replyToExcerpt = reply?.let { replyExcerptOf(it.body) },
                         ),
                     )
                 } else {
@@ -1841,6 +1851,14 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
 
 /** Consecutive same-sender messages closer than this share one timestamp. */
 private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
+
+/** One-line excerpt of a reply target's body for an optimistic row's header
+ *  (the sync echo re-resolves it server-side): the first non-empty line,
+ *  capped with an ellipsis. */
+private fun replyExcerptOf(body: String): String? =
+    body.lineSequence().firstOrNull { it.isNotBlank() }?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { if (it.length > 80) it.take(79) + "…" else it }
 
 /**
  * Outgoing message body: left-aligned text in a block sized to the WIDEST
@@ -2165,6 +2183,26 @@ private fun MessageRow(
                     )
                 }
             } else {
+                // Reply excerpt header: one line — "{sender} · {excerpt of
+                // the original}" — above the body, indented one grid unit
+                // from the text edge. Data only, no tap (calm design; the
+                // excerpt suffices). Text rows only for v1; media rows skip
+                // it. Blank (target unresolved — a pending echo carries the
+                // id only) renders nothing.
+                message.replyToId?.takeIf { message.contentType == "text" }?.let {
+                    val header = listOfNotNull(
+                        message.replyToSender,
+                        message.replyToExcerpt,
+                    ).joinToString(" · ")
+                    if (header.isNotBlank()) {
+                        LightText(
+                            text = header,
+                            variant = LightTextVariant.Superfine,
+                            maxLines = 1,
+                            modifier = Modifier.padding(top = 1.dp, start = 1f.gridUnitsAsDp()),
+                        )
+                    }
+                }
                 if (message.forwarded) {
                     // Forwarded text — incoming and own share the grammar: the
                     // ↷ glyph leads the body on incoming rows, trails it on

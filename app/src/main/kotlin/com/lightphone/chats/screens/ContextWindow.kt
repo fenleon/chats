@@ -83,6 +83,7 @@ fun ContextWindowOverlay(
     onRemoveReaction: () -> Unit,
     onEdit: () -> Unit,
     onUnsend: () -> Unit,
+    onReply: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -130,6 +131,9 @@ fun ContextWindowOverlay(
                     if (copyText.isNotBlank()) {
                         add("COPY" to { ChatClient.copyToClipboard(copyText); onDismiss() })
                     }
+                    // REPLY next, on any message (own or received): opens the
+                    // composer with this message as the reply target.
+                    add("REPLY" to { onReply(); onDismiss() })
                     when {
                         // Own message: the message controls, each only while the
                         // row still allows it (bridge caps / window).

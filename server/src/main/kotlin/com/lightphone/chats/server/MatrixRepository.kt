@@ -382,6 +382,9 @@ object MatrixRepository {
         override val txnId: String,
         override val timestampMs: Long,
         val body: String,
+        /** Event id the send replies to (m.in_reply_to), for the optimistic
+         *  row's excerpt header; null for a plain send. */
+        val replyToEventId: String? = null,
     ) : PendingSend
 
     /** Photo sends awaiting their sync echo, the same optimistic-row pattern as
@@ -3302,7 +3305,10 @@ object MatrixRepository {
         }
         for (pending in pendingTextEchoes(roomId)) {
             addIfMissing(
-                pendingEchoRow(c, RoomId(roomId), pending.txnId, pending.timestampMs, pending.body),
+                pendingEchoRow(
+                    c, RoomId(roomId), pending.txnId, pending.timestampMs, pending.body,
+                    replyToEventId = pending.replyToEventId,
+                ),
             )
         }
         for (pending in pendingImageEchoes(roomId)) {
@@ -3688,6 +3694,9 @@ object MatrixRepository {
         /** Real event id cached on the pending at ack time — the outbox row
          *  (the other source of the id) is removed once the echo processes. */
         cachedEventId: String? = null,
+        /** Event id the send replies to — the optimistic row's excerpt header
+         *  carries the id only (sender/excerpt resolve when the echo lands). */
+        replyToEventId: String? = null,
     ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message {
         val outbox = withTimeoutOrNull(OUTBOX_READ_TIMEOUT_MS) {
             c.room.getOutbox(matrixRoomId, txnId).first()
@@ -3709,6 +3718,7 @@ object MatrixRepository {
             },
             contentType = contentType,
             durationMs = durationMs,
+            replyToId = replyToEventId,
         )
     }
 
@@ -3738,7 +3748,10 @@ object MatrixRepository {
             when (val content = om.content) {
                 is RoomMessageEventContent.TextBased -> if (putPendingIfAbsent(
                         pendingTextEcho, roomKey, om.transactionId,
-                        PendingTextSend(om.transactionId, ts, content.body),
+                        PendingTextSend(
+                            om.transactionId, ts, content.body,
+                            (content.relatesTo as? RelatesTo.Reply)?.replyTo?.eventId?.full,
+                        ),
                     )) { rebuilt++; rebuiltRooms.add(roomKey) }
                 is RoomMessageEventContent.FileBased.Image -> if (putPendingIfAbsent(
                         pendingImageEcho, roomKey, om.transactionId,
@@ -4105,7 +4118,10 @@ object MatrixRepository {
             { pendingTextEcho[roomId]?.remove(it) },
             { p ->
                 val t = p as PendingTextSend
-                pendingEchoRow(c, matrixRoomId, t.txnId, t.timestampMs, t.body)
+                pendingEchoRow(
+                    c, matrixRoomId, t.txnId, t.timestampMs, t.body,
+                    replyToEventId = t.replyToEventId,
+                )
             },
         )
         // Photo rows: same local-… dedup; the echo's real row replaces them.
@@ -5175,7 +5191,7 @@ object MatrixRepository {
         // the thread, and the sync echo (matched by txn id) replaces it in
         // [computeMessagesPage].
         val roomPending = pendingTextEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
-        roomPending[txnId] = PendingTextSend(txnId, System.currentTimeMillis(), markdownBody)
+        roomPending[txnId] = PendingTextSend(txnId, System.currentTimeMillis(), markdownBody, replyToEventId)
         // Keep the cached/disk newest page — re-opening the thread serves it
         // instantly with the optimistic row injected ([injectPendingEchoes]),
         // and the active-room refresher (or the next poll) recomputes the page
@@ -10255,6 +10271,26 @@ object MatrixRepository {
             else -> null to false
         }
         val sender = te.event.sender
+        // Reply context (m.in_reply_to): the relation sits on the ORIGINAL
+        // event (edits replace the body, the reply fields ride along), so
+        // an edited reply still shows its excerpt header. The target event
+        // comes from the same local timeline lookup the send path uses
+        // (a store read, no network); sender/excerpt stay null when the
+        // target is gone or undecryptable.
+        val replyTargetId = (content as? RoomMessageEventContent)?.relatesTo
+            ?.let { it as? RelatesTo.Reply }?.replyTo?.eventId?.full
+        var replyToSender: String? = null
+        var replyToExcerpt: String? = null
+        if (replyTargetId != null) {
+            withTimeoutOrNull(ROOM_BUDGET_MS) {
+                c.room.getTimelineEvent(roomId, EventId(replyTargetId)).firstOrNull()
+            }?.let { target ->
+                replyToSender = senderNameOf(c, roomId, target.event.sender)
+                (target.content?.getOrNull() as? RoomMessageEventContent.TextBased)?.let {
+                    replyToExcerpt = replyExcerptOf(it.body)
+                }
+            }
+        }
         return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
             id = te.event.id.full,
             sender = sender.full,
@@ -10279,8 +10315,24 @@ object MatrixRepository {
             forwarded = forwarded || forwardedByCaption,
             edited = edited && contentType == "text",
             formattedHtml = if (contentType == "text") formattedHtml else null,
+            replyToId = replyTargetId,
+            replyToSender = replyToSender,
+            replyToExcerpt = replyToExcerpt,
         )
     }
+
+    /** Excerpt cap for a reply header (the original message's first line). */
+    private const val REPLY_EXCERPT_MAX = 80
+
+    /** One-line excerpt of a reply target's body: the reply fallback quote
+     *  stripped (a reply to a reply), the first non-empty line, capped with an
+     *  ellipsis. */
+    private fun replyExcerptOf(body: String): String? =
+        stripReplyQuote(body).lineSequence()
+            .firstOrNull { it.isNotBlank() }
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { if (it.length > REPLY_EXCERPT_MAX) it.take(REPLY_EXCERPT_MAX - 1) + "…" else it }
 
     private suspend fun senderNameOf(c: MatrixClient, roomId: RoomId, sender: UserId): String =
         withTimeoutOrNull(ROOM_BUDGET_MS) {

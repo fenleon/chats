@@ -2,6 +2,7 @@ package com.lightphone.chats.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -61,6 +62,9 @@ class ComposerViewModel(
      *  SEND routes to [ChatClient.editMessage] and pops back with the edit
      *  result instead of sending a new message. */
     private val editTarget: LightServiceMethod.GetMessages.Message? = null,
+    /** The message SEND replies to (m.in_reply_to); mutable state so the
+     *  header's tap cancels the reply back to a plain compose. */
+    replyTarget: LightServiceMethod.GetMessages.Message? = null,
 ) : LightViewModel<ComposerResult>() {
 
     val busy = MutableStateFlow(false)
@@ -68,6 +72,13 @@ class ComposerViewModel(
     /** Failure message from the last send/edit (null = none) — displayed so a
      *  rejected send reads as an error, not a silent "still sending". */
     val error = MutableStateFlow<String?>(null)
+
+    /** Event id the send goes out as a reply to; null once cancelled. */
+    val replyToEventId = MutableStateFlow(replyTarget?.id)
+
+    fun cancelReply() {
+        replyToEventId.value = null
+    }
 
     override fun onScreenShow(screen: SimpleLightScreen<ComposerResult>) {
         super.onScreenShow(screen)
@@ -106,7 +117,7 @@ class ComposerViewModel(
                         error.value = editError
                     }
                 } else {
-                    val response = ChatClient.sendMessage(roomId, body)
+                    val response = ChatClient.sendMessage(roomId, body, replyToEventId.value)
                     if (response != null) {
                         screen.goBack(
                             ComposerResult(
@@ -137,12 +148,17 @@ class ComposerScreen(
     /** When set, the composer prefills this message's body and SEND edits it
      *  (Phase C, 2026-09-03, opened from the thread's context window). */
     private val editTarget: LightServiceMethod.GetMessages.Message? = null,
+    /** When set (and not editing), SEND sends this draft as a reply to the
+     *  message (m.in_reply_to); the one-line header above the input cancels
+     *  on tap. */
+    private val replyTarget: LightServiceMethod.GetMessages.Message? = null,
 ) : LightScreen<ComposerResult, ComposerViewModel>(sealedActivity) {
 
     override val viewModelClass: Class<ComposerViewModel>
         get() = ComposerViewModel::class.java
 
-    override fun createViewModel(): ComposerViewModel = ComposerViewModel(roomId, editTarget)
+    override fun createViewModel(): ComposerViewModel =
+        ComposerViewModel(roomId, editTarget, replyTarget)
 
     @Composable
     override fun Content() {
@@ -202,22 +218,52 @@ class ComposerScreen(
                     topBarSubmitIcon = LightIcons.SEND,
                     initialCaps = true,
                 )
-                // Paste row, above the input (the keyboard reserves the 5-gu
-                // bottom-bar row below the keys; the empty draft's first line
-                // sits at ~2 gu above it). Only while the draft is still empty.
-                pasteText?.let { paste ->
-                    if (textState.text.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.BottomStart)
-                                .imePadding()
-                                .padding(start = 1f.gridUnitsAsDp(), bottom = 7f.gridUnitsAsDp())
-                                .lightClickable {
-                                    textState.edit { append(paste) }
-                                    pasteText = null
-                                },
-                        ) {
-                            LightText(text = "Paste", variant = LightTextVariant.Superfine)
+                // Reply header + paste row, above the input (the keyboard
+                // reserves the 5-gu bottom-bar row below the keys; the empty
+                // draft's first line sits at ~2 gu above it). The header is
+                // one line — the reply target's name/excerpt — and a tap
+                // cancels the reply back to a plain compose. The paste row
+                // hides itself once tapped or once the draft is no longer
+                // empty; both can coexist (paste is orthogonal to reply).
+                val replyingTo by viewModel.replyToEventId.collectAsState()
+                if (replyingTo != null || (pasteText != null && textState.text.isEmpty())) {
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .imePadding()
+                            .padding(start = 1f.gridUnitsAsDp(), bottom = 7f.gridUnitsAsDp()),
+                    ) {
+                        replyingTo?.let {
+                            // The full target rides on the constructor param
+                            // (the VM tracks only the id); blank-sender own
+                            // rows render the excerpt alone.
+                            val header = replyTarget?.let { m ->
+                                val excerpt = m.body.lineSequence()
+                                    .firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+                                listOfNotNull(
+                                    m.senderName.takeIf { it.isNotBlank() },
+                                    excerpt.takeIf { it.isNotEmpty() },
+                                ).joinToString(" · ")
+                            }
+                            LightText(
+                                text = header ?: "replying",
+                                variant = LightTextVariant.Superfine,
+                                maxLines = 1,
+                                modifier = Modifier.lightClickable { viewModel.cancelReply() },
+                            )
+                        }
+                        pasteText?.let { paste ->
+                            if (textState.text.isEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .lightClickable {
+                                            textState.edit { append(paste) }
+                                            pasteText = null
+                                        },
+                                ) {
+                                    LightText(text = "Paste", variant = LightTextVariant.Superfine)
+                                }
+                            }
                         }
                     }
                 }

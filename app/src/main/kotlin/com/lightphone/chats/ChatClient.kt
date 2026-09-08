@@ -94,8 +94,9 @@ object ChatClient {
     suspend fun sendMessage(
         roomId: String,
         body: String,
+        replyToEventId: String? = null,
     ): LightServiceMethod.SendMessage.Response? =
-        runCatching { MatrixRepository.sendMessage(roomId, body, null) }.getOrNull()
+        runCatching { MatrixRepository.sendMessage(roomId, body, replyToEventId) }.getOrNull()
 
     /**
      * Re-sends a locally-failed message: the repository clears the outbox error
