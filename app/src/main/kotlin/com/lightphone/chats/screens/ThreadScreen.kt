@@ -2033,8 +2033,10 @@ private fun MessageRow(
             // A forwarded message carries a small "forwarded" tag — the
             // bridge's WhatsApp forward marker, lifted out of the body by the
             // companion and served as this flag. Every forwarded row shares
-            // one grammar, incoming or own: the ↷ glyph trails the content at
-            // the far right, centred vertically on it, and the lowercase
+            // one grammar, incoming or own: the ↷ glyph sits beside the
+            // content on the row's outer side — leading it on incoming rows
+            // (the phone icon on an incoming call), trailing it on own rows —
+            // centred vertically on it, and the lowercase
             // "forwarded" word sits under the whole block — same spot as the
             // other tags. Tight, lowercase, consistent with the other tags.
             // Media rows open the context window on long-press — received rows always (LIKE/REACT [+ SAVE on
@@ -2065,13 +2067,23 @@ private fun MessageRow(
             } else {
                 if (message.forwarded) {
                     // Forwarded text — incoming and own share the grammar: the
-                    // ↷ glyph trails the body at the far right, centred
-                    // vertically on it ([ForwardedArrowGlyph]: Paragraph
+                    // ↷ glyph leads the body on incoming rows, trails it on
+                    // own rows (centred vertically on it —
+                    // [ForwardedArrowGlyph]: Paragraph
                     // scaled ~2.1x about a low pivot keeps the ink centered on
                     // the body's line box), the lowercase "forwarded" word
                     // under the whole block.
                     Column(modifier = Modifier.padding(top = 1.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            // Side follows the row's direction grammar (the
+                            // phone icon on an incoming call): incoming rows
+                            // lead with the glyph, own rows trail it — the
+                            // same 0.5 buffer either way.
+                            if (!message.isMine) {
+                                ForwardedArrowGlyph(
+                                    modifier = Modifier.padding(end = 0.5f.gridUnitsAsDp()),
+                                )
+                            }
                             if (message.isMine) {
                                 // Outgoing: block sized to the first line so
                                 // the top line's last word touches the right
@@ -2083,9 +2095,11 @@ private fun MessageRow(
                                     variant = LightTextVariant.Paragraph,
                                 )
                             }
-                            ForwardedArrowGlyph(
-                                modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
-                            )
+                            if (message.isMine) {
+                                ForwardedArrowGlyph(
+                                    modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
+                                )
+                            }
                         }
                         LightText(
                             text = "forwarded",
@@ -2223,8 +2237,9 @@ private fun ForwardedArrowGlyph(modifier: Modifier = Modifier) {
     )
 }
 
-/** Forwarded MEDIA rows: the ↷ glyph trails the media at the far right
- *  (spaced off it — it used to hug the photo), any caption moves UNDER the
+/** Forwarded MEDIA rows: the ↷ glyph sits beside the media on the row's
+ *  outer side — leading it on incoming rows, trailing it on own rows (spaced
+ *  off it — it used to hug the photo), any caption moves UNDER the
  *  media instead of beside it, and the small "forwarded" word sits under the
  *  whole block — the same grammar as forwarded text. */
 @Composable
@@ -2246,10 +2261,20 @@ private fun ForwardedMediaRow(
     }
     Column(modifier = Modifier.padding(top = 1.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            // Incoming rows lead with the glyph, own rows trail it — the
+            // same 0.5 buffer either way (matches the forwarded text
+            // grammar and the phone icon on an incoming call).
+            if (!message.isMine) {
+                ForwardedArrowGlyph(
+                    modifier = Modifier.padding(end = 0.5f.gridUnitsAsDp()),
+                )
+            }
             content()
-            ForwardedArrowGlyph(
-                modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
-            )
+            if (message.isMine) {
+                ForwardedArrowGlyph(
+                    modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
+                )
+            }
         }
         LightText(
             text = "forwarded",

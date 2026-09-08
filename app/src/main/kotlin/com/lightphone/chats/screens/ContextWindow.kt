@@ -145,18 +145,25 @@ fun ContextWindowOverlay(
                     verticalArrangement = Arrangement.Center,
                 ) {
                     rows.forEach { (label, action) ->
+                        // The 44 dp full-width row is layout spacing only —
+                        // the tap target hugs the label (the full row fired
+                        // on taps far off the text; feedback 2026-09-08).
                         Box(
                             modifier = Modifier
                                 .height(44.dp)
-                                .fillMaxWidth()
-                                .lightClickable(onClick = action),
+                                .fillMaxWidth(),
                             contentAlignment = Alignment.Center,
                         ) {
-                            LightText(
-                                text = label,
-                                variant = LightTextVariant.Button,
-                                maxLines = 1,
-                            )
+                            Box(
+                                modifier = Modifier.lightClickable(onClick = action),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                LightText(
+                                    text = label,
+                                    variant = LightTextVariant.Button,
+                                    maxLines = 1,
+                                )
+                            }
                         }
                     }
                 }

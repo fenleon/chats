@@ -5910,9 +5910,18 @@ object MatrixRepository {
             .setAudioAttributes(mediaAttributes)
             .setOnAudioFocusChangeListener { change ->
                 // Focus loss (another app / a call) stops the note; the row
-                // state follows via the poll's audioPlayingEventId.
+                // state follows via the poll's audioPlayingEventId. A PAUSED
+                // note survives the loss untouched (the recorder's own focus
+                // take must not kill its pause point). The held focus is KEPT
+                // on a loss-stop — abandoning it here would hand GAIN down
+                // the stack to the app we had paused, which auto-resumes on
+                // GAIN (feedback 2026-09-08: recording a voice note restarted
+                // paused background audio). Same contract as natural
+                // completion: the next [stopAudioPlayback] releases it.
                 if (change != android.media.AudioManager.AUDIOFOCUS_GAIN) {
-                    mainHandler.post { stopAudioPlayback() }
+                    mainHandler.post {
+                        if (playingAudioEventId != null) stopAudioPlayback(releaseFocus = false)
+                    }
                 }
             }
             .build()
