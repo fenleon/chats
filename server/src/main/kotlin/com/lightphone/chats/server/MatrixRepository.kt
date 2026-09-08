@@ -5564,20 +5564,21 @@ object MatrixRepository {
                 // must not hang the heal and hold initMutex).
                 withTimeoutOrNull(10_000L) { runCatching { old.closeSuspending() } }
                 android.util.Log.w(TAG, "self-heal: HTTP stack rebuilt for ${restored.userId.full}")
-                if (syncEnabled) {
-                    PushChannel.start(ctx, restored)
-                    // The FGS keep-alive survived the heal, but its sync loop
-                    // AND watchdog belong to the closed old client —
-                    // enterActiveSync's guard trusts ChatSyncService.isRunning
-                    // and would bail, leaving no long-poll and no push wakes
-                    // (onPushDelivered skips in ACTIVE mode) → a stuck
-                    // "Can't reach server" banner. Re-kick
-                    // the service: onStartCommand sees syncedClient !==
-                    // restored and re-arms loop + watchdog on the new client.
-                    runCatching {
-                        ctx.startForegroundService(Intent(ctx, ChatSyncService::class.java))
-                    }.onFailure { applySyncModeForScreenState() }
-                }
+                if (syncEnabled) PushChannel.start(ctx, restored)
+                // Re-kick the service on the new client REGARDLESS of the
+                // sync toggle: the FGS keep-alive survived the heal, but its
+                // sync loop AND watchdog belong to the closed old client —
+                // enterActiveSync's guard trusts ChatSyncService.isRunning
+                // and would bail, leaving no long-poll and no push wakes
+                // (onPushDelivered skips in ACTIVE mode) → a stuck
+                // "Can't reach server" banner (seen 2026-09-08 under
+                // battery saver: the old syncEnabled gate skipped the
+                // re-kick, but toggle off now means only "no sync while
+                // dark" — the service's own onStartCommand guard applies
+                // the dark/battery-saver policy).
+                runCatching {
+                    ctx.startForegroundService(Intent(ctx, ChatSyncService::class.java))
+                }.onFailure { applySyncModeForScreenState() }
             } finally {
                 mediaHealInFlight = false
                 mediaStackSick = false
