@@ -66,4 +66,9 @@ dependencies {
     // Room runtime for Trixnity's TrixnityRoomDatabase (session + event store).
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
+
+    // Unit tests for MarkdownConverter (kotlin-test only — the workspace's
+    // only allowed test framework; junit is its backend).
+    testImplementation(libs.kotlin.test)
+    testImplementation(libs.junit)
 }

@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -54,6 +55,7 @@ import com.lightphone.chats.VolumePanelState
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
+import com.lightphone.chats.formattedMessage
 import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -1846,11 +1848,13 @@ private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
  * max width), so the block hugs the text instead of the full column — a long
  * unbreakable word (a URL, an email address) no longer collapses the block to
  * the width of the short line before it. The block never exceeds the column cap, so no line spans
- * edge to edge.
+ * edge to edge. The body arrives already rendered
+ * ([formattedMessage] — the markdown markup rides on the spans, and the
+ * measurement below sees the FINAL string, markup applied).
  */
 @Composable
 private fun OutgoingBodyText(
-    body: String,
+    body: AnnotatedString,
     maxWidthPx: Int,
     modifier: Modifier = Modifier,
 ) {
@@ -1859,7 +1863,7 @@ private fun OutgoingBodyText(
     val style = LightThemeTokens.typography.paragraph.scaledForScreenHeight()
     val widthDp = remember(body, maxWidthPx, density, style) {
         val layout = textMeasurer.measure(
-            text = AnnotatedString(body),
+            text = body,
             style = style,
             // No width cap: the widest natural line sizes the block (capped
             // below at the column max). Measuring with the cap would break the
@@ -1877,13 +1881,39 @@ private fun OutgoingBodyText(
         val w = minOf(ceil(widestPx), maxWidthPx.toFloat())
         with(density) { w.toFloat().toDp() }
     }
-    LightText(
+    Text(
         text = body,
-        variant = LightTextVariant.Paragraph,
+        style = style,
+        color = LightThemeTokens.colors.content,
         modifier = modifier
             .padding(top = 1.dp)
             .width(widthDp),
     )
+}
+
+/** Incoming message body: LightText for plain rows, the rendered
+ *  [formattedMessage] spans (same paragraph typography/color) for rows whose
+ *  event carried a formatted variant. */
+@Composable
+private fun IncomingBodyText(
+    message: LightServiceMethod.GetMessages.Message,
+    modifier: Modifier = Modifier,
+) {
+    val html = message.formattedHtml
+    if (html == null) {
+        LightText(
+            text = message.body,
+            variant = LightTextVariant.Paragraph,
+            modifier = modifier,
+        )
+    } else {
+        Text(
+            text = formattedMessage(html, message.body),
+            style = LightThemeTokens.typography.paragraph.scaledForScreenHeight(),
+            color = LightThemeTokens.colors.content,
+            modifier = modifier,
+        )
+    }
 }
 
 /** Image-row state shared by every row: the fetched display bytes by message
@@ -2167,14 +2197,12 @@ private fun MessageRow(
                                 // unweighted, the body measured across the full
                                 // row width and squeezed the glyph to nothing.
                                 OutgoingBodyText(
-                                    message.body, bodyMaxWidthPx,
+                                    formattedMessage(message.formattedHtml ?: "", message.body),
+                                    bodyMaxWidthPx,
                                     modifier = Modifier.weight(1f, fill = false),
                                 )
                             } else {
-                                LightText(
-                                    text = message.body,
-                                    variant = LightTextVariant.Paragraph,
-                                )
+                                IncomingBodyText(message)
                             }
                             if (message.isMine) {
                                 ForwardedArrowGlyph(
@@ -2192,7 +2220,10 @@ private fun MessageRow(
                     // Outgoing: block sized to the first line so the top line's
                     // last word always touches the right edge (see
                     // [OutgoingBodyText]).
-                    OutgoingBodyText(message.body, bodyMaxWidthPx)
+                    OutgoingBodyText(
+                        formattedMessage(message.formattedHtml ?: "", message.body),
+                        bodyMaxWidthPx,
+                    )
                 } else if (message.body.startsWith("Incoming call")) {
                     // Bridged call notices ("Incoming call. Use the WhatsApp
                     // app to answer." — Beeper's bridges can't relay calls, so
@@ -2214,9 +2245,8 @@ private fun MessageRow(
                         )
                     }
                 } else {
-                    LightText(
-                        text = message.body,
-                        variant = LightTextVariant.Paragraph,
+                    IncomingBodyText(
+                        message,
                         modifier = Modifier.padding(top = 1.dp),
                     )
                 }

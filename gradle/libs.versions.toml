@@ -32,6 +32,9 @@ sdk-server = { module = "com.thelightphone:sdk-server", version.ref = "sdk" }
 # UnifiedPush app-side connector (the SDK client depends on it too; needed here
 # directly for the probe service that captures LightOS's distributor endpoint).
 unifiedpush-connector = { module = "org.unifiedpush.android:connector", version.ref = "connector" }
+# kotlin-test (JUnit backend) — the only test framework the workspace allows.
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+junit = { module = "junit:junit", version = "4.13.2" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

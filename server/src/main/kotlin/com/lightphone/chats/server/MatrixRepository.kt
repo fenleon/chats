@@ -5151,18 +5151,31 @@ object MatrixRepository {
         // cause (broken /keys/claim deserialization) is fixed, and Trixnity
         // re-shares the room key to new devices on every send with the existing
         // session, so the bridge keeps getting keys without per-message churn.
+        // Markdown is always on for outgoing text (Beeper behavior); the
+        // formatted variant is only produced when the text actually contains a
+        // construct, so plain bodies pass through byte-for-byte. The pending
+        // echo keeps the plain body until the real echo syncs.
+        val (markdownBody, markdownHtml) = MarkdownConverter.toMatrixContent(body)
         val txnId = c.room.sendMessage(matrixRoomId) {
             if (replyToEventId != null) {
                 val replyEvent = c.room.getTimelineEvent(matrixRoomId, EventId(replyToEventId)).firstOrNull()
                 if (replyEvent != null) reply(replyEvent)
             }
-            text(body = body)
+            if (markdownHtml != null) {
+                text(
+                    body = markdownBody,
+                    format = "org.matrix.custom.html",
+                    formattedBody = markdownHtml,
+                )
+            } else {
+                text(body = body)
+            }
         }
         // Record the optimistic echo server-side — the row survives leaving
         // the thread, and the sync echo (matched by txn id) replaces it in
         // [computeMessagesPage].
         val roomPending = pendingTextEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
-        roomPending[txnId] = PendingTextSend(txnId, System.currentTimeMillis(), body)
+        roomPending[txnId] = PendingTextSend(txnId, System.currentTimeMillis(), markdownBody)
         // Keep the cached/disk newest page — re-opening the thread serves it
         // instantly with the optimistic row injected ([injectPendingEchoes]),
         // and the active-room refresher (or the next poll) recomputes the page
@@ -5364,9 +5377,20 @@ object MatrixRepository {
         if (newBody.isBlank()) error("empty edit body")
         val c = client ?: error("not logged in")
         val matrixRoomId = RoomId(roomId)
+        // The user edits the plain text they see; markdown they type
+        // re-formats (same conversion as [sendMessage]).
+        val (markdownBody, markdownHtml) = MarkdownConverter.toMatrixContent(newBody)
         val txnId = c.room.sendMessage(matrixRoomId) {
             replace(EventId(eventId))
-            text(newBody)
+            if (markdownHtml != null) {
+                text(
+                    body = markdownBody,
+                    format = "org.matrix.custom.html",
+                    formattedBody = markdownHtml,
+                )
+            } else {
+                text(newBody)
+            }
         }
         // No ack hold (matching sendMessage): the edit is already enqueued —
         // the 500 ms wait timed out unconfirmed under crawl load and the throw
@@ -10140,17 +10164,25 @@ object MatrixRepository {
         // rows carry it on their caption (a forwarded photo's caption IS the
         // bare header).
         var forwarded = false
-        val (body, contentType) = when (content) {
+        val (body, formattedHtml, contentType) = when (content) {
             is RoomMessageEventContent.FileBased.Image ->
                 // The body is the row's fallback label, not the file name — a
                 // bare "IMG_0312.JPG" renders like a message (gmessages).
                 // Rows with no media uri at all can never fetch
                 // ("[Photo — unavailable]"); the rest get "[Photo]" when their
                 // bytes are missing.
-                (if (content.url.isNullOrBlank() && content.file?.url.isNullOrBlank())
-                    "[Photo — unavailable]" else "[Photo]") to "image"
+                Triple(
+                    if (content.url.isNullOrBlank() && content.file?.url.isNullOrBlank())
+                        "[Photo — unavailable]" else "[Photo]",
+                    null,
+                    "image",
+                )
             is RoomMessageEventContent.FileBased.Audio ->
-                (content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note") to "audio"
+                Triple(
+                    content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note",
+                    null,
+                    "audio",
+                )
             is RoomMessageEventContent.FileBased.Video ->
                 // A video (incl. WhatsApp animated GIFs, which arrive as
                 // m.video) renders as an image row fed by a server-side
@@ -10158,15 +10190,19 @@ object MatrixRepository {
                 // playback, the SDK has no video primitive); the tool tags
                 // the thumbnail "[Video]". The fallback label when the
                 // thumbnail can't fetch stays the body below.
-                "[Video]" to "video"
+                Triple("[Video]", null, "video")
             is RoomMessageEventContent.FileBased.File ->
                 // RCS direct photos arrive as m.file with an image/* mimetype
                 // — render those as image rows so the
                 // media actually fetches; other m.file stays a "[File]" row.
                 if (content.info?.mimeType?.startsWith("image/", ignoreCase = true) == true)
-                    (if (content.url.isNullOrBlank() && content.file?.url.isNullOrBlank())
-                        "[Photo — unavailable]" else "[Photo]") to "image"
-                else "[File]" to "text"
+                    Triple(
+                        if (content.url.isNullOrBlank() && content.file?.url.isNullOrBlank())
+                            "[Photo — unavailable]" else "[Photo]",
+                        null,
+                        "image",
+                    )
+                else Triple("[File]", null, "text")
             is RoomMessageEventContent.TextBased -> {
                 // m.notice = bridge system messages ("Turned off disappearing
                 // messages", timer-set notices… — the mautrix bridge sends them
@@ -10185,9 +10221,23 @@ object MatrixRepository {
                 forwarded = fwd
                 val text = stripOwnPrefix(stripped, ownName)
                 if (text.isBlank()) return null
-                text to if (content is RoomMessageEventContent.TextBased.Notice) "notice" else "text"
+                // Formatted incoming (chats markdown render): only when the
+                // event carries the custom-html format — the <mx-reply> block
+                // (Beeper's reply fallback) is stripped; the remainder feeds
+                // the tool's AnnotatedString converter. An edited text uses
+                // the edit's own content when it has one.
+                val formattedHtml = (editedContent as? RoomMessageEventContent.TextBased ?: content)
+                    .takeIf { it.format == "org.matrix.custom.html" }
+                    ?.formattedBody
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { MX_REPLY_REGEX.replace(it, "").trim().takeIf { h -> h.isNotBlank() } }
+                Triple(
+                    text,
+                    formattedHtml,
+                    if (content is RoomMessageEventContent.TextBased.Notice) "notice" else "text",
+                )
             }
-            else -> ((previewText(te)?.takeIf { it.isNotBlank() }) ?: return null) to "text"
+            else -> Triple(previewText(te)?.takeIf { it.isNotBlank() } ?: return null, null, "text")
         }
         // The media caption (the m.image / m.video body — most clients put the
         // caption there, separate from the file name). A caption that equals
@@ -10228,6 +10278,7 @@ object MatrixRepository {
             caption = caption?.takeIf { it.isNotBlank() },
             forwarded = forwarded || forwardedByCaption,
             edited = edited && contentType == "text",
+            formattedHtml = if (contentType == "text") formattedHtml else null,
         )
     }
 
@@ -10320,6 +10371,11 @@ object MatrixRepository {
         val index = body.indexOf("\n\n")
         return if (index != -1) body.substring(index + 2).trimStart() else body
     }
+
+    /** The <mx-reply> fallback block Beeper/Element bake into a formatted
+     *  reply's `formatted_body` — stripped from the HTML the tool renders
+     *  (same precedent as [stripReplyQuote] on the plain body). */
+    private val MX_REPLY_REGEX = Regex("<mx-reply>[\\s\\S]*?</mx-reply>")
 
     /** Lifts a bridge "forwarded" header off a message body (WhatsApp forwards
      *  arrive as "↷ Forwarded" + a blank line + the content — the bridge's
