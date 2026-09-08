@@ -1787,7 +1787,11 @@ private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
  * edge to edge.
  */
 @Composable
-private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
+private fun OutgoingBodyText(
+    body: String,
+    maxWidthPx: Int,
+    modifier: Modifier = Modifier,
+) {
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer()
     val style = LightThemeTokens.typography.paragraph.scaledForScreenHeight()
@@ -1814,7 +1818,7 @@ private fun OutgoingBodyText(body: String, maxWidthPx: Int) {
     LightText(
         text = body,
         variant = LightTextVariant.Paragraph,
-        modifier = Modifier
+        modifier = modifier
             .padding(top = 1.dp)
             .width(widthDp),
     )
@@ -2073,7 +2077,12 @@ private fun MessageRow(
                     // scaled ~2.1x about a low pivot keeps the ink centered on
                     // the body's line box), the lowercase "forwarded" word
                     // under the whole block.
-                    Column(modifier = Modifier.padding(top = 1.dp)) {
+                    Column(
+                        modifier = Modifier.padding(top = 1.dp),
+                        // The tag tracks the block's own edge — right on own
+                        // rows, left on incoming (feedback 2026-09-08).
+                        horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start,
+                    ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             // Side follows the row's direction grammar (the
                             // phone icon on an incoming call): incoming rows
@@ -2087,8 +2096,14 @@ private fun MessageRow(
                             if (message.isMine) {
                                 // Outgoing: block sized to the first line so
                                 // the top line's last word touches the right
-                                // edge (see [OutgoingBodyText]).
-                                OutgoingBodyText(message.body, bodyMaxWidthPx)
+                                // edge (see [OutgoingBodyText]). weight keeps
+                                // the trailing glyph alive on multi-line rows —
+                                // unweighted, the body measured across the full
+                                // row width and squeezed the glyph to nothing.
+                                OutgoingBodyText(
+                                    message.body, bodyMaxWidthPx,
+                                    modifier = Modifier.weight(1f, fill = false),
+                                )
                             } else {
                                 LightText(
                                     text = message.body,
@@ -2259,7 +2274,12 @@ private fun ForwardedMediaRow(
         }
         return
     }
-    Column(modifier = Modifier.padding(top = 1.dp)) {
+    Column(
+        modifier = Modifier.padding(top = 1.dp),
+        // The tag tracks the block's own edge — right on own rows, left on
+        // incoming (feedback 2026-09-08).
+        horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start,
+    ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Incoming rows lead with the glyph, own rows trail it — the
             // same 0.5 buffer either way (matches the forwarded text
@@ -2275,6 +2295,17 @@ private fun ForwardedMediaRow(
                     modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
                 )
             }
+        }
+        // The caption is content (under the media, like non-forwarded rows);
+        // the "forwarded" tag is metadata and goes last. The server strips
+        // the "↷ Forwarded" header out of it, so a captionless forward's
+        // caption is empty — dropped here. (The forwarded branch previously
+        // dropped the caption entirely — feedback 2026-09-08.)
+        caption?.takeIf { it.isNotBlank() }?.let {
+            LightText(
+                text = it,
+                variant = LightTextVariant.Paragraph,
+            )
         }
         LightText(
             text = "forwarded",

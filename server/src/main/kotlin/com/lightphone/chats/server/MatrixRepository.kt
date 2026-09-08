@@ -2490,9 +2490,12 @@ object MatrixRepository {
             .distinctBy { it.id }
             .take(MAX_ROOMS_OVER_BINDER)
             // The prepend above is about window INCLUSION, not order — restore
-            // the recency order publishRoomList built (pinned, then newest).
+            // the recency order publishRoomList built (pinned, then newest),
+            // except pins order ALPHABETICALLY, not by recency (feedback
+            // 2026-09-08); non-pins stay newest-first.
             .sortedWith(
                 compareByDescending<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> { it.pinned == true }
+                    .thenBy(String.CASE_INSENSITIVE_ORDER) { if (it.pinned == true) it.name else "" }
                     .thenByDescending { it.lastTimestampMs }
             )
     }
