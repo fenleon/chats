@@ -1314,7 +1314,14 @@ class ThreadScreen(
             val delivered = newestMine
                 ?.takeIf { it.sendStatus == "DELIVERED" && !replyIsNewest }
                 ?.let { it.id to "delivered" }
-            val tag = if (newestRead?.id == newestMine?.id) seen ?: delivered else delivered ?: seen
+            // "sent": the homeserver acked the send (outbox event id) but the
+            // sync echo hasn't replaced the pending row yet — Beeper's
+            // SENT_PENDING_SERVER_ECHO. Real DELIVERED/READ evidence outranks
+            // it; it beats the older-message "seen" fallback.
+            val sent = newestMine
+                ?.takeIf { it.sendStatus == "SENT_PENDING_ECHO" && !replyIsNewest }
+                ?.let { it.id to "sent" }
+            val tag = if (newestRead?.id == newestMine?.id) seen ?: delivered else delivered ?: sent ?: seen
             tag
         }
 

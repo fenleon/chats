@@ -3225,6 +3225,10 @@ object MatrixRepository {
         limit: Int,
     ): MessagesPage {
         if (beforeEventId == null) {
+            // A room open warms the megolm send path in the background so the
+            // FIRST send in the room doesn't pay the member-load/session cost
+            // inline (see [warmRoomMegolm]).
+            warmRoomMegolm(roomId)
             val cached = messagePageCache[roomId]
             if (cached != null && cached.limit >= limit) {
                 // The memory page is never older than disk (disk writes are
@@ -3346,16 +3350,22 @@ object MatrixRepository {
         val content = te.content?.getOrNull() ?: return null
         if ((content as? RoomMessageEventContent)?.relatesTo is RelatesTo.Replace) return null
         val sender = te.event.sender.full
+        // origin_server_ts is part of the signature: the dedup exists for the
+        // bridge's EXACT re-imports (same ts), but a user legitimately
+        // repeating a message ("ok", "ok") minted the same sender|text|body
+        // signature minutes apart and the older copy vanished from the served
+        // page (found on-emulator 2026-09-08).
+        val ts = te.event.originTimestamp
         return when (content) {
-            is RoomMessageEventContent.TextBased -> "$sender|text|${content.body}"
+            is RoomMessageEventContent.TextBased -> "$sender|text|$ts|${content.body}"
             is RoomMessageEventContent.FileBased.Image ->
-                "$sender|image|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
+                "$sender|image|$ts|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
             is RoomMessageEventContent.FileBased.Audio ->
-                "$sender|audio|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
+                "$sender|audio|$ts|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
             is RoomMessageEventContent.FileBased.Video ->
-                "$sender|video|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
+                "$sender|video|$ts|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
             is RoomMessageEventContent.FileBased.File ->
-                "$sender|file|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
+                "$sender|file|$ts|${content.url ?: content.file?.url}|${content.fileName ?: ""}"
             else -> null
         }
     }
@@ -3661,7 +3671,9 @@ object MatrixRepository {
     /** Row for a send whose sync echo hasn't rendered yet. The message is
      *  treated as SENT the moment the server acks it: once the outbox records
      *  the real event id (the /send 200 — ~1s after the send, long before the
-     *  sync echo), the row carries that id + the send time; a recorded outbox
+     *  sync echo), the row carries that id + the send time and the
+     *  SENT_PENDING_ECHO status (rendered "sent" by the tool, Beeper's
+     *  SENT_PENDING_SERVER_ECHO); a recorded outbox
      *  error renders as "not delivered" (FAIL_ status, shown by the tool);
      *  only a still-queued send keeps the optimistic "local-…" row. The tool
      *  shows the send time for all three, so the thread reflects a send
@@ -3689,7 +3701,14 @@ object MatrixRepository {
             body = body,
             timestampMs = timestampMs,
             isMine = true,
-            sendStatus = if (outbox?.sendError != null) "FAIL_LOCAL_SEND" else null,
+            sendStatus = when {
+                outbox?.sendError != null -> "FAIL_LOCAL_SEND"
+                // Beeper's SENT_PENDING_SERVER_ECHO parity: the homeserver ack
+                // (outbox event id) flips the row to "sent" while the sync echo
+                // is still in flight; the echo then replaces this row wholesale.
+                outbox?.eventId != null -> "SENT_PENDING_ECHO"
+                else -> null
+            },
             contentType = contentType,
             durationMs = durationMs,
         )
@@ -5013,6 +5032,35 @@ object MatrixRepository {
     }
 
     /**
+     * Pre-warms the megolm send path when a room is opened (Beeper's
+     * prepareSendMessage): the first encrypted send in a room otherwise pays
+     * the /members fetch + outbound-session creation + /keys/claim inline in
+     * the outbox drain, and the just-tapped send waits seconds behind it.
+     * Encrypting a throwaway payload runs exactly that path (member load,
+     * session creation, key share) once per process per room, in the
+     * background — the ciphertext is discarded. Plaintext rooms no-op fast
+     * (encrypt returns null for them).
+     */
+    private val megolmWarmedRooms = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    private fun warmRoomMegolm(roomId: String) {
+        val c = client ?: return
+        if (megolmWarmedRooms.putIfAbsent(roomId, true) != null) return
+        val matrixRoomId = RoomId(roomId)
+        scope.launch {
+            runCatching {
+                c.di.getAll<RoomEventEncryptionService>().forEach { service ->
+                    runCatching {
+                        service.encrypt(RoomMessageEventContent.TextBased.Text(body = ""), matrixRoomId)
+                    }
+                }
+            }.onFailure { e ->
+                android.util.Log.w(TAG, "megolm pre-warm failed for $roomId: ${e.message}")
+            }
+        }
+    }
+
+    /**
      * Rotation triggered directly by a bridge FAIL in the status walk
      * ([sendStatusByEventId], which runs on every newest-page build): once per
      * room per process run, fire-and-forget. The next send creates a fresh
@@ -5117,7 +5165,10 @@ object MatrixRepository {
         // and the active-room refresher (or the next poll) recomputes the page
         // once the sync echo lands.
         // Fetch the echo + refresh the panel even in slow-sync mode (screen off).
-        wakeAfterSend(matrixRoomId.full)
+        // Fire-and-forget like Beeper's send worker: the composer RPC covers
+        // only the outbox insert — the room-list bump, the wake round and the
+        // ack watch all run in the background.
+        scope.launch { wakeAfterSend(matrixRoomId.full) }
         // NO-SEAM: the thread no longer polls — it reacts to page
         // bumps. The send-time bump fires BEFORE the homeserver ack, so the row
         // sat "SENDING" until the sync echo's page rebuild landed — starved for
@@ -5126,6 +5177,7 @@ object MatrixRepository {
         // (sent) from the SAME cached page — no rebuild needed.
         scope.launch {
             var lastAcked = false
+            var lastKickAt = android.os.SystemClock.elapsedRealtime()
             repeat(120) {
                 delay(250)
                 val om = runCatching {
@@ -5137,6 +5189,20 @@ object MatrixRepository {
                     bumpMessagePageRevision(matrixRoomId.full)
                 }
                 if (acked) return@launch
+                // Sync-stall kicker: a send that threw (offline blip) parks in
+                // the outbox drain's retry sleep — 100ms*2^n capped at 5 min
+                // while sync is errored/stopped, and the sleep only ends on a
+                // sync-state change. A successful round sets state RUNNING
+                // (SyncApiClient), which interrupts that sleep immediately, so
+                // re-fire the send-wake round every 5 s while the ack is
+                // missing. Battery saver + dark screen skips the send-wake
+                // (see [wakeAfterSend]) — stay consistent there.
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastKickAt >= SEND_KICK_INTERVAL_MS && (syncEnabled || isScreenInteractive())) {
+                    lastKickAt = now
+                    timedSyncOnce(c, "send-retry")
+                        .onFailure { android.util.Log.w(TAG, "send-retry sync failed: ${it.message}") }
+                }
             }
         }
         android.util.Log.d(TAG, "SendMessage: room=$roomId txn=$txnId body=$body")
@@ -10150,6 +10216,9 @@ object MatrixRepository {
     private const val SEND_ACK_WAIT_MS = 500L
     /** Poll cadence on the outbox row while awaiting the ack. */
     private const val SEND_ACK_POLL_INTERVAL_MS = 100L
+
+    /** Gap between send-stall kicker rounds while a send waits for its ack. */
+    private const val SEND_KICK_INTERVAL_MS = 5_000L
     /** Whole-outbox read for the restart pending reconstruction (one query;
      *  empty outbox → instant). */
     private const val OUTBOX_RECONSTRUCT_BUDGET_MS = 5_000L
