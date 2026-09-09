@@ -3694,12 +3694,28 @@ object MatrixRepository {
         /** Real event id cached on the pending at ack time — the outbox row
          *  (the other source of the id) is removed once the echo processes. */
         cachedEventId: String? = null,
-        /** Event id the send replies to — the optimistic row's excerpt header
-         *  carries the id only (sender/excerpt resolve when the echo lands). */
+        /** Event id the send replies to — sender/excerpt resolve below so the
+         *  pending row's header renders immediately. */
         replyToEventId: String? = null,
     ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message {
         val outbox = withTimeoutOrNull(OUTBOX_READ_TIMEOUT_MS) {
             c.room.getOutbox(matrixRoomId, txnId).first()
+        }
+        // Resolve the reply header now, not at the echo: the pending row can
+        // sit for seconds before the sync echo replaces it, and a header-less
+        // reply reads as a plain message (same lookup as messageFrom — a local
+        // store read, no network).
+        var replyToSender: String? = null
+        var replyToExcerpt: String? = null
+        if (replyToEventId != null) {
+            withTimeoutOrNull(ROOM_BUDGET_MS) {
+                c.room.getTimelineEvent(matrixRoomId, EventId(replyToEventId)).firstOrNull()
+            }?.let { target ->
+                replyToSender = senderNameOf(c, matrixRoomId, target.event.sender)
+                (target.content?.getOrNull() as? RoomMessageEventContent.TextBased)?.let {
+                    replyToExcerpt = replyExcerptOf(it.body)
+                }
+            }
         }
         return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
             id = outbox?.eventId?.full ?: cachedEventId ?: "$LOCAL_PENDING_ID_PREFIX$txnId",
@@ -3719,6 +3735,8 @@ object MatrixRepository {
             contentType = contentType,
             durationMs = durationMs,
             replyToId = replyToEventId,
+            replyToSender = replyToSender,
+            replyToExcerpt = replyToExcerpt,
         )
     }
 

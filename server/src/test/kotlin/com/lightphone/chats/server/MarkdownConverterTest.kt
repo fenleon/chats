@@ -65,6 +65,18 @@ class MarkdownConverterTest {
     }
 
     @Test
+    fun `list interrupts a paragraph without a blank line`() {
+        val (_, html) = MarkdownConverter.toMatrixContent("intro\n- one\n- two\n# Heading")
+        assertEquals("<p>intro</p><ul><li>one</li><li>two</li></ul><h1>Heading</h1>", html)
+    }
+
+    @Test
+    fun `paragraph interrupts a list`() {
+        val (_, html) = MarkdownConverter.toMatrixContent("- one\nplain tail")
+        assertEquals("<ul><li>one</li></ul><p>plain tail</p>", html)
+    }
+
+    @Test
     fun `heading levels`() {
         val (_, h1) = MarkdownConverter.toMatrixContent("# Title")
         val (_, h3) = MarkdownConverter.toMatrixContent("### Deep")

@@ -60,21 +60,27 @@ internal object MarkdownConverter {
                     i++
                 }
                 else -> {
+                    // A block is a run of ONE kind: bullet, ordered or plain.
+                    // A list line interrupts a paragraph and vice versa (no
+                    // blank line required between them).
+                    val kind = blockKind(line)
                     val block = mutableListOf<String>()
-                    while (i < lines.size && lines[i].isNotBlank() && !HEADING.matches(lines[i])) {
+                    while (i < lines.size && lines[i].isNotBlank() && !HEADING.matches(lines[i]) && blockKind(lines[i]) == kind) {
                         block.add(lines[i])
                         i++
                     }
-                    if (block.all { BULLET.matches(it) }) {
-                        out.append("<ul>")
-                        block.forEach { out.append("<li>").append(inline(BULLET.matchEntire(it)!!.groupValues[1])).append("</li>") }
-                        out.append("</ul>")
-                    } else if (block.all { ORDERED.matches(it) }) {
-                        out.append("<ol>")
-                        block.forEach { out.append("<li>").append(inline(ORDERED.matchEntire(it)!!.groupValues[1])).append("</li>") }
-                        out.append("</ol>")
-                    } else {
-                        out.append("<p>").append(block.joinToString("<br/>") { inline(it) }).append("</p>")
+                    when (kind) {
+                        1 -> {
+                            out.append("<ul>")
+                            block.forEach { out.append("<li>").append(inline(BULLET.matchEntire(it)!!.groupValues[1])).append("</li>") }
+                            out.append("</ul>")
+                        }
+                        2 -> {
+                            out.append("<ol>")
+                            block.forEach { out.append("<li>").append(inline(ORDERED.matchEntire(it)!!.groupValues[1])).append("</li>") }
+                            out.append("</ol>")
+                        }
+                        else -> out.append("<p>").append(block.joinToString("<br/>") { inline(it) }).append("</p>")
                     }
                 }
             }
@@ -93,4 +99,11 @@ internal object MarkdownConverter {
 
     private fun stripInline(s: String): String =
         s.replace(BOLD, "$1").replace(CODE, "$1").replace(STRIKE, "$1").replace(ITALIC, "$1")
+
+    /** 0 = plain/paragraph line, 1 = bullet item, 2 = ordered item. */
+    private fun blockKind(line: String) = when {
+        BULLET.matches(line) -> 1
+        ORDERED.matches(line) -> 2
+        else -> 0
+    }
 }
