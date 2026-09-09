@@ -169,6 +169,7 @@ import de.connect2x.trixnity.core.model.events.UnsignedRoomEventData
 import de.connect2x.trixnity.core.model.events.m.room.MemberEventContent
 import de.connect2x.trixnity.core.model.events.m.Presence
 import de.connect2x.trixnity.core.model.events.m.ReceiptType
+import de.connect2x.trixnity.core.model.events.m.Mentions
 import de.connect2x.trixnity.core.model.events.m.RelatesTo
 import de.connect2x.trixnity.core.model.events.m.key.verification.VerificationMethod
 import de.connect2x.trixnity.core.model.events.m.room.CreateEventContent
@@ -5192,8 +5193,18 @@ object MatrixRepository {
         val (markdownBody, markdownHtml) = MarkdownConverter.toMatrixContent(body)
         val txnId = c.room.sendMessage(matrixRoomId) {
             if (replyToEventId != null) {
-                val replyEvent = c.room.getTimelineEvent(matrixRoomId, EventId(replyToEventId)).firstOrNull()
-                if (replyEvent != null) reply(replyEvent)
+                // Relation set directly on the builder, NOT via Trixnity's
+                // reply() helper: it re-fetches the target event and waits
+                // indefinitely for decrypted content (firstWithContent) — an
+                // undecryptable/missing target hung the send forever (LP3
+                // feedback 2026-09-09). The lookup below is budgeted; if the
+                // target resolves, reply() parity: m.mentions on its sender.
+                relatesTo = RelatesTo.Reply(RelatesTo.ReplyTo(EventId(replyToEventId)))
+                withTimeoutOrNull(ROOM_BUDGET_MS) {
+                    c.room.getTimelineEvent(matrixRoomId, EventId(replyToEventId)).firstOrNull()
+                }?.let { replyEvent ->
+                    mentions = Mentions(users = setOf(replyEvent.event.sender))
+                }
             }
             if (markdownHtml != null) {
                 text(
@@ -7459,17 +7470,23 @@ object MatrixRepository {
         // the tool via the SDK flow): skip the whole chain —
         // the decrypt wait, flood/ghost walk and page warm built a preview the
         // OS drops. The room list still updates (separate resolver path).
+        // Archived room got a message — mirror the other Beeper clients:
+        // unarchive (PUT {} to inbox.done). updateRoomFlagsLocal marks the
+        // room list dirty, so the row reappears in the main list, and the
+        // message below notifies like any other (muted still silences).
+        val flags = roomFlagsCache[roomId.full]
+        if (flags?.archived == true) {
+            android.util.Log.d(TAG, "notifyForEvent: archived room $roomId got a message — unarchiving")
+            setRoomArchived(roomId.full, false)
+        }
         if (!ctx.getSystemService(NotificationManager::class.java).areNotificationsEnabled()) return
         if (activeRoomId == roomId.full) return
         if (room.membership != Membership.JOIN) return
-        // Muted/archived room (chats /): stop notifying;
-        // the unread badge and the room list stay (muted), or the room is
-        // hidden from the list entirely and reachable only via search
-        // (archived). Checked before the decrypt wait so a muted room costs
-        // nothing per message.
-        val flags = roomFlagsCache[roomId.full]
-        if (flags?.muted == true || flags?.archived == true) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping ${if (flags.archived == true) "archived" else "muted"} room $roomId")
+        // Muted room (chats /): stop notifying; the unread badge and the room
+        // list stay (muted). Checked before the decrypt wait so a muted room
+        // costs nothing per message.
+        if (flags?.muted == true) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping muted room $roomId")
             return
         }
         // Cold-process miss (the whole-cache build waits on the room-list
@@ -10265,6 +10282,11 @@ object MatrixRepository {
                     ?.formattedBody
                     ?.takeIf { it.isNotBlank() }
                     ?.let { MX_REPLY_REGEX.replace(it, "").trim().takeIf { h -> h.isNotBlank() } }
+                    // The forward header lives in the formatted variant too (the
+                    // plain body's was stripped above) — otherwise the row renders
+                    // "↷ Forwarded" twice (LP3 feedback 2026-09-09).
+                    ?.let { if (forwarded) stripForwardHeaderFromHtml(it) else it }
+                    ?.takeIf { it.isNotBlank() }
                 Triple(
                     text,
                     formattedHtml,
@@ -10448,20 +10470,29 @@ object MatrixRepository {
     private val MX_REPLY_REGEX = Regex("<mx-reply>[\\s\\S]*?</mx-reply>")
 
     /** Lifts a bridge "forwarded" header off a message body (WhatsApp forwards
-     *  arrive as "↷ Forwarded" + a blank line + the content — the bridge's
-     *  text stand-in for WhatsApp's forward chip;). Returns the
+     *  arrive as "↷ Forwarded" or "Forwarded" + a blank line + the content —
+     *  the bridge's text stand-in for WhatsApp's forward chip). Returns the
      *  content ("" when the message is nothing but the header — a forwarded
      *  photo's caption is just the marker) and whether the header was found.
-     *  The tool renders the header itself as a small chip via [Message.forwarded],
-     *  and previews strip it so the room list shows the content, not the marker. */
+     *  The tool renders the header itself as the ↷ glyph + "forwarded" tag via
+     *  [Message.forwarded], and previews strip it so the room list shows the
+     *  content, not the marker. (2026-09-09: header variants without the ↷
+     *  glyph and after a single newline now strip too — rows kept showing the
+     *  header above the content.) */
+    private val FORWARD_HEADER = Regex("^(?:\u21B7 )?Forwarded(?: from [^\\n]*)?(\\n+|\$)")
+
     private fun stripForwardHeader(body: String): Pair<String, Boolean> {
-        val header = "\u21B7 Forwarded" // "↷ Forwarded"
-        if (!body.startsWith(header)) return body to false
-        // The header must be its own first line: "\n\n" + content after it.
-        val rest = body.removePrefix(header)
-        if (rest.isNotEmpty() && !rest.startsWith("\n\n")) return body to false
-        return rest.removePrefix("\n\n").trimStart('\n') to true
+        val match = FORWARD_HEADER.find(body) ?: return body to false
+        return body.substring(match.value.length).trimStart('\n') to true
     }
+
+    /** Same strip for a formatted variant ([formatted_body]): the header is its
+     *  own leading paragraph, or the first line before a <br/>. */
+    private val FORWARD_HEADER_HTML =
+        Regex("^<p>(?:\u21B7 )?Forwarded(?: from [^<]*)?(?:</p>\\s*|<br/>)")
+
+    private fun stripForwardHeaderFromHtml(html: String): String =
+        html.replaceFirst(FORWARD_HEADER_HTML, "").trim()
 
     /** In broadcast rooms (you + the channel ghost) Beeper echoes your own
      *  channel posts back with your display name baked into the body ("FENN:

@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,6 +35,7 @@ import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.lightClickable
+import kotlinx.coroutines.delay
 
 /** What the context window is showing for the long-pressed message. */
 private enum class ContextLevel {
@@ -63,10 +65,10 @@ private val REACTION_ROWS = listOf(
  * stacks the action rows; REACT / EDIT REACTION open the 3x8 emoji grid; a
  * tap sets that reaction. Every completing action dismisses the panel. The
  * wide thin chevron at the very bottom center dismisses (any level).
- * One own reaction at a time (replace semantics) on a RECEIVED message: no
- * own reaction shows LIKE + REACT; an existing one shows EDIT
- * REACTION + REMOVE REACTION. Own messages show
- * EDIT / UNSEND instead — each only when the row still allows it
+ * Row order (feedback 2026-09-09): own messages EDIT / COPY / UNSEND — no
+ * reply to self; other messages LIKE / REPLY / REACT (or EDIT REACTION /
+ * REMOVE REACTION) / COPY. One own reaction at a time (replace semantics).
+ * Each row only shows while the message still allows it
  * ([LightServiceMethod.GetMessages.Message.canEdit] / `canUnsend`, the
  * bridge's capability gate).
  * Raw black/white + fixed sizes are deliberate: this replicates a system
@@ -84,6 +86,7 @@ fun ContextWindowOverlay(
     onEdit: () -> Unit,
     onUnsend: () -> Unit,
     onReply: () -> Unit,
+    onCopy: () -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -127,27 +130,31 @@ fun ContextWindowOverlay(
                     ?.takeIf { message.body.startsWith("[") && message.body.endsWith("]") }
                     ?: message.body
                 val rows: List<Pair<String, () -> Unit>> = buildList {
-                    // COPY first, on any message with text — copies the plain text.
-                    if (copyText.isNotBlank()) {
-                        add("COPY" to { ChatClient.copyToClipboard(copyText); onDismiss() })
-                    }
-                    // REPLY next, on any message (own or received): opens the
-                    // composer with this message as the reply target.
-                    add("REPLY" to { onReply(); onDismiss() })
                     when {
                         // Own message: the message controls, each only while the
-                        // row still allows it (bridge caps / window).
+                        // row still allows it (bridge caps / window) — no reply
+                        // to self (feedback 2026-09-09).
                         message.isMine -> {
                             if (message.canEdit) add("EDIT" to { onEdit(); onDismiss() })
+                            if (copyText.isNotBlank()) {
+                                add("COPY" to { ChatClient.copyToClipboard(copyText); onCopy(); onDismiss() })
+                            }
                             if (message.canUnsend) add("UNSEND" to { onUnsend(); onDismiss() })
                         }
-                        ownReaction == null -> {
-                            add("LIKE" to { onLike(); onDismiss() })
-                            add("REACT" to { level = ContextLevel.Reactions })
-                        }
+                        // Received: LIKE / REPLY / REACT … / COPY last (feedback
+                        // 2026-09-09).
                         else -> {
-                            add("EDIT REACTION" to { level = ContextLevel.Reactions })
-                            add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
+                            add("LIKE" to { onLike(); onDismiss() })
+                            add("REPLY" to { onReply(); onDismiss() })
+                            if (ownReaction == null) {
+                                add("REACT" to { level = ContextLevel.Reactions })
+                            } else {
+                                add("EDIT REACTION" to { level = ContextLevel.Reactions })
+                                add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
+                            }
+                            if (copyText.isNotBlank()) {
+                                add("COPY" to { ChatClient.copyToClipboard(copyText); onCopy(); onDismiss() })
+                            }
                         }
                     }
                 }
@@ -224,6 +231,31 @@ fun ContextWindowOverlay(
                 modifier = Modifier.size(width = 17.dp, height = 10.dp),
             )
         }
+    }
+}
+
+/** A COPY confirmation: a fullscreen black panel with "copy" centered for one
+ *  second (LP3 feedback 2026-09-09) — replaces the system clipboard overlay.
+ *  A tap dismisses it immediately. Mounted over the thread and the composer
+ *  alike; both screens' COPY actions flip [visible]. */
+@Composable
+fun CopyFlashOverlay(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+) {
+    if (!visible) return
+    LaunchedEffect(Unit) {
+        delay(1_000)
+        onDismiss()
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .lightClickable(onClick = onDismiss),
+        contentAlignment = Alignment.Center,
+    ) {
+        LightText(text = "copy", variant = LightTextVariant.Button)
     }
 }
 

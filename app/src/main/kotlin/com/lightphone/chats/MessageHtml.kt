@@ -5,26 +5,40 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.sp
 
 /**
  * HTML subset → [AnnotatedString] for incoming formatted messages (chats
  * markdown): strong/b → Bold, em/i → Italic, del/strike/s → Strikethrough,
  * u → Underline, code → plain (no mono font in the Light design), br →
  * newline, p/li → line breaks, ul/ol → "• "/"1. " prefixes (one level).
- * h1–h6 render as a BOLD SPAN, no font-size change — the design language
- * allows LightText variants only, so headings read as emphasized paragraphs.
- * `a` keeps its text (no clickable links on the LP3); unknown tags drop the
- * TAG but keep their inner text; script/style drop tag AND content; the named
- * + numeric entities unescape. When the HTML parses to nothing, [fallback]
- * (the event's plain body) renders instead.
+ * h1–h6 render as a BOLD span at distinct sizes stepped around the paragraph
+ * size ([paragraphSp] — the caller passes its scaled paragraph size; 0 keeps
+ * every heading at the paragraph size): h1 reads as a heading, h6 barely
+ * smaller than the body (LP3 feedback 2026-09-09: all six were identical).
+ * `a` keeps its text (no clickable links on the LP3, and outgoing links
+ * already strip the URL); unknown tags drop the TAG but keep their inner
+ * text; script/style drop tag AND content; the named + numeric entities
+ * unescape. When the HTML parses to nothing, [fallback] (the event's plain
+ * body) renders instead.
  */
-fun formattedMessage(html: String, fallback: String): AnnotatedString {
+fun formattedMessage(html: String, fallback: String, paragraphSp: Float = 0f): AnnotatedString {
     if (html.isBlank()) return AnnotatedString(fallback)
-    val parsed = parseHtml(html.trim())
+    val parsed = parseHtml(html, paragraphSp)
     return if (parsed.text.isBlank()) AnnotatedString(fallback) else parsed
 }
 
-private fun parseHtml(html: String): AnnotatedString {
+/** Heading size steps, as multiples of the paragraph size. */
+private val HEADING_SCALES = mapOf(
+    "h1" to 1.55f,
+    "h2" to 1.3f,
+    "h3" to 1.15f,
+    "h4" to 1.0f,
+    "h5" to 0.85f,
+    "h6" to 0.75f,
+)
+
+private fun parseHtml(html: String, paragraphSp: Float): AnnotatedString {
     val text = StringBuilder()
     val spans = mutableListOf<Triple<Int, Int, SpanStyle>>() // start, end, style
     // Open-tag frames: the tag, the style it contributes (null = tag with no
@@ -103,9 +117,17 @@ private fun parseHtml(html: String): AnnotatedString {
                     text.append(if (list.tag == "ul") "• " else "${list.counter + 1}. ")
                 }
             }
-            tag == "h1" || tag == "h2" || tag == "h3" || tag == "h4" || tag == "h5" || tag == "h6" -> {
+            tag in HEADING_SCALES -> {
                 breakLine()
-                frames.addLast(Frame(tag, BOLD_STYLE, text.length))
+                val size = paragraphSp.takeIf { it > 0f }
+                    ?.let { HEADING_SCALES[tag]?.times(it) }
+                frames.addLast(
+                    Frame(
+                        tag,
+                        if (size != null) BOLD_STYLE.copy(fontSize = size.sp) else BOLD_STYLE,
+                        text.length,
+                    ),
+                )
             }
             tag == "strong" || tag == "b" -> frames.addLast(Frame(tag, BOLD_STYLE, text.length))
             tag == "em" || tag == "i" -> frames.addLast(Frame(tag, ITALIC_STYLE, text.length))

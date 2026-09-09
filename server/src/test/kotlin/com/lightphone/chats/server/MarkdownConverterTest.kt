@@ -101,6 +101,15 @@ class MarkdownConverterTest {
     }
 
     @Test
+    fun `link keeps only the text in the plain body, url in the html`() {
+        val (plain, html) = MarkdownConverter.toMatrixContent("see [the docs](https://example.com/a) now")
+        assertEquals("see the docs now", plain)
+        assertEquals("<p>see <a href=\"https://example.com/a\">the docs</a> now</p>", html)
+        assertTrue(MarkdownConverter.hasMarkdown("[t](https://x.y)"))
+        assertFalse(MarkdownConverter.hasMarkdown("plain words only"))
+    }
+
+    @Test
     fun `hasMarkdown detects constructs`() {
         assertTrue(MarkdownConverter.hasMarkdown("**x**"))
         assertTrue(MarkdownConverter.hasMarkdown("*y*"))

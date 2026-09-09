@@ -1283,6 +1283,8 @@ class ThreadScreen(
         // target here for the confirm panel.
         var contextMessage by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
         var unsendConfirm by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
+        // COPY confirmation flash (feedback 2026-09-09) — fullscreen "copy".
+        var copyFlash by remember { mutableStateOf(false) }
         // The panel's target resolved against the freshest polled snapshot (so
         // own-reaction detection never runs on a stale page) — declared here,
         // before the list, because the in-list dismiss scrim gates on it.
@@ -1605,6 +1607,7 @@ class ThreadScreen(
                 onEdit = { contextTarget?.let { openComposer(edit = it) } },
                 onUnsend = { contextTarget?.let { unsendConfirm = it } },
                 onReply = { contextTarget?.let { openComposer(reply = it) } },
+                onCopy = { copyFlash = true },
                 onDismiss = { contextMessage = null },
                 modifier = Modifier.align(Alignment.BottomCenter),
             )
@@ -1624,6 +1627,7 @@ class ThreadScreen(
             }
             // The in-app volume panel replica (feedback 2026-08-30): the volume
             // rocker shows it over the thread while a voice note plays/pauses.
+            CopyFlashOverlay(visible = copyFlash, onDismiss = { copyFlash = false })
             val volumePanel by viewModel.volumePanel.collectAsState()
             VolumePanelOverlay(
                 state = volumePanel,
@@ -1911,7 +1915,8 @@ private fun OutgoingBodyText(
 
 /** Incoming message body: LightText for plain rows, the rendered
  *  [formattedMessage] spans (same paragraph typography/color) for rows whose
- *  event carried a formatted variant. */
+ *  event carried a formatted variant. Heading spans size off the same scaled
+ *  paragraph ([formattedMessage]'s paragraphSp). */
 @Composable
 private fun IncomingBodyText(
     message: LightServiceMethod.GetMessages.Message,
@@ -1926,7 +1931,11 @@ private fun IncomingBodyText(
         )
     } else {
         Text(
-            text = formattedMessage(html, message.body),
+            text = formattedMessage(
+                html,
+                message.body,
+                LightThemeTokens.typography.paragraph.scaledForScreenHeight().fontSize.value,
+            ),
             style = LightThemeTokens.typography.paragraph.scaledForScreenHeight(),
             color = LightThemeTokens.colors.content,
             modifier = modifier,
@@ -2235,7 +2244,11 @@ private fun MessageRow(
                                 // unweighted, the body measured across the full
                                 // row width and squeezed the glyph to nothing.
                                 OutgoingBodyText(
-                                    formattedMessage(message.formattedHtml ?: "", message.body),
+                                    formattedMessage(
+                                        message.formattedHtml ?: "",
+                                        message.body,
+                                        LightThemeTokens.typography.paragraph.scaledForScreenHeight().fontSize.value,
+                                    ),
                                     bodyMaxWidthPx,
                                     modifier = Modifier.weight(1f, fill = false),
                                 )
@@ -2259,7 +2272,11 @@ private fun MessageRow(
                     // last word always touches the right edge (see
                     // [OutgoingBodyText]).
                     OutgoingBodyText(
-                        formattedMessage(message.formattedHtml ?: "", message.body),
+                        formattedMessage(
+                                        message.formattedHtml ?: "",
+                                        message.body,
+                                        LightThemeTokens.typography.paragraph.scaledForScreenHeight().fontSize.value,
+                                    ),
                         bodyMaxWidthPx,
                     )
                 } else if (message.body.startsWith("Incoming call")) {
@@ -2388,9 +2405,10 @@ private fun ForwardedArrowGlyph(modifier: Modifier = Modifier) {
 
 /** Forwarded MEDIA rows: the ↷ glyph sits beside the media on the row's
  *  outer side — leading it on incoming rows, trailing it on own rows (spaced
- *  off it — it used to hug the photo), any caption moves UNDER the
- *  media instead of beside it, and the small "forwarded" word sits under the
- *  whole block — the same grammar as forwarded text. */
+ *  off it — it used to hug the photo). The caption renders like any normal
+ *  message's: under the media, edge-aligned, one paragraph gap — it used to
+ *  sit inside the glyph's row slot (LP3 feedback 2026-09-09). The small
+ *  "forwarded" word sits under the whole block. */
 @Composable
 private fun ForwardedMediaRow(
     message: LightServiceMethod.GetMessages.Message,
@@ -2417,33 +2435,27 @@ private fun ForwardedMediaRow(
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Incoming rows lead with the glyph, own rows trail it — the
             // same 0.5 buffer either way (matches the forwarded text
-            // grammar and the phone icon on an incoming call). The glyph
-            // centers on media + caption together: the caption is content
-            // aligned under the media (like non-forwarded rows), inside the
-            // same Row slot.
+            // grammar and the phone icon on an incoming call).
             if (!message.isMine) {
                 ForwardedArrowGlyph(
                     modifier = Modifier.padding(end = 0.5f.gridUnitsAsDp()),
                 )
             }
-            Column {
-                content()
-                // The server strips the "↷ Forwarded" header out of the
-                // caption, so a captionless forward's caption is empty —
-                // dropped here. (The forwarded branch previously dropped the
-                // caption entirely — feedback 2026-09-08.)
-                caption?.takeIf { it.isNotBlank() }?.let {
-                    LightText(
-                        text = it,
-                        variant = LightTextVariant.Paragraph,
-                    )
-                }
-            }
+            content()
             if (message.isMine) {
                 ForwardedArrowGlyph(
                     modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
                 )
             }
+        }
+        // The server strips the "↷ Forwarded" header out of the caption, so a
+        // captionless forward's caption is empty — dropped here.
+        caption?.takeIf { it.isNotBlank() }?.let {
+            LightText(
+                text = it,
+                variant = LightTextVariant.Paragraph,
+                modifier = Modifier.padding(top = 1.dp),
+            )
         }
         LightText(
             text = "forwarded",

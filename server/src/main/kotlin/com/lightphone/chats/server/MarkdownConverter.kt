@@ -24,12 +24,16 @@ internal object MarkdownConverter {
     private val ITALIC = Regex("\\*([^\\s*][^*]*?)\\*")
     private val STRIKE = Regex("~~(.+?)~~")
     private val CODE = Regex("`([^`]+)`")
+    // [text](url): the plain body keeps only the text — the URL shown next to
+    // it was noise (LP3 feedback 2026-09-09); the HTML gets a real <a href>.
+    private val LINK = Regex("\\[([^\\]]+)]\\(([^)\\s]+)\\)")
 
     fun hasMarkdown(text: String): Boolean =
         text.split("\n").any { line ->
             HEADING.matches(line) || BULLET.matches(line) || ORDERED.matches(line)
         } || BOLD.containsMatchIn(text) || STRIKE.containsMatchIn(text) ||
-            CODE.containsMatchIn(text) || ITALIC.containsMatchIn(text)
+            CODE.containsMatchIn(text) || ITALIC.containsMatchIn(text) ||
+            LINK.containsMatchIn(text)
 
     /**
      * (plainBody, formattedHtmlOrNull): the plain body is the original text
@@ -88,17 +92,19 @@ internal object MarkdownConverter {
         return out.toString()
     }
 
-    /** Escape first, then wrap the (already-escaped) marker content. */
+    /** Escape first, then wrap the (already-escaped) marker content. Links
+     *  convert before the others so their text/url survive as one span. */
     private fun inline(s: String): String {
         val e = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return BOLD.replace(e) { "<strong>${it.groupValues[1]}</strong>" }
+        return LINK.replace(e) { "<a href=\"${it.groupValues[2]}\">${it.groupValues[1]}</a>" }
+            .let { BOLD.replace(it) { "<strong>${it.groupValues[1]}</strong>" } }
             .let { CODE.replace(it) { m -> "<code>${m.groupValues[1]}</code>" } }
             .let { STRIKE.replace(it) { m -> "<del>${m.groupValues[1]}</del>" } }
             .let { ITALIC.replace(it) { m -> "<em>${m.groupValues[1]}</em>" } }
     }
 
     private fun stripInline(s: String): String =
-        s.replace(BOLD, "$1").replace(CODE, "$1").replace(STRIKE, "$1").replace(ITALIC, "$1")
+        s.replace(LINK, "$1").replace(BOLD, "$1").replace(CODE, "$1").replace(STRIKE, "$1").replace(ITALIC, "$1")
 
     /** 0 = plain/paragraph line, 1 = bullet item, 2 = ordered item. */
     private fun blockKind(line: String) = when {

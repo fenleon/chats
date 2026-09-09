@@ -35,6 +35,21 @@ import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.defaultKeyboardOptions
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextRange
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -184,20 +199,42 @@ class ComposerScreen(
             val text = textState.text.toString()
             if (text.isEmpty()) composerDrafts.remove(roomId) else composerDrafts[roomId] = text
         }
-        // Paste offer (v1): the clipboard is read once on entry — never
-        // re-checked on recomposition — and only for an empty draft. The row
-        // hides itself once tapped or once the draft is no longer empty.
-        var pasteText by remember { mutableStateOf<String?>(null) }
-        LaunchedEffect(Unit) {
-            if (editTarget == null && textState.text.isEmpty()) pasteText = ChatClient.clipboardText()
+        // Half-panel COPY/PASTE (feedback 2026-09-09): holding in the composer
+        // opens the black panel — COPY takes the whole draft, PASTE inserts the
+        // clipboard at the cursor/selection. The clipboard is read once per
+        // panel open (a paste needs no live tracking). The panel covers the
+        // bottom half only, so the text above stays tappable for cursor moves.
+        var showActions by remember { mutableStateOf(false) }
+        var clipboardText by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(showActions) {
+            if (showActions) clipboardText = ChatClient.clipboardText()
         }
+        // COPY confirmation flash — shared with the thread's context window.
+        var copyFlash by remember { mutableStateOf(false) }
+        // Reply state (title + toptag; the tap on the toptag cancels).
+        val replyingTo by viewModel.replyToEventId.collectAsState()
 
         LightTheme(colors = themeColors) {
-            Box(modifier = Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        // Hold anywhere in the composer → the COPY/PASTE panel.
+                        // The text field sees events first; a long-press it
+                        // consumes (native selection) opens nothing here.
+                        detectTapGestures(onLongPress = { showActions = true })
+                    },
+            ) {
                 LightTextInputEditor(
                     // An edit announces itself in the title slot (the room
-                    // name's place); back (below) cancels it.
-                    title = if (editTarget != null) "Editing Message" else roomName,
+                    // name's place); back (below) cancels it. A reply reads
+                    // "Replying To" (feedback 2026-09-09) — the quoted text
+                    // rides on the toptag above the input.
+                    title = when {
+                        editTarget != null -> "Editing Message"
+                        replyingTo != null -> "Replying To"
+                        else -> roomName
+                    },
                     state = textState,
                     keyboardOptionsFlow = keyboardOptionsFlow,
                     onSubmit = { viewModel.send(it, this@ComposerScreen) },
@@ -218,55 +255,60 @@ class ComposerScreen(
                     topBarSubmitIcon = LightIcons.SEND,
                     initialCaps = true,
                 )
-                // Reply header + paste row, above the input (the keyboard
-                // reserves the 5-gu bottom-bar row below the keys; the empty
-                // draft's first line sits at ~2 gu above it). The header is
-                // one line — the reply target's name/excerpt — and a tap
-                // cancels the reply back to a plain compose. The paste row
-                // hides itself once tapped or once the draft is no longer
-                // empty; both can coexist (paste is orthogonal to reply).
-                val replyingTo by viewModel.replyToEventId.collectAsState()
-                if (replyingTo != null || (pasteText != null && textState.text.isEmpty())) {
-                    Column(
+                // Reply toptag (feedback 2026-09-09, the Radio hint grammar):
+                // the quoted text sits directly above the input line — one
+                // Superfine line "sender · excerpt", a tap cancels the reply.
+                if (replyingTo != null) {
+                    // The full target rides on the constructor param (the VM
+                    // tracks only the id); blank-sender own rows render the
+                    // excerpt alone.
+                    val header = replyTarget?.let { m ->
+                        val excerpt = m.body.lineSequence()
+                            .firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+                        listOfNotNull(
+                            m.senderName.takeIf { it.isNotBlank() },
+                            excerpt.takeIf { it.isNotEmpty() },
+                        ).joinToString(" · ")
+                    }
+                    LightText(
+                        text = header ?: "replying",
+                        variant = LightTextVariant.Superfine,
+                        maxLines = 1,
                         modifier = Modifier
                             .align(Alignment.BottomStart)
                             .imePadding()
-                            .padding(start = 1f.gridUnitsAsDp(), bottom = 7f.gridUnitsAsDp()),
-                    ) {
-                        replyingTo?.let {
-                            // The full target rides on the constructor param
-                            // (the VM tracks only the id); blank-sender own
-                            // rows render the excerpt alone.
-                            val header = replyTarget?.let { m ->
-                                val excerpt = m.body.lineSequence()
-                                    .firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-                                listOfNotNull(
-                                    m.senderName.takeIf { it.isNotBlank() },
-                                    excerpt.takeIf { it.isNotEmpty() },
-                                ).joinToString(" · ")
-                            }
-                            LightText(
-                                text = header ?: "replying",
-                                variant = LightTextVariant.Superfine,
-                                maxLines = 1,
-                                modifier = Modifier.lightClickable { viewModel.cancelReply() },
-                            )
-                        }
-                        pasteText?.let { paste ->
-                            if (textState.text.isEmpty()) {
-                                Box(
-                                    modifier = Modifier
-                                        .lightClickable {
-                                            textState.edit { append(paste) }
-                                            pasteText = null
-                                        },
-                                ) {
-                                    LightText(text = "Paste", variant = LightTextVariant.Superfine)
+                            .padding(start = 1f.gridUnitsAsDp(), bottom = 8f.gridUnitsAsDp())
+                            .lightClickable { viewModel.cancelReply() },
+                    )
+                }
+                // Half-panel COPY/PASTE over the keyboard zone; the composer
+                // text above it stays interactive (cursor moves are taps on the
+                // text, and PASTE inserts at the cursor/selection).
+                if (showActions) {
+                    ComposerActionsOverlay(
+                        canCopy = textState.text.isNotEmpty(),
+                        canPaste = clipboardText != null,
+                        onCopy = {
+                            ChatClient.copyToClipboard(textState.text.toString())
+                            showActions = false
+                            copyFlash = true
+                        },
+                        onPaste = {
+                            clipboardText?.let { clip ->
+                                textState.edit {
+                                    val start = selection.min
+                                    val end = selection.max
+                                    replace(start, end, clip)
+                                    selection = TextRange(start + clip.length)
                                 }
                             }
-                        }
-                    }
+                            showActions = false
+                        },
+                        onDismiss = { showActions = false },
+                        modifier = Modifier.align(Alignment.BottomCenter),
+                    )
                 }
+                CopyFlashOverlay(visible = copyFlash, onDismiss = { copyFlash = false })
                 // Quiet failure line (same grammar as the thread's row error):
                 // a rejected send/edit shows here instead of reading as an
                 // eternal "sending". Cleared on the next send attempt.
@@ -308,6 +350,86 @@ class ComposerScreen(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * The composer's half-panel COPY/PASTE (feedback 2026-09-09): the context
+ * window's panel grammar — a black panel over the bottom half — for the
+ * composer's own text. COPY takes the whole draft, PASTE inserts the
+ * clipboard at the cursor/selection; rows render only when they can act. The
+ * composer text above the panel stays interactive (cursor moves).
+ * Raw black/white is deliberate: same system-panel replica as
+ * [ContextWindowOverlay].
+ */
+@Composable
+private fun ComposerActionsOverlay(
+    canCopy: Boolean,
+    canPaste: Boolean,
+    onCopy: () -> Unit,
+    onPaste: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .fillMaxHeight(0.5f)
+            .background(Color.Black)
+            // Swallow every event in the panel's area (taps under it — the
+            // clear-draft X, the error line — must not fire through).
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false).consume()
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        event.changes.forEach { it.consume() }
+                        if (event.changes.none { it.pressed }) break
+                    }
+                }
+            },
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(bottom = 38.dp), // chevron zone, as in the context window
+            verticalArrangement = Arrangement.Center,
+        ) {
+            if (canCopy) OverlayActionRow("COPY", onCopy)
+            if (canPaste) OverlayActionRow("PASTE", onPaste)
+        }
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .height(38.dp)
+                .lightClickable(onClick = onDismiss),
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                painter = painterResource(com.lightphone.chats.R.drawable.ic_lp3_chevron_down),
+                contentDescription = "Close",
+                contentScale = ContentScale.FillBounds,
+                modifier = Modifier.size(width = 17.dp, height = 10.dp),
+            )
+        }
+    }
+}
+
+/** One centered panel row (the context window's row grammar). */
+@Composable
+private fun OverlayActionRow(label: String, action: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .height(44.dp)
+            .fillMaxWidth(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier.lightClickable(onClick = action),
+            contentAlignment = Alignment.Center,
+        ) {
+            LightText(text = label, variant = LightTextVariant.Button, maxLines = 1)
         }
     }
 }
