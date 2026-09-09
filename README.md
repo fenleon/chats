@@ -27,7 +27,7 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 
 ## Features
 
-- Connect to all your **Networks**, including WhatsApp, Signal, Telegram, Messenger, Google Messages, Instagram DMs and more, through your Beeper account
+- Connect to all your **Networks** through your Beeper account: WhatsApp, Instagram, Telegram, Signal, Messenger, X, Google Messages (SMS/RCS), Google Chat, Google Voice, LinkedIn, Discord, Slack
 - 1:1 and group chats, with archive, pin, mute, search, reactions, delivery status support
 - Notifications; a push channel delivers messages instantly
 - Voice notes and photos
