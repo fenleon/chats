@@ -68,6 +68,7 @@ object ChatServiceMethods {
                         messages = page.messages,
                         hasMore = page.hasMore,
                         encrypted = page.encrypted,
+                        nextBeforeEventId = page.nextBeforeEventId,
                         audioPlayingEventId = MatrixRepository.audioPlayingEventId(),
                         audioPositionMs = MatrixRepository.audioPositionMs(),
                     )

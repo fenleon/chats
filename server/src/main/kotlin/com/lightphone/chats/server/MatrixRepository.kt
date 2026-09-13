@@ -55,7 +55,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -2517,11 +2516,14 @@ object MatrixRepository {
      * the message-filtered list, so a page full of state events or
      * still-encrypted events doesn't end pagination early. [encrypted] is set
      * without fetching when the room needs decryption the device can't do.
+     * [nextBeforeEventId] is the chain position the walk stopped at — the
+     * value to pass back as `beforeEventId` to continue further back.
      */
     data class MessagesPage(
         val messages: List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>,
         val hasMore: Boolean,
         val encrypted: Boolean = false,
+        val nextBeforeEventId: String? = null,
     )
 
     /**
@@ -2536,7 +2538,7 @@ object MatrixRepository {
         var changed = false
         val patched = messages.map { m -> f(m)?.also { changed = true } ?: m }
         if (!changed) return null
-        return MessagesPage(patched, hasMore, encrypted)
+        return MessagesPage(patched, hasMore, encrypted, nextBeforeEventId)
     }
 
     /** One cached newest page: the page plus when it was computed. */
@@ -2768,9 +2770,10 @@ object MatrixRepository {
             file.writeText(
                 com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.encodeResponse(
                     com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Response(
-                        page.messages,
-                        page.hasMore,
-                        page.encrypted,
+                        messages = page.messages,
+                        hasMore = page.hasMore,
+                        encrypted = page.encrypted,
+                        nextBeforeEventId = page.nextBeforeEventId,
                     ),
                 ),
             )
@@ -2785,7 +2788,7 @@ object MatrixRepository {
         return runCatching {
             val r = com.thelightphone.sdk.shared.LightServiceMethod.GetMessages
                 .decodeResponse(file.readText())
-            MessagesPage(r.messages, r.hasMore, r.encrypted)
+            MessagesPage(r.messages, r.hasMore, r.encrypted, r.nextBeforeEventId)
         }.getOrNull()
     }
 
@@ -3321,7 +3324,7 @@ object MatrixRepository {
             )
         }
         return if (result.size == page.messages.size) page
-        else MessagesPage(result, page.hasMore, page.encrypted)
+        else MessagesPage(result, page.hasMore, page.encrypted, page.nextBeforeEventId)
     }
 
     // --- Bridge re-import ("ghost") detection ------------------
@@ -3471,14 +3474,14 @@ object MatrixRepository {
         // from the server (bounded window, active room only, cooldown on
         // failure) and re-walk. Skipped on the fast first-page path — the
         // background refresh fills it seconds later, keeping the first render
-        // instant. A gap on the room's newest event (the walk's head) is
-        // skipped: the next sync naturally picks up those events, and
-        // Trixnity's fill no-ops it anyway.
+        // instant. Only a gap BEFORE an event is filled (a GapAfter on the
+        // walk's head means newer events the next sync picks up naturally, and
+        // Trixnity's fill no-ops it anyway) — that gap is what blocks loading
+        // older messages.
         // Active room only (throttle — the fill is a network + store + decrypt
         // cost) and a previous failed fill's cooldown must have elapsed.
         if (!fast && activeRoomId == matrixRoomId.full && gapBackfillCooldown.allowed(matrixRoomId.full)) {
-            val head = events.firstOrNull()
-            val gapEvent = events.firstOrNull { it.gap != null && it !== head }
+            val gapEvent = events.firstOrNull { it.gap?.batchBefore != null }
             if (gapEvent != null) {
                 backfillTimelineGap(c, matrixRoomId, startEventId, limit, gapEvent.event.id.full)?.let {
                     events = it.first
@@ -3551,6 +3554,32 @@ object MatrixRepository {
     /** Bounds concurrent [readTimelineChainFromDb] walks — see the comment there. */
     private val chainDbSemaphore = Semaphore(permits = 2)
 
+    /** A permit wait this long is worth a debug line (issue #33 probe). */
+    private const val CHAIN_WAIT_LOG_MS = 100L
+
+    /**
+     * [chainDbSemaphore] body with a debugLog-gated acquisition-wait timer —
+     * same permits, same critical section, instrumentation only. [label] names
+     * the caller, because the first LP3 capture (2026-09-13) showed the waits
+     * but not which operation queued: 232 in one 2 s window at launch, and a
+     * ~500 ms wait after every send.
+     */
+    private suspend fun <T> chainDb(label: String, body: suspend () -> T): T {
+        val queuedAt = android.os.SystemClock.elapsedRealtime()
+        chainDbSemaphore.acquire()
+        if (debugLogging()) {
+            val waited = android.os.SystemClock.elapsedRealtime() - queuedAt
+            if (waited >= CHAIN_WAIT_LOG_MS) {
+                android.util.Log.d(TAG, "chainDb[$label]: waited ${waited}ms for a permit")
+            }
+        }
+        try {
+            return body()
+        } finally {
+            chainDbSemaphore.release()
+        }
+    }
+
     /**
      * The room's timeline chain (newest-first, [startEventId] inclusive)
      * straight from the store via a recursive SQL walk over the stored
@@ -3576,7 +3605,7 @@ object MatrixRepository {
         // concurrently — at 4 simultaneous walks the SQLite pool (4 connections)
         // was fully occupied and SENDS waited 30+s for a connection. Bound the concurrency;
         // the walks are CPU/IO-cheap enough that 2 run near-linearly anyway.
-        return chainDbSemaphore.withPermit {
+        return chainDb("readTimelineChainFromDb") {
             withContext(Dispatchers.IO) {
                 runCatching {
                     val sql = """
@@ -3607,8 +3636,15 @@ object MatrixRepository {
                         }
                     }
                     if (events.isNotEmpty()) {
-                        // The deepest event's stored prev link decides hasMore.
-                        hasMore = events.last().previousEventId != null
+                        // The deepest event's prev link decides hasMore — plus
+                        // its gap marker: a sync-boundary tail has no prev link
+                        // but carries GapBefore ("more history on the server"),
+                        // and reporting false there latched the thread's paging
+                        // off until the room was reopened (LP3 feedback
+                        // 2026-09-12).
+                        val deepest = events.last()
+                        hasMore = deepest.previousEventId != null ||
+                            deepest.gap?.batchBefore != null
                     }
                     android.util.Log.d(TAG, "readTimelineChainFromDb: $matrixRoomId from=$startEventId → ${events.size} events hasMore=$hasMore")
                     events to hasMore
@@ -4009,8 +4045,16 @@ object MatrixRepository {
         // The room's bridge caps, fetched lazily on the first own row (see the
         // row loop below).
         var features: RoomFeatures? = null
+        // The deepest event the row loop actually reached — handed back as
+        // [MessagesPage.nextBeforeEventId]. It must be the last event READ, not
+        // the walk's last event: the walk's tail can be invisible rows (blank
+        // re-import copies) and the loop stops at [limit] long before reaching
+        // it, so reporting the walk's deepest event would skip everything in
+        // between on the next page.
+        var deepestVisited = startIndex
         for (i in startIndex until events.size) {
             if (result.size >= limit) break
+            deepestVisited = i
             val te = events[i]
             val txnId = txnIdOf(te)
             if (txnId != null && txnId in pendingTxnIds && te.content?.getOrNull() == null) continue
@@ -4178,7 +4222,12 @@ object MatrixRepository {
             c.room.getById(matrixRoomId).firstOrNull()?.encrypted
         } == true
         val undecryptable = roomEncrypted && beforeEventId == null && events.isNotEmpty() && oldestFirst.isEmpty()
-        return MessagesPage(messages = oldestFirst, hasMore = hasMore, encrypted = undecryptable)
+        return MessagesPage(
+            messages = oldestFirst,
+            hasMore = hasMore,
+            encrypted = undecryptable,
+            nextBeforeEventId = events.getOrNull(deepestVisited)?.event?.id?.full,
+        )
     }
 
     /** Type of Beeper's per-room bridge-capability state event:
@@ -4850,7 +4899,7 @@ object MatrixRepository {
         val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
             ?: return emptyList()
         val json = runCatching { c.di.get<Json>() }.getOrNull() ?: return emptyList()
-        return chainDbSemaphore.withPermit {
+        return chainDb("stuckRowsForSession") {
             withContext(Dispatchers.IO) {
                 runCatching {
                     db.openHelper.writableDatabase.query(
@@ -5197,12 +5246,21 @@ object MatrixRepository {
                 // reply() helper: it re-fetches the target event and waits
                 // indefinitely for decrypted content (firstWithContent) — an
                 // undecryptable/missing target hung the send forever (LP3
-                // feedback 2026-09-09). The lookup below is budgeted; if the
-                // target resolves, reply() parity: m.mentions on its sender.
+                // feedback 2026-09-09). The lookup below is budgeted AND
+                // best-effort: Trixnity's default config is
+                // fetchTimeout/decryptionTimeout = INFINITE, and its
+                // gap-fill/decrypt branches can throw — an escaping throw
+                // aborted the whole send, so every reply failed with
+                // "couldn't send" (LP3 feedback 2026-09-12). mentions are
+                // optional; the reply itself always goes out.
                 relatesTo = RelatesTo.Reply(RelatesTo.ReplyTo(EventId(replyToEventId)))
-                withTimeoutOrNull(ROOM_BUDGET_MS) {
-                    c.room.getTimelineEvent(matrixRoomId, EventId(replyToEventId)).firstOrNull()
-                }?.let { replyEvent ->
+                runCatching {
+                    c.room.getTimelineEvent(matrixRoomId, EventId(replyToEventId)) {
+                        allowReplaceContent = false
+                        fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                        decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
+                    }.firstOrNull()
+                }.getOrNull()?.let { replyEvent ->
                     mentions = Mentions(users = setOf(replyEvent.event.sender))
                 }
             }
@@ -5211,6 +5269,21 @@ object MatrixRepository {
                     body = markdownBody,
                     format = "org.matrix.custom.html",
                     formattedBody = markdownHtml,
+                )
+            } else if (replyToEventId != null) {
+                // A reply ALWAYS ships as format=html: Trixnity's builder
+                // hardcodes that for RelatesTo.Reply and passes formattedBody
+                // straight through, so a plain-text reply went out as
+                // `format="org.matrix.custom.html"` with NO formatted_body — a
+                // malformed content the Beeper bridge would not relay (LP3
+                // feedback 2026-09-12: every reply failed while plain sends and
+                // markdown-carrying replies went through). Give the forced HTML
+                // format its matching body instead of letting the plain branch
+                // emit the bare format.
+                text(
+                    body = body,
+                    format = "org.matrix.custom.html",
+                    formattedBody = MarkdownConverter.toPlainHtml(body),
                 )
             } else {
                 text(body = body)
@@ -5536,15 +5609,17 @@ object MatrixRepository {
     // an in-process wedge in the shared OkHttp engine. Only a process restart
     // cleared it. These counters + rebuild make the stack self-heal instead.
 
-    /** Consecutive voice-media download timeouts while the network is up. */
+    /** Consecutive media download timeouts (voice notes and images) while the
+     *  network is up. */
     @Volatile private var consecutiveMediaStalls = 0
     /** A self-heal is armed/pending — new plays wait for it before fetching. */
     @Volatile private var mediaStackSick = false
     @Volatile private var mediaHealInFlight = false
     @Volatile private var lastMediaHealAtMs = 0L
 
-    /** A voice-media fetch timed out: count it, and heal the HTTP stack once
-     *  the pattern (consecutive timeouts, network up) says it is wedged. */
+    /** A media fetch (voice note or image) timed out: count it, and heal the
+     *  HTTP stack once the pattern (consecutive timeouts, network up) says it
+     *  is wedged. */
     private fun noteMediaFetchTimeout() {
         if (!networkIsUp()) return
         val stalls = ++consecutiveMediaStalls
@@ -5670,7 +5745,12 @@ object MatrixRepository {
 
     /** The shared single-shot media fetch (encrypted when the timeline
      *  carries an [EncryptedFile], plain otherwise), bounded by
-     *  [MEDIA_BUDGET_MS]; a failure is logged under [logLabel]. */
+     *  [MEDIA_BUDGET_MS]; a failure is logged under [logLabel]. Wears the same
+     *  wedge self-heal hooks as [fetchMediaRetrying]: a timeout means the shared
+     *  HTTP engine may be wedged. The image path never fed the stall counter
+     *  before, so a wedged stack could only be cleared by a process restart
+     *  (LP3 feedback 2026-09-13 — the #32 "not loading photos" lead). A fast
+     *  failure still counts as a responsive stack, matching the voice path. */
     private suspend fun fetchMedia(
         c: MatrixClient,
         file: EncryptedFile?,
@@ -5678,17 +5758,30 @@ object MatrixRepository {
         saveToCache: Boolean,
         logLabel: String,
         eventId: String,
-    ): ByteArray? = withTimeoutOrNull(MEDIA_BUDGET_MS) {
-        val mediaService = c.di.get<MediaService>(MediaService::class)
-        val result = when {
-            file != null -> mediaService.getEncryptedMedia(file, maxSize = null, saveToCache = saveToCache)
-            url != null -> mediaService.getMedia(url, maxSize = null, saveToCache = saveToCache)
-            else -> return@withTimeoutOrNull null
+    ): ByteArray? {
+        val encFile = file
+        val mediaUrl = url
+        if (encFile == null && mediaUrl == null) return null
+        val result = withTimeoutOrNull(MEDIA_BUDGET_MS) {
+            val mediaService = c.di.get<MediaService>(MediaService::class)
+            when {
+                encFile != null -> mediaService.getEncryptedMedia(encFile, maxSize = null, saveToCache = saveToCache)
+                mediaUrl != null -> mediaService.getMedia(mediaUrl, maxSize = null, saveToCache = saveToCache)
+                else -> null
+            }
+        }
+        if (result == null) {
+            noteMediaFetchTimeout()
+            android.util.Log.w(TAG, "$logLabel: fetch timed out for $eventId after ${MEDIA_BUDGET_MS}ms")
+            return null
         }
         if (result.isFailure) {
+            noteMediaFetchSuccess()
             android.util.Log.w(TAG, "$logLabel: fetch failed for $eventId", result.exceptionOrNull())
+            return null
         }
-        result.getOrNull()?.toByteArray()
+        noteMediaFetchSuccess()
+        return result.getOrNull()?.toByteArray()
     }
 
     /** [playVoiceNote]/[downloadVoiceNoteToCache]'s two-attempt fetch with the
@@ -6881,6 +6974,9 @@ object MatrixRepository {
                 ?.takeIf { headId != null }
                 ?: System.currentTimeMillis()
             pendingReadClear[roomId] = markerId to markerTs
+            // The store cursor is about to move: drop the shared unread memo
+            // so the next resolve reads the receipt, not the pre-read count.
+            invalidateUnreadMemo()
             roomListCache[roomId]?.let { entry ->
                 if (entry.room.unreadCount > 0) {
                     val cleared = entry.copy(room = entry.room.copy(unreadCount = 0))
@@ -7253,6 +7349,13 @@ object MatrixRepository {
             watch("server-unread collector ended") {
                 c.api.sync.subscribeAsFlow().collect { syncEvents ->
                     val join = syncEvents.syncResponse.room?.join ?: return@collect
+                    // Contention probe (issue #33): every joined room below
+                    // launches a row resolve, all queuing on [chainDb] — so the
+                    // round's fan-out is the number to correlate against the
+                    // send-wake round's permit waits.
+                    if (debugLogging()) {
+                        android.util.Log.d(TAG, "sync round: ${join.size} joined room(s) → ${join.size} row resolves")
+                    }
                     for ((roomId, joinedRoom) in join) {
                         val count = joinedRoom.unreadNotifications?.notificationCount?.toInt() ?: 0
                         if (serverUnreadCounts[roomId.full] != count) {
@@ -7265,6 +7368,10 @@ object MatrixRepository {
                         // rounds never carry receipts (the thin filter drops
                         // m.receipt — by design, INGEST-DERIVED-PLAN).
                         if (ownReceiptEchoed(joinedRoom.ephemeral?.events, c.userId)) {
+                            // The cursor moved: drop the shared unread memo
+                            // before the row publish below, so it reads the
+                            // new receipt instead of the pre-read count.
+                            invalidateUnreadMemo()
                             if (debugLogging() && pendingReadClear.remove(roomId.full) != null) {
                                 android.util.Log.d(
                                     TAG,
@@ -8020,7 +8127,7 @@ object MatrixRepository {
     private suspend fun ownReceiptTs(c: MatrixClient, roomId: String): Long? {
         val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
             ?: return null
-        return chainDbSemaphore.withPermit {
+        return chainDb("ownReceiptTs") {
             withContext(Dispatchers.IO) {
                 runCatching<Long?> {
                     db.openHelper.writableDatabase.query(
@@ -8062,11 +8169,12 @@ object MatrixRepository {
      * events and still-encrypted member copies can skew the count; the row
      * badge renders boolean, so only the false-positive direction matters.
      * Stored per-event position (Beeper's Messages.order) if that ever bites.
+     * The un-memoized single-room query: callers go through [receiptCursorUnread].
      */
-    private suspend fun receiptCursorUnread(c: MatrixClient, roomId: String): Long? {
+    private suspend fun receiptCursorUnreadQuery(c: MatrixClient, roomId: String): Long? {
         val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
             ?: return null
-        return chainDbSemaphore.withPermit {
+        return chainDb("receiptCursorUnread") {
             withContext(Dispatchers.IO) {
                 runCatching<Long?> {
                     val own = db.openHelper.writableDatabase.query(
@@ -8110,8 +8218,156 @@ object MatrixRepository {
         }
     }
 
+    /**
+     * [receiptCursorUnread] for many rooms in two queries instead of two per
+     * room. Rooms with no own receipt are absent, so callers fall back to the
+     * server count exactly as they do for a null single-room result.
+     * The room-list pass resolves every joined room (~228 on the LP3), and
+     * queueing each one on the 2-permit [chainDbSemaphore] turned that into a
+     * ~6 s stall at launch (probe 2026-09-13).
+     *
+     * Null means the batch could not run at all. Callers must then resolve per
+     * room — falling back to the server counts here instead would silently
+     * resurrect the false-positive badges this cursor model exists to fix.
+     */
+    private suspend fun receiptCursorUnreadBatch(
+        c: MatrixClient,
+        roomIds: List<String>,
+    ): Map<String, Long>? {
+        if (roomIds.isEmpty()) return emptyMap()
+        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            ?: return null
+        return chainDb("receiptCursorUnreadBatch") {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val holes = roomIds.joinToString(",") { "?" }
+                    val own = HashMap<String, Long>()
+                    db.openHelper.writableDatabase.query(
+                        "SELECT RoomUserReceipts.roomId, MAX(je.value) FROM RoomUserReceipts, " +
+                            "json_tree(RoomUserReceipts.value) je " +
+                            "WHERE RoomUserReceipts.roomId IN ($holes) " +
+                            "AND RoomUserReceipts.userId=? " +
+                            "AND je.key='ts' AND je.type='integer' " +
+                            "GROUP BY RoomUserReceipts.roomId",
+                        (roomIds + c.userId.full).toTypedArray(),
+                    ).use { cur ->
+                        while (cur.moveToNext()) {
+                            if (!cur.isNull(1)) own[cur.getString(0)] = cur.getLong(1)
+                        }
+                    }
+                    if (own.isEmpty()) return@runCatching emptyMap<String, Long>()
+                    // One VALUES join beats a correlated subquery per timeline
+                    // row. own.ts binds as INTEGER — the single-room version
+                    // needs its CAST for exactly that reason (see the note on
+                    // the roomId query above).
+                    val binding = own.entries.joinToString(",") { "(?,?)" }
+                    val args = ArrayList<Any>(own.size * 2 + 1)
+                    for ((room, ts) in own) {
+                        args += room
+                        args += ts
+                    }
+                    args += c.userId.full
+                    val counts = HashMap<String, Long>(own.size)
+                    db.openHelper.writableDatabase.query(
+                        "WITH own(roomId, ts) AS (VALUES $binding) " +
+                            "SELECT roomId, MIN(99, SUM(n)) FROM (" +
+                            "SELECT t.roomId AS roomId, " +
+                            "json_extract(t.value,'\$.event.origin_server_ts') AS ets, " +
+                            "COUNT(*) AS n " +
+                            "FROM TimelineEvent t JOIN own ON own.roomId = t.roomId " +
+                            "WHERE json_extract(t.value,'\$.event.type') " +
+                            "  IN ('m.room.message','m.room.encrypted') " +
+                            "AND json_extract(t.value,'\$.event.sender') != ? " +
+                            "AND json_extract(t.value,'\$.event.origin_server_ts') > own.ts " +
+                            "GROUP BY t.roomId, ets" +
+                            ") WHERE n <= 6 GROUP BY roomId",
+                        args.toTypedArray(),
+                    ).use { cur ->
+                        while (cur.moveToNext()) counts[cur.getString(0)] = cur.getLong(1)
+                    }
+                    // A receipted room with nothing after the cursor is unread 0,
+                    // not absent — it must not keep its ts as the count.
+                    HashMap<String, Long>(own.size).apply {
+                        for (room in own.keys) put(room, counts[room] ?: 0L)
+                    }
+                }.onFailure {
+                    android.util.Log.w(
+                        TAG,
+                        "receiptCursorUnreadBatch failed — resolving unread per room",
+                        it,
+                    )
+                }.getOrNull()
+            }
+        }
+    }
+
+    /**
+     * Launch-storm memo (issue #33): every joined room's first row publish
+     * resolves unread, and one query per room queued on the 2-permit
+     * [chainDbSemaphore] — the ~350-room launch publish wave stalled for ~6 s
+     * (probe 2026-09-13). The whole set resolves in two batched queries
+     * ([receiptCursorUnreadBatch]) and is shared for [unreadMemoTtlMs] — the
+     * Beeper shape: unread lives in a table the list query reads, never a
+     * per-room job behind a shared permit.
+     * TTL rather than pure invalidation: a new message raises a count with no
+     * store event to hook, so a badge may lag that long. Read-state moves
+     * ([markRead] and the receipt echo that releases it) drop it eagerly.
+     * ponytail: fixed 2 s TTL — a per-room read-state epoch if the lag shows.
+     */
+    @Volatile private var unreadMemo: Pair<Long, Map<String, Long?>>? = null
+    private val unreadMemoLock = Mutex()
+    private val unreadMemoTtlMs = 2_000L
+
+    /** Drops [unreadMemo] on a read-state move; the next resolve rebuilds it. */
+    private fun invalidateUnreadMemo() {
+        unreadMemo = null
+    }
+
+    /** [receiptCursorUnreadQuery] through the shared [unreadMemo]. */
+    private suspend fun receiptCursorUnread(c: MatrixClient, roomId: String): Long? {
+        val memo = unreadCursorMemo(c)
+        if (memo != null && memo.containsKey(roomId)) return memo[roomId]
+        return receiptCursorUnreadQuery(c, roomId)
+    }
+
+    /** [unreadMemo] for the store's rooms, rebuilt when older than
+     *  [unreadMemoTtlMs]. Null when it could not be built — the caller then
+     *  queries the one room (never the server counts, see
+     *  [receiptCursorUnreadBatch]). */
+    private suspend fun unreadCursorMemo(c: MatrixClient): Map<String, Long?>? {
+        unreadMemo?.let { (at, memo) ->
+            if (android.os.SystemClock.elapsedRealtime() - at < unreadMemoTtlMs) return memo
+        }
+        // Single flight: a launch wave's concurrent resolves share one build
+        // instead of each rebuilding the batch behind the same 2 permits.
+        return unreadMemoLock.withLock {
+            unreadMemo?.let { (at, memo) ->
+                if (android.os.SystemClock.elapsedRealtime() - at < unreadMemoTtlMs) {
+                    return@withLock memo
+                }
+            }
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+            val ids = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
+                ?.keys?.map { it.full }
+                ?: return@withLock null
+            val batch = receiptCursorUnreadBatch(c, ids) ?: return@withLock null
+            val memo = HashMap<String, Long?>(ids.size)
+            for (id in ids) memo[id] = batch[id]
+            unreadMemo = startedAt to memo
+            if (debugLogging()) {
+                android.util.Log.d(
+                    TAG,
+                    "unread memo: ${ids.size} room(s) in " +
+                        "${android.os.SystemClock.elapsedRealtime() - startedAt} ms",
+                )
+            }
+            memo
+        }
+    }
+
     private fun resetRoomList() {
         roomListCache.clear()
+        unreadMemo = null
         roomSigSeen.clear()
         bridgeBotByRoom.clear()
         pendingReadClear.clear()
@@ -8553,6 +8809,8 @@ object MatrixRepository {
         // receipt syncs (it counts non-message classes our client never
         // renders — false flags on fully-read rooms).
         val storeUnread = if (verified || !room.encrypted) {
+            // Shared short-TTL batch (unreadCursorMemo); null is the
+            // no-own-receipt-yet case, so the server count is the fallback.
             receiptCursorUnread(c, key) ?: (serverUnreadCounts[key]?.toLong() ?: 0L)
         } else 0
         val cleared = pendingReadClear[key]
@@ -10277,16 +10535,21 @@ object MatrixRepository {
                 // (Beeper's reply fallback) is stripped; the remainder feeds
                 // the tool's AnnotatedString converter. An edited text uses
                 // the edit's own content when it has one.
-                val formattedHtml = (editedContent as? RoomMessageEventContent.TextBased ?: content)
+                val rawHtml = (editedContent as? RoomMessageEventContent.TextBased ?: content)
                     .takeIf { it.format == "org.matrix.custom.html" }
                     ?.formattedBody
                     ?.takeIf { it.isNotBlank() }
                     ?.let { MX_REPLY_REGEX.replace(it, "").trim().takeIf { h -> h.isNotBlank() } }
-                    // The forward header lives in the formatted variant too (the
-                    // plain body's was stripped above) — otherwise the row renders
-                    // "↷ Forwarded" twice (LP3 feedback 2026-09-09).
-                    ?.let { if (forwarded) stripForwardHeaderFromHtml(it) else it }
-                    ?.takeIf { it.isNotBlank() }
+                // The forward header lives in the formatted variant too (the
+                // plain body's was stripped above) — otherwise the row renders
+                // "↷ Forwarded" twice (LP3 feedback 2026-09-09). mautrix marks
+                // its header paragraph with `data-mx-forwarded-notice`, which
+                // the plain flag may miss, so the HTML strips on its own match
+                // and reports the flag back (LP3 feedback 2026-09-13).
+                val (strippedHtml, forwardedByHtml) =
+                    rawHtml?.let { stripForwardHeaderFromHtml(it) } ?: (null to false)
+                forwarded = forwarded || forwardedByHtml
+                val formattedHtml = strippedHtml?.takeIf { it.isNotBlank() }
                 Triple(
                     text,
                     formattedHtml,
@@ -10326,9 +10589,7 @@ object MatrixRepository {
                 c.room.getTimelineEvent(roomId, EventId(replyTargetId)).firstOrNull()
             }?.let { target ->
                 replyToSender = senderNameOf(c, roomId, target.event.sender)
-                (target.content?.getOrNull() as? RoomMessageEventContent.TextBased)?.let {
-                    replyToExcerpt = replyExcerptOf(it.body)
-                }
+                replyToExcerpt = replyExcerptFor(target.content?.getOrNull() as? RoomMessageEventContent)
             }
         }
         return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
@@ -10374,6 +10635,25 @@ object MatrixRepository {
             ?.takeIf { it.isNotEmpty() }
             ?.let { if (it.length > REPLY_EXCERPT_MAX) it.take(REPLY_EXCERPT_MAX - 1) + "…" else it }
 
+    /** One-line excerpt of a reply TARGET of any kind — a text target's first
+     *  line, otherwise the media row's own label ("[Photo]" / "[Video]" / the
+     *  voice note's file name). A reply to a photo or voice note previously
+     *  quoted nothing (the excerpt was read from text targets only), so the
+     *  reply header rendered empty (LP3 feedback 2026-09-12). The labels match
+     *  the body the media row itself shows, so the tool's optimistic reply
+     *  (`replyExcerptOf(target.body)`) and this resolved excerpt agree. */
+    private fun replyExcerptFor(content: RoomMessageEventContent?): String? = when (content) {
+        is RoomMessageEventContent.TextBased -> replyExcerptOf(content.body)
+        is RoomMessageEventContent.FileBased.Image -> "[Photo]"
+        is RoomMessageEventContent.FileBased.Video -> "[Video]"
+        is RoomMessageEventContent.FileBased.Audio ->
+            content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note"
+        is RoomMessageEventContent.FileBased.File ->
+            if (content.info?.mimeType?.startsWith("image/", ignoreCase = true) == true) "[Photo]"
+            else "[File]"
+        else -> null
+    }
+
     private suspend fun senderNameOf(c: MatrixClient, roomId: RoomId, sender: UserId): String =
         withTimeoutOrNull(ROOM_BUDGET_MS) {
             c.user.getById(roomId, sender).firstOrNull()?.name
@@ -10382,11 +10662,14 @@ object MatrixRepository {
     /** The sender's caption for a media message — the m.image / m.video body
      *  (most clients put the caption there, separate from the file name). A
      *  caption that equals the file name is not a caption; neither is a bare file name — Signal's m.image body IS
-     *  "image.jpg" with no caption. */
+     *  "image.jpg" with no caption. Inline markdown is stripped
+     *  ([MarkdownConverter.plainInline]): Instagram/Telegram captions arrive as
+     *  "[clean-url](url-with-tracking)" and the row renders plain text, so the
+     *  label is what shows (LP3 feedback 2026-09-12 — the raw URL pair was). */
     private fun captionOf(file: RoomMessageEventContent.FileBased): String? =
         file.body.takeIf {
             it.isNotBlank() && it != file.fileName && !isBareFilename(it)
-        }
+        }?.let(MarkdownConverter::plainInline)
 
     /** A bare media file name ("image.jpg", "VID_2024.mp4") is not a caption —
      *  no whitespace, ends with a common image/video extension. */
@@ -10469,30 +10752,8 @@ object MatrixRepository {
      *  (same precedent as [stripReplyQuote] on the plain body). */
     private val MX_REPLY_REGEX = Regex("<mx-reply>[\\s\\S]*?</mx-reply>")
 
-    /** Lifts a bridge "forwarded" header off a message body (WhatsApp forwards
-     *  arrive as "↷ Forwarded" or "Forwarded" + a blank line + the content —
-     *  the bridge's text stand-in for WhatsApp's forward chip). Returns the
-     *  content ("" when the message is nothing but the header — a forwarded
-     *  photo's caption is just the marker) and whether the header was found.
-     *  The tool renders the header itself as the ↷ glyph + "forwarded" tag via
-     *  [Message.forwarded], and previews strip it so the room list shows the
-     *  content, not the marker. (2026-09-09: header variants without the ↷
-     *  glyph and after a single newline now strip too — rows kept showing the
-     *  header above the content.) */
-    private val FORWARD_HEADER = Regex("^(?:\u21B7 )?Forwarded(?: from [^\\n]*)?(\\n+|\$)")
-
-    private fun stripForwardHeader(body: String): Pair<String, Boolean> {
-        val match = FORWARD_HEADER.find(body) ?: return body to false
-        return body.substring(match.value.length).trimStart('\n') to true
-    }
-
-    /** Same strip for a formatted variant ([formatted_body]): the header is its
-     *  own leading paragraph, or the first line before a <br/>. */
-    private val FORWARD_HEADER_HTML =
-        Regex("^<p>(?:\u21B7 )?Forwarded(?: from [^<]*)?(?:</p>\\s*|<br/>)")
-
-    private fun stripForwardHeaderFromHtml(html: String): String =
-        html.replaceFirst(FORWARD_HEADER_HTML, "").trim()
+    // The forward-header strip moved to ForwardHeaderStrip.kt (top-level, same
+    // package) so it can be unit-tested without initializing this object.
 
     /** In broadcast rooms (you + the channel ghost) Beeper echoes your own
      *  channel posts back with your display name baked into the body ("FENN:
@@ -10745,7 +11006,7 @@ object MatrixRepository {
     /** Re-reads of the event while its content is still decrypting. */
     private const val MEDIA_CONTENT_RETRIES = 4
     private const val MEDIA_CONTENT_RETRY_DELAY_MS = 1_500L
-    /** Consecutive voice-media download timeouts (network up) that mark the
+    /** Consecutive media download timeouts (network up) that mark the
      *  shared HTTP engine wedged and trigger the in-process self-heal.
      */
     private const val MEDIA_STALL_HEAL_THRESHOLD = 3

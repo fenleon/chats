@@ -206,8 +206,14 @@ class ComposerScreen(
         // bottom half only, so the text above stays tappable for cursor moves.
         var showActions by remember { mutableStateOf(false) }
         var clipboardText by remember { mutableStateOf<String?>(null) }
+        // The panel's appearance gets the app's gesture buzz (feedback
+        // 2026-09-12: the half-panel opened silently).
+        val buzz = rememberHapticBuzz()
         LaunchedEffect(showActions) {
-            if (showActions) clipboardText = ChatClient.clipboardText()
+            if (showActions) {
+                buzz()
+                clipboardText = ChatClient.clipboardText()
+            }
         }
         // COPY confirmation flash — shared with the thread's context window.
         var copyFlash by remember { mutableStateOf(false) }
@@ -219,10 +225,19 @@ class ComposerScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .pointerInput(Unit) {
-                        // Hold anywhere in the composer → the COPY/PASTE panel.
-                        // The text field sees events first; a long-press it
-                        // consumes (native selection) opens nothing here.
-                        detectTapGestures(onLongPress = { showActions = true })
+                        // Hold anywhere in the composer → the COPY/PASTE panel,
+                        // but only when a row could do something: with an empty
+                        // draft and nothing to paste the panel is a dead end, so
+                        // the hold stays silent (feedback 2026-09-12). The text
+                        // field sees events first; a long-press it consumes
+                        // (native selection) opens nothing here either.
+                        detectTapGestures(
+                            onLongPress = {
+                                if (textState.text.isNotEmpty() || ChatClient.clipboardText() != null) {
+                                    showActions = true
+                                }
+                            },
+                        )
                     },
             ) {
                 LightTextInputEditor(
@@ -254,33 +269,29 @@ class ComposerScreen(
                     submitInTopBar = true,
                     topBarSubmitIcon = LightIcons.SEND,
                     initialCaps = true,
+                    // Reply toptag (feedback 2026-09-12, second pass): one
+                    // Superfine line quoting the target message — `"…"` — with
+                    // no name prefix, rendered by the editor directly above the
+                    // input text (it sat over the keyboard when the composer
+                    // drew it itself). The quote alone identifies the target.
+                    // A tap cancels the reply.
+                    topTag = if (replyingTo != null) {
+                        {
+                            val excerpt = replyTarget?.body?.lineSequence()
+                                ?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+                            LightText(
+                                text = if (excerpt.isEmpty()) "\"…\"" else "\"$excerpt\"",
+                                variant = LightTextVariant.Superfine,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .padding(bottom = 0.5f.gridUnitsAsDp())
+                                    .lightClickable { viewModel.cancelReply() },
+                            )
+                        }
+                    } else {
+                        null
+                    },
                 )
-                // Reply toptag (feedback 2026-09-09, the Radio hint grammar):
-                // the quoted text sits directly above the input line — one
-                // Superfine line "sender · excerpt", a tap cancels the reply.
-                if (replyingTo != null) {
-                    // The full target rides on the constructor param (the VM
-                    // tracks only the id); blank-sender own rows render the
-                    // excerpt alone.
-                    val header = replyTarget?.let { m ->
-                        val excerpt = m.body.lineSequence()
-                            .firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-                        listOfNotNull(
-                            m.senderName.takeIf { it.isNotBlank() },
-                            excerpt.takeIf { it.isNotEmpty() },
-                        ).joinToString(" · ")
-                    }
-                    LightText(
-                        text = header ?: "replying",
-                        variant = LightTextVariant.Superfine,
-                        maxLines = 1,
-                        modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .imePadding()
-                            .padding(start = 1f.gridUnitsAsDp(), bottom = 8f.gridUnitsAsDp())
-                            .lightClickable { viewModel.cancelReply() },
-                    )
-                }
                 // Half-panel COPY/PASTE over the keyboard zone; the composer
                 // text above it stays interactive (cursor moves are taps on the
                 // text, and PASTE inserts at the cursor/selection).
@@ -327,27 +338,32 @@ class ComposerScreen(
                 // keys, so the X sits in that row at the far right, vertically
                 // centered like a native bottom-bar icon. Always visible
                 // while the composer is open; with an
-                // empty draft it's a harmless no-op.
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        // Keeps the X above the keyboard when the system IME
-                        // is in use (no-op with the embedded keyboard — the
-                        // IME never shows, so imePadding is 0).
-                        .imePadding()
-                        .padding(end = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp())
-                        .lightClickable {
-                            textState.edit { replace(0, length, "") }
-                        }
-                        .padding(horizontal = 1f.gridUnitsAsDp()),
-                ) {
-                    LightIcon(
-                        icon = LightIcons.CLOSE,
-                        // Same size as the bottom-row icons (2 gu — the SDK's
-                        // bar-button icon size; feedback 2026-08-21: was 1.5f).
-                        size = 2f,
-                        contentDescription = "Clear draft",
-                    )
+                // empty draft it's a harmless no-op. Hidden while the
+                // COPY/PASTE panel — or the COPY confirmation — is up: the X
+                // painted over both (feedback 2026-09-12, both passes).
+                if (!showActions && !copyFlash) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            // Keeps the X above the keyboard when the system
+                            // IME is in use (no-op with the embedded keyboard —
+                            // the IME never shows, so imePadding is 0).
+                            .imePadding()
+                            .padding(end = 1f.gridUnitsAsDp(), bottom = 1f.gridUnitsAsDp())
+                            .lightClickable {
+                                textState.edit { replace(0, length, "") }
+                            }
+                            .padding(horizontal = 1f.gridUnitsAsDp()),
+                    ) {
+                        LightIcon(
+                            icon = LightIcons.CLOSE,
+                            // Same size as the bottom-row icons (2 gu — the
+                            // SDK's bar-button icon size; feedback 2026-08-21:
+                            // was 1.5f).
+                            size = 2f,
+                            contentDescription = "Clear draft",
+                        )
+                    }
                 }
             }
         }

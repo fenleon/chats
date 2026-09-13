@@ -120,4 +120,29 @@ class MarkdownConverterTest {
         assertTrue(MarkdownConverter.hasMarkdown("# heading"))
         assertFalse(MarkdownConverter.hasMarkdown("plain words only"))
     }
+
+    @Test
+    fun `toPlainHtml escapes and keeps hard line breaks`() {
+        // The formatted_body a reply's plain body needs (see
+        // `MatrixRepository.sendMessage`): a reply always ships as format=html,
+        // and the forced format must never travel without a matching body.
+        assertEquals("a &lt;b&gt; &amp; c", MarkdownConverter.toPlainHtml("a <b> & c"))
+        assertEquals("one<br/>two", MarkdownConverter.toPlainHtml("one\ntwo"))
+        assertEquals("plain **x** words", MarkdownConverter.toPlainHtml("plain **x** words"))
+    }
+
+    @Test
+    fun `plainInline collapses a markdown caption to its label`() {
+        // The Instagram/Telegram media-caption shape (LP3 feedback 2026-09-12):
+        // the label is the clean URL, the target carries tracking params — the
+        // row must show the label, not the "(url)" half.
+        assertEquals(
+            "https://www.instagram.com/reel/abc/",
+            MarkdownConverter.plainInline(
+                "[https://www.instagram.com/reel/abc/](https://www.instagram.com/reel/abc/?igsh=x)",
+            ),
+        )
+        assertEquals("a bold caption", MarkdownConverter.plainInline("a **bold** caption"))
+        assertEquals("plain caption", MarkdownConverter.plainInline("plain caption"))
+    }
 }

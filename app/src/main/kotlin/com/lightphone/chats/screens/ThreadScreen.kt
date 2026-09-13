@@ -615,6 +615,14 @@ class ThreadViewModel(
                         mergeWithPending(mergeNewestPage(loaded, messages.value)),
                     )
                     hasMore.value = page?.hasMore ?: false
+                    // While the visible list is still only newest pages, the
+                    // paging cursor is the newest page's own walk position (the
+                    // chain-deepest event it read) — never the visible first
+                    // row, which the serve path's timestamp sort can leave
+                    // mid-chain. Once an older page has been prepended,
+                    // [loadOlder] owns the cursor and a refresh must not drag it
+                    // back up into the newest window.
+                    if (!pagedOlder) olderCursor = page?.nextBeforeEventId
                 }
             } finally {
                 // A binder exception mid-fetch must not leave the thread stuck on
@@ -1154,17 +1162,44 @@ class ThreadViewModel(
         }
     }
 
+    /**
+     * The timeline-chain position the last older-page fetch stopped at — the
+     * cursor the companion hands back with each page
+     * ([LightServiceMethod.GetMessages.Response.nextBeforeEventId]).
+     *
+     * Deriving the cursor from the visible list instead
+     * (`messages.value.firstOrNull()`) breaks in bridged rooms: the companion
+     * serves a page sorted by timestamp, so its first row is the
+     * smallest-timestamp row rather than the chain-deepest one, and in a room
+     * whose bridge re-imported messages out of order the walk from that row
+     * re-served rows already on screen — `distinctBy` dropped them all, nothing
+     * was prepended, `messages.value.first()` never moved, and the same cursor
+     * was refetched on every scroll (LP3 feedback 2026-09-12: "no older
+     * messages are loading").
+     */
+    private var olderCursor: String? = null
+
+    /**
+     * Whether an older page has already been prepended. From that point on only
+     * [loadOlder] writes the cursor — a newest-page refresh must not drag it
+     * back up into the newest window.
+     */
+    private var pagedOlder = false
+
     /** Prepends the page of messages older than the oldest one currently shown. */
     fun loadOlder() {
-        val oldest = messages.value.firstOrNull() ?: return
+        // Fall back to the visible oldest row only when the companion hasn't
+        // reported a cursor yet (a page the loop never advanced through).
+        val cursor = olderCursor ?: messages.value.firstOrNull()?.id ?: return
         // An optimistic "local-…" row is not a real event — paging from it
         // returns nothing and would dead-end pagination (feedback 2026-08-15).
-        if (oldest.id.startsWith(LOCAL_ROW_PREFIX)) return
+        if (cursor.startsWith(LOCAL_ROW_PREFIX)) return
         if (loadingMore.value || !hasMore.value) return
         viewModelScope.launch {
             loadingMore.value = true
             try {
-                val page = ChatClient.getMessages(room.id, oldest.id, OLDER_PAGE_SIZE)
+                val page = ChatClient.getMessages(room.id, cursor, OLDER_PAGE_SIZE)
+                page?.nextBeforeEventId?.let { olderCursor = it }
                 val older = page?.messages.orEmpty()
                 if (older.isNotEmpty()) {
                     // distinctBy guards the page boundary: if the timeline changed
@@ -1179,6 +1214,7 @@ class ThreadViewModel(
                     val merged = (older + messages.value).distinctBy { it.id }
                     dropReflectedOverlays(merged)
                     messages.value = applyMessageOverlays(applyReactionOverlays(merged))
+                    pagedOlder = true
                 }
                 hasMore.value = page?.hasMore ?: hasMore.value
             } finally {
@@ -2192,17 +2228,18 @@ private fun MessageRow(
                     )
                 }
             } else {
-                // Reply excerpt header: one line — "{sender} · {excerpt of
-                // the original}" — above the body, indented one grid unit
-                // from the text edge. Data only, no tap (calm design; the
-                // excerpt suffices). Text rows only for v1; media rows skip
-                // it. Blank (target unresolved — a pending echo carries the
-                // id only) renders nothing.
+                // Reply excerpt header: one line quoting the original —
+                // `reply to "Message from the…"` — above the body, indented one
+                // grid unit from the text edge. No name prefix (feedback
+                // 2026-09-12): the quote alone identifies the target; the
+                // composer's reply toptag shows the quote alone, where the
+                // "reply to" prefix is redundant under the "Replying To" title.
+                // Data only, no tap (calm design; the excerpt suffices). Text
+                // rows only; media rows skip it. Blank (target unresolved — a
+                // pending echo carries the id only) renders nothing.
                 message.replyToId?.takeIf { message.contentType == "text" }?.let {
-                    val header = listOfNotNull(
-                        message.replyToSender,
-                        message.replyToExcerpt,
-                    ).joinToString(" · ")
+                    val excerpt = message.replyToExcerpt?.takeIf { it.isNotBlank() }
+                    val header = excerpt?.let { "reply to \"$it\"" }.orEmpty()
                     if (header.isNotBlank()) {
                         LightText(
                             text = header,
@@ -2405,10 +2442,12 @@ private fun ForwardedArrowGlyph(modifier: Modifier = Modifier) {
 
 /** Forwarded MEDIA rows: the ↷ glyph sits beside the media on the row's
  *  outer side — leading it on incoming rows, trailing it on own rows (spaced
- *  off it — it used to hug the photo). The caption renders like any normal
- *  message's: under the media, edge-aligned, one paragraph gap — it used to
- *  sit inside the glyph's row slot (LP3 feedback 2026-09-09). The small
- *  "forwarded" word sits under the whole block. */
+ *  off it — it used to hug the photo). The caption rides in the media's own
+ *  column, so it lines up with the photo/video edge (own rows: the right
+ *  edge) and clears the glyph's slot by the same 0.5-gu gap as the media —
+ *  it previously hung on the block's outer edge, flush under the ↷ (LP3
+ *  feedback 2026-09-12). The small "forwarded" word sits under the whole
+ *  block. */
 @Composable
 private fun ForwardedMediaRow(
     message: LightServiceMethod.GetMessages.Message,
@@ -2441,21 +2480,29 @@ private fun ForwardedMediaRow(
                     modifier = Modifier.padding(end = 0.5f.gridUnitsAsDp()),
                 )
             }
-            content()
+            // The media's own column: content then caption, both aligned to
+            // the media edge (feedback 2026-09-12 — the caption used to sit
+            // in the outer block column, flush under the glyph).
+            Column(
+                horizontalAlignment = if (message.isMine) Alignment.End else Alignment.Start,
+            ) {
+                content()
+                // The server strips the "↷ Forwarded" header out of the
+                // caption, so a captionless forward's caption is empty —
+                // dropped here.
+                caption?.takeIf { it.isNotBlank() }?.let {
+                    LightText(
+                        text = it,
+                        variant = LightTextVariant.Paragraph,
+                        modifier = Modifier.padding(top = 1.dp),
+                    )
+                }
+            }
             if (message.isMine) {
                 ForwardedArrowGlyph(
                     modifier = Modifier.padding(start = 0.5f.gridUnitsAsDp()),
                 )
             }
-        }
-        // The server strips the "↷ Forwarded" header out of the caption, so a
-        // captionless forward's caption is empty — dropped here.
-        caption?.takeIf { it.isNotBlank() }?.let {
-            LightText(
-                text = it,
-                variant = LightTextVariant.Paragraph,
-                modifier = Modifier.padding(top = 1.dp),
-            )
         }
         LightText(
             text = "forwarded",

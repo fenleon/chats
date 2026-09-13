@@ -34,6 +34,7 @@ import com.lightphone.chats.R
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
+import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.delay
 
@@ -67,7 +68,9 @@ private val REACTION_ROWS = listOf(
  * wide thin chevron at the very bottom center dismisses (any level).
  * Row order (feedback 2026-09-09): own messages EDIT / COPY / UNSEND — no
  * reply to self; other messages LIKE / REPLY / REACT (or EDIT REACTION /
- * REMOVE REACTION) / COPY. One own reaction at a time (replace semantics).
+ * REMOVE REACTION) / COPY — LIKE only while the reader has no reaction of
+ * their own (feedback 2026-09-12). One own reaction at a time (replace
+ * semantics).
  * Each row only shows while the message still allows it
  * ([LightServiceMethod.GetMessages.Message.canEdit] / `canUnsend`, the
  * bridge's capability gate).
@@ -144,7 +147,15 @@ fun ContextWindowOverlay(
                         // Received: LIKE / REPLY / REACT … / COPY last (feedback
                         // 2026-09-09).
                         else -> {
-                            add("LIKE" to { onLike(); onDismiss() })
+                            // LIKE is the ❤️ shortcut; once the message carries
+                            // the reader's own reaction it is redundant — and a
+                            // no-op (setReaction replaces, one own reaction at a
+                            // time) — so the row is dropped and EDIT REACTION /
+                            // REMOVE REACTION below take its place (LP3 feedback
+                            // 2026-09-12).
+                            if (ownReaction == null) {
+                                add("LIKE" to { onLike(); onDismiss() })
+                            }
                             add("REPLY" to { onReply(); onDismiss() })
                             if (ownReaction == null) {
                                 add("REACT" to { level = ContextLevel.Reactions })
@@ -237,7 +248,10 @@ fun ContextWindowOverlay(
 /** A COPY confirmation: a fullscreen black panel with "copy" centered for one
  *  second (LP3 feedback 2026-09-09) — replaces the system clipboard overlay.
  *  A tap dismisses it immediately. Mounted over the thread and the composer
- *  alike; both screens' COPY actions flip [visible]. */
+ *  alike; both screens' COPY actions flip [visible]. The label wears the
+ *  native overlay size — the raw Heading style, the volume-panel replica's
+ *  own label treatment (`tools/volume-panel/VolumePanelOverlay.kt`) — which
+ *  the SDK's scaled `LightTextVariant.Button` renders smaller than. */
 @Composable
 fun CopyFlashOverlay(
     visible: Boolean,
@@ -255,7 +269,11 @@ fun CopyFlashOverlay(
             .lightClickable(onClick = onDismiss),
         contentAlignment = Alignment.Center,
     ) {
-        LightText(text = "copy", variant = LightTextVariant.Button)
+        Text(
+            text = "copy",
+            color = Color.White,
+            style = LightThemeTokens.typography.heading,
+        )
     }
 }
 
