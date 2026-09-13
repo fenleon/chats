@@ -65,6 +65,10 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
 - Requires the **All tools** external-tools tier on a real Light Phone III (dev-signed APKs are treated as unknown by LightOS).
 - Without a configured push endpoint, new messages arrive at the next scheduled sync round.
 
+## Legal
+
+Chats is an independent, unofficial open-source project, not affiliated with or endorsed by The Light Phone, Inc., or Beeper. The Matrix protocol engine is [Trixnity](https://github.com/benkuly/trixnity) (Apache-2.0). Licensed under the [MIT License](LICENSE).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="art/so-many-chats-alpha-white.png">
@@ -72,7 +76,5 @@ The build consumes `../light-sdk` as a composite build; the SDK's chat service m
   </picture>
 </p>
 
+<p align="center">Support my work by leaving me a <a href="https://ko-fi.com/fenleon">tip</a> or  <a href=https://github.com/sponsors/fenleon">sponsoring me</a>. A little goes a long way.</p>
 
-## Legal
-
-Chats is an independent, unofficial open-source project, not affiliated with or endorsed by The Light Phone, Inc., or Beeper. The Matrix protocol engine is [Trixnity](https://github.com/benkuly/trixnity) (Apache-2.0). Licensed under the [MIT License](LICENSE).
