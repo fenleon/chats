@@ -2388,6 +2388,7 @@ object MatrixRepository {
             runCatching { old?.closeSuspending() }
             ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
             ctx.deleteDatabase(DB_NAME)
+            projectionTableReady = false
             ctx.cacheDir.resolve(MEDIA_DIR).deleteRecursively()
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
             clearDiskCache()
@@ -10330,6 +10331,13 @@ object MatrixRepository {
         observeLoginState(c)
         observeNotifications(c)
         observeSyncKeyRequests(c)
+        // Ingest-time projection (PLAN.md 2026-09-14, P0 shadow): materialize
+        // RoomProjection rows at ingest; consumers still derive at read until
+        // P1 flips them.
+        observeProjectionIngest(c)
+        scope.launch {
+            runCatching { backfillProjection(c) }
+        }
         // The room-list resolver's first pass seeds + warms the full room map,
         // so the tool's getRooms (a pure cache read) returns instantly.
         startRoomListResolver(c)
@@ -10472,6 +10480,220 @@ object MatrixRepository {
         }
         notificationWatcherJobs.add(job)
     }
+
+    // ---- Ingest-time projection (PLAN.md 2026-09-14, P0 shadow) -------------
+    // One materialized row per room, decided once per event at ingest by
+    // [ProjectionPredicate]; consumers still derive at read (P1 flips them).
+    // The table lives in Trixnity's DB (raw CREATE TABLE IF NOT EXISTS — the
+    // migrateSyncFilterIfNeeded idiom; Room ignores foreign tables), so it
+    // resets with logout's deleteDatabase like every other store.
+
+    @Volatile
+    private var projectionTableReady = false
+
+    private const val PROJECTION_WALK_MAX = 400
+
+    /** Single decrypt-retry wait for a round's pending encrypted events. */
+    private const val PROJECTION_RECHECK_MS = 30_000L
+
+    private data class ProjectionRow(
+        val roomId: String,
+        val lastRealEventId: String?,
+        val lastRealTs: Long,
+        val unreadCount: Long,
+        val preview: String,
+        val previewResolved: Boolean,
+    )
+
+    private fun ensureProjectionTable(db: TrixnityRoomDatabase) {
+        if (projectionTableReady) return
+        runCatching {
+            db.openHelper.writableDatabase.execSQL(
+                "CREATE TABLE IF NOT EXISTS RoomProjection (" +
+                    "roomId TEXT NOT NULL PRIMARY KEY," +
+                    "lastRealEventId TEXT," +
+                    "lastRealTs INTEGER NOT NULL DEFAULT 0," +
+                    "unreadCount INTEGER NOT NULL DEFAULT 0," +
+                    "preview TEXT NOT NULL DEFAULT ''," +
+                    "previewResolved INTEGER NOT NULL DEFAULT 0)",
+            )
+        }.onSuccess { projectionTableReady = true }
+            .onFailure { android.util.Log.w(TAG, "projection: table create failed: ${it.message}") }
+    }
+
+    /** The serial sync-event seam: the join map IS the changed-room list of
+     *  one sync round (timeline, receipts, state, counts). Same Flow the
+     *  notification watcher collects, run post-store-persist (DEFAULT
+     *  priority). One batched recompute+write per round, O(changed rooms). */
+    private fun observeProjectionIngest(c: MatrixClient) {
+        scope.launch {
+            try {
+                c.api.sync.subscribeAsFlow().collect { syncEvents ->
+                    val join = syncEvents.syncResponse.room?.join ?: return@collect
+                    val changed = join.keys.toList()
+                    if (changed.isEmpty()) return@collect
+                    scope.launch {
+                        yieldToSyncIngest()
+                        recomputeProjectionRows(c, changed)
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "projection ingest observer ended: ${e.message}")
+            }
+        }.also { notificationWatcherJobs.add(it) }
+    }
+
+    /** One-time seed: every joined room through the same recompute as the
+     *  ingest hook. Flag lives in PREFS (cleared at logout together with the
+     *  DB). Retried a few times — a fresh login's room store may not be
+     *  populated until the initial sync lands. */
+    private suspend fun backfillProjection(c: MatrixClient, attempt: Int = 0) {
+        yieldToSyncIngest()
+        val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return
+        if (prefs.getBoolean("projection_backfilled", false)) return
+        val rooms = runCatching {
+            withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
+        }.getOrNull() ?: return
+        val roomIds = rooms.keys.toList()
+        val written = recomputeProjectionRows(c, roomIds)
+        // An empty store (fresh login, initial sync not landed yet) is not
+        // "done" — retry until rooms exist or the attempt cap hits.
+        if ((written < roomIds.size || roomIds.isEmpty()) && attempt < 3) {
+            scope.launch {
+                delay(60_000L)
+                backfillProjection(c, attempt + 1)
+            }
+            return
+        }
+        prefs.edit().putBoolean("projection_backfilled", true).apply()
+        android.util.Log.d(TAG, "projection: backfilled ${written}/${roomIds.size} rooms")
+    }
+
+    private suspend fun recomputeProjectionRows(c: MatrixClient, roomIds: List<RoomId>): Int {
+        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            ?: return 0
+        ensureProjectionTable(db)
+        if (!projectionTableReady) return 0
+        val rows = ArrayList<ProjectionRow>(roomIds.size)
+        val pendingDecrypt = ArrayList<RoomId>()
+        for (roomId in roomIds) {
+            val projected = runCatching { projectRoom(c, roomId) }.getOrNull() ?: continue
+            if (projected.row != null) rows += projected.row
+            if (projected.pendingDecryption) pendingDecrypt += roomId
+        }
+        if (rows.isNotEmpty()) {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val sq = db.openHelper.writableDatabase
+                    sq.beginTransaction()
+                    try {
+                        for (r in rows) {
+                            sq.execSQL(
+                                "INSERT OR REPLACE INTO RoomProjection" +
+                                    "(roomId,lastRealEventId,lastRealTs,unreadCount,preview,previewResolved) " +
+                                    "VALUES(?,?,?,?,?,?)",
+                                arrayOf<Any?>(
+                                    r.roomId,
+                                    r.lastRealEventId,
+                                    r.lastRealTs,
+                                    r.unreadCount,
+                                    r.preview,
+                                    if (r.previewResolved) 1 else 0,
+                                ),
+                            )
+                        }
+                        sq.setTransactionSuccessful()
+                    } finally {
+                        sq.endTransaction()
+                    }
+                }.onFailure { android.util.Log.w(TAG, "projection: write failed: ${it.message}") }
+            }
+            if (debugLogging()) {
+                android.util.Log.d(TAG, "projection: ${rows.size} row(s) updated")
+            }
+        }
+        // One decrypt-retry wait feeding the predicate: pending encrypted
+        // events aren't admitted yet; a real message decrypts within seconds.
+        // No loop — a room that stays pending re-enters via its next sync
+        // round, and once stale the predicate drops it for good.
+        if (pendingDecrypt.isNotEmpty()) {
+            scope.launch {
+                delay(PROJECTION_RECHECK_MS)
+                yieldToSyncIngest()
+                recomputeProjectionRows(c, pendingDecrypt)
+            }
+        }
+        return rows.size
+    }
+
+    private data class ProjectedRoom(val row: ProjectionRow?, val pendingDecryption: Boolean)
+
+    /** Newest-first chain walk through the predicate: first admitted event is
+     *  the projection head, admitted events after the own receipt cursor are
+     *  the unread count. The walked window doubles as the flood-ghost
+     *  context (no second store walk). */
+    private suspend fun projectRoom(c: MatrixClient, roomId: RoomId): ProjectedRoom? {
+        val room = runCatching {
+            withTimeoutOrNull(ROOM_BUDGET_MS) { c.room.getById(roomId).firstOrNull() }
+        }.getOrNull() ?: return null
+        val startId = room?.lastEventId?.full ?: return ProjectedRoom(null, false)
+        val chain = readTimelineChainFromDb(c, roomId, startId, PROJECTION_WALK_MAX)
+            ?: return ProjectedRoom(null, false)
+        val events = chain.first
+        if (events.isEmpty()) return ProjectedRoom(null, false)
+        val own = c.userId.full
+        val ownTs = ownReceiptTs(c, roomId.full)
+        val now = System.currentTimeMillis()
+        var lastId: String? = null
+        var lastTs = 0L
+        var lastPreview = ""
+        var lastPreviewResolved = false
+        var unread = 0L
+        var pendingDecryption = false
+        for (te in events) {
+            val raw = te.event.content
+            val isEncrypted = raw is EncryptedMessageEventContent
+            val decryptedOk = te.content?.getOrNull() != null
+            val messageClass = isEncrypted || raw is RoomMessageEventContent
+            val originTs = te.event.originTimestamp
+            val admitted = ProjectionPredicate.admits(
+                messageClass = messageClass,
+                isReplaceEdit = isReplaceEdit(te),
+                sender = te.event.sender.full,
+                ownUserId = own,
+                originTs = originTs,
+                now = now,
+                isEncrypted = isEncrypted,
+                decryptedOk = decryptedOk,
+            ) && !isFloodGhost(c, te, events)
+            if (isEncrypted && !decryptedOk && !ProjectionPredicate.encryptedStale(originTs, now)) {
+                pendingDecryption = true
+            }
+            if (admitted) {
+                if (ownTs == null || originTs > ownTs) unread++
+                if (lastId == null) {
+                    lastId = te.event.id.full
+                    lastTs = originTs
+                    lastPreview = previewText(te) ?: ""
+                    lastPreviewResolved = lastPreview.isNotBlank()
+                }
+            }
+            if (lastId != null && ownTs != null && originTs < ownTs) break
+        }
+        val row = ProjectionRow(
+            roomId = roomId.full,
+            lastRealEventId = lastId,
+            lastRealTs = lastTs,
+            // No own receipt row yet (fresh room): the cursor has no ground
+            // truth — count everything admitted in the window (bounded by
+            // PROJECTION_WALK_MAX), the receipt lands on a later round.
+            unreadCount = unread,
+            preview = lastPreview,
+            previewResolved = lastPreviewResolved,
+        )
+        return ProjectedRoom(row, pendingDecryption)
+    }
+    // ---- end ingest-time projection -----------------------------------------
 
     /**
      * Stops the sync service shortly after an expiry is detected. The delay
