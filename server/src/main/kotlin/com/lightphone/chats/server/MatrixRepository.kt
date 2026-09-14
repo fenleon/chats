@@ -235,6 +235,7 @@ object MatrixRepository {
      *  re-alert the same newest event a previous run already dinged (ghost burst
      *  fix). Cleared with the prefs at logout. */
     private const val KEY_LAST_NOTIFIED_PREFIX = "last_notified_"
+    private const val KEY_LAST_READ_PREFIX = "last_read_"
     private const val DB_NAME = "matrix_client"
     private const val MEDIA_DIR = "matrix_media"
 
@@ -576,6 +577,16 @@ object MatrixRepository {
      *  ponytail: 15 min is a session value — tighten if the monitor shows
      *  receive latency, loosen if battery still burns. */
     private const val SLOW_SYNC_LAZY_INTERVAL_MS = 900_000L
+
+    /** An encrypted event still-undecryptable this long after its timestamp
+     *  doesn't count toward the receipt-cursor unread: real messages decrypt
+     *  within seconds of landing, so old undecryptable copies are bridge
+     *  re-delivery junk that opening the room can never clear (09-14). */
+    private const val UNREAD_ENCRYPTED_STALE_MS = 600_000L
+
+    /** Events stamped more than this far into the future are bridge clock
+     *  skew — never notified, never counted (see UNREAD_ENCRYPTED_STALE_MS). */
+    private const val UNREAD_FUTURE_SKEW_MS = 300_000L
 
     /** Foreground-service promotion cadence. */
     private const val FGS_PROMOTE_INTERVAL_MS = 5_000L
@@ -2843,6 +2854,30 @@ object MatrixRepository {
         }
         _roomList.value = visible
         android.util.Log.d(TAG, "room list: preloaded ${visible.size} rooms from disk cache")
+        // Re-derive unread from the receipt cursor: the disk cache carries
+        // counts saved under older resolver rules (the 09-14 junk-flood badges),
+        // and Phase C's no-sweep design means a quiet room's row is never
+        // re-published — its stale badge would otherwise survive every restart.
+        // One batched query per cold start; rooms without a receipt row keep
+        // their server-count fallback untouched (absent from the batch result).
+        scope.launch {
+            val c = client ?: return@launch
+            runCatching {
+                val fixed = receiptCursorUnreadBatch(c, visible.map { it.id }) ?: return@launch
+                var changed = false
+                for ((key, count) in fixed) {
+                    val entry = roomListCache[key] ?: continue
+                    if (entry.room.unreadCount != count) {
+                        roomListCache[key] = entry.copy(room = entry.room.copy(unreadCount = count))
+                        changed = true
+                    }
+                }
+                if (changed) {
+                    android.util.Log.d(TAG, "room list: disk-preload unread re-derived")
+                    publishRoomList()
+                }
+            }
+        }
     }
 
     @Volatile
@@ -6956,6 +6991,7 @@ object MatrixRepository {
         }
         // Opening the thread makes the room's notification moot.
         appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
+        recordReadMarker(roomId, markerId)
         if (atHead) {
             // Optimistically clear the room's unread in the served list — the
             // notification count only drops after the read-marker echo
@@ -7287,6 +7323,19 @@ object MatrixRepository {
             ?.edit()?.putString(KEY_LAST_NOTIFIED_PREFIX + roomKey, eventId)?.apply()
     }
 
+    /** Read marker this device last sent for [roomKey] ([markRead]), persisted
+     *  across process restarts. The background sync filter drops m.receipt
+     *  echoes, so the store's own receipt can't prove "already read" at a later
+     *  watcher registration — this persisted marker can. */
+    private fun lastReadMarkerId(roomKey: String): String? =
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.getString(KEY_LAST_READ_PREFIX + roomKey, null)
+
+    private fun recordReadMarker(roomKey: String, eventId: String) {
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.edit()?.putString(KEY_LAST_READ_PREFIX + roomKey, eventId)?.apply()
+    }
+
     /**
      * Watches every joined room's newest relevant event and posts a
      * notification when one arrives from someone else — the sync loop is the
@@ -7365,8 +7414,8 @@ object MatrixRepository {
                         // read on another device): the optimistic clear's job
                         // is done — release it so the row publish below
                         // recomputes unread from the moved cursor. Background
-                        // rounds never carry receipts (the thin filter drops
-                        // m.receipt — by design, INGEST-DERIVED-PLAN).
+                        // rounds carry receipts too (m.receipt is no longer
+                        // filtered out — see [fullSyncOnceFilters]).
                         if (ownReceiptEchoed(joinedRoom.ephemeral?.events, c.userId)) {
                             // The cursor moved: drop the shared unread memo
                             // before the row publish below, so it reads the
@@ -7460,16 +7509,33 @@ object MatrixRepository {
                                             // once — and not again on every launch: an
                                             // event this watcher already alerted in an
                                             // earlier process ([recordNotifiedEvent]) is
-                                            // not re-dinged (ghost bursts).
+                                            // not re-dinged (ghost bursts). The receipt
+                                            // alone can't be the whole story though: the
+                                            // background sync filter drops m.receipt
+                                            // echoes, so a marker [markRead] already sent
+                                            // (persisted [lastReadMarkerId]) counts as
+                                            // read here too — else every re-registration
+                                            // re-dings the rooms it marked (LP3 09-14
+                                            // overnight burst).
                                             val ownRead = ownReadReceiptId(c, roomId)
                                             val alreadyAlerted = lastNotifiedEventId(key) == regLastId
-                                            if (!alreadyAlerted && ownRead != regLastId) {
+                                            val readHere = lastReadMarkerId(key) == regLastId
+                                            if (!alreadyAlerted && !readHere && ownRead != regLastId) {
                                                 android.util.Log.d(
                                                     TAG,
                                                     "notification watcher: $key registered with unread newest " +
                                                         "(${if (key in knownRooms) "known" else "new post-settle"}, " +
                                                         "ownRead=$ownRead) — notifying for first message",
                                                 )
+                                                // Record BEFORE [notifyForEvent], not only
+                                                // after a post: it silently skips (m.replace
+                                                // edit, bridge flood, undecryptable head, no
+                                                // preview) without recording, and an
+                                                // unrecorded head re-fires this gate on EVERY
+                                                // process start — the 09-14 overnight ghost
+                                                // bursts. A transient decrypt miss is
+                                                // self-healing: the next head change re-arms.
+                                                recordNotifiedEvent(key, regLastId)
                                                 notifyForEvent(c, roomId, regLastId, regRoom)
                                             }
                                         }
@@ -7620,6 +7686,15 @@ object MatrixRepository {
         // replaces its target, never a new message. Don't notify.
         if (isReplaceEdit(te)) {
             android.util.Log.d(TAG, "notifyForEvent: skipping m.replace edit $eventId in $roomId")
+            return
+        }
+        // Bridge clock skew: re-delivered events stamped minutes-to-hours into
+        // the FUTURE (09-14: 1€ Doc Chat head at 17:41 vs phone clock 11:20)
+        // decrypt fine and sail past every undecryptable guard — notify anyway?
+        // No: a real message is stamped at send time; nothing notify-worthy
+        // arrives from the future. (The unread resolver applies the same rule.)
+        if (te.event.originTimestamp > System.currentTimeMillis() + UNREAD_FUTURE_SKEW_MS) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping future-stamped event $eventId in $roomId")
             return
         }
         // Bridge re-import floods (the 7am wall) must not notify — a real
@@ -8209,9 +8284,28 @@ object MatrixRepository {
                             // genuinely-unread badges vanished).
                             "AND json_extract(value,'$.event.origin_server_ts') " +
                             "  > CAST(? AS INTEGER) " +
+                            // Bridge re-delivery storms dump undecryptable
+                            // m.room.encrypted copies (09-14 00:57-01:08: 967
+                            // counted events / 82 rooms, none ever decrypts)
+                            // that sit AFTER the receipt cursor and can never
+                            // be cleared by opening the room. A real encrypted
+                            // message decrypts within seconds of landing, so
+                            // encrypted events still-undecryptable after
+                            // UNREAD_ENCRYPTED_STALE_MS don't count; and a
+                            // future-stamped event (bridge clock skew) counts
+                            // for no receipt ever — cap at now+5 min.
+                            "AND (json_extract(value,'$.event.type') = 'm.room.message' " +
+                            "     OR json_extract(value,'$.event.origin_server_ts') >= CAST(? AS INTEGER)) " +
+                            "AND json_extract(value,'$.event.origin_server_ts') <= CAST(? AS INTEGER) " +
                             "GROUP BY ets" +
                             ") WHERE n <= 6)",
-                        arrayOf(roomId, c.userId.full, own.toString()),
+                        arrayOf(
+                            roomId,
+                            c.userId.full,
+                            own.toString(),
+                            (System.currentTimeMillis() - UNREAD_ENCRYPTED_STALE_MS).toString(),
+                            (System.currentTimeMillis() + UNREAD_FUTURE_SKEW_MS).toString(),
+                        ),
                     ).use { cur -> if (cur.moveToFirst()) cur.getLong(0) else 0L }
                 }.getOrNull()
             }
@@ -8267,6 +8361,9 @@ object MatrixRepository {
                         args += ts
                     }
                     args += c.userId.full
+                    val staleEncryptedCut = System.currentTimeMillis() - UNREAD_ENCRYPTED_STALE_MS
+                    args += staleEncryptedCut
+                    args += System.currentTimeMillis() + UNREAD_FUTURE_SKEW_MS
                     val counts = HashMap<String, Long>(own.size)
                     db.openHelper.writableDatabase.query(
                         "WITH own(roomId, ts) AS (VALUES $binding) " +
@@ -8279,6 +8376,9 @@ object MatrixRepository {
                             "  IN ('m.room.message','m.room.encrypted') " +
                             "AND json_extract(t.value,'\$.event.sender') != ? " +
                             "AND json_extract(t.value,'\$.event.origin_server_ts') > own.ts " +
+                            "AND (json_extract(t.value,'\$.event.type') = 'm.room.message' " +
+                            "     OR json_extract(t.value,'\$.event.origin_server_ts') >= ?) " +
+                            "AND json_extract(t.value,'\$.event.origin_server_ts') <= ? " +
                             "GROUP BY t.roomId, ets" +
                             ") WHERE n <= 6 GROUP BY roomId",
                         args.toTypedArray(),
@@ -9953,8 +10053,10 @@ object MatrixRepository {
             // between the last response arriving and this next request is the
             // previous round's emit/ingest. Normally ≈ instant; when it blows
             // past one long-poll period the emit path (e.g. Trixnity's inline
-            // OTK regen + /keys/upload) froze the whole loop — name it.
-            if (lastSyncResponseAt > 0) {
+            // OTK regen + /keys/upload) froze the whole loop — name it. Slow
+            // mode's deliberate inter-round delay (300 s / 900 s) is not a
+            // stall — exclude it (a 505 s "gap" was just a slow round, 09-14).
+            if (lastSyncResponseAt > 0 && syncMode != SyncMode.SLOW) {
                 val ingestGap = android.os.SystemClock.elapsedRealtime() - lastSyncResponseAt
                 if (ingestGap > 35_000L) {
                     android.util.Log.w(TAG, "sync ingest gap: ${ingestGap}ms between last response and this request — emit path stalled the loop")
@@ -10072,9 +10174,12 @@ object MatrixRepository {
     // survives the merge. Nothing renders incoming typing (the composer only
     // sends it), and it is the noisiest per-sync element in active rooms —
     // both filters drop m.typing. The syncOnce filter (background rounds +
-    // push wakes) also drops m.receipt: seen/delivered only matter while the
-    // tool is open, and the long-poll (syncFilter) delivers them fresh the
-    // moment it is.
+    // push wakes) used to also drop m.receipt — but reads on OTHER devices
+    // only ever land through receipts, so dropping them left ownRead stale
+    // all night: rooms read elsewhere re-registered as unread and re-dinged
+    // old content on the next process start (09-14 ghost bursts + the
+    // stuck "Anni" badge). Receipts are quiet compared to typing — a round
+    // only carries rooms someone actually read. m.typing stays dropped.
     private val fullSyncFilters = Filters(
         presence = Filters.EventFilter(notTypes = setOf("*")),
         room = Filters.RoomFilter(
@@ -10098,7 +10203,7 @@ object MatrixRepository {
         presence = Filters.EventFilter(notTypes = setOf("*")),
         room = Filters.RoomFilter(
             timeline = Filters.RoomFilter.RoomEventFilter(limit = SYNC_TIMELINE_LIMIT_BACKGROUND),
-            ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing", "m.receipt")),
+            ephemeral = Filters.RoomFilter.RoomEventFilter(notTypes = setOf("m.typing")),
         ),
     )
 
