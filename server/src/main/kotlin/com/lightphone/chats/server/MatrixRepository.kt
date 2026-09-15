@@ -10585,10 +10585,22 @@ object MatrixRepository {
         yieldToSyncIngest()
         val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return
         if (prefs.getBoolean("projection_backfilled", false)) return
+        // The room map often isn't surfaced yet on a cold login (the initial
+        // sync takes longer than the budget on a 358-room account) — a silent
+        // return here killed the whole backfill on the LP3 (09-15). Retry.
         val rooms = runCatching {
             withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
-        }.getOrNull() ?: return
+        }.getOrNull()
+        if (rooms == null) {
+            if (attempt < 5) {
+                scope.launch { delay(30_000L); backfillProjection(c, attempt + 1) }
+            } else {
+                android.util.Log.w(TAG, "projection: backfill gave up — room map never surfaced")
+            }
+            return
+        }
         val roomIds = rooms.keys.toList()
+        android.util.Log.d(TAG, "projection: backfill starting (${roomIds.size} rooms)")
         val written = recomputeProjectionRows(c, roomIds)
         // An empty store (fresh login, initial sync not landed yet) is not
         // "done" — retry until rooms exist or the attempt cap hits.
