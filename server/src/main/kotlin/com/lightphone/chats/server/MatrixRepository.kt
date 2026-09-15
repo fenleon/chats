@@ -10656,11 +10656,10 @@ object MatrixRepository {
             val decryptedOk = te.content?.getOrNull() != null
             val messageClass = isEncrypted || raw is RoomMessageEventContent
             val originTs = te.event.originTimestamp
-            val admitted = ProjectionPredicate.admits(
+            val sender = te.event.sender.full
+            val renders = ProjectionPredicate.renders(
                 messageClass = messageClass,
                 isReplaceEdit = isReplaceEdit(te),
-                sender = te.event.sender.full,
-                ownUserId = own,
                 originTs = originTs,
                 now = now,
                 isEncrypted = isEncrypted,
@@ -10669,8 +10668,8 @@ object MatrixRepository {
             if (isEncrypted && !decryptedOk && !ProjectionPredicate.encryptedStale(originTs, now)) {
                 pendingDecryption = true
             }
-            if (admitted) {
-                if (ownTs == null || originTs > ownTs) unread++
+            if (renders) {
+                if (sender != own && (ownTs == null || originTs > ownTs)) unread++
                 if (lastId == null) {
                     lastId = te.event.id.full
                     lastTs = originTs

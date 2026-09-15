@@ -11,14 +11,29 @@ class ProjectionPredicateTest {
     private val own = "@me:example.org"
     private val other = "@other:example.org"
 
-    private fun admits(
+    private fun renders(
         originTs: Long = now - 1_000,
         messageClass: Boolean = true,
         isReplaceEdit: Boolean = false,
-        sender: String = other,
         isEncrypted: Boolean = false,
         decryptedOk: Boolean = true,
-    ): Boolean = ProjectionPredicate.admits(
+    ): Boolean = ProjectionPredicate.renders(
+        messageClass = messageClass,
+        isReplaceEdit = isReplaceEdit,
+        originTs = originTs,
+        now = now,
+        isEncrypted = isEncrypted,
+        decryptedOk = decryptedOk,
+    )
+
+    private fun unread(
+        sender: String = other,
+        originTs: Long = now - 1_000,
+        messageClass: Boolean = true,
+        isReplaceEdit: Boolean = false,
+        isEncrypted: Boolean = false,
+        decryptedOk: Boolean = true,
+    ): Boolean = ProjectionPredicate.countsAsUnread(
         messageClass = messageClass,
         isReplaceEdit = isReplaceEdit,
         sender = sender,
@@ -29,50 +44,69 @@ class ProjectionPredicateTest {
         decryptedOk = decryptedOk,
     )
 
+    // --- head (renders): own messages INCLUDED ---
+
     @Test
-    fun `plain text message from other admits`() {
-        assertTrue(admits())
+    fun `plain text message renders`() {
+        assertTrue(renders())
     }
 
     @Test
-    fun `own sender never admits`() {
-        assertFalse(admits(sender = own))
+    fun `own sender renders (advances head, never unread)`() {
+        assertTrue(renders())
+        assertFalse(unread(sender = own))
     }
 
     @Test
-    fun `non message class (reactions acks state) never admits`() {
-        assertFalse(admits(messageClass = false))
+    fun `non message class (reactions acks state) never renders`() {
+        assertFalse(renders(messageClass = false))
     }
 
     @Test
-    fun `m replace edit never admits`() {
-        assertFalse(admits(isReplaceEdit = true))
+    fun `m replace edit never renders`() {
+        assertFalse(renders(isReplaceEdit = true))
     }
 
     @Test
-    fun `future stamped beyond skew window never admits`() {
-        assertFalse(admits(originTs = now + ProjectionPredicate.FUTURE_SKEW_MS + 1))
+    fun `future stamped beyond skew window never renders`() {
+        assertFalse(renders(originTs = now + ProjectionPredicate.FUTURE_SKEW_MS + 1))
     }
 
     @Test
-    fun `future stamped within skew window admits`() {
-        assertTrue(admits(originTs = now + 60_000))
+    fun `future stamped within skew window renders`() {
+        assertTrue(renders(originTs = now + 60_000))
     }
 
     @Test
-    fun `encrypted that decrypted admits`() {
-        assertTrue(admits(isEncrypted = true, decryptedOk = true))
+    fun `encrypted that decrypted renders`() {
+        assertTrue(renders(isEncrypted = true, decryptedOk = true))
     }
 
     @Test
-    fun `encrypted not decrypted (pending or failed) does not admit`() {
-        assertFalse(admits(isEncrypted = true, decryptedOk = false))
+    fun `encrypted not decrypted (pending or failed) does not render`() {
+        assertFalse(renders(isEncrypted = true, decryptedOk = false))
     }
 
     @Test
-    fun `plain message outside future window admits regardless of encrypted window`() {
+    fun `plain message outside future window renders regardless of encrypted window`() {
         // sanity: the stale-encrypted rule must not touch plaintext events
-        assertTrue(admits(originTs = now - ProjectionPredicate.STALE_ENCRYPTED_MS - 1))
+        assertTrue(renders(originTs = now - ProjectionPredicate.STALE_ENCRYPTED_MS - 1))
+    }
+
+    // --- unread (countsAsUnread) ---
+
+    @Test
+    fun `other sender counts as unread`() {
+        assertTrue(unread())
+    }
+
+    @Test
+    fun `unread rules mirror renders for non-own senders`() {
+        assertFalse(unread(messageClass = false))
+        assertFalse(unread(isReplaceEdit = true))
+        assertFalse(unread(originTs = now + ProjectionPredicate.FUTURE_SKEW_MS + 1))
+        assertFalse(unread(isEncrypted = true, decryptedOk = false))
+        assertTrue(unread(isEncrypted = true, decryptedOk = true))
     }
 
     @Test
