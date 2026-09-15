@@ -10582,6 +10582,14 @@ object MatrixRepository {
      *  DB). Retried a few times — a fresh login's room store may not be
      *  populated until the initial sync lands. */
     private suspend fun backfillProjection(c: MatrixClient, attempt: Int = 0) {
+        // Mark the table ready immediately: the rows persist in the DB across
+        // restarts, and the notification gate registers ~10 s in — before the
+        // first sync round would ensure the table. Without this, every
+        // restart's first registrations fall back to the summary-id gate
+        // (the junk-head path this plan removes).
+        runCatching {
+            ensureProjectionTable(c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class))
+        }
         yieldToSyncIngest()
         val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return
         if (prefs.getBoolean("projection_backfilled", false)) return
