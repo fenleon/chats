@@ -2855,30 +2855,10 @@ object MatrixRepository {
         }
         _roomList.value = visible
         android.util.Log.d(TAG, "room list: preloaded ${visible.size} rooms from disk cache")
-        // Re-derive unread from the receipt cursor: the disk cache carries
-        // counts saved under older resolver rules (the 09-14 junk-flood badges),
-        // and Phase C's no-sweep design means a quiet room's row is never
-        // re-published — its stale badge would otherwise survive every restart.
-        // One batched query per cold start; rooms without a receipt row keep
-        // their server-count fallback untouched (absent from the batch result).
-        scope.launch {
-            val c = client ?: return@launch
-            runCatching {
-                val fixed = receiptCursorUnreadBatch(c, visible.map { it.id }) ?: return@launch
-                var changed = false
-                for ((key, count) in fixed) {
-                    val entry = roomListCache[key] ?: continue
-                    if (entry.room.unreadCount != count) {
-                        roomListCache[key] = entry.copy(room = entry.room.copy(unreadCount = count))
-                        changed = true
-                    }
-                }
-                if (changed) {
-                    android.util.Log.d(TAG, "room list: disk-preload unread re-derived")
-                    publishRoomList()
-                }
-            }
-        }
+        // Disk cache v3 (PLAN.md 2026-09-14 P1): rows are projection-backed
+        // materialized state — no re-derive pass on preload. (The 09-14
+        // receipt-cursor re-derive here fixed stale derived badges; the
+        // projection keeps the rows right at the source.)
     }
 
     @Volatile
@@ -6993,6 +6973,7 @@ object MatrixRepository {
         // Opening the thread makes the room's notification moot.
         appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
         recordReadMarker(roomId, markerId)
+        projectionMarkRead(roomId)
         if (atHead) {
             // Optimistically clear the room's unread in the served list — the
             // notification count only drops after the read-marker echo
@@ -7518,6 +7499,35 @@ object MatrixRepository {
                                             // read here too — else every re-registration
                                             // re-dings the rooms it marked (LP3 09-14
                                             // overnight burst).
+                                            // P1 (PLAN.md 2026-09-14): the
+                                            // projection decides — its head is
+                                            // the newest real message and its
+                                            // count already excludes junk
+                                            // (stale-undecryptable storm
+                                            // copies, future-stamped, edits,
+                                            // reactions, own), so registration
+                                            // can't re-ding a junk head the
+                                            // way the summary-id gate did
+                                            // (the 09-14 overnight bursts).
+                                            // Rooms not projected yet
+                                            // (pre-backfill) fall back to the
+                                            // summary-id gate until then.
+                                            val proj = projectionRow(c, key)
+                                            val projHead = proj?.lastRealEventId
+                                            if (proj != null && projHead != null) {
+                                                val alreadyAlerted = lastNotifiedEventId(key) == projHead
+                                                val readHere = lastReadMarkerId(key) == projHead
+                                                if (proj.unreadCount > 0 && !alreadyAlerted && !readHere) {
+                                                    android.util.Log.d(
+                                                        TAG,
+                                                        "notification watcher: $key registered with unread newest " +
+                                                            "(${if (key in knownRooms) "known" else "new post-settle"}, " +
+                                                            "projection unread=${proj.unreadCount}) — notifying",
+                                                    )
+                                                    recordNotifiedEvent(key, projHead)
+                                                    notifyForEvent(c, roomId, projHead, regRoom)
+                                                }
+                                            } else {
                                             val ownRead = ownReadReceiptId(c, roomId)
                                             val alreadyAlerted = lastNotifiedEventId(key) == regLastId
                                             val readHere = lastReadMarkerId(key) == regLastId
@@ -7538,6 +7548,7 @@ object MatrixRepository {
                                                 // self-healing: the next head change re-arms.
                                                 recordNotifiedEvent(key, regLastId)
                                                 notifyForEvent(c, roomId, regLastId, regRoom)
+                                            }
                                             }
                                         }
                                     }
@@ -8819,6 +8830,12 @@ object MatrixRepository {
             return
         }
         val prev = roomListCache[key]
+        // P1 (PLAN.md 2026-09-14): the ingest-time projection is the row's
+        // source of truth — head/time/preview/unread come from the table the
+        // sync hook materializes. The derive-at-read machinery below only
+        // serves rooms the projection doesn't cover yet (pre-backfill), and
+        // is deleted in P2.
+        val projection = projectionRow(c, key)
         // Ghost-aware last event: after a bridge re-import flood the server's
         // summary points at a ghost, which would bump the room to the top of
         // the list and show the re-imported message as its preview.
@@ -8831,7 +8848,7 @@ object MatrixRepository {
         // back to the timeline's newest event when the summary is empty: read
         // its head timestamp from the DB chain (the same bounded walk
         // [effectiveLastEvent] uses) so the row keeps a real time.
-        if (serverLastId == null) {
+        if (projection == null && serverLastId == null) {
             // Head timestamp from the RAW DB chain (any event type): a head
             // that isn't a message (bridge status ack, edit, reaction) must
             // still give the row a real time — [effectiveLastEvent] walks back
@@ -8863,7 +8880,7 @@ object MatrixRepository {
             // restore crawl's pattern, so the row keeps a real time. Cached
             // downstream: [effectiveLastEvent] pins the head id, so the walk
             // runs once per new head instead of every pass.
-            if (serverLastId == null) {
+            if (projection == null && serverLastId == null) {
                 val head = withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
                     collectNewestEvents(c, roomId, { maxSize = 8 }, ROOM_LIST_ROOM_BUDGET_MS)
                         ?.maxByOrNull { it.event.originTimestamp }
@@ -8874,6 +8891,9 @@ object MatrixRepository {
                 }
             }
         }
+        val (lastEventId, ts) = if (projection != null) {
+            projection.lastRealEventId to projection.lastRealTs
+        } else {
         // Early pin (fix): when the summary-gap head is a real,
         // readable message — the same test [effectiveLastEvent]'s fast pin
         // applies — write its pin directly and skip the 51-event walk. A
@@ -8884,7 +8904,7 @@ object MatrixRepository {
         val gapHead = serverLastId?.let { id ->
             summaryGapHeadCache[key]?.takeIf { it.lastEventId == id }?.headEvent
         }
-        val (lastEventId, ts) = if (gapHead != null && txnIdOf(gapHead) == null &&
+        val pair = if (gapHead != null && txnIdOf(gapHead) == null &&
             isRenderableRow(gapHead) && previewText(gapHead)?.isNotBlank() == true &&
             contentSignature(c, gapHead) != null
         ) {
@@ -8892,6 +8912,8 @@ object MatrixRepository {
             serverLastId!! to serverTs
         } else {
             effectiveLastEvent(c, roomId, serverLastId, serverTs)
+        }
+        pair
         }
         // Own send in flight (echo not yet in the store): the row must bump to
         // the top NOW with the send's preview + time — the panel must not keep
@@ -8908,19 +8930,26 @@ object MatrixRepository {
         // Cursor-based unread (receiptCursorUnread): message-class events after
         // the own read receipt; server notification_count only until the first
         // receipt syncs (it counts non-message classes our client never
-        // renders — false flags on fully-read rooms).
-        val storeUnread = if (verified || !room.encrypted) {
-            // Shared short-TTL batch (unreadCursorMemo); null is the
-            // no-own-receipt-yet case, so the server count is the fallback.
-            receiptCursorUnread(c, key) ?: (serverUnreadCounts[key]?.toLong() ?: 0L)
-        } else 0
+        // renders — false flags on fully-read rooms). P1: the projection's
+        // count replaces the cursor when the room is projected (the hook
+        // applies the same junk rules at ingest; the receipt-cursor path is
+        // deleted in P2).
         val cleared = pendingReadClear[key]
-        val unread = servedUnread(
-            c,
-            key,
-            cleared?.second,
-            storeUnread,
-        )
+        val unread = if (projection != null) {
+            projection.unreadCount
+        } else {
+            val storeUnread = if (verified || !room.encrypted) {
+                // Shared short-TTL batch (unreadCursorMemo); null is the
+                // no-own-receipt-yet case, so the server count is the fallback.
+                receiptCursorUnread(c, key) ?: (serverUnreadCounts[key]?.toLong() ?: 0L)
+            } else 0
+            servedUnread(
+                c,
+                key,
+                cleared?.second,
+                storeUnread,
+            )
+        }
         val stateChanged = prev == null ||
             prev.room.lastEventId != lastEventId ||
             prev.room.unreadCount != unread ||
@@ -8964,6 +8993,11 @@ object MatrixRepository {
                     }
                 }
                 previewResolved = true
+                previewRetryAtMs = 0L
+            }
+            projection != null -> {
+                preview = projection.preview
+                previewResolved = projection.previewResolved
                 previewRetryAtMs = 0L
             }
             prev != null && prev.previewResolved && !stateChanged -> {
@@ -10691,6 +10725,54 @@ object MatrixRepository {
             previewResolved = lastPreviewResolved,
         )
         return ProjectedRoom(row, pendingDecryption)
+    }
+
+    /** The projection row for [roomId], or null when the table isn't ready /
+     *  the room isn't projected yet (pre-backfill) — consumers fall back to
+     *  the derive-at-read path for those. */
+    private suspend fun projectionRow(c: MatrixClient, roomId: String): ProjectionRow? {
+        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            ?: return null
+        if (!projectionTableReady) return null
+        return chainDb("projectionRow") {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    db.openHelper.writableDatabase.query(
+                        "SELECT lastRealEventId,lastRealTs,unreadCount,preview,previewResolved " +
+                            "FROM RoomProjection WHERE roomId=?",
+                        arrayOf(roomId),
+                    ).use { cur ->
+                        if (cur.moveToFirst() && !cur.isNull(1)) ProjectionRow(
+                            roomId = roomId,
+                            lastRealEventId = if (cur.isNull(0)) null else cur.getString(0),
+                            lastRealTs = cur.getLong(1),
+                            unreadCount = cur.getLong(2),
+                            preview = cur.getString(3) ?: "",
+                            previewResolved = cur.getInt(4) != 0,
+                        ) else null
+                    }
+                }.getOrNull()
+            }
+        }
+    }
+
+    /** Optimistic badge clear at [markRead]: zero the row now; the receipt
+     *  echo round recomputes to the same value. */
+    private fun projectionMarkRead(roomId: String) {
+        scope.launch {
+            val c = client ?: return@launch
+            val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+                ?: return@launch
+            if (!projectionTableReady) return@launch
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    db.openHelper.writableDatabase.execSQL(
+                        "UPDATE RoomProjection SET unreadCount=0 WHERE roomId=?",
+                        arrayOf<Any?>(roomId),
+                    )
+                }
+            }
+        }
     }
     // ---- end ingest-time projection -----------------------------------------
 

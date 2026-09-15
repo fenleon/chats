@@ -88,6 +88,13 @@ In the existing sync-flow collector (`observeNotifications`, the
 
 ### Phase C — demote the crawl
 
+> **SUPERSEDED (2026-09-15, P1 of "Ingest-time projection" — PLAN.md
+> 2026-09-14):** the projection table replaces this phase's job. Row
+> truth (head/time/preview/unread) is materialized at ingest by the sync
+> hook; consumers read `RoomProjection` (P1) and the derive machinery this
+> phase was scaffolding for is deleted in P2. The "no steady-state sweep"
+> rule stands — the projection writes ARE the trigger; no sweep returns.
+
 - `startRoomListResolver`'s loop keeps only: the **initial crawl** (until
   `initialRoomCrawlDone` — names/previews for the whole account must be built
   once per process) and **pending-resolve retries** (`hasPendingResolveWork`:
