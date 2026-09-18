@@ -85,6 +85,10 @@ object ThreadRowLogic {
     const val REDACTED_BODY = "Redacted"
     const val CONTENT_REDACTED = "redacted"
 
+    /** The body a stuck-decrypt row renders as (MatrixRepository's previewText
+     *  and the store serve path share it). */
+    const val ENCRYPTED_PLACEHOLDER_BODY = "[Encrypted message]"
+
     /** Mirrors MatrixRepository.BEEPER_SEND_STATUS_EVENT_TYPE. */
     const val SEND_STATUS_EVENT_TYPE = "com.beeper.message_send_status"
 
@@ -294,6 +298,17 @@ object ThreadRowLogic {
     /** Inverse of [keysetBefore]. */
     fun parseKeyset(raw: String): Pair<Long, Int> =
         raw.substringBefore('|').toLong() to raw.substringAfter('|').toInt()
+
+    /**
+     * The seed mapping's placeholder rule: a computed page row whose served
+     * body is the stuck-decrypt placeholder must seed as an `encrypted=1`
+     * placeholder (body null), never as real text. The ingest hook never
+     * replays pre-update events, so the seed is existing installs' only entry
+     * into the store — and `writeRows` skips existing non-placeholder rows
+     * while the 30 s recheck only scans `encrypted=1` rows, so a seeded text
+     * row would freeze as the placeholder forever.
+     */
+    fun isStuckDecryptBody(body: String?): Boolean = body == ENCRYPTED_PLACEHOLDER_BODY
 
     /** Beeper bridges report delivery as SUCCESS + `delivered_to_users` —
      *  that IS the delivered state (same mapping the read path applies today,

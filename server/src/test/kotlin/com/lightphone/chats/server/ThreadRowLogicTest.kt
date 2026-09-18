@@ -352,4 +352,22 @@ class ThreadRowLogicTest {
     fun `reactionSummaryOf empty list is empty object`() {
         assertEquals("{}", ThreadRowLogic.reactionSummaryOf(emptyList()))
     }
+
+    // --- seed mapping: stuck-decrypt placeholder rule ---
+
+    @Test
+    fun `placeholder body detected as stuck decrypt`() {
+        assertTrue(
+            ThreadRowLogic.isStuckDecryptBody(ThreadRowLogic.ENCRYPTED_PLACEHOLDER_BODY),
+            "the rendered placeholder body must map to an encrypted=1 seed row",
+        )
+    }
+
+    @Test
+    fun `real bodies are not stuck decrypt`() {
+        assertTrue(!ThreadRowLogic.isStuckDecryptBody(null))
+        assertTrue(!ThreadRowLogic.isStuckDecryptBody("hi"))
+        assertTrue(!ThreadRowLogic.isStuckDecryptBody("[Encrypted messages]"))
+        assertTrue(!ThreadRowLogic.isStuckDecryptBody(""))
+    }
 }

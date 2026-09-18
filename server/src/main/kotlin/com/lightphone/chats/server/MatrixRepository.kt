@@ -3271,7 +3271,9 @@ object MatrixRepository {
                     // Store exhausted below the keyset: deeper history lives
                     // only in the event chain — continue through the recompute
                     // engine from the deepest stored row's resume link, and
-                    // write the page through so the next scroll is local again.
+                    // write the page through so FUTURE sessions scroll locally
+                    // (this page carries the legacy event-id cursor, so this
+                    // session keeps computing).
                     val deepest = ThreadRowStore.deepestRow(attachedClient, roomId)
                     val resume = deepest?.prevEventId ?: deepest?.batchBefore
                     if (resume != null) {
@@ -3488,9 +3490,9 @@ object MatrixRepository {
             val edit = editByTarget[row.eventId]
             val (durationMs, caption, forwarded) = mediaMetaOf(row.mediaMeta)
             // Undecrypted placeholder rows render as the same calm
-            // "[Encrypted message]" the walk's preview serves (SPEC §4); the
-            // recheck fills them in place.
-            val body = if (row.encrypted == 1) "[Encrypted message]" else row.body.orEmpty()
+            // ENCRYPTED_PLACEHOLDER_BODY the walk's preview serves (SPEC §4);
+            // the recheck fills them in place.
+            val body = if (row.encrypted == 1) ThreadRowLogic.ENCRYPTED_PLACEHOLDER_BODY else row.body.orEmpty()
             val reply = row.replyToId?.let { resolveReplyHeader(c, matrixRoomId, it) }
             var canEdit = true
             var canUnsend = true
@@ -3696,11 +3698,16 @@ object MatrixRepository {
 
     /** One computed row → its ThreadRow message row + pseudo side rows (the
      *  seed mapping — the same rendered-field derivation the ingest writer's
-     *  override stage applies). */
+     *  override stage applies). A row whose served body is the stuck-decrypt
+     *  placeholder is stored as an `encrypted=1` placeholder (body null) so
+     *  the recheck fills it when the key lands — the ingest hook never replays
+     *  pre-update events, so the seed is existing installs' only entry into
+     *  the store. */
     private fun threadRowValuesFromMessage(
         roomId: String,
         msg: com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message,
     ): List<ThreadRowValues> {
+        val placeholder = ThreadRowLogic.isStuckDecryptBody(msg.body)
         val message = ThreadRowValues(
             roomId = roomId,
             eventId = msg.id,
@@ -3708,13 +3715,13 @@ object MatrixRepository {
             sender = msg.sender,
             timestampMs = msg.timestampMs,
             ingestSeq = 0, // rebased inside writeRows' transaction
-            body = msg.body,
-            formattedHtml = msg.formattedHtml,
+            body = if (placeholder) null else msg.body,
+            formattedHtml = if (placeholder) null else msg.formattedHtml,
             contentType = msg.contentType,
             replyToId = msg.replyToId,
             mediaMeta = mediaMetaJsonOf(msg),
             sendStatus = msg.sendStatus,
-            encrypted = 0,
+            encrypted = if (placeholder) 1 else 0,
             prevEventId = null,
             batchBefore = null,
             targetEventId = null,
@@ -11081,12 +11088,12 @@ object MatrixRepository {
             // the head (unread flag stuck — LP3 window), so the
             // placeholder renders and the row exists; a late-arriving key
             // re-renders it as real content.
-            te.content?.isFailure == true -> "[Encrypted message]"
+            te.content?.isFailure == true -> ThreadRowLogic.ENCRYPTED_PLACEHOLDER_BODY
             else ->
                 if (System.currentTimeMillis() - te.event.originTimestamp >
                     DECRYPT_PENDING_PLACEHOLDER_AFTER_MS &&
                     te.event.content is EncryptedMessageEventContent
-                ) "[Encrypted message]" else null
+                ) ThreadRowLogic.ENCRYPTED_PLACEHOLDER_BODY else null
         }
     }
 
