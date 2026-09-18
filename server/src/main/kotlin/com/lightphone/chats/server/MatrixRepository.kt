@@ -3266,7 +3266,13 @@ object MatrixRepository {
             if (beforeEventId != null) {
                 // The store's keyset cursor ("ts|seq"); a plain event id means
                 // the previous page came from the legacy fallback below.
-                if (keysetParse(beforeEventId) != null) {
+                keysetParse(beforeEventId)?.let { keyset ->
+                    // Part F top-up (SPEC §6): a short local page with chain
+                    // links left pays ONE bounded gap-marker round — written
+                    // through the ingest writer — before the serve. First
+                    // scroll into unfetched history = one network round;
+                    // subsequent scrolls stay local.
+                    topUpOlderPage(attachedClient, roomId, keyset, limit)
                     serveFromStore(attachedClient, roomId, beforeEventId, limit)?.let { return it }
                     // Store exhausted below the keyset: deeper history lives
                     // only in the event chain — continue through the recompute
@@ -3549,6 +3555,60 @@ object MatrixRepository {
         )
     }
 
+    /**
+     * Part F gap top-up (SPEC §6): the older store page came back short while
+     * [ThreadRowStore.hasMoreFrom] still says more — pay ONE bounded round.
+     * The chain walk from the deepest served row (previous-event links) spans
+     * the local history the store hasn't written yet and, at its end, any gap
+     * marker blocking deeper history; a gap marker triggers the recompute
+     * path's gap backfill ([backfillTimelineGap], incl. its 300 s failure
+     * cooldown) exactly as it does there. The walked window maps through the
+     * ingest writer ([threadRowsFromRound] — [ThreadRowLogic.buildRows] plus
+     * rendered overrides, [ThreadRowStore.writeRows]' re-delivery skip)
+     * verbatim, then the caller re-serves from the store. A round that adds
+     * nothing (fill no-op, walk already written, dead-end store) parks the
+     * cooldown so retries rate-limit instead of re-polling the network on
+     * every scroll — the page serves short with hasMore still true.
+     */
+    private suspend fun topUpOlderPage(
+        c: MatrixClient,
+        roomId: String,
+        keyset: Pair<Long, Int>,
+        limit: Int,
+    ) {
+        val rows = ThreadRowStore.olderPage(c, roomId, keyset, limit)
+        if (rows.isEmpty() || rows.size >= limit) return
+        val deepest = rows.last() // newest-first — the deepest served row
+        if (!ThreadRowStore.hasMoreFrom(c, roomId, deepest.eventId)) return
+        if (!gapBackfillCooldown.allowed(roomId)) return
+        val matrixRoomId = RoomId(roomId)
+        var walk = readTimelineChainFromDb(
+            c, matrixRoomId, deepest.eventId, GAP_BACKFILL_LIMIT.toInt(),
+        ) ?: return // chain walk unavailable — the legacy fallback below keeps working
+        val gapEvent = walk.first.firstOrNull { it.gap?.batchBefore != null }
+        if (gapEvent != null) {
+            walk = backfillTimelineGap(
+                c, matrixRoomId, deepest.eventId, GAP_BACKFILL_LIMIT.toInt(),
+                gapEvent.event.id.full,
+            ) ?: return // failed — [backfillTimelineGap] parked the cooldown
+        }
+        val before = ThreadRowStore.rowCount(c, roomId)
+        val newRows = threadRowsFromRound(c, matrixRoomId, walk.first.map { it.event.id.full })
+        ThreadRowStore.writeRows(c, newRows)
+        val added = ThreadRowStore.rowCount(c, roomId) - before
+        if (added <= 0) {
+            gapBackfillCooldown.park(roomId, GAP_BACKFILL_COOLDOWN_MS)
+        } else {
+            bumpMessagePageRevision(roomId)
+            if (debugLogging()) {
+                android.util.Log.d(
+                    TAG,
+                    "thread-store: gap top-up ${roomId.takeLast(12)} wrote $added row(s)",
+                )
+            }
+        }
+    }
+
     /** Reaction tags for store-served rows, rebuilt from the target's reaction
      *  side rows (the truth; the summary column is their cache) with the same
      *  label shape the timeline walk produces: one tag per reactor, a person's
@@ -3736,7 +3796,7 @@ object MatrixRepository {
             val keys = tag.substring(at + " reacted ".length).takeIf { it.isNotBlank() } ?: return@forEachIndexed
             sides += ThreadRowValues(
                 roomId = roomId,
-                eventId = "seed:${msg.id}:r$i",
+                eventId = "${ThreadRowLogic.SEED_ROW_PREFIX}${msg.id}:r$i",
                 kind = RowKind.REACTION.wire,
                 sender = who,
                 timestampMs = msg.timestampMs,
@@ -3752,7 +3812,7 @@ object MatrixRepository {
         if (msg.edited) {
             sides += ThreadRowValues(
                 roomId = roomId,
-                eventId = "seed:${msg.id}:edit",
+                eventId = "${ThreadRowLogic.SEED_ROW_PREFIX}${msg.id}:edit",
                 kind = RowKind.EDIT.wire,
                 sender = null,
                 timestampMs = msg.timestampMs,
@@ -10345,6 +10405,15 @@ object MatrixRepository {
             if (eventIds.isEmpty()) continue
             val rows = threadRowsFromRound(c, roomId, eventIds)
             if (rows.isEmpty()) continue
+            // Seeded pseudo reaction retirement (Task 5 ruling): the first
+            // REAL reaction row a round writes for a target retires the
+            // target's `seed:`-pseudo reaction rows (label senders) — seeded
+            // tags must not outlive the truth. The write below re-folds the
+            // target (summary recomputed from the surviving rows).
+            val seedTargets = ThreadRowLogic.seedReactionRetireTargets(rows)
+            if (seedTargets.isNotEmpty()) {
+                ThreadRowStore.retireSeedReactions(c, roomId.full, seedTargets)
+            }
             ThreadRowStore.writeRows(c, rows)
             bumpMessagePageRevision(roomId.full)
             if (debugLogging()) {

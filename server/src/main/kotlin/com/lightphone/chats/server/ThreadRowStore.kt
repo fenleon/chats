@@ -197,6 +197,74 @@ object ThreadRowStore {
         }
     }
 
+    /**
+     * Pseudo seeded reaction retirement (Task 5 review ruling): delete every
+     * `seed:`-prefixed reaction row ([ThreadRowLogic.SEED_ROW_PREFIX]) that
+     * targets one of [targetEventIds] and recompute each affected target's
+     * cached `reactionSummary` from the reaction rows still standing — the
+     * fold's exact query (unredacted). One transaction; returns the number of
+     * rows deleted (0 = nothing to retire). The caller (the ingest writer's
+     * reaction-write hook) runs this before [writeRows], whose fold then
+     * re-applies the batch's real side rows onto the recomputed base.
+     */
+    suspend fun retireSeedReactions(
+        c: MatrixClient,
+        roomId: String,
+        targetEventIds: Collection<String>,
+    ): Int {
+        if (targetEventIds.isEmpty()) return 0
+        val db = database(c) ?: return 0
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val sq = db.openHelper.writableDatabase
+                sq.beginTransaction()
+                try {
+                    ensureTable(sq)
+                    var removed = 0
+                    for (target in targetEventIds) {
+                        val seeds = queryRows(
+                            sq,
+                            "SELECT * FROM ThreadRow WHERE roomId=? AND kind='reaction' " +
+                                "AND targetEventId=?",
+                            arrayOf(roomId, target),
+                        ).filter { it.eventId.startsWith(ThreadRowLogic.SEED_ROW_PREFIX) }
+                        if (seeds.isEmpty()) continue
+                        for (seed in seeds) {
+                            sq.execSQL(
+                                "DELETE FROM ThreadRow WHERE roomId=? AND eventId=?",
+                                arrayOf(roomId, seed.eventId),
+                            )
+                            removed++
+                        }
+                        val remaining = queryRows(
+                            sq,
+                            // Reactions still standing after the retirement —
+                            // the same redaction-guarded query the fold's
+                            // summary recompute applies.
+                            "SELECT * FROM ThreadRow WHERE roomId=? AND kind='reaction' " +
+                                "AND targetEventId=? AND NOT EXISTS (SELECT 1 FROM ThreadRow rd " +
+                                "WHERE rd.roomId=ThreadRow.roomId AND rd.kind='redaction' " +
+                                "AND rd.targetEventId=ThreadRow.eventId)",
+                            arrayOf(roomId, target),
+                        )
+                        sq.execSQL(
+                            "UPDATE ThreadRow SET reactionSummary=? WHERE roomId=? AND eventId=?",
+                            arrayOf<Any?>(
+                                ThreadRowLogic.reactionSummaryOf(remaining),
+                                roomId,
+                                target,
+                            ),
+                        )
+                    }
+                    sq.setTransactionSuccessful()
+                    removed
+                } finally {
+                    sq.endTransaction()
+                }
+            }.getOrDefault(0)
+        }
+    }
+
     /** Newest page (SPEC §6): message rows only, newest first. */
     suspend fun newestPage(c: MatrixClient, roomId: String, limit: Int): List<ThreadRowValues> {
         val db = database(c) ?: return emptyList()

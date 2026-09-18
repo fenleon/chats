@@ -370,4 +370,46 @@ class ThreadRowLogicTest {
         assertTrue(!ThreadRowLogic.isStuckDecryptBody("[Encrypted messages]"))
         assertTrue(!ThreadRowLogic.isStuckDecryptBody(""))
     }
+
+    // --- pseudo seeded reaction retirement (Task 5 ruling) ---
+
+    private fun reactionRow(eventId: String, target: String, key: String = "👍") =
+        ThreadRowValues(
+            roomId = "!r", eventId = eventId, kind = "reaction", sender = "@a",
+            timestampMs = 100, ingestSeq = 1, body = null, formattedHtml = null,
+            contentType = null, replyToId = null, mediaMeta = null, sendStatus = null,
+            encrypted = 0, prevEventId = null, batchBefore = null,
+            targetEventId = target, payload = key, reactionSummary = null)
+
+    @Test
+    fun `real reaction rows name their targets for seed retirement`() {
+        assertEquals(
+            setOf("m1", "m2"),
+            ThreadRowLogic.seedReactionRetireTargets(
+                listOf(reactionRow("r1", "m1"), reactionRow("r2", "m1", key = "❤️"), reactionRow("r3", "m2")),
+            ),
+            "every target of a batch's real reaction rows must retire its seed rows",
+        )
+    }
+
+    @Test
+    fun `seed pseudo reaction rows never trigger retirement`() {
+        assertTrue(
+            ThreadRowLogic.seedReactionRetireTargets(
+                listOf(reactionRow("seed:m1:r0", "m1"), reactionRow("seed:m1:r1", "m1")),
+            ).isEmpty(),
+            "pseudo seed rows are the retirement's object, never its trigger",
+        )
+    }
+
+    @Test
+    fun `non reaction and untargeted rows do not trigger retirement`() {
+        assertTrue(ThreadRowLogic.seedReactionRetireTargets(listOf(msg("m1"))).isEmpty())
+        assertTrue(
+            ThreadRowLogic.seedReactionRetireTargets(
+                listOf(reactionRow("r1", "m1").copy(targetEventId = null)),
+            ).isEmpty(),
+        )
+        assertTrue(ThreadRowLogic.seedReactionRetireTargets(emptyList()).isEmpty())
+    }
 }

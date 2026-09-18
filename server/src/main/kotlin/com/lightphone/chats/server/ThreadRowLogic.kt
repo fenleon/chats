@@ -89,6 +89,12 @@ object ThreadRowLogic {
      *  and the store serve path share it). */
     const val ENCRYPTED_PLACEHOLDER_BODY = "[Encrypted message]"
 
+    /** Event-id prefix of the seed mapping's pseudo side rows (SPEC §7) —
+     *  stand-ins written from a computed page (label senders for reactions,
+     *  the edited body for edits) until the real events arrive through the
+     *  ingest writer. */
+    const val SEED_ROW_PREFIX = "seed:"
+
     /** Mirrors MatrixRepository.BEEPER_SEND_STATUS_EVENT_TYPE. */
     const val SEND_STATUS_EVENT_TYPE = "com.beeper.message_send_status"
 
@@ -309,6 +315,22 @@ object ThreadRowLogic {
      * row would freeze as the placeholder forever.
      */
     fun isStuckDecryptBody(body: String?): Boolean = body == ENCRYPTED_PLACEHOLDER_BODY
+
+    /**
+     * Pseudo seeded reaction retirement (Task 5 review ruling): the distinct
+     * targets whose `seed:`-prefixed pseudo reaction rows must go when this
+     * batch's REAL reaction rows land (ingest writer hook). A batch carrying a
+     * real reaction row for T means the truth has arrived — the pseudo rows
+     * (label senders) must retire before they outlive it: a redaction of the
+     * real reaction event could never remove a seeded tag, and a display-name
+     * change would duplicate one (the serve path's label dedup only absorbs
+     * the identical label). Pseudo rows themselves never trigger retirement —
+     * they ARE the retirement's object.
+     */
+    fun seedReactionRetireTargets(rows: List<ThreadRowValues>): Set<String> =
+        rows.filter {
+            it.kind == RowKind.REACTION.wire && !it.eventId.startsWith(SEED_ROW_PREFIX)
+        }.mapNotNull { it.targetEventId }.toSet()
 
     /** Beeper bridges report delivery as SUCCESS + `delivered_to_users` —
      *  that IS the delivered state (same mapping the read path applies today,
