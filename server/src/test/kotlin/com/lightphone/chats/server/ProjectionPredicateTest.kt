@@ -17,6 +17,8 @@ class ProjectionPredicateTest {
         isReplaceEdit: Boolean = false,
         isEncrypted: Boolean = false,
         decryptedOk: Boolean = true,
+        isFlood: Boolean = false,
+        isBatchReplay: Boolean = false,
     ): Boolean = ProjectionPredicate.renders(
         messageClass = messageClass,
         isReplaceEdit = isReplaceEdit,
@@ -24,6 +26,8 @@ class ProjectionPredicateTest {
         now = now,
         isEncrypted = isEncrypted,
         decryptedOk = decryptedOk,
+        isFlood = isFlood,
+        isBatchReplay = isBatchReplay,
     )
 
     private fun unread(
@@ -33,6 +37,8 @@ class ProjectionPredicateTest {
         isReplaceEdit: Boolean = false,
         isEncrypted: Boolean = false,
         decryptedOk: Boolean = true,
+        isFlood: Boolean = false,
+        isBatchReplay: Boolean = false,
     ): Boolean = ProjectionPredicate.countsAsUnread(
         messageClass = messageClass,
         isReplaceEdit = isReplaceEdit,
@@ -42,6 +48,8 @@ class ProjectionPredicateTest {
         now = now,
         isEncrypted = isEncrypted,
         decryptedOk = decryptedOk,
+        isFlood = isFlood,
+        isBatchReplay = isBatchReplay,
     )
 
     // --- head (renders): own messages INCLUDED ---
@@ -114,5 +122,43 @@ class ProjectionPredicateTest {
         assertEquals(false, ProjectionPredicate.encryptedStale(now - 1_000, now))
         assertEquals(false, ProjectionPredicate.encryptedStale(now - ProjectionPredicate.STALE_ENCRYPTED_MS, now))
         assertEquals(true, ProjectionPredicate.encryptedStale(now - ProjectionPredicate.STALE_ENCRYPTED_MS - 1, now))
+    }
+
+    // --- flood (density fallback, folded into the predicate) ---
+
+    @Test
+    fun `flood blocks renders and unread at threshold`() {
+        assertTrue(ProjectionPredicate.floodGhost(ProjectionPredicate.FLOOD_THRESHOLD))
+        assertFalse(ProjectionPredicate.floodGhost(ProjectionPredicate.FLOOD_THRESHOLD - 1))
+        assertFalse(
+            renders(isFlood = true),
+            "a flood-ghost event must not advance the head",
+        )
+        assertFalse(unread(isFlood = true))
+    }
+
+    // --- batch/ txn history re-import replay ---
+
+    @Test
+    fun `batch txn event with existing row never advances the head`() {
+        assertTrue(ProjectionPredicate.batchReplay("batch/1787302461807/53", 0L))
+        assertTrue(ProjectionPredicate.batchReplay("batch/1", 1_759_070_645_000))
+        assertFalse(
+            renders(isBatchReplay = true),
+            "a batch re-import must not become the head",
+        )
+        assertFalse(unread(isBatchReplay = true))
+    }
+
+    @Test
+    fun `batch txn event admits when no row exists yet (fresh backfill)`() {
+        assertFalse(ProjectionPredicate.batchReplay("batch/1787302461807/53", null))
+    }
+
+    @Test
+    fun `non batch txn ids and absent txn ids are not replays`() {
+        assertFalse(ProjectionPredicate.batchReplay(null, 0L))
+        assertFalse(ProjectionPredicate.batchReplay("SENDAUTH123", 0L))
+        assertFalse(ProjectionPredicate.batchReplay("batched", 0L), "prefix must match batch/")
     }
 }

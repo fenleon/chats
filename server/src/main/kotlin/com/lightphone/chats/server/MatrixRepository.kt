@@ -578,14 +578,9 @@ object MatrixRepository {
      *  receive latency, loosen if battery still burns. */
     private const val SLOW_SYNC_LAZY_INTERVAL_MS = 900_000L
 
-    /** An encrypted event still-undecryptable this long after its timestamp
-     *  doesn't count toward the receipt-cursor unread: real messages decrypt
-     *  within seconds of landing, so old undecryptable copies are bridge
-     *  re-delivery junk that opening the room can never clear (09-14). */
-    private const val UNREAD_ENCRYPTED_STALE_MS = 600_000L
-
     /** Events stamped more than this far into the future are bridge clock
-     *  skew — never notified, never counted (see UNREAD_ENCRYPTED_STALE_MS). */
+     *  skew — never notified, never counted (the same rule lives in
+     *  ProjectionPredicate as FUTURE_SKEW_MS). */
     private const val UNREAD_FUTURE_SKEW_MS = 300_000L
 
     /** Foreground-service promotion cadence. */
@@ -773,6 +768,7 @@ object MatrixRepository {
             scope.launch {
                 runCatching { c.stopSync() }
                 android.util.Log.d(TAG, "network back after loss — resetting sync loop")
+                Diagnostics.record("network back after loss — sync reset")
                 if (isScreenInteractive()) {
                     // Re-arm through the shared entry point (the stopSync above
                     // un-armed the slot, so [startSyncLoop] must re-arm it). A
@@ -792,6 +788,7 @@ object MatrixRepository {
     fun init(context: Context) {
         val app = context.applicationContext
         if (appContext == null) appContext = app
+        Diagnostics.init(app)
         enableTrixnityLogging()
         // Settings → Sync pause (audit 2026-08-14): a paused companion starts
         // no sync loop and no foreground service — the battery escape hatch.
@@ -904,6 +901,7 @@ object MatrixRepository {
         activeRoomRefreshJob = null
         PushChannel.stop()
         ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
+        Diagnostics.record("sync stopped")
     }
 
     /**
@@ -977,6 +975,7 @@ object MatrixRepository {
         if (isScreenInteractive()) return // screen came back on — enterActiveSync owns sync
         syncMode = SyncMode.SLOW // gate first: the watchdog must not restart the long-poll
         runCatching { c.stopSync() }
+        Diagnostics.record("sync paused (slow mode)")
         inProcessSyncJob?.cancel()
         inProcessSyncJob = null
         inProcessSyncRunning = false
@@ -990,6 +989,7 @@ object MatrixRepository {
             TAG,
             "sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s)",
         )
+        Diagnostics.record("sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s)")
     }
 
     /** One syncOnce round with a wall-clock duration log — the per-sync cost is
@@ -1018,6 +1018,7 @@ object MatrixRepository {
         // would burn its full 8s yield for nothing.
         syncRoundEndedAt = android.os.SystemClock.elapsedRealtime()
         android.util.Log.d(TAG, "syncOnce took ${android.os.SystemClock.elapsedRealtime() - t0}ms ($reason)")
+        Diagnostics.record("syncOnce took ${android.os.SystemClock.elapsedRealtime() - t0}ms ($reason)")
         return result
     }
 
@@ -1075,6 +1076,7 @@ object MatrixRepository {
         if (client != null) {
             startSyncLoop(ctx)
             android.util.Log.d(TAG, "sync mode: active (long-poll)")
+            Diagnostics.record("sync mode: active (long-poll)")
         }
     }
 
@@ -1173,6 +1175,7 @@ object MatrixRepository {
         }
         slowSyncJob?.cancel()
         slowSyncJob = null
+        Diagnostics.record("push wake")
         var caughtUp = false
         // NOTE: `return@repeat` would NOT break here — repeat's inline lambda
         // returning just continues the next index.
@@ -2849,7 +2852,6 @@ object MatrixRepository {
                         room.name != ROOM_NAME_FALLBACK && !nameIsGhostLocalpart,
                     previewResolved = room.lastMessage.isNotBlank() &&
                         !room.lastMessage.startsWith("[Encrypted"),
-                    previewRetryAtMs = 0L,
                 ),
             )
         }
@@ -3394,33 +3396,18 @@ object MatrixRepository {
         }
     }
 
-    /** Density fallback: a txn-id event inside a >=[GHOST_FLOOD_THRESHOLD]-per-minute flood. */
+    /** Density fallback: a txn-id event inside a >=30-per-window flood. The
+     *  count is decided by [ProjectionPredicate.floodGhost] — the caller
+     *  (walk or live event) supplies the window's events. */
     private fun isFloodGhost(c: MatrixClient, te: TimelineEvent, context: List<TimelineEvent>): Boolean {
         if (txnIdOf(te) == null) return false
         val ts = te.event.originTimestamp
-        return context.count { other ->
-            other.event.id != te.event.id && txnIdOf(other) != null &&
-                kotlin.math.abs(other.event.originTimestamp - ts) < GHOST_BURST_WINDOW_MS
-        } >= GHOST_FLOOD_THRESHOLD
-    }
-
-    /**
-     * Drops re-import copies from [raw] (newest first). Newest-first: the
-     * first occurrence of a content signature is kept (the newest event),
-     * older duplicates are the copies — a real new message whose body repeats
-     * an older one must win over the older message. Flood events (density fallback)
-     * are dropped regardless of content readability.
-     */
-    private fun filterGhosts(c: MatrixClient, raw: List<TimelineEvent>): List<TimelineEvent> {
-        val seen = HashSet<String>()
-        return raw.filter { te ->
-            if (isFloodGhost(c, te, raw)) return@filter false
-            val sig = contentSignature(c, te) ?: return@filter true
-            if (sig in seen) false else {
-                seen.add(sig)
-                true
-            }
-        }
+        return ProjectionPredicate.floodGhost(
+            context.count { other ->
+                other.event.id != te.event.id && txnIdOf(other) != null &&
+                    kotlin.math.abs(other.event.originTimestamp - ts) < GHOST_BURST_WINDOW_MS
+            },
+        )
     }
 
     /**
@@ -4077,8 +4064,8 @@ object MatrixRepository {
             // Tombstone: a redacted MESSAGE renders as a
             // quiet "Message unsent" row instead of silently vanishing (the
             // message type only — redacted reactions are timeline noise, not
-            // rows). The room-list preview machinery ([effectiveLastEvent])
-            // keeps skipping these like any other non-renderable event. In an
+            // rows). The projection's ingest walk skips these like any other
+            // non-renderable event. In an
             // e2ee room the original type is unrecoverable — Trixnity stores
             // any redacted encrypted event as RedactedEventContent
             // ("m.room.encrypted"), whatever it was — so a redacted message
@@ -4713,22 +4700,6 @@ object MatrixRepository {
         return readEventIds
     }
 
-    /** The event id of our own latest m.read receipt in [matrixRoomId], or
-     *  null when the thread was never opened (no receipt) or the read state
-     *  isn't readable yet. Used by the notification watcher to tell "already
-     *  seen" from "genuinely unread" at room-registration time. */
-    private suspend fun ownReadReceiptId(c: MatrixClient, matrixRoomId: RoomId): String? =
-        withTimeoutOrNull(MESSAGES_BUDGET_MS) {
-            // Direct repository reads need an explicit store transaction (the
-            // flow APIs set it up themselves; see [readReceiptsByEvent]).
-            val txManager = c.di.get<StoreTransactionManager>(StoreTransactionManager::class)
-            txManager.readTransaction {
-                c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class)
-                    .get(matrixRoomId)[c.userId]
-                    ?.receipts?.get(ReceiptType.Read)?.eventId?.full
-            }
-        }
-
     /** Collects a room's timeline events (newest first), null cursor = newest page. */
     private suspend fun collectTimelineEvents(
         c: MatrixClient,
@@ -5237,6 +5208,8 @@ object MatrixRepository {
     ): com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response {
         try {
         val c = client ?: error("not logged in")
+        val sendT0 = android.os.SystemClock.elapsedRealtime()
+        Diagnostics.record("send ${Diagnostics.short(roomId)} start")
         val matrixRoomId = RoomId(roomId)
         // One-shot self-heal for the bridge-key bug window (see the
         // megolm section above) — before enqueueing, never per-send, and never
@@ -5368,13 +5341,16 @@ object MatrixRepository {
         return com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response(
             transactionId = txnId,
             eventId = null,
-        )
+        ).also {
+            Diagnostics.record("send ${Diagnostics.short(roomId)} done ${android.os.SystemClock.elapsedRealtime() - sendT0}ms")
+        }
         } catch (e: Exception) {
             // A send that dies before enqueueing used to be invisible: the RPC
             // failure maps to null on the tool side and the resend looked like
             // a no-op. Log the full stack so the
             // next resend attempt is diagnosable.
             android.util.Log.e(TAG, "SendMessage FAILED room=$roomId body=$body", e)
+            Diagnostics.record("send ${Diagnostics.short(roomId)} failed ${Diagnostics.err(e)}")
             throw e
         }
     }
@@ -6925,8 +6901,8 @@ object MatrixRepository {
         // process, across restarts, while every other room resolves instantly).
         // The receipt still goes out at the rendered row; without the clear the
         // badge could never clear by design. Clear optimistically — the
-        // suppression lifts as soon as a newer message arrives ([servedUnread]),
-        // so nothing newer is ever silently marked seen.
+        // projection row is zeroed below, so nothing newer is ever silently
+        // marked seen.
         if (headId == null) {
             android.util.Log.w(
                 TAG,
@@ -6961,7 +6937,8 @@ object MatrixRepository {
         } catch (e: Exception) {
             // The tool's runCatching would swallow this and the badge would
             // clear on an echo that never comes — skip the optimistic clear
-            // + [pendingReadClear] so the badge honestly stays up.
+            // (the projection row + the served list) so the badge honestly
+            // stays up.
             if (debugLogging()) {
                 android.util.Log.w(
                     TAG,
@@ -6978,23 +6955,9 @@ object MatrixRepository {
             // Optimistically clear the room's unread in the served list — the
             // notification count only drops after the read-marker echo
             // round-trips through sync (a full tick on a big account), which
-            // used to leave the badge up long after the thread was opened. The
-            // resolver keeps serving 0 until the store's own receipt echoes
-            // ([servedUnread]; the stored marker ts is the marked event's
-            // origin_server_ts — the head in every atHead case — so the
-            // comparison is server-stamp on both ends and device clock skew
-            // can't pin the badge). The marker id may be a snapped
-            // unrenderable head the room's relevant head equals immediately,
-            // which disarmed the old id-match check.
-            // Head unresolved: no event ts exists at all — the wall clock
-            // stays as that corner's best effort (logged above).
-            val markerTs = room?.lastRelevantEventTimestamp?.toEpochMilliseconds()
-                ?.takeIf { headId != null }
-                ?: System.currentTimeMillis()
-            pendingReadClear[roomId] = markerId to markerTs
-            // The store cursor is about to move: drop the shared unread memo
-            // so the next resolve reads the receipt, not the pre-read count.
-            invalidateUnreadMemo()
+            // used to leave the badge up long after the thread was opened.
+            // The projection row was already zeroed above ([projectionMarkRead]);
+            // the echo round's recompute confirms it.
             roomListCache[roomId]?.let { entry ->
                 if (entry.room.unreadCount > 0) {
                     val cleared = entry.copy(room = entry.room.copy(unreadCount = 0))
@@ -7372,11 +7335,10 @@ object MatrixRepository {
             }
             // Server unread counts: the sync response carries the
             // server-computed per-room unread_notifications.notification_count.
-            // It's the fallback badge while a room's own receipt hasn't synced
-            // yet ([receiptCursorUnread] is primary) — it counts non-message
-            // classes our client never renders, so it must not override the
-            // cursor. Incremental syncs only include changed rooms, which
-            // is exactly when a count can move.
+            // It's the fallback badge while a room has no projection row yet
+            // (pre-backfill) — the projection's count is the truth once the
+            // room is projected. Incremental syncs only include changed rooms,
+            // which is exactly when a count can move.
             watch("server-unread collector ended") {
                 c.api.sync.subscribeAsFlow().collect { syncEvents ->
                     val join = syncEvents.syncResponse.room?.join ?: return@collect
@@ -7392,32 +7354,11 @@ object MatrixRepository {
                         if (serverUnreadCounts[roomId.full] != count) {
                             serverUnreadCounts[roomId.full] = count
                         }
-                        // Own m.read receipt echoed (a markRead's echo, or a
-                        // read on another device): the optimistic clear's job
-                        // is done — release it so the row publish below
-                        // recomputes unread from the moved cursor. Background
-                        // rounds carry receipts too (m.receipt is no longer
-                        // filtered out — see [fullSyncOnceFilters]).
-                        if (ownReceiptEchoed(joinedRoom.ephemeral?.events, c.userId)) {
-                            // The cursor moved: drop the shared unread memo
-                            // before the row publish below, so it reads the
-                            // new receipt instead of the pre-read count.
-                            invalidateUnreadMemo()
-                            if (debugLogging() && pendingReadClear.remove(roomId.full) != null) {
-                                android.util.Log.d(
-                                    TAG,
-                                    "pendingReadClear: released on own receipt echo (room=${roomId.full})",
-                                )
-                            }
-                        }
                         // The join map IS the invalidation list: every room in
                         // it changed somehow (timeline, state, receipts,
                         // counts). publishRoomRowNow is burst-deduped, so a
                         // whole-account round costs one resolve per changed
-                        // room. Ungated on RoomSig — receipt-only changes and
-                        // summary-frozen rooms never move the summary, so only
-                        // this trigger reaches them (the room-flow collector
-                        // keeps its gate). The store reads inside are safe
+                        // room. The store reads inside are safe
                         // post-ingest: subscribeAsFlow runs at DEFAULT
                         // priority, after the STORE_EVENTS (receipts) /
                         // ROOM_LIST (summary) / STORE_TIMELINE_EVENTS
@@ -7499,19 +7440,20 @@ object MatrixRepository {
                                             // read here too — else every re-registration
                                             // re-dings the rooms it marked (LP3 09-14
                                             // overnight burst).
-                                            // P1 (PLAN.md 2026-09-14): the
-                                            // projection decides — its head is
-                                            // the newest real message and its
+                                            // P2 (PLAN.md 2026-09-14): the
+                                            // projection ALONE decides — its head
+                                            // is the newest real message and its
                                             // count already excludes junk
                                             // (stale-undecryptable storm
                                             // copies, future-stamped, edits,
                                             // reactions, own), so registration
-                                            // can't re-ding a junk head the
-                                            // way the summary-id gate did
+                                            // can't re-ding a junk head
                                             // (the 09-14 overnight bursts).
-                                            // Rooms not projected yet
-                                            // (pre-backfill) fall back to the
-                                            // summary-id gate until then.
+                                            // The derive-era summary-id
+                                            // fallback is deleted; a room
+                                            // without a row (pre-backfill)
+                                            // stays quiet until the backfill
+                                            // writes it.
                                             val proj = projectionRow(c, key)
                                             val projHead = proj?.lastRealEventId
                                             if (proj != null && projHead != null) {
@@ -7527,28 +7469,6 @@ object MatrixRepository {
                                                     recordNotifiedEvent(key, projHead)
                                                     notifyForEvent(c, roomId, projHead, regRoom)
                                                 }
-                                            } else {
-                                            val ownRead = ownReadReceiptId(c, roomId)
-                                            val alreadyAlerted = lastNotifiedEventId(key) == regLastId
-                                            val readHere = lastReadMarkerId(key) == regLastId
-                                            if (!alreadyAlerted && !readHere && ownRead != regLastId) {
-                                                android.util.Log.d(
-                                                    TAG,
-                                                    "notification watcher: $key registered with unread newest " +
-                                                        "(${if (key in knownRooms) "known" else "new post-settle"}, " +
-                                                        "ownRead=$ownRead) — notifying for first message",
-                                                )
-                                                // Record BEFORE [notifyForEvent], not only
-                                                // after a post: it silently skips (m.replace
-                                                // edit, bridge flood, undecryptable head, no
-                                                // preview) without recording, and an
-                                                // unrecorded head re-fires this gate on EVERY
-                                                // process start — the 09-14 overnight ghost
-                                                // bursts. A transient decrypt miss is
-                                                // self-healing: the next head change re-arms.
-                                                recordNotifiedEvent(key, regLastId)
-                                                notifyForEvent(c, roomId, regLastId, regRoom)
-                                            }
                                             }
                                         }
                                     }
@@ -7559,16 +7479,10 @@ object MatrixRepository {
                                         // resolver has no steady-state sweep
                                         // (INGEST-DERIVED-PLAN Phase C); unread
                                         // changes come via the count collector
-                                        // above.
-                                        val sig = RoomSig(
-                                            updated.lastRelevantEventId?.full,
-                                            updated.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
-                                            updated.membership?.name,
-                                        )
-                                        if (roomSigSeen[key] != sig) {
-                                            roomSigSeen[key] = sig
-                                            publishRoomRowNow(c, roomId, updated)
-                                        }
+                                        // above. No signature gate: the row
+                                        // resolve is a projection read now, and
+                                        // publishRoomRowNow burst-dedupes.
+                                        publishRoomRowNow(c, roomId, updated)
                                         val lastId = updated.lastRelevantEventId?.full ?: return@collect
                                         if (updated.membership != Membership.JOIN) return@collect
                                         val prev = seen[key]
@@ -7750,7 +7664,9 @@ object MatrixRepository {
             ) null else senderNameOf(c, roomId, te.event.sender),
             preview = preview,
             direct = room.isDirect,
-            unreadCount = receiptCursorUnread(c, roomId.full)
+            // The projection's count (junk rules already applied at ingest);
+            // the sync's server count until the room is projected.
+            unreadCount = projectionRow(c, roomId.full)?.unreadCount
                 ?: (serverUnreadCounts[roomId.full]?.toLong() ?: 0L),
         )
         // Persist "alerted this event" so a later watcher registration (new
@@ -7795,49 +7711,9 @@ object MatrixRepository {
         val room: com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room,
         val nameResolved: Boolean,
         val previewResolved: Boolean,
-        /** A "[Encrypted]" preview retries no earlier than this (elapsedRealtime). */
-        val previewRetryAtMs: Long,
     )
-
-    /** Cached ghost-aware "last event" per room (see [effectiveLastEvent]). */
-    private data class EffectiveLast(
-        /** The server's lastRelevantEventId this was computed for. */
-        val serverLastEventId: String,
-        /** Newest NON-ghost event (id, timestamp) in the room. */
-        val effectiveEventId: String?,
-        val effectiveTs: Long,
-        /** When a timed-out walk may be retried (0 = resolved, cache forever). */
-        val retryAtMs: Long = 0L,
-    )
-
-    private val effectiveLastCache = java.util.concurrent.ConcurrentHashMap<String, EffectiveLast>()
-
-    /** Cached summary-gap head probe (fix): the raw-chain head read
-     *  in [resolveRoomListEntry] used to run UNCACHED every pass and
-     *  [effectiveLastEvent] then re-walked the same head (51 events) — the
-     *  1→51 double read across the ~85-155 summary-gap rooms dominated the
-     *  775-read send sweep. Keyed by the room's lastEventId, mirroring
-     *  [effectiveLastCache]; only readable heads are cached. */
-    private data class SummaryGapHead(
-        /** The room lastEventId this head was probed for. */
-        val lastEventId: String,
-        val headEvent: TimelineEvent,
-    )
-
-    private val summaryGapHeadCache = java.util.concurrent.ConcurrentHashMap<String, SummaryGapHead>()
 
     private val roomListCache = java.util.concurrent.ConcurrentHashMap<String, RoomListEntry>()
-    /** Last-seen room signatures, maintained by [observeNotifications] — a
-     *  difference publishes that room's row ([publishRoomRowNow]; the
-     *  resolver no longer sweeps, INGEST-DERIVED-PLAN Phase C). */
-    private val roomSigSeen = java.util.concurrent.ConcurrentHashMap<String, RoomSig>()
-    /** Room ids the user has opened (MarkRead fired) → (event id marked read,
-     *  its origin_server_ts). The notification count only drops after the
-     *  read-marker echo round-trips through sync (a full tick on a big
-     *  account), so the served list shows 0 until the store's own receipt
-     *  reaches the marker ([servedUnread]) — released early by the echo
-     *  detection in the server-unread collector. */
-    private val pendingReadClear = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
     private val _roomList = MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>(emptyList())
 
     /**
@@ -8161,13 +8037,6 @@ object MatrixRepository {
         roomListWake.trySend(Unit)
     }
 
-    /** The room-map fields that decide whether a resolver pass can be skipped. */
-    private data class RoomSig(
-        val lastEventId: String?,
-        val lastTsMs: Long,
-        val membership: String?,
-    )
-
     /**
      * Server-computed per-room unread notification counts, captured straight
      * from the sync response (see the collector in [observeNotifications]).
@@ -8177,40 +8046,9 @@ object MatrixRepository {
      */
     private val serverUnreadCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
-    /**
-     * Unread count to show in the list. While a MarkRead is pending (the
-     * store hasn't echoed it yet — see [pendingReadClear]) the count reads 0;
-     * the suppression lifts when the room's own m.read receipt in the store
-     * reaches the marked event's ts — the same cursor [receiptCursorUnread]
-     * reads, server-stamped on both ends, so device clock skew can no longer
-     * pin the badge (the old wall-clock comparison could).
-     */
-    private suspend fun servedUnread(
-        c: MatrixClient,
-        roomId: String,
-        markedTs: Long?,
-        storeUnread: Long,
-    ): Long {
-        if (markedTs == null) return storeUnread
-        val receiptTs = ownReceiptTs(c, roomId)
-        return if (receiptTs != null && receiptTs >= markedTs) {
-            if (debugLogging() && pendingReadClear.remove(roomId) != null) {
-                android.util.Log.d(
-                    TAG,
-                    "pendingReadClear: released on stored receipt ts=$receiptTs >= marker ts=$markedTs (room=$roomId)",
-                )
-            }
-            storeUnread
-        } else {
-            0
-        }
-    }
-
-    /** The ts of the account's own latest m.read receipt, read from the store
-     *  (the same RoomUserReceipts query [receiptCursorUnread] takes its cursor
-     *  from). Null when no receipt has synced yet or the store is unreadable.
-     *  Used by [servedUnread] to release the optimistic badge clear on the
-     *  receipt echo itself instead of the device wall clock. */
+    /** The ts of the account's own latest m.read receipt, read from the store.
+     *  Null when no receipt has synced yet or the store is unreadable.
+     *  Used by the projection walk ([projectRoom]) as the unread cursor. */
     private suspend fun ownReceiptTs(c: MatrixClient, roomId: String): Long? {
         val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
             ?: return null
@@ -8229,263 +8067,10 @@ object MatrixRepository {
         }
     }
 
-    /** True when [events] (a sync response's ephemeral block) carries an own
-     *  m.read receipt for the room it belongs to — our markRead's echo or a
-     *  read on another device landed or moved. Background rounds never carry
-     *  receipts (the thin sync filter drops m.receipt — by design). */
-    private fun ownReceiptEchoed(
-        events: List<ClientEvent.EphemeralEvent<*>>?,
-        own: UserId,
-    ): Boolean = events?.any { event ->
-        (event.content as? ReceiptEventContent)?.events?.values
-            ?.any { it[ReceiptType.Read]?.containsKey(own) == true } == true
-    } == true
-
-    /**
-     * Cursor-based unread (the Beeper app's model — replaces the old own-vs-
-     * others receipt comparison): the cursor is the account's own m.read
-     * receipt (synced account-wide — a read on any device moves it), and
-     * unread = COUNT(message-class, not-ours timeline events strictly after
-     * it). Never compared against the server's notification_count, whose
-     * non-message accounting (reactions, member churn, send-status echoes our
-     * client never renders) flags fully-read rooms (LP3: 1€ Doc Chat, JobV,
-     * +16315652210, +4917668998995).
-     * Null when no own receipt has synced yet — callers fall back to the
-     * server count.
-     * ponytail: ts cursor over the thin-sync timeline — same-second boundary
-     * events and still-encrypted member copies can skew the count; the row
-     * badge renders boolean, so only the false-positive direction matters.
-     * Stored per-event position (Beeper's Messages.order) if that ever bites.
-     * The un-memoized single-room query: callers go through [receiptCursorUnread].
-     */
-    private suspend fun receiptCursorUnreadQuery(c: MatrixClient, roomId: String): Long? {
-        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
-            ?: return null
-        return chainDb("receiptCursorUnread") {
-            withContext(Dispatchers.IO) {
-                runCatching<Long?> {
-                    val own = db.openHelper.writableDatabase.query(
-                        "SELECT MAX(je.value) FROM RoomUserReceipts, " +
-                            "json_tree(RoomUserReceipts.value) je " +
-                            "WHERE RoomUserReceipts.roomId=? AND RoomUserReceipts.userId=? " +
-                            "AND je.key='ts' AND je.type='integer'",
-                        arrayOf(roomId, c.userId.full),
-                    ).use { cur -> if (cur.moveToFirst() && !cur.isNull(0)) cur.getLong(0) else -1L }
-                    if (own < 0) return@runCatching null
-                    db.openHelper.writableDatabase.query(
-                        // Bridge re-import floods re-deliver a whole read batch as
-                        // "new" undecryptable events sharing one origin ts (LP3:
-                        // à bientôt — 35 copies stamped 08-23 07:08:24 across 3
-                        // senders). Count same-ts groups of ≤6 only: a genuine
-                        // burst never lands >6 messages in the same millisecond.
-                        // ponytail: real history re-imports of NEW messages would
-                        // under-count; Beeper dedups equivalents at ingestion.
-                        "SELECT MIN(99, SUM(n)) FROM (" +
-                            "SELECT n FROM (" +
-                            "SELECT json_extract(value,'$.event.origin_server_ts') AS ets, " +
-                            "COUNT(*) AS n " +
-                            "FROM TimelineEvent " +
-                            "WHERE TimelineEvent.roomId=? " +
-                            "AND json_extract(value,'$.event.type') " +
-                            "  IN ('m.room.message','m.room.encrypted') " +
-                            "AND json_extract(value,'$.event.sender') != ? " +
-                            // CAST: query() binds selection args as TEXT, and an
-                            // INTEGER column never compares greater than a TEXT
-                            // value in SQLite — the un-cast version silently
-                            // counted 0 for every room (LP3: Jasmine/Rose
-                            // genuinely-unread badges vanished).
-                            "AND json_extract(value,'$.event.origin_server_ts') " +
-                            "  > CAST(? AS INTEGER) " +
-                            // Bridge re-delivery storms dump undecryptable
-                            // m.room.encrypted copies (09-14 00:57-01:08: 967
-                            // counted events / 82 rooms, none ever decrypts)
-                            // that sit AFTER the receipt cursor and can never
-                            // be cleared by opening the room. A real encrypted
-                            // message decrypts within seconds of landing, so
-                            // encrypted events still-undecryptable after
-                            // UNREAD_ENCRYPTED_STALE_MS don't count; and a
-                            // future-stamped event (bridge clock skew) counts
-                            // for no receipt ever — cap at now+5 min.
-                            "AND (json_extract(value,'$.event.type') = 'm.room.message' " +
-                            "     OR json_extract(value,'$.event.origin_server_ts') >= CAST(? AS INTEGER)) " +
-                            "AND json_extract(value,'$.event.origin_server_ts') <= CAST(? AS INTEGER) " +
-                            "GROUP BY ets" +
-                            ") WHERE n <= 6)",
-                        arrayOf(
-                            roomId,
-                            c.userId.full,
-                            own.toString(),
-                            (System.currentTimeMillis() - UNREAD_ENCRYPTED_STALE_MS).toString(),
-                            (System.currentTimeMillis() + UNREAD_FUTURE_SKEW_MS).toString(),
-                        ),
-                    ).use { cur -> if (cur.moveToFirst()) cur.getLong(0) else 0L }
-                }.getOrNull()
-            }
-        }
-    }
-
-    /**
-     * [receiptCursorUnread] for many rooms in two queries instead of two per
-     * room. Rooms with no own receipt are absent, so callers fall back to the
-     * server count exactly as they do for a null single-room result.
-     * The room-list pass resolves every joined room (~228 on the LP3), and
-     * queueing each one on the 2-permit [chainDbSemaphore] turned that into a
-     * ~6 s stall at launch (probe 2026-09-13).
-     *
-     * Null means the batch could not run at all. Callers must then resolve per
-     * room — falling back to the server counts here instead would silently
-     * resurrect the false-positive badges this cursor model exists to fix.
-     */
-    private suspend fun receiptCursorUnreadBatch(
-        c: MatrixClient,
-        roomIds: List<String>,
-    ): Map<String, Long>? {
-        if (roomIds.isEmpty()) return emptyMap()
-        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
-            ?: return null
-        return chainDb("receiptCursorUnreadBatch") {
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    val holes = roomIds.joinToString(",") { "?" }
-                    val own = HashMap<String, Long>()
-                    db.openHelper.writableDatabase.query(
-                        "SELECT RoomUserReceipts.roomId, MAX(je.value) FROM RoomUserReceipts, " +
-                            "json_tree(RoomUserReceipts.value) je " +
-                            "WHERE RoomUserReceipts.roomId IN ($holes) " +
-                            "AND RoomUserReceipts.userId=? " +
-                            "AND je.key='ts' AND je.type='integer' " +
-                            "GROUP BY RoomUserReceipts.roomId",
-                        (roomIds + c.userId.full).toTypedArray(),
-                    ).use { cur ->
-                        while (cur.moveToNext()) {
-                            if (!cur.isNull(1)) own[cur.getString(0)] = cur.getLong(1)
-                        }
-                    }
-                    if (own.isEmpty()) return@runCatching emptyMap<String, Long>()
-                    // One VALUES join beats a correlated subquery per timeline
-                    // row. own.ts binds as INTEGER — the single-room version
-                    // needs its CAST for exactly that reason (see the note on
-                    // the roomId query above).
-                    val binding = own.entries.joinToString(",") { "(?,?)" }
-                    val args = ArrayList<Any>(own.size * 2 + 1)
-                    for ((room, ts) in own) {
-                        args += room
-                        args += ts
-                    }
-                    args += c.userId.full
-                    val staleEncryptedCut = System.currentTimeMillis() - UNREAD_ENCRYPTED_STALE_MS
-                    args += staleEncryptedCut
-                    args += System.currentTimeMillis() + UNREAD_FUTURE_SKEW_MS
-                    val counts = HashMap<String, Long>(own.size)
-                    db.openHelper.writableDatabase.query(
-                        "WITH own(roomId, ts) AS (VALUES $binding) " +
-                            "SELECT roomId, MIN(99, SUM(n)) FROM (" +
-                            "SELECT t.roomId AS roomId, " +
-                            "json_extract(t.value,'\$.event.origin_server_ts') AS ets, " +
-                            "COUNT(*) AS n " +
-                            "FROM TimelineEvent t JOIN own ON own.roomId = t.roomId " +
-                            "WHERE json_extract(t.value,'\$.event.type') " +
-                            "  IN ('m.room.message','m.room.encrypted') " +
-                            "AND json_extract(t.value,'\$.event.sender') != ? " +
-                            "AND json_extract(t.value,'\$.event.origin_server_ts') > own.ts " +
-                            "AND (json_extract(t.value,'\$.event.type') = 'm.room.message' " +
-                            "     OR json_extract(t.value,'\$.event.origin_server_ts') >= ?) " +
-                            "AND json_extract(t.value,'\$.event.origin_server_ts') <= ? " +
-                            "GROUP BY t.roomId, ets" +
-                            ") WHERE n <= 6 GROUP BY roomId",
-                        args.toTypedArray(),
-                    ).use { cur ->
-                        while (cur.moveToNext()) counts[cur.getString(0)] = cur.getLong(1)
-                    }
-                    // A receipted room with nothing after the cursor is unread 0,
-                    // not absent — it must not keep its ts as the count.
-                    HashMap<String, Long>(own.size).apply {
-                        for (room in own.keys) put(room, counts[room] ?: 0L)
-                    }
-                }.onFailure {
-                    android.util.Log.w(
-                        TAG,
-                        "receiptCursorUnreadBatch failed — resolving unread per room",
-                        it,
-                    )
-                }.getOrNull()
-            }
-        }
-    }
-
-    /**
-     * Launch-storm memo (issue #33): every joined room's first row publish
-     * resolves unread, and one query per room queued on the 2-permit
-     * [chainDbSemaphore] — the ~350-room launch publish wave stalled for ~6 s
-     * (probe 2026-09-13). The whole set resolves in two batched queries
-     * ([receiptCursorUnreadBatch]) and is shared for [unreadMemoTtlMs] — the
-     * Beeper shape: unread lives in a table the list query reads, never a
-     * per-room job behind a shared permit.
-     * TTL rather than pure invalidation: a new message raises a count with no
-     * store event to hook, so a badge may lag that long. Read-state moves
-     * ([markRead] and the receipt echo that releases it) drop it eagerly.
-     * ponytail: fixed 2 s TTL — a per-room read-state epoch if the lag shows.
-     */
-    @Volatile private var unreadMemo: Pair<Long, Map<String, Long?>>? = null
-    private val unreadMemoLock = Mutex()
-    private val unreadMemoTtlMs = 2_000L
-
-    /** Drops [unreadMemo] on a read-state move; the next resolve rebuilds it. */
-    private fun invalidateUnreadMemo() {
-        unreadMemo = null
-    }
-
-    /** [receiptCursorUnreadQuery] through the shared [unreadMemo]. */
-    private suspend fun receiptCursorUnread(c: MatrixClient, roomId: String): Long? {
-        val memo = unreadCursorMemo(c)
-        if (memo != null && memo.containsKey(roomId)) return memo[roomId]
-        return receiptCursorUnreadQuery(c, roomId)
-    }
-
-    /** [unreadMemo] for the store's rooms, rebuilt when older than
-     *  [unreadMemoTtlMs]. Null when it could not be built — the caller then
-     *  queries the one room (never the server counts, see
-     *  [receiptCursorUnreadBatch]). */
-    private suspend fun unreadCursorMemo(c: MatrixClient): Map<String, Long?>? {
-        unreadMemo?.let { (at, memo) ->
-            if (android.os.SystemClock.elapsedRealtime() - at < unreadMemoTtlMs) return memo
-        }
-        // Single flight: a launch wave's concurrent resolves share one build
-        // instead of each rebuilding the batch behind the same 2 permits.
-        return unreadMemoLock.withLock {
-            unreadMemo?.let { (at, memo) ->
-                if (android.os.SystemClock.elapsedRealtime() - at < unreadMemoTtlMs) {
-                    return@withLock memo
-                }
-            }
-            val startedAt = android.os.SystemClock.elapsedRealtime()
-            val ids = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
-                ?.keys?.map { it.full }
-                ?: return@withLock null
-            val batch = receiptCursorUnreadBatch(c, ids) ?: return@withLock null
-            val memo = HashMap<String, Long?>(ids.size)
-            for (id in ids) memo[id] = batch[id]
-            unreadMemo = startedAt to memo
-            if (debugLogging()) {
-                android.util.Log.d(
-                    TAG,
-                    "unread memo: ${ids.size} room(s) in " +
-                        "${android.os.SystemClock.elapsedRealtime() - startedAt} ms",
-                )
-            }
-            memo
-        }
-    }
-
     private fun resetRoomList() {
         roomListCache.clear()
-        unreadMemo = null
-        roomSigSeen.clear()
         bridgeBotByRoom.clear()
-        pendingReadClear.clear()
         serverUnreadCounts.clear()
-        effectiveLastCache.clear()
-        ghostResolveInFlight.clear()
         _roomList.value = emptyList()
         roomListJob?.cancel()
         roomListJob = null
@@ -8506,27 +8091,13 @@ object MatrixRepository {
      * Background resolver for the room list. COLD-START ONLY
      * (INGEST-DERIVED-PLAN Phase C): until [initialRoomCrawlDone] it seeds
      * every room with a placeholder row first (so the list shows instantly),
-     * then resolves names + previews newest-first within a per-pass time
-     * budget, publishing the snapshot after each pass. After the wrap it runs
-     * only for the flags-only re-stamp and pending-resolve retries
-     * ([hasPendingResolveWork]: parked "[Encrypted]" previews, ghost-walk
-     * retry windows) — row facts are derived and published per-room at ingest
-     * ([publishRoomRowNow]); there is NO steady-state sweep. A missed trigger
-     * shows as a stale row and is fixed at the trigger, never swept under.
+     * then resolves names newest-first within a per-pass time budget,
+     * publishing the snapshot after each pass. After the wrap it runs only
+     * for the flags-only re-stamp — row facts are published per-room at
+     * ingest ([publishRoomRowNow]); there is NO steady-state sweep. A missed
+     * trigger shows as a stale row and is fixed at the trigger, never swept
+     * under.
      */
-
-    /**
-     * True when a parked room-list entry has resolution work that just came
-     * due: an unresolved "[Encrypted]" preview past its retry time, or a
-     * ghost-walk retry window that expired. Parked (future-retry) entries
-     * don't count — they'd otherwise force a pass every tick on accounts with
-     * many still-encrypted rooms.
-     */
-    private fun hasPendingResolveWork(): Boolean {
-        val now = android.os.SystemClock.elapsedRealtime()
-        return roomListCache.values.any { !it.previewResolved && now >= it.previewRetryAtMs } ||
-            effectiveLastCache.values.any { it.retryAtMs > 0L && now >= it.retryAtMs }
-    }
 
     private fun startRoomListResolver(c: MatrixClient) {
         roomListJob?.cancel()
@@ -8539,11 +8110,11 @@ object MatrixRepository {
             val nameMemo = HashMap<String, String>()
             while (true) {
                 // Skip the pass unless a local flags write is waiting (the
-                // flags-only fast path), a parked preview/ghost-walk retry
-                // came due, or the initial crawl hasn't wrapped yet (see
-                // [initialRoomCrawlDone]). No steady-state sweep: sync-derived
-                // changes publish their own row ([publishRoomRowNow]).
-                if (!roomListDirty && !hasPendingResolveWork() && initialRoomCrawlDone) {
+                // flags-only fast path) or the initial crawl hasn't wrapped
+                // yet (see [initialRoomCrawlDone]). No steady-state sweep:
+                // sync-derived changes publish their own row
+                // ([publishRoomRowNow]).
+                if (!roomListDirty && initialRoomCrawlDone) {
                     // Idle sleep, interruptible: [wakeRoomList] (screen-on,
                     // push-wake, list re-opened) ends it early so a message
                     // that landed while the screen was dark is served the
@@ -8585,9 +8156,9 @@ object MatrixRepository {
                     }
                 }
                 // After the initial crawl the flags-only re-stamp above is the
-                // whole pass unless a parked preview/ghost-walk retry is due —
-                // no steady-state crawl (INGEST-DERIVED-PLAN Phase C).
-                if (initialRoomCrawlDone && !hasPendingResolveWork()) {
+                // whole pass — no steady-state crawl (INGEST-DERIVED-PLAN
+                // Phase C).
+                if (initialRoomCrawlDone) {
                     withTimeoutOrNull(
                         if (isScreenInteractive()) ROOM_LIST_REFRESH_DELAY_MS else SLOW_RESOLVER_DELAY_MS
                     ) {
@@ -8654,7 +8225,7 @@ object MatrixRepository {
                         if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
                         bridgeContacts(c, bridgeId)
                     }
-                    seedRoomList(c, loaded, verified, networks, communities, flags)
+                    seedRoomList(loaded, verified, networks, communities, flags)
                     // Every joined room gets a preview attempt (rooms beyond the
                     // preview window showed no latest message at all).
                     // The per-pass budget + the encrypted-room retry backoff keep
@@ -8752,7 +8323,6 @@ object MatrixRepository {
 
     /** Inserts a placeholder row for every joined room not yet in the cache. */
     private suspend fun seedRoomList(
-        c: MatrixClient,
         rooms: List<Pair<RoomId, MatrixRoom>>,
         verified: Boolean,
         networks: Map<String, String>,
@@ -8764,7 +8334,6 @@ object MatrixRepository {
             if (room.membership != Membership.JOIN) continue
             val key = roomId.full
             if (roomListCache.containsKey(key)) continue
-            val cleared = pendingReadClear[key]
             roomListCache[key] = RoomListEntry(
                 room = com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room(
                     id = key,
@@ -8772,12 +8341,9 @@ object MatrixRepository {
                     lastMessage = "",
                     // An unverified device can't decrypt — suppress unread for
                     // encrypted rooms only; unencrypted ones stay readable.
-                    unreadCount = servedUnread(
-                        c,
-                        key,
-                        cleared?.second,
-                        if (verified || !room.encrypted) (serverUnreadCounts[key]?.toLong() ?: 0L) else 0,
-                    ),
+                    unreadCount = if (verified || !room.encrypted) {
+                        serverUnreadCounts[key]?.toLong() ?: 0L
+                    } else 0,
                     lastTimestampMs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L,
                     lastEventId = room.lastRelevantEventId?.full,
                     // Beeper never writes m.direct for self-rooms (Note-to-Self
@@ -8798,7 +8364,6 @@ object MatrixRepository {
                 ),
                 nameResolved = false,
                 previewResolved = false,
-                previewRetryAtMs = 0L,
             )
             seeded++
         }
@@ -8830,90 +8395,19 @@ object MatrixRepository {
             return
         }
         val prev = roomListCache[key]
-        // P1 (PLAN.md 2026-09-14): the ingest-time projection is the row's
-        // source of truth — head/time/preview/unread come from the table the
-        // sync hook materializes. The derive-at-read machinery below only
-        // serves rooms the projection doesn't cover yet (pre-backfill), and
-        // is deleted in P2.
+        // P2 (PLAN.md 2026-09-14): the ingest-time projection is the row's
+        // ONLY source of truth — head/time/preview/unread come from the table
+        // the sync hook materializes. The derive-at-read machinery
+        // (summary-gap walks, effectiveLastEvent, ghost walks, preview retry
+        // parks) is deleted: a room without a row (fresh login pre-backfill,
+        // brand-new room pre-ingest) serves the room summary as-is and the
+        // backfill + ingest hook write the true row within one round.
         val projection = projectionRow(c, key)
-        // Ghost-aware last event: after a bridge re-import flood the server's
-        // summary points at a ghost, which would bump the room to the top of
-        // the list and show the re-imported message as its preview.
-        var serverTs = room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L
-        var serverLastId = room.lastRelevantEventId?.full
-        // Summary gap: rooms whose lastRelevantEvent* the (partial)
-        // sync never re-stamped resolve to timestamp 0 — which sorts them below
-        // every real room and drops them out of the main list's 200-room window
-        // ("Jeff" missing though searchable; 155/296 rooms on the LP3). Fall
-        // back to the timeline's newest event when the summary is empty: read
-        // its head timestamp from the DB chain (the same bounded walk
-        // [effectiveLastEvent] uses) so the row keeps a real time.
-        if (projection == null && serverLastId == null) {
-            // Head timestamp from the RAW DB chain (any event type): a head
-            // that isn't a message (bridge status ack, edit, reaction) must
-            // still give the row a real time — [effectiveLastEvent] walks back
-            // to the renderable message for the display time below. The raw
-            // chain read is also gap-immune (it follows previous-event links;
-            // the API view truncates at a gap marker — the Annette-room class,).
-            room.lastEventId?.full?.let { lastId ->
-                // Head probe, cached per room.lastEventId (see [summaryGapHeadCache]).
-                val head = summaryGapHeadCache[key]
-                    ?.takeIf { it.lastEventId == lastId }
-                    ?.headEvent
-                    ?: withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
-                        readTimelineChainFromDb(c, roomId, lastId, 1)?.first?.firstOrNull()
-                    }?.also {
-                        // Don't cache a still-encrypted head: its content may
-                        // resolve on a later pass, and a cached unreadable head
-                        // would fall through to [effectiveLastEvent] forever.
-                        if (it.content?.getOrNull() != null) {
-                            summaryGapHeadCache[key] = SummaryGapHead(lastId, it)
-                        }
-                    }
-                if (head != null) {
-                    serverLastId = lastId
-                    serverTs = head.event.originTimestamp
-                }
-            }
-            // No summary cursor at all (the sync never re-stamped this room —
-            // 85 rooms on the LP3): walk the timeline head directly, the
-            // restore crawl's pattern, so the row keeps a real time. Cached
-            // downstream: [effectiveLastEvent] pins the head id, so the walk
-            // runs once per new head instead of every pass.
-            if (projection == null && serverLastId == null) {
-                val head = withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
-                    collectNewestEvents(c, roomId, { maxSize = 8 }, ROOM_LIST_ROOM_BUDGET_MS)
-                        ?.maxByOrNull { it.event.originTimestamp }
-                }
-                if (head != null) {
-                    serverLastId = head.event.id.full
-                    serverTs = head.event.originTimestamp
-                }
-            }
-        }
         val (lastEventId, ts) = if (projection != null) {
             projection.lastRealEventId to projection.lastRealTs
         } else {
-        // Early pin (fix): when the summary-gap head is a real,
-        // readable message — the same test [effectiveLastEvent]'s fast pin
-        // applies — write its pin directly and skip the 51-event walk. A
-        // txn-id-free head can't be a flood ghost (see [isFloodGhost]: only
-        // txn-id events density-match), so the flood check the walk does is
-        // moot here. Everything else (mid-decrypt, ghost, parked rooms) falls
-        // through to [effectiveLastEvent] unchanged.
-        val gapHead = serverLastId?.let { id ->
-            summaryGapHeadCache[key]?.takeIf { it.lastEventId == id }?.headEvent
-        }
-        val pair = if (gapHead != null && txnIdOf(gapHead) == null &&
-            isRenderableRow(gapHead) && previewText(gapHead)?.isNotBlank() == true &&
-            contentSignature(c, gapHead) != null
-        ) {
-            effectiveLastCache[key] = EffectiveLast(serverLastId!!, serverLastId!!, serverTs)
-            serverLastId!! to serverTs
-        } else {
-            effectiveLastEvent(c, roomId, serverLastId, serverTs)
-        }
-        pair
+            room.lastRelevantEventId?.full to
+                (room.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L)
         }
         // Own send in flight (echo not yet in the store): the row must bump to
         // the top NOW with the send's preview + time — the panel must not keep
@@ -8927,37 +8421,18 @@ object MatrixRepository {
             is PendingImageSend -> maxOf(ts, p.timestampMs)
             null -> ts
         }
-        // Cursor-based unread (receiptCursorUnread): message-class events after
-        // the own read receipt; server notification_count only until the first
-        // receipt syncs (it counts non-message classes our client never
-        // renders — false flags on fully-read rooms). P1: the projection's
-        // count replaces the cursor when the room is projected (the hook
-        // applies the same junk rules at ingest; the receipt-cursor path is
-        // deleted in P2).
-        val cleared = pendingReadClear[key]
+        // Unread: the projection's count (the hook applied the junk rules at
+        // ingest). No row yet → the sync's server count (a free map read, no
+        // store walk), suppressed for encrypted rooms on an unverified device.
         val unread = if (projection != null) {
             projection.unreadCount
-        } else {
-            val storeUnread = if (verified || !room.encrypted) {
-                // Shared short-TTL batch (unreadCursorMemo); null is the
-                // no-own-receipt-yet case, so the server count is the fallback.
-                receiptCursorUnread(c, key) ?: (serverUnreadCounts[key]?.toLong() ?: 0L)
-            } else 0
-            servedUnread(
-                c,
-                key,
-                cleared?.second,
-                storeUnread,
-            )
-        }
+        } else if (verified || !room.encrypted) {
+            serverUnreadCounts[key]?.toLong() ?: 0L
+        } else 0
         val stateChanged = prev == null ||
             prev.room.lastEventId != lastEventId ||
             prev.room.unreadCount != unread ||
             prev.room.lastTimestampMs != rowTs
-        // A parked preview stays stale only while the room is unchanged — a new
-        // message (lastEventId move) re-attempts the preview immediately, so a
-        // freshly-decryptable arrival isn't hidden for the rest of the park.
-        val newMessageArrived = lastEventId != null && lastEventId != prev?.room?.lastEventId
 
         val nameResolved = prev?.nameResolved == true && !stateChanged
         val freshName = if (nameResolved) {
@@ -8979,11 +8454,10 @@ object MatrixRepository {
 
         val preview: String
         val previewResolved: Boolean
-        val previewRetryAtMs: Long
         when {
             pending != null -> {
                 // A send in flight: the preview is the sent body ("Voice note"
-                // for audio), named like [resolveRoomPreview] would.
+                // for audio), named like the room list would name it.
                 preview = pending.let { p ->
                     when (p) {
                         is PendingTextSend ->
@@ -8993,33 +8467,20 @@ object MatrixRepository {
                     }
                 }
                 previewResolved = true
-                previewRetryAtMs = 0L
             }
             projection != null -> {
                 preview = projection.preview
                 previewResolved = projection.previewResolved
-                previewRetryAtMs = 0L
             }
             prev != null && prev.previewResolved && !stateChanged -> {
                 preview = prev.room.lastMessage
                 previewResolved = true
-                previewRetryAtMs = 0L
-            }
-            lastEventId == null -> {
-                preview = ""
-                previewResolved = true
-                previewRetryAtMs = 0L
-            }
-            !newMessageArrived && android.os.SystemClock.elapsedRealtime() < (prev?.previewRetryAtMs ?: 0L) -> {
-                preview = prev?.room?.lastMessage.orEmpty()
-                previewResolved = false
-                previewRetryAtMs = prev!!.previewRetryAtMs
             }
             else -> {
-                val resolved = resolveRoomPreview(c, roomId, lastEventId, room)
-                preview = resolved.first
-                previewResolved = resolved.second
-                previewRetryAtMs = resolved.third
+                // No projection row yet: no preview until the hook writes one —
+                // never re-derive at read (P2).
+                preview = ""
+                previewResolved = true
             }
         }
 
@@ -9062,7 +8523,6 @@ object MatrixRepository {
             // keep re-resolving so the row upgrades when they arrive.
             nameResolved = name != ROOM_NAME_FALLBACK,
             previewResolved = previewResolved,
-            previewRetryAtMs = previewRetryAtMs,
         )
     }
 
@@ -9702,310 +9162,6 @@ object MatrixRepository {
     }
 
     /**
-     * The room's newest event that renders as a message row, for the list's
-     * sort + timestamp + preview. The server's room summary points at the newest event — after a
-     * bridge re-import flood that is a ghost, which bumped every room to the
-     * top of the chat list. When the server's last event is a ghost (or any
-     * non-renderable event — ack, reaction, redaction, edit), walk back
-     * through the store to the first renderable event (bounded); otherwise
-     * the server values pass through. Cached per server last event (the
-     * summary is stable between new messages, so the walk runs once).
-     */
-    private suspend fun effectiveLastEvent(
-        c: MatrixClient,
-        matrixRoomId: RoomId,
-        serverLastId: String?,
-        serverTs: Long,
-    ): Pair<String?, Long> {
-        if (serverLastId == null) return null to serverTs
-        val key = matrixRoomId.full
-        val now = android.os.SystemClock.elapsedRealtime()
-        effectiveLastCache[key]?.let { cached ->
-            if (cached.serverLastEventId == serverLastId) {
-                if (cached.retryAtMs == 0L || now < cached.retryAtMs) {
-                    // Resolved, or a timed-out walk still inside its retry
-                    // window — serve the cached values without re-walking.
-                    return cached.effectiveEventId to cached.effectiveTs
-                }
-                // Retry window expired — re-walk.
-                effectiveLastCache.remove(key)
-            }
-        }
-        // Last-known-good row for the unresolved paths below: the cache can
-        // hold the PREVIOUS server-last event's resolution — keep showing
-        // that message instead of stamping the row with an undecryptable
-        // event's time (re-import copies arrive re-encrypted; their content
-        // can't be read).
-        val prev = effectiveLastCache[key]
-        // Fast in-path walk (no session restore — old originals may not
-        // decrypt yet): if the server's newest event survives the dedup AND
-        // isn't inside a flood, it's a real message (the common case). The
-        // renderable filter also drops bridge status acks / reactions /
-        // redactions — events the thread never shows — so the row's time +
-        // preview match the newest actual message.
-        val fast = withTimeoutOrNull(ROOM_BUDGET_MS) {
-            // The DB chain, not the API walk: a gap marker at the room's
-            // newest event truncates the API view to just the head event, so
-            // the real messages behind a re-import copy were invisible and the
-            // stamp persisted (LP3: Antoine/+15052308756/🌠/+491625672577
-            // stuck at 09:08). The chain read walks past gap markers.
-            collectRelevantTimelineEvents(c, matrixRoomId, serverLastId, EFFECTIVE_LAST_FAST, fast = true).first
-        }.orEmpty()
-        // Renderable AND non-empty: a bridge status ack, reaction, redaction,
-        // or an empty-rendering re-import copy must not be the "real last
-        // message" — the first entry here is what the row shows. Filtering
-        // empties out lets the FIRST real message behind a run of copies/acks
-        // resolve immediately (the fast window holds it), instead of waiting
-        // on the async ghost resolve.
-        val fastFiltered = filterGhosts(c, fast)
-            .filter { isRenderableRow(it) && previewText(it)?.isNotBlank() == true }
-        val serverLast = fast.firstOrNull { it.event.id.full == serverLastId }
-        val inFlood = serverLast != null && isFloodGhost(c, serverLast, fast)
-        // Pin permanently only when the server-last event is a REAL message:
-        // its content must be READABLE (an undecryptable re-import copy must
-        // not top the list —) AND it must RENDER something (a
-        // re-import copy whose body resolves to nothing shows an empty
-        // preview — LP3: rooms stamped 09:08 with lastMsg='' after the
-        // bridge's history re-import; "the timestamp should reflect the
-        // latest real message").
-        if (fastFiltered.firstOrNull()?.event?.id?.full == serverLastId && !inFlood &&
-            serverLast?.let { contentSignature(c, it) != null && previewText(it)?.isNotBlank() == true } == true
-        ) {
-            effectiveLastCache[key] = EffectiveLast(serverLastId, serverLastId, serverTs)
-            return serverLastId to serverTs
-        }
-        // The newest event is still mid-decrypt (content unresolved, not yet a
-        // failure — the megolm key arrived after this pass started): it drops
-        // out of fastFiltered below, so without this branch the firstReal pin
-        // would cache yesterday's message forever and the row would keep the
-        // old timestamp until the room's next message or a restart. Stamp the new event now — the room bumps to today on the
-        // same dirty pass — and retry after the decrypt window; the re-walk
-        // then pins it permanently once readable, or routes a failed decrypt
-        // to the ghost machinery below.
-        val newestDecryptPending = serverLast != null &&
-            serverLast.content?.getOrNull() == null &&
-            serverLast.event.content is EncryptedMessageEventContent &&
-            serverLast.content?.isFailure != true
-        if (newestDecryptPending && !inFlood) {
-            effectiveLastCache[key] = EffectiveLast(
-                serverLastId, serverLastId, serverTs, retryAtMs = now + GHOST_WALK_RETRY_MS,
-            )
-            return serverLastId to serverTs
-        }
-        // A head that is a MESSAGE (text, media, or an encrypted payload that
-        // will decrypt to one) is real activity even when its content can't be
-        // read at resolve time — stamp the row with its id+time instead of
-        // serving the last-known-good row. Without this, a failed-decrypt head
-        // (megolm session missing until the backup restore, Beeper bridged
-        // rooms) fell through to the ghost machinery below and the row sat on
-        // the old message for hours-to-weeks while the thread itself showed
-        // the newer message. Edits (m.replace)
-        // and flood ghosts are excluded — the row must not bump to edit time
-        // or to a re-import flood. The ghost resolve
-        // below still runs so the preview heals once content resolves; member
-        // -join/ack heads keep the no-fake-time park.
-        if (serverLast != null && isMessageClassHead(serverLast) && !inFlood) {
-            // A RESOLVED message head (plaintext or decrypted payload) is real
-            // activity — pin permanently. An encryption-FAILED head (isFailure)
-            // is only ASSUMED to be a message: it may never decrypt, or decrypt
-            // to member/state churn (bridges push megolm member joins — LP3:
-            // the empty "Josh Schiff" room was stamped by its own join event
-            // and stuck at the list top). So failed heads pin tentatively and
-            // re-classify after the retry window; a genuine message keeps the
-            // bump across retries.
-            val headResolved = serverLast.content?.getOrNull() != null
-            if (!headResolved) enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
-            effectiveLastCache[key] = EffectiveLast(
-                serverLastId, serverLastId, serverTs,
-                retryAtMs = if (headResolved) 0L else now + GHOST_WALK_RETRY_MS,
-            )
-            return serverLastId to serverTs
-        }
-        // The server's newest event renders as nothing — a dropped edit, a
-        // bridge status ack / reaction / redaction, or an in-flood ghost. When
-        // the fast window already holds a renderable event, resolve it
-        // immediately: real messages decrypt fine, so the background walk
-        // would find the same event after a needless session-restore detour.
-        val firstReal = fastFiltered.firstOrNull()
-        // A still-decrypting newest must not pin the older message forever
-        // either (in-flood copies fall through here) — route to the ghost
-        // machinery instead, which preserves the last-good row and retries.
-        if (firstReal != null && firstReal.event.id.full != serverLastId && !newestDecryptPending) {
-            val realTs = firstReal.event.originTimestamp
-            effectiveLastCache[key] = EffectiveLast(serverLastId, firstReal.event.id.full, realTs)
-            return firstReal.event.id.full to realTs
-        }
-        // A room whose newest event is pure state (member join, reaction,
-        // bridge ack) and which has NEVER resolved a real message (prev ==
-        // null) has nothing to stamp: the server's head time is a state
-        // re-delivery, not activity, and surfacing it as fresh fakes a
-        // timestamp. Park the row at the bottom (ts 0, no preview) until the
-        // ghost walk finds real content or a real message arrives — the fast
-        // path re-checks on every server-last change, so a genuine arrival
-        // still surfaces. (LP3: this check MUST sit before the
-        // decrypt-restore branch below — with the cooldown inactive that
-        // branch serves the raw head (member id + ts) and re-stamps parked
-        // rows: Josh Schiff / WhatsApp (+49…) bounced between park and the
-        // top of the list on every cooldown expiry.)
-        if (prev == null && serverLast?.let { !isRenderableRow(it) } == true) {
-            enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
-            effectiveLastCache[key] = EffectiveLast(
-                serverLastId, null, 0L, retryAtMs = now + GHOST_WALK_RETRY_MS,
-            )
-            return null to 0L
-        }
-        // Suspicious (dropped by the dedup, or inside a flood): keep the
-        // last-known-good (or the raw head — only reachable for renderable
-        // heads now that the park above runs first) until the background
-        // walk lands. The walk is skipped while a futile-restore park is
-        // active (the originals' sessions are gone — it can't resolve);
-        // the retry then aligns with the park's end instead of the default
-        // GHOST_WALK_RETRY_MS.
-        if (decryptRestoreCooldown.allowed(matrixRoomId.full)) {
-            enqueueGhostResolve(c, matrixRoomId, serverLastId, serverTs)
-        }
-        effectiveLastCache[key] = EffectiveLast(
-            serverLastId, prev?.effectiveEventId ?: serverLastId, prev?.effectiveTs ?: serverTs,
-            retryAtMs = decryptRestoreCooldown.until(key).takeIf { it > 0L }
-                ?: (now + GHOST_WALK_RETRY_MS),
-        )
-        return (prev?.effectiveEventId ?: serverLastId) to (prev?.effectiveTs ?: serverTs)
-    }
-
-    /** Rooms currently being ghost-resolved in the background (keyed by room|serverLast). */
-    private val ghostResolveInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-
-    /**
-     * Background resolution of a room's real last event: collects the newest
-     * events, restores the originals' megolm sessions from the key backup
-     * (bounded), re-reads, and content-dedups — then caches the result so the
-     * resolver's next pass picks it up. Runs off the resolver's pass loop so a
-     * slow key-backup restore doesn't stall the whole list.
-     */
-    private fun enqueueGhostResolve(c: MatrixClient, matrixRoomId: RoomId, serverLastId: String, serverTs: Long) {
-        val key = matrixRoomId.full
-        if (!ghostResolveInFlight.add("$key|$serverLastId")) return
-        scope.launch {
-            try {
-                // Sync-ingest gate: the walk (collect + key-backup restore) is
-                // exactly the heavy store/CPU work that must not contend with
-                // a running sync ingest (SYNC-PERF-SPEC §Phase 1).
-                yieldToSyncIngest()
-                val walked = withTimeoutOrNull(GHOST_WALK_BUDGET_MS) {
-                    val events = collectTimelineEvents(c, matrixRoomId, serverLastId, EFFECTIVE_LAST_WALK)
-                    // Skip the re-collect when the restore found nothing to
-                    // load — nothing changed, the first walk's events are the
-                    // final answer.
-                    val loaded = restoreRoomSessions(c, matrixRoomId, events)
-                    if (loaded > 0) {
-                        collectTimelineEvents(c, matrixRoomId, serverLastId, EFFECTIVE_LAST_WALK)
-                    } else events
-                }
-                if (walked != null) {
-                    val real = filterGhosts(c, walked).filter { isRenderableRow(it) }.firstOrNull()
-                    val kept = effectiveLastCache[key]
-                    val healed = real != null && kept?.effectiveEventId != real.event.id.full
-                    effectiveLastCache[key] = EffectiveLast(
-                        serverLastId,
-                        real?.event?.id?.full,
-                        real?.event?.originTimestamp ?: 0L,
-                    )
-                    android.util.Log.d(
-                        TAG,
-                        "ghostResolve: $key server last $serverLastId → real last ${real?.event?.id?.full ?: "none"}",
-                    )
-                    // Phase 2.1 heal (SYNC-PERF-SPEC): the walk resolves what the
-                    // resolve path couldn't read yet — the room-state flow fires
-                    // before the timeline event is queryable in the store, and the
-                    // row parks on last-known-good (probe: row stuck 10 min
-                    // behind a message the walk had resolved 0.8 s after it
-                    // landed). Publish the healed room's row directly — the
-                    // resolver has no sweep to re-resolve it
-                    // (INGEST-DERIVED-PLAN Phase C).
-                    if (healed) {
-                        c.room.getById(matrixRoomId).firstOrNull()?.let {
-                            publishRoomRowNow(c, matrixRoomId, it)
-                        }
-                    }
-                } else {
-                    // Timed out: the walk can't complete within budget (large or
-                    // undecryptable rooms). Back off hard instead of retrying
-                    // every 2 minutes — the room isn't going to resolve, and the
-                    // fast path re-checks it on every server-last change anyway.
-                    // Keep the current effective
-                    // values (the message-less park's null/0, or the last-known-
-                    // good message) — re-stamping the raw head here would
-                    // resurrect a fake state-event time.
-                    val kept = effectiveLastCache[key]
-                    effectiveLastCache[key] = EffectiveLast(
-                        serverLastId,
-                        kept?.effectiveEventId ?: serverLastId,
-                        kept?.effectiveTs ?: serverTs,
-                        retryAtMs = android.os.SystemClock.elapsedRealtime() + GHOST_WALK_FAIL_BACKOFF_MS,
-                    )
-                }
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "ghostResolve failed for $key", e)
-            } finally {
-                ghostResolveInFlight.remove("$key|$serverLastId")
-            }
-        }
-    }
-
-    /**
-     * Bounded read of the room's newest event. Returns (preview, resolved,
-     * retryAtMs): an "[Encrypted]" preview is unresolved; the room is parked
-     * (futile-restore cooldown) and retried only after the park expires. A
-     * real session arrival decrypts in-band and re-resolves it via the room's
-     * state change, so short retries just burn CPU on rooms that can't decrypt.
-     */
-    private suspend fun resolveRoomPreview(
-        c: MatrixClient,
-        roomId: RoomId,
-        lastEventId: String,
-        room: MatrixRoom,
-    ): Triple<String, Boolean, Long> {
-        val te = withTimeoutOrNull(PREVIEW_BUDGET_MS) {
-            c.room.getTimelineEvent(roomId, EventId(lastEventId)).filterNotNull().firstOrNull {
-                it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
-            }
-        }
-        if (te == null) {
-            // An undecryptable preview won't resolve until a megolm session
-            // arrives — and when one does, sync decrypts in-band and the
-            // room's state change re-resolves this preview fresh. Park the
-            // room instead of re-attempting every 60 s forever; the park also
-            // lets the resolver's pass loop idle (no pending work to wake for).
-            decryptRestoreCooldown.park(roomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
-            return Triple("", false, decryptRestoreCooldown.until(roomId.full))
-        }
-        val text = previewText(te) ?: ""
-        val encrypted = text.startsWith("[Encrypted")
-        // DMs and broadcast channels (you + the channel ghost) don't need a
-        // sender prefix — Beeper never marks Telegram channel rooms as direct,
-        // so the same ≤2-member test as the room list applies.
-        // Channel echoes also bake your own name into the body ("FENN: post"),
-        // stripped here so the preview shows the post itself.
-        val broadcast = room.isDirect || (room.joinedMemberCount ?: 0L) <= 2L
-        val stripped = if (broadcast) stripOwnPrefix(text, senderNameOf(c, roomId, c.userId)) else text
-        // Group-chat previews name the sender ("Anni: the message", "You: …" —
-        // the WhatsApp/Beeper convention); DMs don't need it and an unresolved
-        // "[Encrypted]" row has no readable sender.
-        val preview = if (encrypted || broadcast) stripped else {
-            val sender = if (te.event.sender == c.userId) "You" else senderNameOf(c, roomId, te.event.sender)
-            "$sender: $stripped"
-        }
-        return Triple(
-            preview,
-            !encrypted,
-            if (encrypted) {
-                decryptRestoreCooldown.park(roomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
-                decryptRestoreCooldown.until(roomId.full)
-            } else 0L,
-        )
-    }
-
-    /**
      * Drops stale community-room duplicates: when the
      * WhatsApp number changed, Beeper re-created community groups under new
      * rooms; the old rooms linger outside the community sub-space (no
@@ -10095,6 +9251,7 @@ object MatrixRepository {
                 val ingestGap = android.os.SystemClock.elapsedRealtime() - lastSyncResponseAt
                 if (ingestGap > 35_000L) {
                     android.util.Log.w(TAG, "sync ingest gap: ${ingestGap}ms between last response and this request — emit path stalled the loop")
+                    Diagnostics.record("sync ingest gap: ${ingestGap}ms — emit path stalled")
                 }
             }
             val t0 = android.os.SystemClock.elapsedRealtime()
@@ -10434,6 +9591,7 @@ object MatrixRepository {
                 sessionExpired = true
                 PushChannel.stop()
                 android.util.Log.w(TAG, "session no longer logged in ($state) — treating as expired")
+                Diagnostics.record("session expired — sync stopped")
                 setConnectionState(ChatConnectionState.Offline("session expired — sign in again"))
                 scheduleSyncStop()
             }
@@ -10704,6 +9862,12 @@ object MatrixRepository {
         var lastPreviewResolved = false
         var unread = 0L
         var pendingDecryption = false
+        // Existing row's head ts, fetched lazily: only a room whose walk meets
+        // a `batch/` txn event (bridge history re-import) pays the one indexed
+        // SELECT — the replay rule compares against row existence (null =
+        // no row yet).
+        var existingHeadTs: Long? = null
+        var fetchedExistingRow = false
         for (te in events) {
             val raw = te.event.content
             val isEncrypted = raw is EncryptedMessageEventContent
@@ -10711,6 +9875,15 @@ object MatrixRepository {
             val messageClass = isEncrypted || raw is RoomMessageEventContent
             val originTs = te.event.originTimestamp
             val sender = te.event.sender.full
+            val txn = txnIdOf(te)
+            var isBatchReplay = false
+            if (txn != null && txn.startsWith(ProjectionPredicate.BATCH_TXN_PREFIX)) {
+                if (existingHeadTs == null && !fetchedExistingRow) {
+                    existingHeadTs = projectionRow(c, roomId.full)?.lastRealTs
+                    fetchedExistingRow = true
+                }
+                isBatchReplay = ProjectionPredicate.batchReplay(txn, existingHeadTs)
+            }
             val renders = ProjectionPredicate.renders(
                 messageClass = messageClass,
                 isReplaceEdit = isReplaceEdit(te),
@@ -10718,7 +9891,9 @@ object MatrixRepository {
                 now = now,
                 isEncrypted = isEncrypted,
                 decryptedOk = decryptedOk,
-            ) && !isFloodGhost(c, te, events)
+                isFlood = isFloodGhost(c, te, events),
+                isBatchReplay = isBatchReplay,
+            )
             if (isEncrypted && !decryptedOk && !ProjectionPredicate.encryptedStale(originTs, now)) {
                 pendingDecryption = true
             }
@@ -10831,16 +10006,6 @@ object MatrixRepository {
         return content is RoomMessageEventContent ||
             (content == null && te.event.content is EncryptedMessageEventContent)
     }
-
-    /** Message-class head (text, media, encrypted payload) — the only event
-     *  class a room row may stamp its time from while undecryptable. Edits
-     *  (m.replace) excluded: the row follows the original message. */
-    private fun isMessageClassHead(te: TimelineEvent): Boolean =
-        when (val raw = te.event.content) {
-            is EncryptedMessageEventContent -> true
-            is RoomMessageEventContent -> raw.relatesTo !is RelatesTo.Replace
-            else -> false
-        }
 
     /**
      * The "[Message unsent]" tombstone row for a redacted message event (Phase
@@ -11392,26 +10557,9 @@ object MatrixRepository {
     private const val MEGOLM_STALE_CHECK_TTL_MS = 300_000L
 
     // Bridge-ghost filtering (Phase 14.5).
-    /** Density-fallback window: a txn-id event inside this many of [GHOST_FLOOD_THRESHOLD] others is a flood. */
+    /** Density-fallback window: a txn-id event inside this many of
+     *  [ProjectionPredicate.FLOOD_THRESHOLD] others is a flood. */
     private const val GHOST_BURST_WINDOW_MS = 60_000L
-    /** Flood fallback: real conversations rarely exceed this rate (re-imports are per-second). */
-    private const val GHOST_FLOOD_THRESHOLD = 30
-    /** Room-list effective-last walk cap (decrypted events). Was 800 — walks
-     *  over that depth never completed inside [GHOST_WALK_BUDGET_MS] on the
-     *  LP3 (1284-room account), so rooms backed off instead of
-     *  healing; 100 still spans any ack/reaction/re-import run. */
-    private const val EFFECTIVE_LAST_WALK = 100
-    /** In-path fast window — big enough to spot a >=[GHOST_FLOOD_THRESHOLD] flood. */
-    private const val EFFECTIVE_LAST_FAST = 50
-    /** How long a pending ghost-resolution is parked before the resolver retries. */
-    private const val GHOST_WALK_RETRY_MS = 120_000L
-    /** Backoff after a ghost walk times out (can't complete within its budget).
-     *  Was 4 h — with the head-time stamp the row no longer
-     *  depends on the walk for its timestamp, so 15 min keeps the heal cheap
-     *  without a 4 h-stale row as the cost of a failed walk. */
-    private const val GHOST_WALK_FAIL_BACKOFF_MS = 900_000L
-    /** Bound for the effective-last decrypting walk (one-time per room, cached). */
-    private const val GHOST_WALK_BUDGET_MS = 8_000L
 
     // Media / photos.
     /**
