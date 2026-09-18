@@ -9781,8 +9781,31 @@ object MatrixRepository {
             }
             return
         }
-        val roomIds = rooms.keys.toList()
+        // JOIN rooms only: the projection describes the joined set — a left
+        // room's row would linger forever (no sync events ever recompute it)
+        // and drift the Account "x of n rooms" stat.
+        val roomIds = rooms.keys.mapNotNull { id ->
+            withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
+                rooms[id]?.filterNotNull()?.firstOrNull()
+            }?.takeIf { it.membership == Membership.JOIN }?.let { id }
+        }
         android.util.Log.d(TAG, "projection: backfill starting (${roomIds.size} rooms)")
+        // Reconcile: drop rows for rooms no longer joined (left, or pruned
+        // from the store entirely). Once per login, not a sweep.
+        if (roomIds.isNotEmpty()) {
+            val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            if (db != null && projectionTableReady) {
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        val holes = roomIds.joinToString(",") { "?" }
+                        db.openHelper.writableDatabase.execSQL(
+                            "DELETE FROM RoomProjection WHERE roomId NOT IN ($holes)",
+                            roomIds.map { it.full as Any }.toTypedArray(),
+                        )
+                    }
+                }
+            }
+        }
         val written = recomputeProjectionRows(c, roomIds)
         // An empty store (fresh login, initial sync not landed yet) is not
         // "done" — retry until rooms exist or the attempt cap hits.
