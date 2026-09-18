@@ -841,6 +841,17 @@ private fun AccountStatus(
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }
+            // P2 stat (2026-09-15 design): the honest restore→sync→projecting
+            // aggregate — rooms whose ingest-time projection row is
+            // materialized, vs the joined-room count. Hidden until the room
+            // count is known (n > 0).
+            if (state.roomsJoined > 0) {
+                LightText(
+                    text = "Synced ${state.roomsProjected} of ${state.roomsJoined} rooms",
+                    variant = LightTextVariant.Fine,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
         }
     }
 }

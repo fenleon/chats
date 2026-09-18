@@ -2460,6 +2460,20 @@ object MatrixRepository {
         val roomsTotal = roomListCache.size
         val roomsResolved = roomListCache.values.count { it.nameResolved }
         val restore = _restoreProgress.value
+        // P2 stat: x = COUNT(*) of RoomProjection rows, n = joined rooms (the
+        // list cache is the JOIN-filtered room set). One indexed COUNT on the
+        // binder thread — the GetRooms handler runBlocks multi-second calls,
+        // this is noise. No table / no client → 0 (the screen hides the line).
+        val roomsProjected = client?.let { c ->
+            runCatching {
+                val db = c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class)
+                if (!projectionTableReady) 0
+                else db.openHelper.writableDatabase
+                    .query("SELECT COUNT(*) FROM RoomProjection", arrayOf<String>()).use { cur ->
+                        if (cur.moveToFirst()) cur.getInt(0) else 0
+                    }
+            }.getOrDefault(0)
+        } ?: 0
         return com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response(
             state = when (state) {
                 ChatConnectionState.LoggedOut -> "logged_out"
@@ -2475,6 +2489,8 @@ object MatrixRepository {
             restoreScanned = restore.scanned,
             restoreRoomsTotal = restore.roomsTotal,
             restoreCompleted = restore.completed,
+            roomsProjected = roomsProjected,
+            roomsJoined = roomsTotal,
         )
     }
 
