@@ -52,6 +52,12 @@ object ThreadRowStore {
         "CREATE INDEX IF NOT EXISTS idx_threadrow_target " +
             "ON ThreadRow (roomId, targetEventId)"
 
+    /** Partial index for the recheck's placeholder scan (pendingRows) — the
+     *  full-table `encrypted=1` scan ran every 30 s otherwise. */
+    private const val DDL_IDX_PENDING =
+        "CREATE INDEX IF NOT EXISTS idx_threadrow_pending " +
+            "ON ThreadRow(roomId, ingestSeq) WHERE encrypted=1"
+
     /** Part H backfill bookmark: one resume token per room. Lives in the same
      *  SQLite (not PREFS) so it dies with the store at logout — a re-login
      *  backfills from scratch, per SPEC §8. */
@@ -66,6 +72,7 @@ object ThreadRowStore {
         db.execSQL(DDL_THREADROW)
         db.execSQL(DDL_IDX_PAGE)
         db.execSQL(DDL_IDX_TARGET)
+        db.execSQL(DDL_IDX_PENDING)
         db.execSQL(DDL_CURSOR)
     }
 

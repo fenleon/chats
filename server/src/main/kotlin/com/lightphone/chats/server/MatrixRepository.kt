@@ -4858,7 +4858,10 @@ object MatrixRepository {
             android.util.Log.d(TAG, "restoreRoomSessions: $matrixRoomId — all ${sessionIds.size} session(s) local, re-decrypted $resolvedLocal event(s), no backup needed")
             return resolvedLocal
         }
-        if (decryptRestoreCooldown.allowed(matrixRoomId.full)) return resolvedLocal
+        // allowed() is true when NOT parked (CooldownMap) — the backup
+        // round-trip must run only then (polarity was inverted by the
+        // cooldown refactor 70e0702, so it ran exactly while parked).
+        if (!decryptRestoreCooldown.allowed(matrixRoomId.full)) return resolvedLocal
         backupSessionIds.forEach { sessionId ->
             try {
                 val ok = withTimeoutOrNull(KEY_BACKUP_LOAD_TIMEOUT_MS) {
@@ -10055,12 +10058,18 @@ object MatrixRepository {
             val root = runCatching { json.parseToJsonElement(value).jsonObject }.getOrNull()
                 ?: return@mapNotNull null
             val eventJson = root["event"] as? JsonObject
+            val type = eventJson?.get("type")?.jsonPrimitive?.contentOrNull
             StoredTimelineEvent(
                 event = event,
-                type = eventJson?.get("type")?.jsonPrimitive?.contentOrNull,
+                type = type,
                 redactsTopLevel = eventJson?.get("redacts")?.jsonPrimitive?.contentOrNull,
+                // An encrypted event without Trixnity's re-persisted
+                // {type, value} wrapper is still ciphertext — contentJson
+                // must be null then (RawEventInput's resolved-content
+                // contract), never the m.room.encrypted payload.
                 contentJson = ((root["content"] as? JsonObject)?.get("value")
-                    ?: eventJson?.get("content"))?.let { runCatching { json.encodeToString(it) }.getOrNull() },
+                    ?: if (type == "m.room.encrypted") null else eventJson?.get("content"))
+                    ?.let { runCatching { json.encodeToString(it) }.getOrNull() },
             )
         }
     }
@@ -10118,6 +10127,7 @@ object MatrixRepository {
                 decryptRestoreCooldown.park(roomId, DECRYPT_RESTORE_COOLDOWN_MS)
             }
             val fills = ArrayList<ThreadRowValues>(roomRows.size)
+            var roomDropped = 0
             for (stored in readStoredTimelineEvents(c, matrixRoomId, eventIds)) {
                 val row = roomRows.first { it.eventId == stored.event.event.id.full }
                 if (stored.event.content?.getOrNull() == null) continue // still pending — next pass
@@ -10127,6 +10137,7 @@ object MatrixRepository {
                     // text, tombstone) — drop the placeholder, same rule the
                     // read path applies to such events.
                     ThreadRowStore.deleteRow(c, roomId, row.eventId)
+                    roomDropped++
                     dropped++
                     continue
                 }
@@ -10141,8 +10152,9 @@ object MatrixRepository {
             if (fills.isNotEmpty()) {
                 ThreadRowStore.writeRows(c, fills)
                 filled += fills.size
-                bumpMessagePageRevision(roomId)
             }
+            // Any pass change (fill or drop) repaints an open thread.
+            if (fills.isNotEmpty() || roomDropped > 0) bumpMessagePageRevision(roomId)
         }
         if (debugLogging() && (filled > 0 || dropped > 0)) {
             android.util.Log.d(TAG, "thread-store recheck: $filled filled, $dropped dropped")
