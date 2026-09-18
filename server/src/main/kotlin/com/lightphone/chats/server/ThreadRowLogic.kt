@@ -36,11 +36,24 @@ data class RawEventInput(
     val type: String,
     val sender: String,
     val originTs: Long,
+    /**
+     * MUST be the resolved event content JSON — for `m.room.encrypted`
+     * events, the DECRYPTED content (the persisted `TimelineEvent` JSON after
+     * Trixnity re-persists the decrypted payload). All relation
+     * classification (m.replace edits, m.annotation reactions, reply-to,
+     * send-status targets) reads from here; the ciphertext blob carries no
+     * relations, so a writer passing raw ciphertext for a decrypted event
+     * would misclassify it as a plain message row.
+     */
     val contentJson: String?,
     val decryptedBody: String?,
     val formattedBody: String?,
     val prevEventId: String?,
     val batchBefore: String?,
+    /** Pre-v11 room redactions carry the target as the event's top-level
+     *  `redacts` field, outside content — the writer passes it here. Used
+     *  only when content-level `redacts` is absent. */
+    val redactsTopLevel: String? = null,
 )
 
 /** Renderable item kinds — the `kind` column's wire values (SPEC §1). */
@@ -78,7 +91,6 @@ object ThreadRowLogic {
     private const val TYPE_MESSAGE = "m.room.message"
     private const val TYPE_ENCRYPTED = "m.room.encrypted"
     private const val TYPE_REDACTION = "m.room.redaction"
-    private const val TYPE_STICKER = "m.sticker"
 
     private const val REL_ANNOTATION = "m.annotation"
     private const val REL_REPLACE = "m.replace"
@@ -144,9 +156,9 @@ object ThreadRowLogic {
             when {
                 e.type == TYPE_REDACTION -> {
                     kind = RowKind.REDACTION.wire
-                    // Room v11 moved `redacts` into content; the writer's
-                    // RawEventInput carries that JSON only.
-                    targetEventId = content?.redacts
+                    // Room v11 moved `redacts` into content; pre-v11 events
+                    // carry it top-level on the event (redactsTopLevel).
+                    targetEventId = content?.redacts ?: e.redactsTopLevel
                 }
                 rel?.relType == REL_REPLACE -> {
                     kind = RowKind.EDIT.wire
@@ -164,8 +176,10 @@ object ThreadRowLogic {
                     payload = sendStatusOf(content)
                 }
                 else -> {
-                    val messageClass = e.type == TYPE_MESSAGE ||
-                        e.type == TYPE_ENCRYPTED || e.type == TYPE_STICKER
+                    // Stickers are NOT message class: today's read path has no
+                    // sticker handling, so a message row would diverge from
+                    // what the §7 seed path (computeMessagesPage) produces.
+                    val messageClass = e.type == TYPE_MESSAGE || e.type == TYPE_ENCRYPTED
                     val renders = ProjectionPredicate.renders(
                         messageClass = messageClass,
                         isReplaceEdit = false,

@@ -2,6 +2,7 @@ package com.lightphone.chats.server
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -24,9 +25,10 @@ class ThreadRowLogicTest {
         formattedBody: String? = null,
         prevEventId: String? = null,
         batchBefore: String? = null,
+        redactsTopLevel: String? = null,
     ) = RawEventInput(
         eventId, type, sender, originTs, contentJson, decryptedBody,
-        formattedBody, prevEventId, batchBefore,
+        formattedBody, prevEventId, batchBefore, redactsTopLevel,
     )
 
     // --- buildRows: message rows ---
@@ -76,6 +78,16 @@ class ThreadRowLogicTest {
             now = 1_000,
         )
         assertTrue(rows.isEmpty(), "future-stamped bridge skew must not become a row")
+    }
+
+    @Test
+    fun `sticker event is dropped (not message class)`() {
+        val rows = ThreadRowLogic.buildRows(
+            "!r", 0,
+            listOf(raw("st1", type = "m.sticker", contentJson = """{"body":"sticker"}""")),
+            now = 1_000,
+        )
+        assertTrue(rows.isEmpty(), "stickers must not become message rows (no read-path handling)")
     }
 
     // --- buildRows: side rows (bypass the predicate) ---
@@ -186,6 +198,78 @@ class ThreadRowLogicTest {
         assertEquals("secret", rows[0].body)
     }
 
+    @Test
+    fun `encrypted event with decrypted relations classifies as side rows`() {
+        // contentJson is the DECRYPTED content (the writer's contract): an
+        // m.replace relation must classify as an edit, an m.annotation as a
+        // reaction — not as message rows.
+        val edit = ThreadRowLogic.buildRows(
+            "!r", 0,
+            listOf(
+                raw(
+                    "e1", type = "m.room.encrypted",
+                    contentJson = """{"msgtype":"m.text","body":"* edited",""" +
+                        """"m.new_content":{"body":"edited"},""" +
+                        """"m.relates_to":{"rel_type":"m.replace","event_id":"m1"}}""",
+                    decryptedBody = "edited",
+                )
+            ),
+            now = 1_000,
+        )
+        assertEquals("edit", edit.single().kind)
+        assertEquals("m1", edit.single().targetEventId)
+        assertEquals("edited", edit.single().payload)
+
+        val reaction = ThreadRowLogic.buildRows(
+            "!r", 0,
+            listOf(
+                raw(
+                    "e2", type = "m.room.encrypted",
+                    contentJson = """{"m.relates_to":{"rel_type":"m.annotation",""" +
+                        """"event_id":"m1","key":"❤️"}}""",
+                    decryptedBody = "❤️",
+                )
+            ),
+            now = 1_000,
+        )
+        assertEquals("reaction", reaction.single().kind)
+        assertEquals("m1", reaction.single().targetEventId)
+        assertEquals("❤️", reaction.single().payload)
+    }
+
+    @Test
+    fun `redaction falls back to top level redacts (pre v11)`() {
+        val rows = ThreadRowLogic.buildRows(
+            "!r", 0,
+            listOf(
+                raw(
+                    "rd1", type = "m.room.redaction",
+                    contentJson = """{}""",
+                    redactsTopLevel = "m1",
+                )
+            ),
+            now = 1_000,
+        )
+        assertEquals("redaction", rows.single().kind)
+        assertEquals("m1", rows.single().targetEventId)
+    }
+
+    @Test
+    fun `content level redacts wins over top level`() {
+        val rows = ThreadRowLogic.buildRows(
+            "!r", 0,
+            listOf(
+                raw(
+                    "rd1", type = "m.room.redaction",
+                    contentJson = """{"redacts":"m-content"}""",
+                    redactsTopLevel = "m-top",
+                )
+            ),
+            now = 1_000,
+        )
+        assertEquals("m-content", rows.single().targetEventId)
+    }
+
     // --- applySideRow ---
 
     @Test
@@ -252,5 +336,20 @@ class ThreadRowLogicTest {
     @Test
     fun `keyset roundtrip`() {
         assertEquals(100L to 7, ThreadRowLogic.parseKeyset(ThreadRowLogic.keysetBefore(100, 7)))
+    }
+
+    @Test
+    fun `parseKeyset malformed input throws`() {
+        assertFailsWith<NumberFormatException>("a cursor without the | separator must not parse silently") {
+            ThreadRowLogic.parseKeyset("not-a-cursor")
+        }
+        assertFailsWith<NumberFormatException>("a non-numeric component must not parse silently") {
+            ThreadRowLogic.parseKeyset("100|x")
+        }
+    }
+
+    @Test
+    fun `reactionSummaryOf empty list is empty object`() {
+        assertEquals("{}", ThreadRowLogic.reactionSummaryOf(emptyList()))
     }
 }
