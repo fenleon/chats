@@ -77,6 +77,14 @@ object ThreadRowStore {
      * rebased seqs stay monotonic over the list. Rows come from one room
      * ([ThreadRowLogic.buildRows] contract).
      *
+     * Re-delivery idempotency (Task 3 review ruling): an eventId already in
+     * the table is SKIPPED — a re-synced round must not churn the page
+     * order — with one exception: a decrypt placeholder (encrypted=1) that
+     * receives its decrypted body updates IN PLACE, keeping the original
+     * `ingestSeq`. The fold below then re-applies the side rows onto the
+     * updated target, recomputing its cached columns (reactionSummary
+     * included).
+     *
      * Side rows (reaction / edit / redaction / send-status) are stored as
      * rows — the only truth — and folded into their target message row here:
      * targets present in this batch, targets of this batch's side rows, and
@@ -95,6 +103,40 @@ object ThreadRowStore {
                 try {
                     ensureTable(sq)
                     for (row in rows) {
+                        val existing = queryFirst(
+                            sq,
+                            "SELECT * FROM ThreadRow WHERE roomId=? AND eventId=?",
+                            arrayOf(row.roomId, row.eventId),
+                        )
+                        if (existing != null) {
+                            if (existing.encrypted == 1 && row.encrypted == 0 &&
+                                existing.kind == RowKind.MESSAGE.wire &&
+                                row.kind == RowKind.MESSAGE.wire &&
+                                row.body != null
+                            ) {
+                                sq.execSQL(
+                                    "UPDATE ThreadRow SET sender=?,timestampMs=?,body=?," +
+                                        "formattedHtml=?,contentType=?,replyToId=?,mediaMeta=?," +
+                                        "sendStatus=?,encrypted=0,prevEventId=?,batchBefore=? " +
+                                        "WHERE roomId=? AND eventId=?",
+                                    arrayOf<Any?>(
+                                        row.sender,
+                                        row.timestampMs,
+                                        row.body,
+                                        row.formattedHtml,
+                                        row.contentType,
+                                        row.replyToId,
+                                        row.mediaMeta,
+                                        row.sendStatus,
+                                        row.prevEventId,
+                                        row.batchBefore,
+                                        row.roomId,
+                                        row.eventId,
+                                    ),
+                                )
+                            }
+                            continue
+                        }
                         val seq = sq.query(
                             "SELECT COALESCE(MAX(ingestSeq),0)+1 FROM ThreadRow WHERE roomId=?",
                             arrayOf(row.roomId),
@@ -110,6 +152,41 @@ object ThreadRowStore {
                     sq.endTransaction()
                 }
             }.onFailure { Log.w(TAG, "write failed: ${it.message}") }
+        }
+    }
+
+    /**
+     * Placeholder rows (encrypted=1) for the ingest writer's 30 s decrypt
+     * recheck (SPEC §2/§4), oldest room+ingest first, bounded per pass.
+     */
+    suspend fun pendingRows(c: MatrixClient, limit: Int): List<ThreadRowValues> {
+        val db = database(c) ?: return emptyList()
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                queryRows(
+                    db.openHelper.writableDatabase,
+                    "SELECT * FROM ThreadRow WHERE encrypted=1 " +
+                        "ORDER BY roomId, ingestSeq LIMIT ?",
+                    arrayOf<Any?>(limit),
+                )
+            }.getOrDefault(emptyList<ThreadRowValues>())
+        }
+    }
+
+    /**
+     * Remove one row — the decrypt recheck drops a placeholder that decrypted
+     * to something the page would not render (the same rule the read path
+     * applies to such events).
+     */
+    suspend fun deleteRow(c: MatrixClient, roomId: String, eventId: String) {
+        val db = database(c) ?: return
+        withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase.execSQL(
+                    "DELETE FROM ThreadRow WHERE roomId=? AND eventId=?",
+                    arrayOf(roomId, eventId),
+                )
+            }
         }
     }
 

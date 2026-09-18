@@ -161,6 +161,7 @@ import de.connect2x.trixnity.clientserverapi.model.authentication.IdentifierType
 import de.connect2x.trixnity.clientserverapi.model.authentication.LoginType
 import de.connect2x.trixnity.clientserverapi.model.room.GetEvents.Direction
 import de.connect2x.trixnity.clientserverapi.model.room.GetEvents.Direction.BACKWARDS
+import de.connect2x.trixnity.clientserverapi.model.sync.Sync
 import de.connect2x.trixnity.core.model.EventId
 import de.connect2x.trixnity.core.model.RoomId
 import de.connect2x.trixnity.core.model.UserId
@@ -9542,6 +9543,10 @@ object MatrixRepository {
         // RoomProjection rows at ingest; consumers still derive at read until
         // P1 flips them.
         observeProjectionIngest(c)
+        // Ingest-time thread store (docs/THREAD-STORE-SPEC.md §2): the same
+        // seam feeding the ThreadRow ingest writer + its 30 s decrypt recheck.
+        observeThreadStoreIngest(c)
+        startThreadStoreRecheckLoop(c)
         scope.launch {
             runCatching { backfillProjection(c) }
         }
@@ -9703,6 +9708,16 @@ object MatrixRepository {
 
     /** Single decrypt-retry wait for a round's pending encrypted events. */
     private const val PROJECTION_RECHECK_MS = 30_000L
+
+    /** ThreadRow placeholder recheck cadence (SPEC §2/§4) — same wait as the
+     *  projection's [PROJECTION_RECHECK_MS]. */
+    private const val THREAD_ROW_RECHECK_MS = 30_000L
+
+    /** Per-recheck-pass placeholder cap (SPEC §2: bounded per pass). */
+    private const val THREAD_ROW_RECHECK_LIMIT = 50
+
+    /** Rooms served per recheck pass — one [restoreRoomSessions] call each. */
+    private const val THREAD_ROW_RECHECK_ROOMS = 8
 
     private data class ProjectionRow(
         val roomId: String,
@@ -9875,6 +9890,263 @@ object MatrixRepository {
             }
         }
         return rows.size
+    }
+
+    // -------------------------------------------------------------------------
+    // ThreadRow ingest writer (docs/THREAD-STORE-SPEC.md §2) — the message-page
+    // counterpart of the projection above: sync-round events materialize into
+    // the ThreadRow store at ingest (rules in ThreadRowLogic, SQL in
+    // ThreadRowStore), so a room open becomes a paged SELECT (Task 4) instead
+    // of a read-time recompute.
+
+    /** The serial sync-event seam, the exact flow + DEFAULT priority of
+     *  [observeProjectionIngest]: changed rooms = `room.join` keys, one
+     *  yield-gated ingest launch per round. */
+    private fun observeThreadStoreIngest(c: MatrixClient) {
+        scope.launch {
+            try {
+                c.api.sync.subscribeAsFlow().collect { syncEvents ->
+                    val join = syncEvents.syncResponse.room?.join ?: return@collect
+                    if (join.isEmpty()) return@collect
+                    scope.launch {
+                        yieldToSyncIngest()
+                        ingestThreadStoreRound(c, join)
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "thread-store ingest observer ended: ${e.message}")
+            }
+        }.also { notificationWatcherJobs.add(it) }
+    }
+
+    /** One sync round → ThreadRow rows per changed room. Round events are read
+     *  back out of the persisted `TimelineEvent` JSON (persisted before the
+     *  DEFAULT-priority flow emits): the raw JSON yields the type string,
+     *  pre-v11 top-level `redacts` and the resolved content JSON
+     *  ([RawEventInput.contentJson]); the decoded [TimelineEvent] yields the
+     *  typed resolved content for the render-ready body/media derivation —
+     *  [messageFrom], the same fields the current read path serves. An event
+     *  whose content is still unresolved writes a placeholder row (encrypted=1,
+     *  body null, SPEC §4); an event the page would not render ([messageFrom]
+     *  null: blank texts, replace edits, non-renderable content) writes
+     *  nothing — replace edits classify as their own edit side row. */
+    private suspend fun ingestThreadStoreRound(
+        c: MatrixClient,
+        join: Map<RoomId, Sync.Response.Rooms.JoinedRoom>,
+    ) {
+        for ((roomId, joinedRoom) in join) {
+            val eventIds = joinedRoom.timeline?.events?.map { it.id.full }.orEmpty()
+            if (eventIds.isEmpty()) continue
+            val rows = threadRowsFromRound(c, roomId, eventIds)
+            if (rows.isEmpty()) continue
+            ThreadRowStore.writeRows(c, rows)
+            bumpMessagePageRevision(roomId.full)
+            if (debugLogging()) {
+                android.util.Log.d(
+                    TAG,
+                    "thread-store: ${roomId.full.takeLast(12)} wrote ${rows.size} row(s) " +
+                        "(${rows.count { it.encrypted == 1 }} pending decrypt)",
+                )
+            }
+        }
+    }
+
+    /** [ThreadRowLogic.buildRows] inputs + rendered overrides for one room's
+     *  round events (see [ingestThreadStoreRound]). */
+    private suspend fun threadRowsFromRound(
+        c: MatrixClient,
+        roomId: RoomId,
+        eventIds: List<String>,
+    ): List<ThreadRowValues> {
+        val stored = readStoredTimelineEvents(c, roomId, eventIds)
+        if (stored.isEmpty()) return emptyList()
+        val rendered = HashMap<String, LightServiceMethod.GetMessages.Message>(stored.size)
+        val inputs = ArrayList<RawEventInput>(stored.size)
+        for (storedEvent in stored) {
+            val eventId = storedEvent.event.event.id.full
+            val resolved = storedEvent.event.content?.getOrNull()
+            if (resolved != null) messageFrom(c, roomId, storedEvent.event)?.let {
+                rendered[eventId] = it
+            }
+            val type = storedEvent.type ?: continue
+            inputs += RawEventInput(
+                eventId = eventId,
+                type = type,
+                sender = storedEvent.event.event.sender.full,
+                originTs = storedEvent.event.event.originTimestamp,
+                contentJson = storedEvent.contentJson,
+                // Non-null means "content resolved" (ThreadRowLogic's
+                // undecrypted check keys off this for m.room.encrypted) — the
+                // real render body rides on [rendered].
+                decryptedBody = resolved?.let { (it as? RoomMessageEventContent)?.body ?: "" },
+                formattedBody = null,
+                prevEventId = storedEvent.event.previousEventId?.full,
+                batchBefore = storedEvent.event.gap?.batchBefore,
+                redactsTopLevel = storedEvent.redactsTopLevel,
+            )
+        }
+        val built = ThreadRowLogic.buildRows(roomId.full, 0, inputs)
+        val out = ArrayList<ThreadRowValues>(built.size)
+        for (row in built) {
+            if (row.kind != RowKind.MESSAGE.wire || row.encrypted == 1) {
+                out += row
+                continue
+            }
+            val msg = rendered[row.eventId] ?: continue
+            out += row.copy(
+                body = msg.body,
+                formattedHtml = msg.formattedHtml,
+                contentType = msg.contentType,
+                mediaMeta = mediaMetaJsonOf(msg),
+            )
+        }
+        return out
+    }
+
+    /** One persisted `TimelineEvent` row: the decoded event plus the raw
+     *  stored JSON facts the typed model doesn't surface — the event type
+     *  string, pre-v11 top-level `redacts`, and the resolved content as raw
+     *  JSON (Trixnity re-persists the decrypted payload under the
+     *  `{type, value}` `content` wrapper; unencrypted events keep their parsed
+     *  content inside the event JSON). */
+    private data class StoredTimelineEvent(
+        val event: TimelineEvent,
+        val type: String?,
+        val redactsTopLevel: String?,
+        val contentJson: String?,
+    )
+
+    /** Reads [eventIds]' rows straight out of the `TimelineEvent` table (the
+     *  store decode [readTimelineChainFromDb] uses), preserving the given
+     *  order — the sync round's oldest-first timeline order. Events not in
+     *  the store yet are skipped. */
+    private suspend fun readStoredTimelineEvents(
+        c: MatrixClient,
+        roomId: RoomId,
+        eventIds: List<String>,
+    ): List<StoredTimelineEvent> {
+        val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
+            ?: return emptyList()
+        val json = runCatching { c.di.get<Json>() }.getOrNull() ?: return emptyList()
+        val values = withContext(Dispatchers.IO) {
+            runCatching {
+                val out = HashMap<String, String>(eventIds.size)
+                val sq = db.openHelper.writableDatabase
+                eventIds.chunked(100).forEach { chunk ->
+                    val holes = chunk.joinToString(",") { "?" }
+                    sq.query(
+                        "SELECT eventId, value FROM TimelineEvent WHERE roomId=? AND eventId IN ($holes)",
+                        listOf<Any?>(roomId.full).plus(chunk).toTypedArray(),
+                    ).use { cur ->
+                        while (cur.moveToNext()) {
+                            val id = cur.getString(0) ?: continue
+                            val value = cur.getString(1) ?: continue
+                            out[id] = value
+                        }
+                    }
+                }
+                out
+            }.getOrDefault(emptyMap())
+        }
+        return eventIds.mapNotNull { id ->
+            val value = values[id] ?: return@mapNotNull null
+            val event = runCatching { json.decodeFromString<TimelineEvent>(value) }.getOrNull()
+                ?: return@mapNotNull null
+            val root = runCatching { json.parseToJsonElement(value).jsonObject }.getOrNull()
+                ?: return@mapNotNull null
+            val eventJson = root["event"] as? JsonObject
+            StoredTimelineEvent(
+                event = event,
+                type = eventJson?.get("type")?.jsonPrimitive?.contentOrNull,
+                redactsTopLevel = eventJson?.get("redacts")?.jsonPrimitive?.contentOrNull,
+                contentJson = ((root["content"] as? JsonObject)?.get("value")
+                    ?: eventJson?.get("content"))?.let { runCatching { json.encodeToString(it) }.getOrNull() },
+            )
+        }
+    }
+
+    /** The store's mediaMeta JSON (SPEC §1): the media fields the current page
+     *  rows serve ([LightServiceMethod.GetMessages.Message.durationMs /
+     *  caption / forwarded]), derived by [messageFrom] exactly as the read
+     *  path derives them. */
+    private fun mediaMetaJsonOf(msg: LightServiceMethod.GetMessages.Message): String? {
+        val json = buildJsonObject {
+            msg.durationMs?.let { put("durationMs", it) }
+            msg.caption?.let { put("caption", it) }
+            if (msg.forwarded) put("forwarded", true)
+        }
+        return json.toString().takeIf { it != "{}" }
+    }
+
+    /** Placeholder recheck loop (SPEC §2/§4): a 30 s tick over rooms holding
+     *  `encrypted=1` rows, bounded per pass ([THREAD_ROW_RECHECK_LIMIT] rows /
+     *  [THREAD_ROW_RECHECK_ROOMS] rooms). The key-backup restore
+     *  ([restoreRoomSessions]) runs HERE instead of on every room open — its
+     *  re-decrypt re-persists decrypted content into the `TimelineEvent`
+     *  rows, the pass then fills the placeholder rows in place (the store's
+     *  re-delivery path keeps the original ingestSeq) and bumps the page
+     *  revision so an open thread repaints. The loop ends when the store has
+     *  no placeholders left; new ones arrive via the ingest hook. */
+    private fun startThreadStoreRecheckLoop(c: MatrixClient) {
+        scope.launch {
+            while (isActive) {
+                delay(THREAD_ROW_RECHECK_MS)
+                yieldToSyncIngest()
+                runCatching { recheckThreadStorePlaceholders(c) }
+                    .onFailure { android.util.Log.w(TAG, "thread-store recheck failed: ${it.message}") }
+            }
+        }.also { notificationWatcherJobs.add(it) }
+    }
+
+    /** One recheck pass over the store's placeholder rows (see
+     *  [startThreadStoreRecheckLoop]). */
+    private suspend fun recheckThreadStorePlaceholders(c: MatrixClient) {
+        val pending = ThreadRowStore.pendingRows(c, THREAD_ROW_RECHECK_LIMIT)
+        if (pending.isEmpty()) return
+        var filled = 0
+        var dropped = 0
+        for ((roomId, roomRows) in pending.groupBy { it.roomId }.entries.take(THREAD_ROW_RECHECK_ROOMS)) {
+            val matrixRoomId = RoomId(roomId)
+            val eventIds = roomRows.map { it.eventId }
+            // Key-backup restore, bounded: only the pass's placeholder events,
+            // same park-on-zero dance as the read path (the park gates the
+            // backup network round-trip inside restoreRoomSessions).
+            val stuck = readStoredTimelineEvents(c, matrixRoomId, eventIds).map { it.event }
+            if (stuck.isNotEmpty() &&
+                runCatching { restoreRoomSessions(c, matrixRoomId, stuck) }.getOrDefault(0) == 0
+            ) {
+                decryptRestoreCooldown.park(roomId, DECRYPT_RESTORE_COOLDOWN_MS)
+            }
+            val fills = ArrayList<ThreadRowValues>(roomRows.size)
+            for (stored in readStoredTimelineEvents(c, matrixRoomId, eventIds)) {
+                val row = roomRows.first { it.eventId == stored.event.event.id.full }
+                if (stored.event.content?.getOrNull() == null) continue // still pending — next pass
+                val msg = messageFrom(c, matrixRoomId, stored.event)
+                if (msg == null) {
+                    // Decrypted to something the page would not render (blank
+                    // text, tombstone) — drop the placeholder, same rule the
+                    // read path applies to such events.
+                    ThreadRowStore.deleteRow(c, roomId, row.eventId)
+                    dropped++
+                    continue
+                }
+                fills += row.copy(
+                    body = msg.body,
+                    formattedHtml = msg.formattedHtml,
+                    contentType = msg.contentType,
+                    mediaMeta = mediaMetaJsonOf(msg),
+                    encrypted = 0,
+                )
+            }
+            if (fills.isNotEmpty()) {
+                ThreadRowStore.writeRows(c, fills)
+                filled += fills.size
+                bumpMessagePageRevision(roomId)
+            }
+        }
+        if (debugLogging() && (filled > 0 || dropped > 0)) {
+            android.util.Log.d(TAG, "thread-store recheck: $filled filled, $dropped dropped")
+        }
     }
 
     private data class ProjectedRoom(val row: ProjectionRow?, val pendingDecryption: Boolean)
