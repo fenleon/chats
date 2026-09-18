@@ -3134,11 +3134,7 @@ object MatrixRepository {
                 id != null && id in pendingTxnIds
             }) return null
         // Broadcast-rooms own-name (same rule as the full rebuild).
-        val ownName = if (withTimeoutOrNull(ROOM_BUDGET_MS) {
-            c.room.getById(matrixRoomId).firstOrNull()?.joinedMemberCount
-        }?.let { it <= 2L } == true) {
-            senderNameOf(c, matrixRoomId, c.userId)
-        } else null
+        val ownName = broadcastOwnNameOf(c, matrixRoomId)
         // Edits: an edit replaces its target — patch body + edited flag. The
         // delta is newer than the whole cached page, so the newest edit wins
         // (first occurrence in newest-first order), like the full rebuild.
@@ -3250,66 +3246,111 @@ object MatrixRepository {
      * Messages of a room, oldest first. [beforeEventId] pages further back;
      * null returns the newest [limit] messages.
      *
-     * The newest page is served from the in-memory [messagePageCache] when
-     * fresh — re-opening a thread is a cache read, not a timeline re-collect +
-     * key-backup restore (which is what made every open slow). When the memory
-     * cache is cold but a page exists on disk (e.g. re-opening a thread after
-     * the TTL, or a cold process), it is served immediately and recomputed in
-     * the background so the next poll is fresh — the Beeper-like "messages are
-     * instantly available" behavior. Pagination ([beforeEventId] != null)
-     * always reads the store directly.
+     * Warm store (SPEC §3): every page is a plain paged SELECT off the
+     * ingest-materialized ThreadRow store — [serveFromStore] builds the RPC
+     * rows from the stored columns; no recompute, no TTL cache, no disk page,
+     * no patchers. A room whose store is empty falls back to the existing
+     * recompute path once and seeds the store behind it ([seedThreadRow],
+     * SPEC §7); a failed seed self-heals (rowCount stays 0, the next open
+     * retries). Older pages past the seeded window resume through the
+     * recompute engine from the deepest stored row's chain link and write the
+     * page through, so the next scroll continues locally.
      */
     suspend fun getMessages(
         roomId: String,
         beforeEventId: String?,
         limit: Int,
     ): MessagesPage {
-        if (beforeEventId == null) {
-            // A room open warms the megolm send path in the background so the
-            // FIRST send in the room doesn't pay the member-load/session cost
-            // inline (see [warmRoomMegolm]).
-            warmRoomMegolm(roomId)
-            val cached = messagePageCache[roomId]
-            if (cached != null && cached.limit >= limit) {
-                // The memory page is never older than disk (disk writes are
-                // throttled/skipped AFTER memory is updated), so a stale page
-                // is served from memory — recompute in the background and the
-                // next poll is fresh. The old path re-read + JSON-decoded the
-                // same page from disk on every TTL expiry (the thread polls
-                // every 3 s vs the 5 s TTL — constant disk churn).
-                if (android.os.SystemClock.elapsedRealtime() - cached.refreshedAtMs >= MESSAGE_PAGE_TTL_MS) {
-                    refreshMessagePage(roomId, limit)
+        val attachedClient = client
+        if (attachedClient != null) {
+            if (beforeEventId != null) {
+                // The store's keyset cursor ("ts|seq"); a plain event id means
+                // the previous page came from the legacy fallback below.
+                if (keysetParse(beforeEventId) != null) {
+                    serveFromStore(attachedClient, roomId, beforeEventId, limit)?.let { return it }
+                    // Store exhausted below the keyset: deeper history lives
+                    // only in the event chain — continue through the recompute
+                    // engine from the deepest stored row's resume link, and
+                    // write the page through so the next scroll is local again.
+                    val deepest = ThreadRowStore.deepestRow(attachedClient, roomId)
+                    val resume = deepest?.prevEventId ?: deepest?.batchBefore
+                    if (resume != null) {
+                        val page = computeMessagesPage(roomId, resume, limit)
+                        scope.launch {
+                            runCatching { seedThreadRow(attachedClient, roomId, page) }
+                                .onFailure { android.util.Log.w(TAG, "thread-store write-through failed: ${it.message}") }
+                        }
+                        return page
+                    }
+                    return MessagesPage(emptyList(), false)
                 }
-                return injectPendingEchoes(roomId, cached.page)
+            } else {
+                // A room open warms the megolm send path in the background so the
+                // FIRST send in the room doesn't pay the member-load/session cost
+                // inline (see [warmRoomMegolm]).
+                warmRoomMegolm(roomId)
+                val storeCold = ThreadRowStore.rowCount(attachedClient, roomId) == 0
+                if (!storeCold) {
+                    serveFromStore(attachedClient, roomId, null, limit)?.let {
+                        return injectPendingEchoes(roomId, it)
+                    }
+                }
+                if (storeCold) {
+                    attachedClient.let { c ->
+                        scope.launch {
+                            runCatching {
+                                // One full recompute behind the fast first
+                                // paint (the fallback above serves it) — its
+                                // rendered rows ARE the seed (SPEC §7).
+                                seedThreadRow(c, roomId, computeMessagesPage(roomId, null, limit))
+                            }.onFailure { android.util.Log.w(TAG, "thread-store seed failed: ${it.message}") }
+                        }
+                    }
+                }
             }
-            // Cold process / first open: serve the persisted page at once and
-            // recompute in the background — the next poll is fresh.
-            loadMessagePageFromDisk(roomId)?.let { disk ->
-                messagePageCache[roomId] = MessagePageEntry(
-                    disk,
-                    limit,
-                    android.os.SystemClock.elapsedRealtime(),
-                )
+        }
+        if (beforeEventId != null) return computeMessagesPage(roomId, beforeEventId, limit)
+        // Fallback newest page: the pre-store cascade, kept verbatim as the
+        // seeding/fallback engine (Task 7 deletes it).
+        val cached = messagePageCache[roomId]
+        if (cached != null && cached.limit >= limit) {
+            // The memory page is never older than disk (disk writes are
+            // throttled/skipped AFTER memory is updated), so a stale page
+            // is served from memory — recompute in the background and the
+            // next poll is fresh. The old path re-read + JSON-decoded the
+            // same page from disk on every TTL expiry (the thread polls
+            // every 3 s vs the 5 s TTL — constant disk churn).
+            if (android.os.SystemClock.elapsedRealtime() - cached.refreshedAtMs >= MESSAGE_PAGE_TTL_MS) {
                 refreshMessagePage(roomId, limit)
-                return injectPendingEchoes(roomId, disk)
             }
-            // Cold with no disk page (first open of the room): serve a SMALL
-            // page immediately — the decrypt restores + status walks that make
-            // a full page slow are what kept the thread on "Loading messages…"
-            // — then recompute the full page in the background; the thread's
-            // poll swaps it in seconds later.
-            val first = computeMessagesPage(roomId, null, minOf(limit, INCREMENTAL_FIRST_PAGE), fast = true)
+            return injectPendingEchoes(roomId, cached.page)
+        }
+        // Cold process / first open: serve the persisted page at once and
+        // recompute in the background — the next poll is fresh.
+        loadMessagePageFromDisk(roomId)?.let { disk ->
             messagePageCache[roomId] = MessagePageEntry(
-                first,
+                disk,
                 limit,
                 android.os.SystemClock.elapsedRealtime(),
             )
-            saveMessagePageToDisk(roomId, first)
-            bumpMessagePageRevision(roomId)
             refreshMessagePage(roomId, limit)
-            return first
+            return injectPendingEchoes(roomId, disk)
         }
-        return computeMessagesPage(roomId, beforeEventId, limit)
+        // Cold with no disk page (first open of the room): serve a SMALL
+        // page immediately — the decrypt restores + status walks that make
+        // a full page slow are what kept the thread on "Loading messages…"
+        // — then recompute the full page in the background; the thread's
+        // poll swaps it in seconds later.
+        val first = computeMessagesPage(roomId, null, minOf(limit, INCREMENTAL_FIRST_PAGE), fast = true)
+        messagePageCache[roomId] = MessagePageEntry(
+            first,
+            limit,
+            android.os.SystemClock.elapsedRealtime(),
+        )
+        saveMessagePageToDisk(roomId, first)
+        bumpMessagePageRevision(roomId)
+        refreshMessagePage(roomId, limit)
+        return first
     }
 
     /**
@@ -3360,6 +3401,365 @@ object MatrixRepository {
         }
         return if (result.size == page.messages.size) page
         else MessagesPage(result, page.hasMore, page.encrypted, page.nextBeforeEventId)
+    }
+
+    // --- ThreadRow read path (docs/THREAD-STORE-SPEC.md §3/§7) ----------------
+
+    /** A `ts|seq` keyset cursor ([ThreadRowLogic.keysetBefore]), or null when
+     *  [raw] is not one — a plain event id means the page came from the legacy
+     *  recompute fallback, whose cursor keeps flowing through it. */
+    private fun keysetParse(raw: String): Pair<Long, Int>? =
+        if (raw.matches(Regex("\\d+\\|\\d+"))) {
+            runCatching { ThreadRowLogic.parseKeyset(raw) }.getOrNull()
+        } else null
+
+    /**
+     * One page built straight off ThreadRow rows (SPEC §3): reactions rebuilt
+     * from the stored reaction side rows (gated by each row's cached
+     * `reactionSummary` — the column answers "is there anything to render",
+     * the side rows carry the reactor names), receipts joined on the page's
+     * rows in memory, sender names / reply headers / bridge caps resolved
+     * exactly as [messageFrom] resolves them. Returns null when the store has
+     * no rows for the request (caller falls back to the recompute engine).
+     * [rows] arrive newest-first from the store's queries.
+     */
+    private suspend fun serveFromStore(
+        c: MatrixClient,
+        roomId: String,
+        beforeEventId: String?,
+        limit: Int,
+    ): MessagesPage? {
+        val matrixRoomId = RoomId(roomId)
+        val rows = if (beforeEventId == null) {
+            ThreadRowStore.newestPage(c, roomId, limit)
+        } else {
+            val keyset = keysetParse(beforeEventId) ?: return null
+            ThreadRowStore.olderPage(c, roomId, keyset, limit)
+        }
+        if (rows.isEmpty()) return null
+        val oldestFirst = rows.asReversed()
+        val senderNames = oldestFirst.mapNotNull { it.sender }.distinct().associateWith { sender ->
+            senderNameOf(c, matrixRoomId, UserId(sender))
+        }
+        // Reaction tags: only rows whose cached summary says they have any —
+        // no reaction rows in the store, no side-row query at all.
+        val reactionTags = oldestFirst
+            .filter { !it.reactionSummary.isNullOrEmpty() && it.reactionSummary != "{}" }
+            .map { it.eventId }
+            .takeIf { it.isNotEmpty() }
+            ?.let { reactionTagsForStoreRows(c, matrixRoomId, it) }
+            ?: emptyMap()
+        // Edits: the newest edit side row per target — it marks the row edited
+        // and carries the edited formattedHtml (mediaMeta), the read-path
+        // parity (today's page rewrites formattedHtml from the edit).
+        val editByTarget = HashMap<String, ThreadRowValues>()
+        for (edit in ThreadRowStore.rowsForTargets(
+            c, roomId, RowKind.EDIT.wire, oldestFirst.map { it.eventId }, excludeRedacted = false,
+        )) {
+            edit.targetEventId?.let { editByTarget[it] = edit } // ingestSeq order — newest wins
+        }
+        // Read receipts describe the newest events (the RPC contract: older
+        // pages always report false) — one receipts read, joined in memory.
+        val readEventIds = if (beforeEventId == null) {
+            receiptReadEventIds(c, matrixRoomId, rows.map { it.eventId })
+        } else emptySet()
+        var features: RoomFeatures? = null
+        val messages = ArrayList<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>(oldestFirst.size)
+        for (row in oldestFirst) {
+            val sender = row.sender ?: continue
+            val senderName = senderNames[sender] ?: sender
+            val isMine = sender == c.userId.full
+            // A redacted message renders as the quiet tombstone, preserved in
+            // its conversation slot — no reactions/status/read apply
+            // (mirrors [redactedRow]).
+            if (row.contentType == ThreadRowLogic.CONTENT_REDACTED) {
+                messages += com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+                    id = row.eventId,
+                    sender = sender,
+                    senderName = senderName,
+                    body = "[Message unsent]",
+                    timestampMs = row.timestampMs,
+                    isMine = isMine,
+                    contentType = "redacted",
+                )
+                continue
+            }
+            val contentType = row.contentType ?: "text"
+            val edit = editByTarget[row.eventId]
+            val (durationMs, caption, forwarded) = mediaMetaOf(row.mediaMeta)
+            // Undecrypted placeholder rows render as the same calm
+            // "[Encrypted message]" the walk's preview serves (SPEC §4); the
+            // recheck fills them in place.
+            val body = if (row.encrypted == 1) "[Encrypted message]" else row.body.orEmpty()
+            val reply = row.replyToId?.let { resolveReplyHeader(c, matrixRoomId, it) }
+            var canEdit = true
+            var canUnsend = true
+            if (isMine) {
+                // Bridge caps: fetched once on the first own row (same lazy
+                // rule as [computeMessagesPage]).
+                val f = features ?: roomFeatures(c, matrixRoomId).also { features = it }
+                val ageMs = System.currentTimeMillis() - row.timestampMs
+                canEdit = f.editSupported && contentType == "text" &&
+                    (f.editMaxAgeMs == null || ageMs < f.editMaxAgeMs)
+                canUnsend = f.deleteSupported &&
+                    (f.deleteMaxAgeMs == null || ageMs < f.deleteMaxAgeMs)
+            }
+            messages += com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+                id = row.eventId,
+                sender = sender,
+                senderName = senderName,
+                body = body,
+                timestampMs = row.timestampMs,
+                isMine = isMine,
+                sendStatus = row.sendStatus?.takeIf { isMine },
+                contentType = contentType,
+                read = row.eventId in readEventIds,
+                reactions = reactionTags[row.eventId].orEmpty(),
+                durationMs = durationMs,
+                caption = caption,
+                forwarded = forwarded,
+                edited = edit != null && contentType == "text",
+                formattedHtml = when {
+                    contentType != "text" -> null
+                    edit != null -> edit.mediaMeta
+                    else -> row.formattedHtml
+                },
+                replyToId = row.replyToId,
+                replyToSender = reply?.first,
+                replyToExcerpt = reply?.second,
+                canEdit = canEdit,
+                canUnsend = canUnsend,
+            )
+        }
+        val oldest = oldestFirst.first()
+        val allPlaceholders = oldestFirst.all { it.encrypted == 1 }
+        return MessagesPage(
+            messages = messages,
+            hasMore = ThreadRowStore.hasMoreFrom(c, roomId, oldest.eventId),
+            // An encrypted room whose whole page is still-undecrypted
+            // placeholders reads as the decryption notice, not "no messages".
+            encrypted = if (beforeEventId == null && allPlaceholders) {
+                withTimeoutOrNull(ROOM_BUDGET_MS) {
+                    c.room.getById(matrixRoomId).firstOrNull()?.encrypted
+                } == true
+            } else false,
+            nextBeforeEventId = ThreadRowLogic.keysetBefore(oldest.timestampMs, oldest.ingestSeq),
+        )
+    }
+
+    /** Reaction tags for store-served rows, rebuilt from the target's reaction
+     *  side rows (the truth; the summary column is their cache) with the same
+     *  label shape the timeline walk produces: one tag per reactor, a person's
+     *  latest reaction wins, "You" for own, collapsed at two lines. Seeded
+     *  rooms carry pseudo reaction rows whose `sender` is the tag's display
+     *  label ("You" / a name) — used verbatim as the label. Dedup keys on the
+     *  LABEL, so a post-seed real reaction row for the same reactor replaces
+     *  the seeded pseudo row instead of duplicating it. */
+    private suspend fun reactionTagsForStoreRows(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        targetIds: List<String>,
+    ): Map<String, List<String>> {
+        val rows = ThreadRowStore.rowsForTargets(
+            c, matrixRoomId.full, RowKind.REACTION.wire, targetIds, excludeRedacted = true,
+        )
+        val seen = HashMap<String, ReactionEntry>() // "target|label" → entry (latest kept)
+        val result = HashMap<String, MutableList<ReactionEntry>>()
+        for (row in rows) { // ingestSeq order
+            val target = row.targetEventId ?: continue
+            val key = row.payload?.takeIf { it.isNotBlank() } ?: continue
+            val sender = row.sender ?: continue
+            val who = when {
+                sender == c.userId.full -> "You"
+                sender.startsWith("@") -> senderNameOf(c, matrixRoomId, UserId(sender))
+                else -> sender
+            }
+            val dedupeKey = "$target|$who"
+            val existing = seen[dedupeKey]
+            if (existing != null) {
+                if (row.timestampMs >= existing.timestampMs) {
+                    existing.timestampMs = row.timestampMs
+                    existing.key = key
+                }
+                continue
+            }
+            val entry = ReactionEntry(row.timestampMs, who, key)
+            seen[dedupeKey] = entry
+            result.getOrPut(target) { mutableListOf() }.add(entry)
+        }
+        return result.mapValues { (_, entries) ->
+            collapseReactionTags(entries.sortedBy { it.timestampMs }.map { "${it.who} reacted ${it.key}" })
+        }
+    }
+
+    /** Which of [newestFirstEventIds] the other room members have read — the
+     *  receipts read of [readReceiptsByEvent] keyed on a page's event ids
+     *  instead of walked TimelineEvents: a receipt pointing at a page row
+     *  covers that row and every older one. */
+    private suspend fun receiptReadEventIds(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        newestFirstEventIds: List<String>,
+    ): Set<String> {
+        val rawIndex = HashMap<String, Int>()
+        newestFirstEventIds.forEachIndexed { i, id -> rawIndex[id] = i }
+        val (receiptsByUser, bridgebot) = withTimeoutOrNull(MESSAGES_BUDGET_MS) {
+            // The Room-backed repositories only work inside a store transaction
+            // (the flow APIs set it up themselves; direct repo reads need the
+            // explicit scope, or Room answers "read transaction is missing").
+            val txManager = c.di.get<StoreTransactionManager>(StoreTransactionManager::class)
+            txManager.readTransaction {
+                val receipts = c.di.get<RoomUserReceiptsRepository>(RoomUserReceiptsRepository::class)
+                    .get(matrixRoomId)
+                // Bridge bots post m.read receipts as room bookkeeping, not
+                // human reads (see [bridgeBotOf]).
+                val bridgebot = if (receipts.isEmpty()) "" else bridgeBotOf(c, matrixRoomId)
+                receipts to bridgebot
+            }
+        } ?: return emptySet()
+        val readEventIds = mutableSetOf<String>()
+        for ((userId, roomUserReceipts) in receiptsByUser) {
+            if (userId == c.userId || userId.full == bridgebot) continue
+            val receiptIndex = roomUserReceipts.receipts[ReceiptType.Read]?.eventId?.full
+                ?.let { rawIndex[it] } ?: continue
+            for ((eventId, index) in rawIndex) {
+                if (index >= receiptIndex) readEventIds.add(eventId)
+            }
+        }
+        return readEventIds
+    }
+
+    /** Reply header for a store-served row, resolved at read time from the
+     *  timeline store (the ThreadRow schema carries the target id only) —
+     *  the same bounded lookup + excerpt rules [messageFrom] applies. */
+    private suspend fun resolveReplyHeader(
+        c: MatrixClient,
+        matrixRoomId: RoomId,
+        replyTargetId: String,
+    ): Pair<String?, String?> {
+        val target = withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getTimelineEvent(matrixRoomId, EventId(replyTargetId)).firstOrNull()
+        } ?: return null to null
+        return senderNameOf(c, matrixRoomId, target.event.sender) to
+            replyExcerptFor(target.content?.getOrNull() as? RoomMessageEventContent)
+    }
+
+    /** Inverse of [mediaMetaJsonOf]: the served media fields. */
+    private fun mediaMetaOf(json: String?): Triple<Long?, String?, Boolean> {
+        val obj = json?.let {
+            runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
+        } ?: return Triple(null, null, false)
+        return Triple(
+            (obj["durationMs"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull(),
+            (obj["caption"] as? JsonPrimitive)?.contentOrNull,
+            (obj["forwarded"] as? JsonPrimitive)?.contentOrNull == "true",
+        )
+    }
+
+    /**
+     * Seed (SPEC §7): map a computed page's rendered rows back into ThreadRow
+     * values and write them. The page was rendered by the recompute engine —
+     * bodies are exactly what today's read path serves (broadcast own-name
+     * stripping included), so the store keeps PRE-STRIP bodies and the serving
+     * path serves them raw. Reaction tags / edit state ride along as pseudo
+     * side rows ("seed:…" ids, label senders) so the served tags and the
+     * `edited` flag survive the seed; real side rows from later sync rounds
+     * layer on top (the label-keyed tag dedup absorbs the overlap). The
+     * deepest row carries the page's chain cursor as its `batchBefore` resume
+     * link so [hasMoreFrom] keeps scroll-up alive past the seeded window.
+     * Optimistic rows (local-… ids, not-yet-echoed sends) are skipped — their
+     * real events arrive through the ingest writer.
+     */
+    private suspend fun seedThreadRow(c: MatrixClient, roomId: String, page: MessagesPage) {
+        val msgs = page.messages.filter {
+            !it.id.startsWith(LOCAL_PENDING_ID_PREFIX) &&
+                it.sendStatus != "SENT_PENDING_ECHO" && it.sendStatus != "FAIL_LOCAL_SEND"
+        }
+        if (msgs.isEmpty()) return
+        val rows = ArrayList<ThreadRowValues>(msgs.size * 2)
+        for (msg in msgs) rows += threadRowValuesFromMessage(roomId, msg)
+        if (page.hasMore && page.nextBeforeEventId != null) {
+            // msgs is oldest-first (the page's ts-stable sort), so the first
+            // written row is the store's deepest.
+            val deepest = rows.first { it.kind == RowKind.MESSAGE.wire }
+            val index = rows.indexOf(deepest)
+            rows[index] = deepest.copy(batchBefore = page.nextBeforeEventId)
+        }
+        ThreadRowStore.writeRows(c, rows)
+        if (debugLogging()) {
+            android.util.Log.d(
+                TAG,
+                "thread-store: seeded ${roomId.takeLast(12)} with ${rows.count { it.kind == RowKind.MESSAGE.wire }} row(s)",
+            )
+        }
+    }
+
+    /** One computed row → its ThreadRow message row + pseudo side rows (the
+     *  seed mapping — the same rendered-field derivation the ingest writer's
+     *  override stage applies). */
+    private fun threadRowValuesFromMessage(
+        roomId: String,
+        msg: com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message,
+    ): List<ThreadRowValues> {
+        val message = ThreadRowValues(
+            roomId = roomId,
+            eventId = msg.id,
+            kind = RowKind.MESSAGE.wire,
+            sender = msg.sender,
+            timestampMs = msg.timestampMs,
+            ingestSeq = 0, // rebased inside writeRows' transaction
+            body = msg.body,
+            formattedHtml = msg.formattedHtml,
+            contentType = msg.contentType,
+            replyToId = msg.replyToId,
+            mediaMeta = mediaMetaJsonOf(msg),
+            sendStatus = msg.sendStatus,
+            encrypted = 0,
+            prevEventId = null,
+            batchBefore = null,
+            targetEventId = null,
+            payload = null,
+            reactionSummary = null,
+        )
+        val sides = ArrayList<ThreadRowValues>(msg.reactions.size + 1)
+        msg.reactions.forEachIndexed { i, tag ->
+            val at = tag.indexOf(" reacted ")
+            if (at <= 0) return@forEachIndexed
+            val who = tag.substring(0, at)
+            val keys = tag.substring(at + " reacted ".length).takeIf { it.isNotBlank() } ?: return@forEachIndexed
+            sides += ThreadRowValues(
+                roomId = roomId,
+                eventId = "seed:${msg.id}:r$i",
+                kind = RowKind.REACTION.wire,
+                sender = who,
+                timestampMs = msg.timestampMs,
+                ingestSeq = 0,
+                body = null, formattedHtml = null, contentType = null, replyToId = null,
+                mediaMeta = null, sendStatus = null, encrypted = 0,
+                prevEventId = null, batchBefore = null,
+                targetEventId = msg.id,
+                payload = keys,
+                reactionSummary = null,
+            )
+        }
+        if (msg.edited) {
+            sides += ThreadRowValues(
+                roomId = roomId,
+                eventId = "seed:${msg.id}:edit",
+                kind = RowKind.EDIT.wire,
+                sender = null,
+                timestampMs = msg.timestampMs,
+                ingestSeq = 0,
+                body = null, formattedHtml = null, contentType = null, replyToId = null,
+                mediaMeta = msg.formattedHtml, // the edited row's served HTML
+                sendStatus = null, encrypted = 0,
+                prevEventId = null, batchBefore = null,
+                targetEventId = msg.id,
+                payload = msg.body, // already the edited (stripped) body
+                reactionSummary = null,
+            )
+        }
+        return sides + message
     }
 
     // --- Bridge re-import ("ghost") detection ------------------
@@ -3885,11 +4285,7 @@ object MatrixRepository {
         // back with your display name baked into the body ("FENN: post").
         // Resolve the name once so [messageFrom] can
         // strip it; null outside broadcast rooms = no stripping.
-        val ownName = if (withTimeoutOrNull(ROOM_BUDGET_MS) {
-            c.room.getById(matrixRoomId).firstOrNull()?.joinedMemberCount
-        }?.let { it <= 2L } == true) {
-            senderNameOf(c, matrixRoomId, c.userId)
-        } else null
+        val ownName = broadcastOwnNameOf(c, matrixRoomId)
 
         // The newest page (null cursor) pages BACKWARDS from the room's newest
         // event instead of using getLastTimelineEvents' newest-page stream:
@@ -9963,12 +10359,15 @@ object MatrixRepository {
     ): List<ThreadRowValues> {
         val stored = readStoredTimelineEvents(c, roomId, eventIds)
         if (stored.isEmpty()) return emptyList()
+        // Broadcast own-name: stored bodies are PRE-STRIP (the same value the
+        // read path uses), so store-served pages render raw with parity.
+        val ownName = broadcastOwnNameOf(c, roomId)
         val rendered = HashMap<String, LightServiceMethod.GetMessages.Message>(stored.size)
         val inputs = ArrayList<RawEventInput>(stored.size)
         for (storedEvent in stored) {
             val eventId = storedEvent.event.event.id.full
             val resolved = storedEvent.event.content?.getOrNull()
-            if (resolved != null) messageFrom(c, roomId, storedEvent.event)?.let {
+            if (resolved != null) messageFrom(c, roomId, storedEvent.event, ownName = ownName)?.let {
                 rendered[eventId] = it
             }
             val type = storedEvent.type ?: continue
@@ -9989,8 +10388,13 @@ object MatrixRepository {
             )
         }
         val built = ThreadRowLogic.buildRows(roomId.full, 0, inputs)
+        val storedByEvent = stored.associateBy { it.event.event.id.full }
         val out = ArrayList<ThreadRowValues>(built.size)
         for (row in built) {
+            if (row.kind == RowKind.EDIT.wire) {
+                out += editRowForStore(row, storedByEvent[row.eventId], ownName)
+                continue
+            }
             if (row.kind != RowKind.MESSAGE.wire || row.encrypted == 1) {
                 out += row
                 continue
@@ -10004,6 +10408,34 @@ object MatrixRepository {
             )
         }
         return out
+    }
+
+    /**
+     * The edit side row as the store keeps it. [ThreadRowLogic.buildRows]
+     * carries the raw `m.new_content` body in [ThreadRowValues.payload]; the
+     * writer rebases it onto the exact body today's read path serves for an
+     * edited row (reply-quote / forward-header / own-prefix strip) and parks
+     * the edit's own formatted HTML on `mediaMeta` — the store has no edit
+     * html column, and today's page rewrites formattedHtml from the edit
+     * (or nulls it when the edit is plain), which the serving path mirrors.
+     */
+    private fun editRowForStore(
+        row: ThreadRowValues,
+        storedEvent: StoredTimelineEvent?,
+        ownName: String?,
+    ): ThreadRowValues {
+        val newContent = storedEvent?.event?.content?.getOrNull()
+            ?.let { content -> (content as? RoomMessageEventContent)?.relatesTo as? RelatesTo.Replace }
+            ?.newContent as? RoomMessageEventContent.TextBased
+            ?: return row
+        val stripped = stripOwnPrefix(stripForwardHeader(stripReplyQuote(newContent.body)).first, ownName)
+        val html = newContent.takeIf { it.format == "org.matrix.custom.html" }
+            ?.formattedBody
+            ?.takeIf { it.isNotBlank() }
+            ?.let { MX_REPLY_REGEX.replace(it, "").trim() }
+            ?.takeIf { it.isNotBlank() }
+            ?.let { stripForwardHeaderFromHtml(it).first.takeIf { h -> !h.isNullOrBlank() } }
+        return row.copy(payload = stripped, mediaMeta = html)
     }
 
     /** One persisted `TimelineEvent` row: the decoded event plus the raw
@@ -10116,6 +10548,9 @@ object MatrixRepository {
         var dropped = 0
         for ((roomId, roomRows) in pending.groupBy { it.roomId }.entries.take(THREAD_ROW_RECHECK_ROOMS)) {
             val matrixRoomId = RoomId(roomId)
+            // Same pre-strip convention as the live ingest: filled bodies are
+            // what the read path serves.
+            val ownName = broadcastOwnNameOf(c, matrixRoomId)
             val eventIds = roomRows.map { it.eventId }
             // Key-backup restore, bounded: only the pass's placeholder events,
             // same park-on-zero dance as the read path (the park gates the
@@ -10131,7 +10566,7 @@ object MatrixRepository {
             for (stored in readStoredTimelineEvents(c, matrixRoomId, eventIds)) {
                 val row = roomRows.first { it.eventId == stored.event.event.id.full }
                 if (stored.event.content?.getOrNull() == null) continue // still pending — next pass
-                val msg = messageFrom(c, matrixRoomId, stored.event)
+                val msg = messageFrom(c, matrixRoomId, stored.event, ownName = ownName)
                 if (msg == null) {
                     // Decrypted to something the page would not render (blank
                     // text, tombstone) — drop the placeholder, same rule the
@@ -10679,6 +11114,21 @@ object MatrixRepository {
      *  must keep their words. */
     private fun stripOwnPrefix(text: String, ownName: String?): String =
         if (ownName != null && text.startsWith("$ownName: ")) text.removePrefix("$ownName: ") else text
+
+    /**
+     * The broadcast-channel own name (the ≤2-member rule): the display name
+     * whose "FENN: " prefix the channel's echo bakes into own posts — resolved
+     * once per page/round so [messageFrom] can strip it. Null outside
+     * broadcast rooms = no stripping. The ingest writer passes the same value
+     * so the ThreadRow store keeps pre-strip bodies and the store-served path
+     * renders them raw (read-path parity).
+     */
+    private suspend fun broadcastOwnNameOf(c: MatrixClient, matrixRoomId: RoomId): String? =
+        if (withTimeoutOrNull(ROOM_BUDGET_MS) {
+            c.room.getById(matrixRoomId).firstOrNull()?.joinedMemberCount
+        }?.let { it <= 2L } == true) {
+            senderNameOf(c, matrixRoomId, c.userId)
+        } else null
 
     private const val MAX_PREVIEW_LENGTH = 80
     /** How many recent timeline events to scan for Beeper send-status events. */

@@ -266,6 +266,59 @@ object ThreadRowStore {
         }
     }
 
+    /** The room's oldest message row — the scroll-up resume point (SPEC §6):
+     *  its chain/backfill links tell whether deeper history exists and where
+     *  the read path's legacy fallback continues from. */
+    suspend fun deepestRow(c: MatrixClient, roomId: String): ThreadRowValues? {
+        val db = database(c) ?: return null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                queryFirst(
+                    db.openHelper.writableDatabase,
+                    "SELECT * FROM ThreadRow WHERE roomId=? AND kind='message' " +
+                        "ORDER BY timestampMs ASC, ingestSeq ASC LIMIT 1",
+                    arrayOf(roomId),
+                )
+            }.getOrNull()
+        }
+    }
+
+    /** Side rows of [kind] targeting any of [targetEventIds] — the page's rows
+     *  joined against the target index in memory. With [excludeRedacted],
+     *  rows an unsend (a redaction row targeting the side row) removed are
+     *  dropped — the same rule the fold's summary recompute applies. */
+    suspend fun rowsForTargets(
+        c: MatrixClient,
+        roomId: String,
+        kind: String,
+        targetEventIds: Collection<String>,
+        excludeRedacted: Boolean,
+    ): List<ThreadRowValues> {
+        if (targetEventIds.isEmpty()) return emptyList()
+        val db = database(c) ?: return emptyList()
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val redactGuard = if (excludeRedacted) {
+                    " AND NOT EXISTS (SELECT 1 FROM ThreadRow rd " +
+                        "WHERE rd.roomId=ThreadRow.roomId AND rd.kind='redaction' " +
+                        "AND rd.targetEventId=ThreadRow.eventId)"
+                } else ""
+                val sq = db.openHelper.writableDatabase
+                val out = ArrayList<ThreadRowValues>()
+                targetEventIds.chunked(100).forEach { chunk ->
+                    val holes = chunk.joinToString(",") { "?" }
+                    out += queryRows(
+                        sq,
+                        "SELECT * FROM ThreadRow WHERE roomId=? AND kind=? " +
+                            "AND targetEventId IN ($holes)$redactGuard ORDER BY ingestSeq",
+                        arrayOf<Any?>(roomId, kind, *chunk.toTypedArray()),
+                    )
+                }
+                out
+            }.getOrDefault(emptyList<ThreadRowValues>())
+        }
+    }
+
     /** Persist (or, with null, clear) a room's Part H backfill resume token. */
     suspend fun markBackfillCursor(c: MatrixClient, roomId: String, batchBefore: String?) {
         val db = database(c) ?: return
