@@ -3592,10 +3592,13 @@ object MatrixRepository {
                 gapEvent.event.id.full,
             ) ?: return // failed — [backfillTimelineGap] parked the cooldown
         }
-        val before = ThreadRowStore.rowCount(c, roomId)
-        val newRows = threadRowsFromRound(c, matrixRoomId, walk.first.map { it.event.id.full })
-        ThreadRowStore.writeRows(c, newRows)
-        val added = ThreadRowStore.rowCount(c, roomId) - before
+        // The walk arrives newest→oldest; the ingest writer's seq convention
+        // is oldest-first input order — reversing keeps equal-timestamp ties
+        // ordered like a sync round instead of inverting them.
+        val newRows = threadRowsFromRound(
+            c, matrixRoomId, walk.first.asReversed().map { it.event.id.full },
+        )
+        val added = writeThreadRowsThrough(c, roomId, newRows)
         if (added <= 0) {
             gapBackfillCooldown.park(roomId, GAP_BACKFILL_COOLDOWN_MS)
         } else {
@@ -3607,6 +3610,30 @@ object MatrixRepository {
                 )
             }
         }
+    }
+
+    /**
+     * One ThreadRow batch write, ingest-writer rules (Task 3) — the single
+     * write-through seam for BOTH the live sync ingest and the Part F top-up's
+     * backfilled window (sync never re-delivers old events, so the top-up is
+     * the only path a backfilled real reaction ever travels, and its targets'
+     * `seed:`-pseudo reaction rows must retire here exactly as they do when
+     * the reaction arrives live). The batch's real reaction rows retire their
+     * targets' seeded pseudo rows first ([ThreadRowLogic.seedReactionRetireTargets]
+     * → [ThreadRowStore.retireSeedReactions]); the write then lands the batch
+     * and re-folds. Returns the rows actually inserted (any kind — the
+     * top-up's zero-added guard).
+     */
+    private suspend fun writeThreadRowsThrough(
+        c: MatrixClient,
+        roomId: String,
+        rows: List<ThreadRowValues>,
+    ): Int {
+        val seedTargets = ThreadRowLogic.seedReactionRetireTargets(rows)
+        if (seedTargets.isNotEmpty()) {
+            ThreadRowStore.retireSeedReactions(c, roomId, seedTargets)
+        }
+        return ThreadRowStore.writeRows(c, rows)
     }
 
     /** Reaction tags for store-served rows, rebuilt from the target's reaction
@@ -10405,16 +10432,12 @@ object MatrixRepository {
             if (eventIds.isEmpty()) continue
             val rows = threadRowsFromRound(c, roomId, eventIds)
             if (rows.isEmpty()) continue
-            // Seeded pseudo reaction retirement (Task 5 ruling): the first
-            // REAL reaction row a round writes for a target retires the
-            // target's `seed:`-pseudo reaction rows (label senders) — seeded
-            // tags must not outlive the truth. The write below re-folds the
-            // target (summary recomputed from the surviving rows).
-            val seedTargets = ThreadRowLogic.seedReactionRetireTargets(rows)
-            if (seedTargets.isNotEmpty()) {
-                ThreadRowStore.retireSeedReactions(c, roomId.full, seedTargets)
-            }
-            ThreadRowStore.writeRows(c, rows)
+            // Seeded pseudo reaction retirement + write — the shared
+            // write-through seam ([writeThreadRowsThrough]): the first REAL
+            // reaction row a round writes for a target retires the target's
+            // `seed:`-pseudo reaction rows (label senders) — seeded tags must
+            // not outlive the truth.
+            writeThreadRowsThrough(c, roomId.full, rows)
             bumpMessagePageRevision(roomId.full)
             if (debugLogging()) {
                 android.util.Log.d(

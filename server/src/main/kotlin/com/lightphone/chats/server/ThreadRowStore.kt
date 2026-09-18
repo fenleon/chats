@@ -99,12 +99,17 @@ object ThreadRowStore {
      * side rows of a target re-apply in ingest order on every write, so the
      * cached columns converge (and pending side rows from earlier rounds —
      * whose target only now arrived — apply at the same time, SPEC §1).
+     *
+     * Returns the number of rows actually inserted — skips and in-place
+     * placeholder updates excluded, side rows included — the caller's
+     * "did this batch add anything" signal (any kind counted).
      */
-    suspend fun writeRows(c: MatrixClient, rows: List<ThreadRowValues>) {
-        if (rows.isEmpty()) return
-        val db = database(c) ?: return
-        withContext(Dispatchers.IO) {
+    suspend fun writeRows(c: MatrixClient, rows: List<ThreadRowValues>): Int {
+        if (rows.isEmpty()) return 0
+        val db = database(c) ?: return 0
+        return withContext(Dispatchers.IO) {
             runCatching {
+                var inserted = 0
                 val sq = db.openHelper.writableDatabase
                 sq.beginTransaction()
                 try {
@@ -152,13 +157,15 @@ object ThreadRowStore {
                             cur.getInt(0)
                         }
                         insert(sq, row.copy(ingestSeq = seq))
+                        inserted++
                     }
                     foldTargets(sq, rows)
                     sq.setTransactionSuccessful()
                 } finally {
                     sq.endTransaction()
                 }
-            }.onFailure { Log.w(TAG, "write failed: ${it.message}") }
+                inserted
+            }.onFailure { Log.w(TAG, "write failed: ${it.message}") }.getOrDefault(0)
         }
     }
 
