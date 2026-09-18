@@ -358,6 +358,36 @@ object ThreadRowStore {
         }
     }
 
+    /** Fresh-login probe (SPEC §8 trigger): does the store hold ANY rows?
+     *  The probe is taken at client attach — before the first sync round can
+     *  write — so an empty store means a fresh login, not an unwritten one. */
+    suspend fun anyRows(c: MatrixClient): Boolean {
+        val db = database(c) ?: return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val sq = db.openHelper.writableDatabase
+                ensureTable(sq)
+                sq.query("SELECT 1 FROM ThreadRow LIMIT 1", arrayOf<String>())
+                    .use { it.moveToFirst() }
+            }.getOrDefault(false)
+        }
+    }
+
+    /** Interrupted-pass probe (SPEC §8 resume): any Part H backfill
+     *  bookmarks? Only the backfill worker writes this table, so any row
+     *  means a pass died mid-walk (process death, rate limit, reboot). */
+    suspend fun hasBackfillBookmarks(c: MatrixClient): Boolean {
+        val db = database(c) ?: return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val sq = db.openHelper.writableDatabase
+                ensureTable(sq)
+                sq.query("SELECT 1 FROM ThreadRowCursor LIMIT 1", arrayOf<String>())
+                    .use { it.moveToFirst() }
+            }.getOrDefault(false)
+        }
+    }
+
     /** Side rows of [kind] targeting any of [targetEventIds] — the page's rows
      *  joined against the target index in memory. With [excludeRedacted],
      *  rows an unsend (a redaction row targeting the side row) removed are

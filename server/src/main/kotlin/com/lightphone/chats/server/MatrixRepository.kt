@@ -2351,6 +2351,9 @@ object MatrixRepository {
             manualLogout = true
             val old = client
             client = null
+            threadBackfillJob?.cancel() // the walk walks the deleted store — stop it
+            threadBackfillJob = null
+            threadBackfillStoreEmptyAtAttach = null // the next login re-probes
             slowSyncJob?.cancel()
             slowSyncJob = null
             screenOffJob?.cancel()
@@ -3634,6 +3637,111 @@ object MatrixRepository {
             ThreadRowStore.retireSeedReactions(c, roomId, seedTargets)
         }
         return ThreadRowStore.writeRows(c, rows)
+    }
+
+    // --- Part H: fresh-login ThreadRow backfill (docs/THREAD-STORE-SPEC.md §8) ---
+
+    /**
+     * One backfill round for [roomId], driven by the pure [ThreadBackfill]
+     * state machine: the Part F top-up walk ([topUpOlderPage]) unrolled into
+     * a worker round — chain walk from the deepest store row, ONE gap
+     * `/messages` window ([backfillTimelineGap], token semantics included)
+     * when the walk ends on a gap marker, then the window through the Task 5
+     * write seam ([writeThreadRowsThrough]). Chain end — the room's creation
+     * — is the deepest row carrying no gap token after the round. Returns
+     * null when the round could not advance (walk unavailable, fill failed,
+     * nothing new written and the deepest row unchanged): the caller keeps
+     * the bookmark and the room resumes on a later pass (SPEC §8 resumable).
+     * A room with no rows at all is done for this pass — the ingest writer
+     * covers its new events, Part F its scroll-ups.
+     */
+    private suspend fun threadBackfillStep(
+        c: MatrixClient,
+        roomId: String,
+    ): ThreadBackfill.RoomStep? {
+        val matrixRoomId = RoomId(roomId)
+        val deepest = ThreadRowStore.deepestRow(c, roomId)
+            ?: return ThreadBackfill.RoomStep(0, null)
+        if (deepest.batchBefore == null) return ThreadBackfill.RoomStep(0, null)
+        var walk = readTimelineChainFromDb(
+            c, matrixRoomId, deepest.eventId, GAP_BACKFILL_LIMIT.toInt(),
+        ) ?: return null
+        val gapEvent = walk.first.firstOrNull { it.gap?.batchBefore != null }
+        if (gapEvent != null) {
+            walk = backfillTimelineGap(
+                c, matrixRoomId, deepest.eventId, GAP_BACKFILL_LIMIT.toInt(),
+                gapEvent.event.id.full,
+            ) ?: return null
+        }
+        // The walk arrives newest→oldest; the ingest writer's seq convention
+        // is oldest-first input order (the same reversal topUpOlderPage does).
+        val newRows = threadRowsFromRound(
+            c, matrixRoomId, walk.first.asReversed().map { it.event.id.full },
+        )
+        val added = writeThreadRowsThrough(c, roomId, newRows)
+        if (added <= 0) return null
+        bumpMessagePageRevision(roomId)
+        val token = ThreadRowStore.deepestRow(c, roomId)?.batchBefore
+        return ThreadBackfill.RoomStep(added, token)
+    }
+
+    /** [ThreadBackfill.Deps] against this client's real APIs. */
+    private fun threadBackfillDeps(c: MatrixClient): ThreadBackfill.Deps =
+        object : ThreadBackfill.Deps {
+            override suspend fun roomIds(): List<String>? {
+                val rooms = runCatching {
+                    withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
+                }.getOrNull() ?: return null
+                // The same JOIN-filtered walk backfillProjection uses — the
+                // room-list order as-is, no new ordering code (SPEC §8).
+                return rooms.keys.mapNotNull { id ->
+                    withTimeoutOrNull(ROOM_LIST_ROOM_BUDGET_MS) {
+                        rooms[id]?.filterNotNull()?.firstOrNull()
+                    }?.takeIf { it.membership == Membership.JOIN }?.let { id.full }
+                }
+            }
+
+            override suspend fun storeEmpty(): Boolean =
+                threadBackfillStoreEmptyAtAttach ?: false
+
+            override suspend fun hasBackfillBookmarks(): Boolean =
+                runCatching { ThreadRowStore.hasBackfillBookmarks(c) }.getOrDefault(false)
+
+            override suspend fun backfillCursor(roomId: String): String? = runCatching {
+                val db = c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class)
+                ThreadRowStore.backfillCursor(db.openHelper.writableDatabase, roomId)
+            }.getOrNull()
+
+            override suspend fun markBackfillCursor(roomId: String, batchBefore: String?) {
+                ThreadRowStore.markBackfillCursor(c, roomId, batchBefore)
+            }
+
+            override suspend fun stepRoom(roomId: String): ThreadBackfill.RoomStep? =
+                threadBackfillStep(c, roomId)
+
+            override fun log(message: String) {
+                if (debugLogging()) android.util.Log.d(TAG, message)
+            }
+        }
+
+    /**
+     * The fresh-login probe (SPEC §8 trigger), captured at client attach —
+     * BEFORE the first sync round can write rows, which is the only moment
+     * an empty store still means "fresh login". Null = probe not landed yet
+     * (the worker treats that as not-fresh, the conservative side).
+     */
+    @Volatile
+    private var threadBackfillStoreEmptyAtAttach: Boolean? = null
+
+    private var threadBackfillJob: Job? = null
+
+    /** Launch the Part H backfill pass, once per client. Called when the
+     *  projection backfill completes (fresh login — initial sync done, room
+     *  list known, the same sequencing it retries for) or short-circuits on
+     *  the already-backfilled flag (restore/restart — the resume path). */
+    private fun startThreadBackfill(c: MatrixClient) {
+        if (threadBackfillJob?.isActive == true) return
+        threadBackfillJob = ThreadBackfill.start(scope, threadBackfillDeps(c))
     }
 
     /** Reaction tags for store-served rows, rebuilt from the target's reaction
@@ -10026,6 +10134,12 @@ object MatrixRepository {
     private fun observeClient(c: MatrixClient) {
         if (observedClient === c) return
         observedClient = c
+        // Part H fresh-login probe (SPEC §8): must land before the first sync
+        // round writes rows — it's enqueued ahead of every observer below.
+        scope.launch {
+            threadBackfillStoreEmptyAtAttach =
+                runCatching { !ThreadRowStore.anyRows(c) }.getOrDefault(false)
+        }
         notificationWatcherJobs.forEach { it.cancel() }
         notificationWatcherJobs.clear()
         observeSyncState(c)
@@ -10274,7 +10388,13 @@ object MatrixRepository {
         }
         yieldToSyncIngest()
         val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return
-        if (prefs.getBoolean("projection_backfilled", false)) return
+        if (prefs.getBoolean("projection_backfilled", false)) {
+            // Restore/restart: the projection is done, but a Part H backfill
+            // pass interrupted by process death / rate-limit / reboot resumes
+            // from its bookmarks (SPEC §8).
+            startThreadBackfill(c)
+            return
+        }
         // The room map often isn't surfaced yet on a cold login (the initial
         // sync takes longer than the budget on a 358-room account) — a silent
         // return here killed the whole backfill on the LP3 (09-15). Retry.
@@ -10326,6 +10446,9 @@ object MatrixRepository {
         }
         prefs.edit().putBoolean("projection_backfilled", true).apply()
         android.util.Log.d(TAG, "projection: backfilled ${written}/${roomIds.size} rooms")
+        // Fresh login: initial sync done, room list known — start the Part H
+        // bounded ThreadRow backfill (SPEC §8).
+        startThreadBackfill(c)
     }
 
     private suspend fun recomputeProjectionRows(c: MatrixClient, roomIds: List<RoomId>): Int {
