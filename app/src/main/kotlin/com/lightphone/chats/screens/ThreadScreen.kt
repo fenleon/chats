@@ -1146,7 +1146,10 @@ class ThreadViewModel(
 
     /** Fetches an image message's display bytes if they aren't cached yet. */
     fun ensureMedia(eventId: String, allowMobileData: Boolean) {        if (mediaBytes.value.containsKey(eventId)) return
-        viewModelScope.launch {
+        // IO: the server side downloads + decodes media inline (video frame
+        // extraction via MediaMetadataRetriever is seconds of blocking work) —
+        // on the default Main dispatcher this ANRs the app (LP3, 2026-09-19).
+        viewModelScope.launch(Dispatchers.IO) {
             // Retry a few times: the first read can hit a still-decrypting
             // event or a transient download failure, and a null result is not
             // cached — the row would otherwise stay on its text fallback.
@@ -1437,7 +1440,15 @@ class ThreadScreen(
                 val info = listState.layoutInfo
                 val topIndex = info.visibleItemsInfo.maxOfOrNull { it.index } ?: -1
                 val total = info.totalItemsCount
-                if (total > 0 && topIndex >= total - OLDER_LOAD_THRESHOLD) {
+                // A short page (few renderable rows — e.g. a bridged room whose
+                // newest window is mostly ghost-filtered events) can't scroll,
+                // so a scroll-position trigger never fires and older messages
+                // dead-end. When every item is already visible, load regardless
+                // of scroll position; loadOlder's own guards (loadingMore /
+                // hasMore) keep this from looping, and each prepend eventually
+                // makes the list scrollable.
+                val allVisible = info.visibleItemsInfo.size >= total
+                if (total > 0 && (topIndex >= total - OLDER_LOAD_THRESHOLD || allVisible)) {
                     viewModel.loadOlder()
                 }
                 scrollMetrics = listState.threadListMetrics(heightSampler)
