@@ -2344,6 +2344,12 @@ object MatrixRepository {
             threadBackfillJob?.cancel() // the walk walks the deleted store — stop it
             threadBackfillJob = null
             threadBackfillStoreEmptyAtAttach = null // the next login re-probes
+            // The watchers (sync observers + the ThreadRow recheck loop) collect
+            // from the old client — cancel them with the session or the recheck
+            // keeps spinning against the closed client. The next login
+            // re-observes (the attach path cancels + re-registers anyway).
+            notificationWatcherJobs.forEach { it.cancel() }
+            notificationWatcherJobs.clear()
             slowSyncJob?.cancel()
             slowSyncJob = null
             screenOffJob?.cancel()
@@ -2840,23 +2846,24 @@ object MatrixRepository {
                     }
                 }
                 if (storeCold) {
-                    attachedClient.let { c ->
-                        scope.launch {
-                            runCatching {
-                                // One full recompute behind the fast first
-                                // paint (the fallback above serves it) — its
-                                // rendered rows ARE the seed (SPEC §7).
-                                seedThreadRow(c, roomId, computeMessagesPage(roomId, null, limit))
-                            }.onFailure { android.util.Log.w(TAG, "thread-store seed failed: ${it.message}") }
-                        }
+                    // One full recompute serves the first paint AND seeds the
+                    // store from the SAME result (SPEC §7) — computing twice
+                    // (background seed + fallback below) ran the 10-40 s walk
+                    // in parallel twice and saturated the recompute semaphore
+                    // with no fast first paint.
+                    val page = computeMessagesPage(roomId, null, limit)
+                    scope.launch {
+                        runCatching { seedThreadRow(attachedClient, roomId, page) }
+                            .onFailure { android.util.Log.w(TAG, "thread-store seed failed: ${it.message}") }
                     }
+                    return injectPendingEchoes(roomId, page)
                 }
             }
         }
         if (beforeEventId != null) return computeMessagesPage(roomId, beforeEventId, limit)
         // Fallback newest page (SPEC §7): the recompute engine IS the fallback —
-        // reached when the client is down, the store is cold (its seed runs in
-        // the background above), or the store read failed. The pre-store
+        // reached when the client is down or the store read failed (a cold
+        // store computed and seeded above, then returned). The pre-store
         // memory/disk page cascade it replaced is retired (Task 7).
         return injectPendingEchoes(roomId, computeMessagesPage(roomId, null, limit))
     }
@@ -2867,7 +2874,7 @@ object MatrixRepository {
      * read — and re-opening a thread served the pre-echo store page, so a
      * just-sent message appeared missing until the next ingest round. The
      * rows dedup by their "local-…" id; the store's echo row replaces them
-     * on the next poll after the ingest writer writes it through.
+     * on the next re-serve after the ingest writer writes it through.
      */
     private suspend fun injectPendingEchoes(roomId: String, page: MessagesPage): MessagesPage {
         val c = client ?: return page
@@ -3098,7 +3105,7 @@ object MatrixRepository {
         val newRows = threadRowsFromRound(
             c, matrixRoomId, walk.first.asReversed().map { it.event.id.full },
         )
-        val added = writeThreadRowsThrough(c, roomId, newRows)
+        val (added, _) = writeThreadRowsThrough(c, roomId, newRows)
         if (added <= 0) {
             gapBackfillCooldown.park(roomId, GAP_BACKFILL_COOLDOWN_MS)
         } else {
@@ -3122,18 +3129,19 @@ object MatrixRepository {
      * targets' seeded pseudo rows first ([ThreadRowLogic.seedReactionRetireTargets]
      * → [ThreadRowStore.retireSeedReactions]); the write then lands the batch
      * and re-folds. Returns the rows actually inserted (any kind — the
-     * top-up's zero-added guard).
+     * top-up's zero-added guard) paired with whether the retirement removed
+     * any rows — the caller's "did this batch change the store" signal.
      */
     private suspend fun writeThreadRowsThrough(
         c: MatrixClient,
         roomId: String,
         rows: List<ThreadRowValues>,
-    ): Int {
+    ): Pair<Int, Boolean> {
         val seedTargets = ThreadRowLogic.seedReactionRetireTargets(rows)
-        if (seedTargets.isNotEmpty()) {
+        val retired = if (seedTargets.isEmpty()) 0 else {
             ThreadRowStore.retireSeedReactions(c, roomId, seedTargets)
         }
-        return ThreadRowStore.writeRows(c, rows)
+        return ThreadRowStore.writeRows(c, rows) to (retired > 0)
     }
 
     // --- Part H: fresh-login ThreadRow backfill (docs/THREAD-STORE-SPEC.md §8) ---
@@ -3175,7 +3183,7 @@ object MatrixRepository {
         val newRows = threadRowsFromRound(
             c, matrixRoomId, walk.first.asReversed().map { it.event.id.full },
         )
-        val added = writeThreadRowsThrough(c, roomId, newRows)
+        val (added, _) = writeThreadRowsThrough(c, roomId, newRows)
         if (added <= 0) return null
         bumpMessagePageRevision(roomId)
         val token = ThreadRowStore.deepestRow(c, roomId)?.batchBefore
@@ -4715,27 +4723,6 @@ object MatrixRepository {
     }
 
     /**
-     * Merges cached + delta reaction tags per reactor: the delta's tag for a
-     * reactor replaces their cached one. [reactionTagsForEvents] dedupes per
-     * sender within one event window, but the incremental patch only sees the
-     * delta — the replaced reaction's tag still sits in the cached page. The tag
-     * label's shape ("Who reacted …") carries the reactor name; a
-     * collapsed "X and others" cached line only matches on its exact prefix,
-     * the same ceiling [ownReactionKeys] on the tool side lives with.
-     */
-    private fun mergeReactionTags(cached: List<String>, added: List<String>): List<String> {
-        if (added.isEmpty()) return cached
-        val replaced = added.mapNotNull { tag ->
-            val at = tag.indexOf(" reacted ")
-            if (at <= 0) null else tag.substring(0, at)
-        }.toSet()
-        return cached.filterNot { tag ->
-            val at = tag.indexOf(" reacted ")
-            at > 0 && tag.substring(0, at) in replaced
-        } + added
-    }
-
-    /**
      * Which raw-timeline event ids the other room members have read (their
      * m.read receipts), as a set of event ids. Newest-first index math: a
      * receipt pointing at raw index r covers every event at index >= r — all
@@ -5398,10 +5385,10 @@ object MatrixRepository {
         // [computeMessagesPage].
         val roomPending = pendingTextEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
         roomPending[txnId] = PendingTextSend(txnId, System.currentTimeMillis(), markdownBody, replyToEventId)
-        // Keep the cached/disk newest page — re-opening the thread serves it
-        // instantly with the optimistic row injected ([injectPendingEchoes]),
-        // and the active-room refresher (or the next poll) recomputes the page
-        // once the sync echo lands.
+        // Keep the served store page — re-opening the thread serves it
+        // instantly with the optimistic row injected ([injectPendingEchoes])
+        // until the sync echo lands (the ingest writer's revision bump
+        // re-serves the page with the real row).
         // Fetch the echo + refresh the panel even in slow-sync mode (screen off).
         // Fire-and-forget like Beeper's send worker: the composer RPC covers
         // only the outbox insert — the room-list bump, the wake round and the
@@ -5409,10 +5396,10 @@ object MatrixRepository {
         scope.launch { wakeAfterSend(matrixRoomId.full) }
         // NO-SEAM: the thread no longer polls — it reacts to page
         // bumps. The send-time bump fires BEFORE the homeserver ack, so the row
-        // sat "SENDING" until the sync echo's page rebuild landed — starved for
+        // sat "SENDING" until the sync echo's re-serve landed — starved for
         // ~95 s under the post-attach crawl. Watch the outbox row and bump at the
         // ack: the serve-time [pendingEchoRow] then renders the real event id
-        // (sent) from the SAME cached page — no rebuild needed.
+        // (sent) from the same served page — no rebuild needed.
         scope.launch {
             var lastAcked = false
             var lastKickAt = android.os.SystemClock.elapsedRealtime()
@@ -5620,20 +5607,22 @@ object MatrixRepository {
         // the 500 ms wait timed out unconfirmed under crawl load and the throw
         // showed the user "failed" for an edit that landed seconds later.
         // Failures surface as the edit never appearing (the
-        // outbox keeps retrying); the echo applies it on the next poll.
+        // outbox keeps retrying); the echo applies it on the ingest writer's
+        // re-serve.
         wakeAfterSend(matrixRoomId.full)
     }
 
     /**
      * Unsends an own message for everyone: a plain
      * Matrix redaction — the identical call [unsendReaction] uses, pointed at
-     * the message event instead of a reaction. The delta page patch bails to
-     * the full rebuild on redactions, so the tombstone lands on the next
-     * poll. Throws on failure; the dispatch maps it to a tool-side error.
+     * the message event instead of a reaction. The redaction lands through
+     * the ingest writer (a side row over the target), whose revision bump
+     * re-serves the thread with the tombstone. Throws on failure; the
+     * dispatch maps it to a tool-side error.
      */
     suspend fun unsendMessage(roomId: String, eventId: String) {
         val c = client ?: error("not logged in")
-        // The marker goes down BEFORE the redaction call: the page rebuild this
+        // The marker goes down BEFORE the redaction call: the re-serve this
         // triggers can beat the redaction's sync echo into the store, and the
         // tombstone must survive both orderings (e2ee rooms can't recognize a
         // redacted message by type — see [unsentMessageIds]).
@@ -6627,12 +6616,12 @@ object MatrixRepository {
             }
         }.getOrNull() ?: return false
         android.util.Log.d(TAG, "SendVoiceNote: room=$roomId txn=$txnId bytes=${bytes.size} duration=${durationMs}ms voice=m.audio+msc3245")
-        // Keep the cached/disk newest page — re-opening serves it instantly
+        // Keep the served store page — re-opening serves it instantly
         // with the optimistic "Voice note" row injected ([injectPendingEchoes])
-        // until the sync echo lands (the refresher then replaces it with the
-        // real event). The send previously dropped the cache, so a re-open
-        // recomputed from scratch (slow — "Loading messages…") and could show
-        // the note as missing.
+        // until the sync echo lands (the ingest writer's revision bump then
+        // re-serves the page with the real event). The send previously dropped
+        // the cache, so a re-open recomputed from scratch (slow — "Loading
+        // messages…") and could show the note as missing.
         val roomPending = pendingAudioEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
         // Keep a copy of the recorded file for the pending row: the activity
         // deletes the original as soon as this RPC returns, and the row must
@@ -6648,9 +6637,9 @@ object MatrixRepository {
         // RPC returns the real event id and the composer swaps it in); a voice
         // send's row is served from the pending map, whose id fell back to
         // "local-…" (→ SENDING) once Trixnity removed the outbox row at echo
-        // processing — and the active room's page isn't recomputed on the echo,
+        // processing — and the active room's page isn't re-served on the echo,
         // so the row stuck until a re-entry. Cache the acked id on
-        // the pending + bump the page: the next poll serves the row with its
+        // the pending + bump the page: the next re-serve shows the row with its
         // real id (~1-2 s after send) instead of SENDING. Holds the RPC up to
         // [SEND_ACK_WAIT_MS] like [sendMessage] does (the recording activity
         // shows its "sending" state meanwhile).
@@ -9712,6 +9701,12 @@ object MatrixRepository {
     /** Rooms served per recheck pass — one [restoreRoomSessions] call each. */
     private const val THREAD_ROW_RECHECK_ROOMS = 8
 
+    /** Recheck pass number — the rotating scan start ([recheckThreadStorePlaceholders]).
+     *  In-memory is enough: within a process run the rotation wraps over the
+     *  whole pending set, so no placeholder is starved. */
+    @Volatile
+    private var recheckPass = 0L
+
     private data class ProjectionRow(
         val roomId: String,
         val lastRealEventId: String?,
@@ -9937,21 +9932,37 @@ object MatrixRepository {
         join: Map<RoomId, Sync.Response.Rooms.JoinedRoom>,
     ) {
         for ((roomId, joinedRoom) in join) {
+            // Receipts are sync-ephemeral: a receipts-only round carries no
+            // timeline events, so without this check it never bumped the
+            // revision and an open thread froze its "seen" flags. The serve
+            // path reads RoomUserReceipts fresh ([serveFromStore]), so a bump
+            // is all the re-serve needs.
+            val hasReceipts = joinedRoom.ephemeral?.events
+                ?.any { it.content is ReceiptEventContent } == true
             val eventIds = joinedRoom.timeline?.events?.map { it.id.full }.orEmpty()
-            if (eventIds.isEmpty()) continue
+            if (eventIds.isEmpty()) {
+                if (hasReceipts) bumpMessagePageRevision(roomId.full)
+                continue
+            }
             val rows = threadRowsFromRound(c, roomId, eventIds)
-            if (rows.isEmpty()) continue
+            if (rows.isEmpty()) {
+                if (hasReceipts) bumpMessagePageRevision(roomId.full)
+                continue
+            }
             // Seeded pseudo reaction retirement + write — the shared
             // write-through seam ([writeThreadRowsThrough]): the first REAL
             // reaction row a round writes for a target retires the target's
             // `seed:`-pseudo reaction rows (label senders) — seeded tags must
             // not outlive the truth.
-            writeThreadRowsThrough(c, roomId.full, rows)
-            bumpMessagePageRevision(roomId.full)
-            if (debugLogging()) {
+            val (inserted, retired) = writeThreadRowsThrough(c, roomId.full, rows)
+            // A 0-row round (every event skipped as a re-delivery) must not
+            // re-serve the tool spuriously — but a retirement removed rows,
+            // and receipts changed the served seen flags: both bump.
+            if (inserted > 0 || retired || hasReceipts) bumpMessagePageRevision(roomId.full)
+            if (inserted > 0 && debugLogging()) {
                 android.util.Log.d(
                     TAG,
-                    "thread-store: ${roomId.full.takeLast(12)} wrote ${rows.size} row(s) " +
+                    "thread-store: ${roomId.full.takeLast(12)} wrote $inserted row(s) " +
                         "(${rows.count { it.encrypted == 1 }} pending decrypt)",
                 )
             }
@@ -10148,9 +10159,18 @@ object MatrixRepository {
     }
 
     /** One recheck pass over the store's placeholder rows (see
-     *  [startThreadStoreRecheckLoop]). */
+     *  [startThreadStoreRecheckLoop]). The scan start rotates each pass
+     *  ([recheckPass]): the fixed `ORDER BY roomId, ingestSeq` head let >8
+     *  permanently-stuck rooms occupy the [THREAD_ROW_RECHECK_ROOMS] window
+     *  forever and starve every room after them — the recheck is the only
+     *  healer left (the read-path restore was retired), so every placeholder
+     *  must eventually get a pass. */
     private suspend fun recheckThreadStorePlaceholders(c: MatrixClient) {
-        val pending = ThreadRowStore.pendingRows(c, THREAD_ROW_RECHECK_LIMIT)
+        val total = ThreadRowStore.pendingCount(c)
+        if (total == 0) return
+        val pass = recheckPass++
+        val offset = ((pass * THREAD_ROW_RECHECK_LIMIT) % total).toInt()
+        val pending = ThreadRowStore.pendingRows(c, THREAD_ROW_RECHECK_LIMIT, offset)
         if (pending.isEmpty()) return
         var filled = 0
         var dropped = 0

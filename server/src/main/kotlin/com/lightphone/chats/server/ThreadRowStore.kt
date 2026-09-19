@@ -191,18 +191,38 @@ object ThreadRowStore {
     /**
      * Placeholder rows (encrypted=1) for the ingest writer's 30 s decrypt
      * recheck (SPEC §2/§4), oldest room+ingest first, bounded per pass.
+     * [offset] rotates the scan start — a fixed head let permanently-stuck
+     * rooms occupy the recheck window forever and starve every room after
+     * them ([pendingCount] wraps the rotation).
      */
-    suspend fun pendingRows(c: MatrixClient, limit: Int): List<ThreadRowValues> {
+    suspend fun pendingRows(c: MatrixClient, limit: Int, offset: Int = 0): List<ThreadRowValues> {
         val db = database(c) ?: return emptyList()
         return withContext(Dispatchers.IO) {
             runCatching {
                 queryRows(
                     db.openHelper.writableDatabase,
                     "SELECT * FROM ThreadRow WHERE encrypted=1 " +
-                        "ORDER BY roomId, ingestSeq LIMIT ?",
-                    arrayOf<Any?>(limit),
+                        "ORDER BY roomId, ingestSeq LIMIT ? OFFSET ?",
+                    arrayOf<Any?>(limit, offset),
                 )
             }.getOrDefault(emptyList<ThreadRowValues>())
+        }
+    }
+
+    /** Total placeholder rows — the wrap bound for the recheck's rotating
+     *  scan start ([pendingRows]). */
+    suspend fun pendingCount(c: MatrixClient): Int {
+        val db = database(c) ?: return 0
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase.query(
+                    "SELECT COUNT(*) FROM ThreadRow WHERE encrypted=1",
+                    arrayOf<String>(),
+                ).use { cur ->
+                    check(cur.moveToFirst())
+                    cur.getInt(0)
+                }
+            }.getOrDefault(0)
         }
     }
 
