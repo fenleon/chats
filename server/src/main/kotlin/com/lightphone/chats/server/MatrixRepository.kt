@@ -56,6 +56,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.KSerializer
@@ -8943,6 +8947,19 @@ object MatrixRepository {
     @Volatile
     private var resolvedContactsCache: Map<String, ResolveEntry> = emptyMap()
 
+    /** In-flight provision requests — the caches are only written after the
+     *  response, so without dedup a burst of unknown DM ghosts (observed: ~12
+     *  concurrent GETs in one second on room-list open) each fired their own
+     *  HTTP GET for the same id. Concurrent callers share one Deferred; the
+     *  winner writes the cache as before. */
+    private val bridgeContactsInFlight =
+        java.util.concurrent.ConcurrentHashMap<String, Deferred<Map<String, BridgeContact>?>>()
+    private val resolveIdentifierInFlight =
+        java.util.concurrent.ConcurrentHashMap<String, Deferred<String?>>()
+    /** Caps concurrent provision HTTP rounds ([BRIDGE_HTTP_CONCURRENCY]) so a
+     *  burst of new ghosts trickles instead of stampeding the bridge. */
+    private val bridgeHttpPermits = Semaphore(BRIDGE_HTTP_CONCURRENCY)
+
     /** The bridge key from a bridged contact's Matrix id — the localpart
      *  prefix IS the provision bridgeId ("whatsapp_lid-…" → "whatsapp",
      *  "instagramgo-…" → "instagramgo"). Whitelisted so ordinary user ids
@@ -9017,6 +9034,29 @@ object MatrixRepository {
         return token
     }
 
+    /** Runs [block] once per [key]: concurrent callers share one in-flight
+     *  job ([Deferred.await]) instead of each firing their own request —
+     *  the winner's result feeds the cache writes exactly as a solo call
+     *  would. The job removes itself on completion; the double-checked
+     *  cache checks in each fetch cover the tiny gap between completion
+     *  and removal. */
+    private suspend fun <T> shareInFlight(
+        map: java.util.concurrent.ConcurrentHashMap<String, Deferred<T?>>,
+        key: String,
+        block: suspend () -> T?,
+    ): T? {
+        map[key]?.let { return it.await() }
+        val deferred = scope.async(start = CoroutineStart.LAZY) { block() }
+        val winner = map.putIfAbsent(key, deferred)
+        if (winner != null) {
+            deferred.cancel()
+            return winner.await()
+        }
+        deferred.invokeOnCompletion { map.remove(key, deferred) }
+        deferred.start()
+        return deferred.await()
+    }
+
     /** The bridge's contact list (mxid → contact), fetched once per TTL. Null
      *  when the fetch failed (retried after [BRIDGE_CONTACTS_RETRY_MS]); an
      *  empty map when the bridge serves none (cached like a real list). The
@@ -9028,26 +9068,41 @@ object MatrixRepository {
             if (now - (bridgeContactsFetchedAtMs[bridgeId] ?: 0L) < BRIDGE_CONTACTS_TTL_MS) return it
         }
         if (now - (bridgeContactsFailedAtMs[bridgeId] ?: 0L) < BRIDGE_CONTACTS_RETRY_MS) return null
+        return shareInFlight(bridgeContactsInFlight, bridgeId) { fetchBridgeContacts(c, bridgeId) }
+    }
+
+    /** The actual provision-list fetch behind [bridgeContacts] — the TTL +
+     *  backoff checks re-run inside the shared job, so a caller that raced
+     *  another's completed request still gets the fresh cache instead of a
+     *  duplicate fetch. */
+    private suspend fun fetchBridgeContacts(c: MatrixClient, bridgeId: String): Map<String, BridgeContact>? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        bridgeContactsCache[bridgeId]?.let {
+            if (now - (bridgeContactsFetchedAtMs[bridgeId] ?: 0L) < BRIDGE_CONTACTS_TTL_MS) return it
+        }
+        if (now - (bridgeContactsFailedAtMs[bridgeId] ?: 0L) < BRIDGE_CONTACTS_RETRY_MS) return null
         val url = "$BEEPER_HOMESERVER/_matrix/client/unstable/com.beeper.bridge/$bridgeId/_matrix/provision/v3/contacts"
         val token = appContext?.let { accessToken(it) }
-        val outcome = withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
-            try {
-                val resp = c.api.baseClient.baseClient.get(url) {
-                    parameter("user_id", c.userId.full)
-                    token?.let { header(HttpHeaders.Authorization, "Bearer $it") }
-                }
-                resp.status.value to resp.bodyAsText()
-            } catch (e: MatrixServerException) {
-                // A 404 from the list endpoint is deterministic (the bridge
-                // serves no contact list, e.g. instagramgo) — not a transient
-                // failure, so don't count it for the retry backoff.
-                if (e.statusCode.value == 404) 404 to "" else {
+        val outcome = bridgeHttpPermits.withPermit {
+            withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
+                try {
+                    val resp = c.api.baseClient.baseClient.get(url) {
+                        parameter("user_id", c.userId.full)
+                        token?.let { header(HttpHeaders.Authorization, "Bearer $it") }
+                    }
+                    resp.status.value to resp.bodyAsText()
+                } catch (e: MatrixServerException) {
+                    // A 404 from the list endpoint is deterministic (the bridge
+                    // serves no contact list, e.g. instagramgo) — not a transient
+                    // failure, so don't count it for the retry backoff.
+                    if (e.statusCode.value == 404) 404 to "" else {
+                        android.util.Log.w(TAG, "bridge contacts: $bridgeId request failed", e)
+                        null
+                    }
+                } catch (e: Exception) {
                     android.util.Log.w(TAG, "bridge contacts: $bridgeId request failed", e)
                     null
                 }
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "bridge contacts: $bridgeId request failed", e)
-                null
             }
         }
         val contacts = when {
@@ -9124,19 +9179,39 @@ object MatrixRepository {
         val localpart = contactId.substringAfter("@").substringBefore(":")
         val id = localpart.removePrefix("${bridgeId}_")
         if (id == localpart || id.isBlank()) return null
+        return shareInFlight(resolveIdentifierInFlight, contactId) {
+            fetchResolvedBridgeIdentifier(c, bridgeId, contactId, id)
+        }
+    }
+
+    /** The actual resolve_identifier request behind [resolveBridgeIdentifier]
+     *  — the TTL check re-runs inside the shared job for callers that raced
+     *  another's completed resolve. */
+    private suspend fun fetchResolvedBridgeIdentifier(
+        c: MatrixClient,
+        bridgeId: String,
+        contactId: String,
+        id: String,
+    ): String? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        resolvedContactsCache[contactId]?.let {
+            if (now - it.fetchedAtMs < BRIDGE_CONTACTS_TTL_MS) return it.contact?.identifier()
+        }
         val url = "$BEEPER_HOMESERVER/_matrix/client/unstable/com.beeper.bridge/$bridgeId/" +
             "_matrix/provision/v3/resolve_identifier/${id.encodeURLPathPart()}"
         val token = appContext?.let { accessToken(it) }
-        val outcome = withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
-            try {
-                val resp = c.api.baseClient.baseClient.get(url) {
-                    parameter("user_id", c.userId.full)
-                    token?.let { header(HttpHeaders.Authorization, "Bearer $it") }
+        val outcome = bridgeHttpPermits.withPermit {
+            withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
+                try {
+                    val resp = c.api.baseClient.baseClient.get(url) {
+                        parameter("user_id", c.userId.full)
+                        token?.let { header(HttpHeaders.Authorization, "Bearer $it") }
+                    }
+                    resp.status.value to resp.bodyAsText()
+                } catch (e: Exception) {
+                    android.util.Log.w(TAG, "bridge resolve: $bridgeId/$id request failed", e)
+                    null
                 }
-                resp.status.value to resp.bodyAsText()
-            } catch (e: Exception) {
-                android.util.Log.w(TAG, "bridge resolve: $bridgeId/$id request failed", e)
-                null
             }
         }
         val contact = when {
@@ -10782,6 +10857,9 @@ object MatrixRepository {
      *  usually transient; the backoff stops the room-list pass hammering an
      *  unreachable/auth-rejected endpoint every pass). */
     private const val BRIDGE_CONTACTS_RETRY_MS = 60_000L
+    /** Concurrent provision HTTP rounds cap (list fetches + per-contact
+     *  resolves share it — see [bridgeHttpPermits]). */
+    private const val BRIDGE_HTTP_CONCURRENCY = 3
     /** Rebuild a bridge's contact list at most this often (the bridge's own
      *  address book — real numbers incl. LID-resolved, usernames; stable
      *  between changes; battery: one fetch per bridge per hour, only when a
