@@ -10112,6 +10112,18 @@ object MatrixRepository {
                 out += editRowForStore(row, storedByEvent[row.eventId], ownName)
                 continue
             }
+            // The user's OWN just-sent message whose sync echo landed before
+            // Trixnity persisted the decrypted content: skipping (not writing
+            // an encrypted placeholder) is the documented design (PLAN.md
+            // "undecrypted pending-echo events are skipped in the page — the
+            // optimistic send row covers display until the real row lands",
+            // 2026-08-14 fix) — on re-entering the room a placeholder read as
+            // "[Encrypted message]" for the user's own send. Other users'
+            // placeholders are kept — the recheck fills them when the key
+            // lands.
+            if (row.kind == RowKind.MESSAGE.wire && row.encrypted == 1 && row.sender == c.userId.full) {
+                continue
+            }
             if (row.kind != RowKind.MESSAGE.wire || row.encrypted == 1) {
                 out += row
                 continue
