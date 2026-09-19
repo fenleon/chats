@@ -166,11 +166,15 @@ object ThreadRowStore {
                                     ),
                                 )
                             } else if (existing.prevEventId == null && row.prevEventId != null) {
-                                // Link self-heal: seeded/top-up-written rows
-                                // carry null prevEventId; when a later chain
-                                // walk re-covers them with the real link,
-                                // patch it in place — hasMore at the store's
-                                // bottom depends on it (LP3 2026-09-19).
+                                // Link self-heal — LEGACY-STORE COMPAT (the
+                                // seed routes through the canonical builder
+                                // since the 2026-09-19 unification, so new
+                                // rows always carry links): rows written by
+                                // pre-unification seeds carry null
+                                // prevEventId; when a chain walk re-covers
+                                // them, patch in place — hasMore at the
+                                // store's bottom depends on it. Converges:
+                                // once patched the branch never fires again.
                                 sq.execSQL(
                                     "UPDATE ThreadRow SET prevEventId=?,batchBefore=? " +
                                         "WHERE roomId=? AND eventId=?",
@@ -596,6 +600,46 @@ object ThreadRowStore {
                     .query("SELECT 1 FROM TimelineEvent LIMIT 1", arrayOf<String>())
                     .use { it.moveToFirst() }
             }.getOrDefault(false)
+        }
+    }
+
+    /** Room ids from RoomProjection, most recently active first. */
+    suspend fun recentProjectionRoomIds(c: MatrixClient, limit: Int): List<String> {
+        val db = database(c) ?: return emptyList()
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase
+                    .query(
+                        "SELECT roomId FROM RoomProjection ORDER BY lastRealTs DESC LIMIT ?",
+                        arrayOf(limit.toString()),
+                    ).use { cur ->
+                        buildList {
+                            while (cur.moveToNext()) add(cur.getString(0))
+                        }
+                    }
+            }.getOrDefault(emptyList())
+        }
+    }
+
+    /** Newest [window] TimelineEvent ids for [roomId] (store insertion order)
+     *  that have NO ThreadRow — the re-ingest repair candidates. */
+    suspend fun missingRecentEventIds(c: MatrixClient, roomId: String, window: Int): List<String> {
+        val db = database(c) ?: return emptyList()
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase
+                    .query(
+                        "SELECT te.eventId FROM TimelineEvent te " +
+                            "LEFT JOIN ThreadRow r ON r.roomId = te.roomId AND r.eventId = te.eventId " +
+                            "WHERE te.roomId = ? AND r.eventId IS NULL " +
+                            "ORDER BY te.rowid DESC LIMIT ?",
+                        arrayOf(roomId, window.toString()),
+                    ).use { cur ->
+                        buildList {
+                            while (cur.moveToNext()) add(cur.getString(0))
+                        }
+                    }
+            }.getOrDefault(emptyList())
         }
     }
 

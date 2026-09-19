@@ -3078,10 +3078,13 @@ object MatrixRepository {
         val allPlaceholders = oldestFirst.all { it.encrypted == 1 }
         // hasMore: mid-store pages ALWAYS have more below (the store's true
         // deepest row is deeper than this page's oldest) — only at the store's
-        // bottom do the deepest row's own chain links decide. Row-level links
-        // are unreliable mid-store: seeded/top-up-written rows carry null
-        // prevEventId (LP3 2026-09-19: a 23-row store reported hasMore=false
-        // with 549 chain events behind it — scroll-up dead-ended).
+        // bottom do the deepest row's own chain links decide. Since the seed
+        // maps through the canonical builder (2026-09-19 unification) new rows
+        // carry reliable links and hasMoreFrom alone would suffice — this
+        // query stays because pre-unification installs still hold link-less
+        // seeded rows, where trusting links alone would dead-end scroll-up
+        // (LP3 2026-09-19: a 23-row store reported hasMore=false with 549
+        // chain events behind it).
         val storeDeepest = ThreadRowStore.deepestRow(c, roomId)
         val hasMore = if (storeDeepest != null && storeDeepest.eventId != oldest.eventId) {
             true
@@ -3408,18 +3411,23 @@ object MatrixRepository {
     }
 
     /**
-     * Seed (SPEC §7): map a computed page's rendered rows back into ThreadRow
-     * values and write them. The page was rendered by the recompute engine —
+     * Seed (SPEC §7): write a computed page's rows into the store through the
+     * CANONICAL builder ([threadRowsFromRound] with the page's rendered
+     * messages as the override stage) — the row-builder unification (PLAN
+     * 2026-09-19): the seed is no longer a second, link-less builder; its
+     * message rows carry the same envelope-derived prevEventId/batchBefore the
+     * live ingest writes. The page was rendered by the recompute engine —
      * bodies are exactly what today's read path serves (broadcast own-name
      * stripping included), so the store keeps PRE-STRIP bodies and the serving
      * path serves them raw. Reaction tags / edit state ride along as pseudo
-     * side rows ("seed:…" ids, label senders) so the served tags and the
-     * `edited` flag survive the seed; real side rows from later sync rounds
-     * layer on top (the label-keyed tag dedup absorbs the overlap). The
-     * deepest row carries the page's chain cursor as its `batchBefore` resume
-     * link so [hasMoreFrom] keeps scroll-up alive past the seeded window.
-     * Optimistic rows (local-… ids, not-yet-echoed sends) are skipped — their
-     * real events arrive through the ingest writer.
+     * side rows ("seed:…" ids, label senders, [seedSideRowsOf]) so the served
+     * tags and the `edited` flag survive the seed; real side rows from later
+     * sync rounds layer on top (the label-keyed tag dedup absorbs the
+     * overlap). The deepest row carries the page's chain cursor as its
+     * `batchBefore` resume link so [hasMoreFrom] keeps scroll-up alive past
+     * the seeded window (only when the envelope didn't already provide a real
+     * gap marker). Optimistic rows (local-… ids, not-yet-echoed sends) are
+     * skipped — their real events arrive through the ingest writer.
      */
     private suspend fun seedThreadRow(c: MatrixClient, roomId: String, page: MessagesPage) {
         val msgs = page.messages.filter {
@@ -3427,14 +3435,30 @@ object MatrixRepository {
                 it.sendStatus != "SENT_PENDING_ECHO" && it.sendStatus != "FAIL_LOCAL_SEND"
         }
         if (msgs.isEmpty()) return
-        val rows = ArrayList<ThreadRowValues>(msgs.size * 2)
-        for (msg in msgs) rows += threadRowValuesFromMessage(roomId, msg)
+        // The canonical builder reads each id's stored envelope (links,
+        // relations, decrypt state) and applies the page's rendered fields.
+        val rows = threadRowsFromRound(
+            c, RoomId(roomId), msgs.map { it.id },
+            rendered = msgs.associateBy { it.id },
+        ).toMutableList()
+        // Safety net: an id whose envelope is missing from the TimelineEvent
+        // table (the page's ids come from the store-backed chain walk, so this
+        // should not happen) would silently lose its row — write the old
+        // link-less mapping for it instead. The seed must never drop a page
+        // row the tool just showed the user.
+        val rowIds = rows.mapTo(HashSet()) { it.eventId }
+        for (msg in msgs) {
+            if (msg.id !in rowIds) rows += fallbackMessageRow(roomId, msg)
+        }
+        rows += seedSideRowsAll(roomId, msgs)
         if (page.hasMore && page.nextBeforeEventId != null) {
-            // msgs is oldest-first (the page's ts-stable sort), so the first
-            // written row is the store's deepest.
-            val deepest = rows.first { it.kind == RowKind.MESSAGE.wire }
-            val index = rows.indexOf(deepest)
-            rows[index] = deepest.copy(batchBefore = page.nextBeforeEventId)
+            // The page is oldest-first, so the first message row is the
+            // store's deepest. A real envelope gap marker wins over the
+            // page's legacy event-id cursor.
+            val index = rows.indexOfFirst { it.kind == RowKind.MESSAGE.wire }
+            if (index >= 0 && rows[index].batchBefore == null) {
+                rows[index] = rows[index].copy(batchBefore = page.nextBeforeEventId)
+            }
         }
         ThreadRowStore.writeRows(c, rows)
         if (debugLogging()) {
@@ -3445,19 +3469,17 @@ object MatrixRepository {
         }
     }
 
-    /** One computed row → its ThreadRow message row + pseudo side rows (the
-     *  seed mapping — the same rendered-field derivation the ingest writer's
-     *  override stage applies). A row whose served body is the stuck-decrypt
-     *  placeholder is stored as an `encrypted=1` placeholder (body null) so
-     *  the recheck fills it when the key lands — the ingest hook never replays
-     *  pre-update events, so the seed is existing installs' only entry into
-     *  the store. */
-    private fun threadRowValuesFromMessage(
+    /**
+     * The seed's fallback MESSAGE row for a page message whose stored envelope
+     * is missing (see [seedThreadRow]) — the old [threadRowValuesFromMessage]
+     * construction, link-less. A stuck-decrypt body still maps to an
+     * `encrypted=1` placeholder (body null) so the recheck heals it. */
+    private fun fallbackMessageRow(
         roomId: String,
         msg: com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message,
-    ): List<ThreadRowValues> {
+    ): ThreadRowValues {
         val placeholder = ThreadRowLogic.isStuckDecryptBody(msg.body)
-        val message = ThreadRowValues(
+        return ThreadRowValues(
             roomId = roomId,
             eventId = msg.id,
             kind = RowKind.MESSAGE.wire,
@@ -3477,45 +3499,61 @@ object MatrixRepository {
             payload = null,
             reactionSummary = null,
         )
-        val sides = ArrayList<ThreadRowValues>(msg.reactions.size + 1)
-        msg.reactions.forEachIndexed { i, tag ->
-            val at = tag.indexOf(" reacted ")
-            if (at <= 0) return@forEachIndexed
-            val who = tag.substring(0, at)
-            val keys = tag.substring(at + " reacted ".length).takeIf { it.isNotBlank() } ?: return@forEachIndexed
-            sides += ThreadRowValues(
-                roomId = roomId,
-                eventId = "${ThreadRowLogic.SEED_ROW_PREFIX}${msg.id}:r$i",
-                kind = RowKind.REACTION.wire,
-                sender = who,
-                timestampMs = msg.timestampMs,
-                ingestSeq = 0,
-                body = null, formattedHtml = null, contentType = null, replyToId = null,
-                mediaMeta = null, sendStatus = null, encrypted = 0,
-                prevEventId = null, batchBefore = null,
-                targetEventId = msg.id,
-                payload = keys,
-                reactionSummary = null,
-            )
+    }
+
+    /**
+     * The seed's pseudo side rows (the unification's leftover from the old
+     * [threadRowValuesFromMessage] mapping): reaction tags / edit state as
+     * "seed:…" stand-in rows keyed to their target message. The MESSAGE row
+     * itself comes from the canonical builder now — the pseudo rows only
+     * carry what a rendered page knows but its event ids don't (label senders
+     * for reactions, the edited body), until the real events arrive through
+     * the ingest writer. */
+    private fun seedSideRowsAll(
+        roomId: String,
+        msgs: List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>,
+    ): List<ThreadRowValues> {
+        val sides = ArrayList<ThreadRowValues>(msgs.size * 2)
+        for (msg in msgs) {
+            msg.reactions.forEachIndexed { i, tag ->
+                val at = tag.indexOf(" reacted ")
+                if (at <= 0) return@forEachIndexed
+                val who = tag.substring(0, at)
+                val keys = tag.substring(at + " reacted ".length).takeIf { it.isNotBlank() } ?: return@forEachIndexed
+                sides += ThreadRowValues(
+                    roomId = roomId,
+                    eventId = "${ThreadRowLogic.SEED_ROW_PREFIX}${msg.id}:r$i",
+                    kind = RowKind.REACTION.wire,
+                    sender = who,
+                    timestampMs = msg.timestampMs,
+                    ingestSeq = 0,
+                    body = null, formattedHtml = null, contentType = null, replyToId = null,
+                    mediaMeta = null, sendStatus = null, encrypted = 0,
+                    prevEventId = null, batchBefore = null,
+                    targetEventId = msg.id,
+                    payload = keys,
+                    reactionSummary = null,
+                )
+            }
+            if (msg.edited) {
+                sides += ThreadRowValues(
+                    roomId = roomId,
+                    eventId = "${ThreadRowLogic.SEED_ROW_PREFIX}${msg.id}:edit",
+                    kind = RowKind.EDIT.wire,
+                    sender = null,
+                    timestampMs = msg.timestampMs,
+                    ingestSeq = 0,
+                    body = null, formattedHtml = null, contentType = null, replyToId = null,
+                    mediaMeta = msg.formattedHtml, // the edited row's served HTML
+                    sendStatus = null, encrypted = 0,
+                    prevEventId = null, batchBefore = null,
+                    targetEventId = msg.id,
+                    payload = msg.body, // already the edited (stripped) body
+                    reactionSummary = null,
+                )
+            }
         }
-        if (msg.edited) {
-            sides += ThreadRowValues(
-                roomId = roomId,
-                eventId = "${ThreadRowLogic.SEED_ROW_PREFIX}${msg.id}:edit",
-                kind = RowKind.EDIT.wire,
-                sender = null,
-                timestampMs = msg.timestampMs,
-                ingestSeq = 0,
-                body = null, formattedHtml = null, contentType = null, replyToId = null,
-                mediaMeta = msg.formattedHtml, // the edited row's served HTML
-                sendStatus = null, encrypted = 0,
-                prevEventId = null, batchBefore = null,
-                targetEventId = msg.id,
-                payload = msg.body, // already the edited (stripped) body
-                reactionSummary = null,
-            )
-        }
-        return sides + message
+        return sides
     }
 
     // --- Bridge re-import ("ghost") detection ------------------
@@ -9653,6 +9691,40 @@ object MatrixRepository {
         // Re-seed the in-memory pending maps from the outbox after a process
         // restart, so queued/acked-but-not-yet-echoed sends still show a row.
         scope.launch { reconstructOutboxPendings(c) }
+        scope.launch {
+            delay(THREAD_ROW_REPAIR_DELAY_MS) // let the attach + initial sync settle first
+            runCatching { repairMissingThreadRows(c) }
+                .onFailure { android.util.Log.w(TAG, "thread-store repair failed: ${it.message}") }
+        }
+    }
+
+    /** One-shot per attach: re-ingest recent timeline events that have NO
+     *  ThreadRow. The live ingest can permanently skip an own echo (the
+     *  own-undecrypted skip — no later sync round re-delivers the event, and
+     *  the decrypt recheck only heals rows that exist), and history predating
+     *  the store's install was never backfilled (upgrades skip the fresh-login
+     *  backfill) — both leave messages invisible though their events sit in
+     *  the timeline store (Anni room, LP3 2026-09-19). Bounded: recent-activity
+     *  rooms × a per-room window; converges, because a repaired event gains a
+     *  row and re-ingesting rowed events is the writer's re-delivery no-op. */
+    private suspend fun repairMissingThreadRows(c: MatrixClient) {
+        for (roomId in ThreadRowStore.recentProjectionRoomIds(c, THREAD_ROW_REPAIR_ROOMS)) {
+            // Newest-first from the store; the writer wants oldest-first input.
+            val missing = ThreadRowStore.missingRecentEventIds(c, roomId, THREAD_ROW_REPAIR_WINDOW)
+            if (missing.isEmpty()) continue
+            val rows = threadRowsFromRound(c, RoomId(roomId), missing.asReversed())
+            val (added, _) = writeThreadRowsThrough(c, roomId, rows)
+            if (added > 0) {
+                bumpMessagePageRevision(roomId)
+                if (debugLogging()) {
+                    android.util.Log.d(
+                        TAG,
+                        "thread-store repair: ${roomId.takeLast(12)} wrote $added row(s) " +
+                            "of ${missing.size} missing",
+                    )
+                }
+            }
+        }
     }
 
     private fun observeSyncState(c: MatrixClient) {
@@ -10084,25 +10156,55 @@ object MatrixRepository {
         }
     }
 
-    /** [ThreadRowLogic.buildRows] inputs + rendered overrides for one room's
-     *  round events (see [ingestThreadStoreRound]). */
+    /**
+     * THE canonical ThreadRow builder (PLAN "Row-builder unification",
+     * 2026-09-19): event ids in → complete rows out. Every store write path
+     * maps its event ids through here — live ingest ([ingestThreadStoreRound]),
+     * the scroll-up top-up, the attach repair pass, and now the seed
+     * ([seedThreadRow], which passes its already-rendered page rows as
+     * [rendered] so the §7 mapping can no longer produce link-less rows).
+     * [rendered] (seed only) supplies the rendered overrides computed by the
+     * recompute engine's page (edits folded, bridge strips, reply excerpts —
+     * richer than a raw [messageFrom] on the envelope); when null, the
+     * overrides are computed here exactly as the live ingest always did.
+     *
+     * [ThreadRowLogic.buildRows] supplies the classification + link fields
+     * (prevEventId/batchBefore from the stored envelope per id); the
+     * rendered-message override stage (same fields the read path serves)
+     * applies to resolved MESSAGE rows.
+     */
     private suspend fun threadRowsFromRound(
         c: MatrixClient,
         roomId: RoomId,
         eventIds: List<String>,
+        rendered: Map<String, LightServiceMethod.GetMessages.Message>? = null,
     ): List<ThreadRowValues> {
         val stored = readStoredTimelineEvents(c, roomId, eventIds)
         if (stored.isEmpty()) return emptyList()
         // Broadcast own-name: stored bodies are PRE-STRIP (the same value the
         // read path uses), so store-served pages render raw with parity.
         val ownName = broadcastOwnNameOf(c, roomId)
-        val rendered = HashMap<String, LightServiceMethod.GetMessages.Message>(stored.size)
+        val renderedMap: HashMap<String, LightServiceMethod.GetMessages.Message> =
+            rendered?.let { HashMap(it) } ?: HashMap(stored.size)
         val inputs = ArrayList<RawEventInput>(stored.size)
         for (storedEvent in stored) {
             val eventId = storedEvent.event.event.id.full
-            val resolved = storedEvent.event.content?.getOrNull()
-            if (resolved != null) messageFrom(c, roomId, storedEvent.event, ownName = ownName)?.let {
-                rendered[eventId] = it
+            // An OWN event whose stored content is still unresolved (the sync
+            // round read the event before Trixnity's async decrypt persist
+            // finished): one bounded API re-read nudges the decrypt to land —
+            // the device holds the outbound megolm session for its own sends —
+            // so the row writes like any resolved one. Without this the
+            // own-undecrypted skip below drops the echo FOREVER (no later
+            // sync round re-delivers it, the decrypt recheck only heals rows
+            // that exist), and once Trixnity removes the acked outbox entry
+            // the send's pending echo degrades into a stuck SENDING row
+            // (Note-to-self sends, LP3 2026-09-19).
+            val event = if (storedEvent.event.content?.getOrNull() == null) {
+                healOwnEcho(c, roomId, storedEvent.event) ?: storedEvent.event
+            } else storedEvent.event
+            val resolved = event.content?.getOrNull()
+            if (rendered == null && resolved != null) {
+                messageFrom(c, roomId, event, ownName = ownName)?.let { renderedMap[eventId] = it }
             }
             val type = storedEvent.type ?: continue
             inputs += RawEventInput(
@@ -10145,15 +10247,52 @@ object MatrixRepository {
                 out += row
                 continue
             }
-            val msg = rendered[row.eventId] ?: continue
+            val msg = renderedMap[row.eventId] ?: continue
             out += row.copy(
                 body = msg.body,
                 formattedHtml = msg.formattedHtml,
                 contentType = msg.contentType,
                 mediaMeta = mediaMetaJsonOf(msg),
+                // The seed's rendered rows carry the page's Beeper status (its
+                // status events ride outside the mapped ids); the inline path's
+                // messageFrom runs without the status map, so this is null
+                // there — the SEND_STATUS side row owns the column for ingest.
+                sendStatus = msg.sendStatus,
             )
+            // The echo landed and its row wrote: retire the send's pending
+            // entry (keyed by the echo's txn id). Retirement used to live
+            // only in the recompute engine's insertPendingEchoes — dead code
+            // on the warm-store serve path — so a lingering entry
+            // re-injected its optimistic "local-…" row (stuck SENDING) on
+            // every later serve once the outbox was removed.
+            storedByEvent[row.eventId]?.event?.let { te ->
+                txnIdOf(te)?.let { retirePendingEcho(roomId.full, it) }
+            }
         }
         return out
+    }
+
+    /** One bounded API re-read for an own event whose stored content is still
+     *  unresolved (see the loop in [threadRowsFromRound]). Null keeps the
+     *  own-undecrypted skip: the optimistic send row covers display. */
+    private suspend fun healOwnEcho(
+        c: MatrixClient,
+        roomId: RoomId,
+        te: TimelineEvent,
+    ): TimelineEvent? =
+        if (te.event.sender.full != c.userId.full) null
+        else withTimeoutOrNull(DECRYPT_WAIT_MS) {
+            c.room.getTimelineEvent(roomId, te.event.id, timelineEventConfig)
+                .filterNotNull().firstOrNull { it.content?.getOrNull() != null }
+        }
+
+    /** Retires a room's pending echo entry once its real row is written (the
+     *  sync echo carries the send's txn id) — text, photo and voice-note
+     *  maps together. The audio copy's local file goes with it. */
+    private fun retirePendingEcho(roomKey: String, txnId: String) {
+        pendingTextEcho[roomKey]?.remove(txnId)
+        pendingImageEcho[roomKey]?.remove(txnId)
+        pendingAudioEcho[roomKey]?.remove(txnId)?.localFile?.let { runCatching { it.delete() } }
     }
 
     /**
@@ -10959,6 +11098,14 @@ object MatrixRepository {
      *  unaffected: a session arriving mid-park decrypts the room fresh. */
     private const val DECRYPT_RESTORE_COOLDOWN_MS = 14_400_000L
     private const val DECRYPT_WAIT_MS = 3_000L
+
+    /** Missing-row repair bounds: how many recently-active rooms and how deep
+     *  into each room's timeline one attach re-ingests, and the settle delay
+     *  before the pass starts (it must not contend with the attach's initial
+     *  sync). See [repairMissingThreadRows]. */
+    private const val THREAD_ROW_REPAIR_ROOMS = 24
+    private const val THREAD_ROW_REPAIR_WINDOW = 250
+    private const val THREAD_ROW_REPAIR_DELAY_MS = 15_000L
     /** Peek budget for events after the first one failed to decrypt. */
     private const val QUICK_DECRYPT_WAIT_MS = 100L
     /** Older than this at render time, a still-PENDING decrypt (content never

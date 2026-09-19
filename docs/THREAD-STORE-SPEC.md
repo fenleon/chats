@@ -315,6 +315,11 @@ whose `ThreadRow` is empty. Options considered:
   store (with `prevEventId`/`batchBefore`), serve. Old rows keep working; the expensive
   path runs at most once per room per login, in the background after a fast first
   paint (the cold-open fast path, `:3300-3309`, already exists as the model).
+  *2026-09-19 update (row-builder unification): the seed maps the page's event ids
+  through the canonical builder (`threadRowsFromRound` with the page as the rendered
+  override), so seeded rows carry the same envelope-derived links the ingest writer
+  writes — the link self-heal + mid-store hasMore query survive only as legacy-store
+  compat.*
 - (rejected) Bulk seed of all rooms at login: same objection as §6's bulk backfill —
   1284-room walk on battery.
 - (rejected) Dual-read forever: keeps both code paths alive; the whole point is to
