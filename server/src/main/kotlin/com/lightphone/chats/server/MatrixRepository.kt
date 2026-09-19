@@ -2320,6 +2320,13 @@ object MatrixRepository {
                         decryptRestoreCooldown.park(roomId.full, DECRYPT_RESTORE_COOLDOWN_MS)
                     }
                     roomsTouched++
+                    // The projection pass ran before the key restore (fresh
+                    // login), so its row wrote lastRealTs=0 and the tool
+                    // hides the room — recompute the ones whose keys just
+                    // landed, in lockstep with the crawl's counter.
+                    if (projectionRow(c, roomId.full)?.lastRealTs == 0L) {
+                        recomputeAndPublishProjectionRow(c, roomId.full)
+                    }
                 }
             }
         } finally {
@@ -3237,14 +3244,23 @@ object MatrixRepository {
         val (added, _) = writeThreadRowsThrough(c, roomId, newRows)
         if (added <= 0) return null
         bumpMessagePageRevision(roomId)
-        // The backfill just gave this room its historical rows — recompute its
-        // projection row (the login-time pass ran before the key restore, so
-        // heads were undecryptable and the row wrote lastRealTs=0) and publish
-        // the room-list row: the tool hides ts-0 rows, so without this the
-        // room stays invisible until it happens to receive a live event (LP3
-        // fresh login, 2026-09-20). The list heals in lockstep with the
-        // backfill counter the Account screen shows.
-        recomputeProjectionRows(c, listOf(matrixRoomId))
+        recomputeAndPublishProjectionRow(c, roomId)
+        val token = ThreadRowStore.deepestRow(c, roomId)?.batchBefore
+        return ThreadBackfill.RoomStep(added, token)
+    }
+
+    /**
+     * Recompute [roomId]'s projection row and republish its room-list row —
+     * the fresh-login heal seam. The projection backfill runs before the key
+     * restore, so its rows write lastRealTs=0 (undecryptable heads) and the
+     * tool's ts-0 guard hides every non-pinned room — permanent unless
+     * something recomputes once the room's keys land (LP3 2026-09-20: 352/362
+     * rows still ts=0 ten minutes after login, list stuck at 3 pinned rooms).
+     * Shared by the ThreadRow backfill step and the key-restore crawl; both
+     * drive an Account-screen counter, so the list heals in lockstep with it.
+     */
+    private suspend fun recomputeAndPublishProjectionRow(c: MatrixClient, roomId: String) {
+        recomputeProjectionRows(c, listOf(RoomId(roomId)))
         projectionRow(c, roomId)?.let { row ->
             roomListCache[roomId]?.let { entry ->
                 if (row.lastRealTs > entry.room.lastTimestampMs) {
@@ -3260,8 +3276,6 @@ object MatrixRepository {
             }
         }
         publishRoomList()
-        val token = ThreadRowStore.deepestRow(c, roomId)?.batchBefore
-        return ThreadBackfill.RoomStep(added, token)
     }
 
     /** [ThreadBackfill.Deps] against this client's real APIs. */
