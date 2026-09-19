@@ -2802,7 +2802,12 @@ object MatrixRepository {
         roomId: String,
         beforeEventId: String?,
         limit: Int,
-    ): MessagesPage {
+    ): MessagesPage = withContext(Dispatchers.Default) {
+        // Callers land here off their own dispatcher (the tool's
+        // ThreadViewModel runs on Main) — the cold paths below walk +
+        // parse the full event chain on CPU, so the whole body is pinned
+        // to Default regardless of the caller (the store reads switch
+        // to IO internally; nested withContext is fine).
         val attachedClient = client
         if (attachedClient != null) {
             if (beforeEventId != null) {
@@ -2815,7 +2820,7 @@ object MatrixRepository {
                     // scroll into unfetched history = one network round;
                     // subsequent scrolls stay local.
                     topUpOlderPage(attachedClient, roomId, keyset, limit)
-                    serveFromStore(attachedClient, roomId, beforeEventId, limit)?.let { return it }
+                    serveFromStore(attachedClient, roomId, beforeEventId, limit)?.let { return@withContext it }
                     // Store exhausted below the keyset: deeper history lives
                     // only in the event chain — continue through the recompute
                     // engine from the deepest stored row's resume link, and
@@ -2830,9 +2835,9 @@ object MatrixRepository {
                             runCatching { seedThreadRow(attachedClient, roomId, page) }
                                 .onFailure { android.util.Log.w(TAG, "thread-store write-through failed: ${it.message}") }
                         }
-                        return page
+                        return@withContext page
                     }
-                    return MessagesPage(emptyList(), false)
+                    return@withContext MessagesPage(emptyList(), false)
                 }
             } else {
                 // A room open warms the megolm send path in the background so the
@@ -2842,7 +2847,7 @@ object MatrixRepository {
                 val storeCold = ThreadRowStore.rowCount(attachedClient, roomId) == 0
                 if (!storeCold) {
                     serveFromStore(attachedClient, roomId, null, limit)?.let {
-                        return injectPendingEchoes(roomId, it)
+                        return@withContext injectPendingEchoes(roomId, it)
                     }
                 }
                 if (storeCold) {
@@ -2856,16 +2861,16 @@ object MatrixRepository {
                         runCatching { seedThreadRow(attachedClient, roomId, page) }
                             .onFailure { android.util.Log.w(TAG, "thread-store seed failed: ${it.message}") }
                     }
-                    return injectPendingEchoes(roomId, page)
+                    return@withContext injectPendingEchoes(roomId, page)
                 }
             }
         }
-        if (beforeEventId != null) return computeMessagesPage(roomId, beforeEventId, limit)
+        if (beforeEventId != null) return@withContext computeMessagesPage(roomId, beforeEventId, limit)
         // Fallback newest page (SPEC §7): the recompute engine IS the fallback —
         // reached when the client is down or the store read failed (a cold
         // store computed and seeded above, then returned). The pre-store
         // memory/disk page cascade it replaced is retired (Task 7).
-        return injectPendingEchoes(roomId, computeMessagesPage(roomId, null, limit))
+        injectPendingEchoes(roomId, computeMessagesPage(roomId, null, limit))
     }
 
     /**
