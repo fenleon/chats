@@ -801,28 +801,28 @@ private fun AccountStatus(
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
     ) {
         connection?.let { state ->
-            val allSynced = state.state == "syncing" &&
-                state.roomsTotal > 0 && state.roomsResolved >= state.roomsTotal
+            // Sync caught up = every joined room's store row is materialized
+            // (the P2 stat below). The old gate (every room's display name
+            // resolved) never fired — a few nameless bridge ghost rooms hold
+            // nameResolved=false forever, and the line read "Syncing 358 of
+            // 362 threads" indefinitely while the store was fully caught up
+            // (LP3 2026-09-19). The stale name-resolution counter comes off
+            // this line entirely.
+            val storeCaughtUp = state.roomsJoined > 0 &&
+                state.roomsProjected >= state.roomsJoined
             // The status line reads plainly — "battery
             // saver" when background sync is off, "offline" when there's
-            // simply no connection. The thread count shares the same line:
-            // "Syncing 34 of 52 threads" (no separator dot). Same Fine
-            // size as the restore line below.
+            // simply no connection.
             val statusText = when {
-                allSynced -> "Synced"
+                state.state == "syncing" && storeCaughtUp -> "Synced"
                 state.state == "syncing" -> "Syncing"
                 !state.syncEnabled -> "battery saver"
                 state.state == "offline" -> "offline"
                 state.state == "connecting" -> "connecting"
                 else -> state.state.replaceFirstChar { it.uppercase() }
             }
-            val countText = when {
-                state.roomsTotal <= 0 -> null
-                state.roomsResolved >= state.roomsTotal -> pluralThreads(state.roomsTotal)
-                else -> "${state.roomsResolved} of ${pluralThreads(state.roomsTotal)}"
-            }
             LightText(
-                text = countText?.let { "$statusText $it" } ?: statusText,
+                text = statusText,
                 variant = LightTextVariant.Fine,
             )
             // Key-backup restore crawl: "Recovering… x of y
@@ -834,7 +834,7 @@ private fun AccountStatus(
                     variant = LightTextVariant.Fine,
                     modifier = Modifier.padding(top = 1.dp),
                 )
-            } else if (state.restoreCompleted && allSynced) {
+            } else if (state.restoreCompleted && storeCaughtUp) {
                 LightText(
                     text = "All messages restored",
                     variant = LightTextVariant.Fine,
@@ -855,10 +855,6 @@ private fun AccountStatus(
         }
     }
 }
-
-/** "1 thread" / "N threads". */
-private fun pluralThreads(count: Int): String =
-    if (count == 1) "1 thread" else "$count threads"
 
 /** Device-verification row: the action reads "Verify Device"
  *  while unverified, and is a status-only row once verified. No toggle — the
