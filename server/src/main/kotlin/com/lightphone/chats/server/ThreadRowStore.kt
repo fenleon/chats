@@ -58,13 +58,15 @@ object ThreadRowStore {
         "CREATE INDEX IF NOT EXISTS idx_threadrow_pending " +
             "ON ThreadRow(roomId, ingestSeq) WHERE encrypted=1"
 
-    /** Part H backfill bookmark: one resume token per room. Lives in the same
-     *  SQLite (not PREFS) so it dies with the store at logout — a re-login
-     *  backfills from scratch, per SPEC §8. */
+    /** Part H backfill bookmark: one resume token + fetched counter per
+     *  room. Lives in the same SQLite (not PREFS) so it dies with the store
+     *  at logout — a re-login backfills from scratch, per SPEC §8. (The
+     *  table is new on this branch — no migration.) */
     private const val DDL_CURSOR =
         "CREATE TABLE IF NOT EXISTS ThreadRowCursor (" +
             "roomId TEXT NOT NULL PRIMARY KEY," +
-            "batchBefore TEXT)"
+            "batchBefore TEXT," +
+            "fetchedCount INTEGER NOT NULL DEFAULT 0)"
 
     /** Create the store schema. Cheap (IF NOT EXISTS) — call it before every
      *  use, like ensureProjectionTable's callers do. */
@@ -424,8 +426,16 @@ object ThreadRowStore {
         }
     }
 
-    /** Persist (or, with null, clear) a room's Part H backfill resume token. */
-    suspend fun markBackfillCursor(c: MatrixClient, roomId: String, batchBefore: String?) {
+    /** Persist (or, with null, clear) a room's Part H backfill bookmark:
+     *  the walk's resume token plus [fetchedCount], the events already
+     *  fetched toward this login's cap — a bookmark restart must NOT reset
+     *  the counter (the walk resumes the budget, it does not restart it). */
+    suspend fun markBackfillCursor(
+        c: MatrixClient,
+        roomId: String,
+        batchBefore: String?,
+        fetchedCount: Int = 0,
+    ) {
         val db = database(c) ?: return
         withContext(Dispatchers.IO) {
             runCatching {
@@ -437,8 +447,9 @@ object ThreadRowStore {
                         sq.execSQL("DELETE FROM ThreadRowCursor WHERE roomId=?", arrayOf(roomId))
                     } else {
                         sq.execSQL(
-                            "INSERT OR REPLACE INTO ThreadRowCursor(roomId,batchBefore) VALUES(?,?)",
-                            arrayOf(roomId, batchBefore),
+                            "INSERT OR REPLACE INTO ThreadRowCursor(roomId,batchBefore,fetchedCount) " +
+                                "VALUES(?,?,?)",
+                            arrayOf<Any?>(roomId, batchBefore, fetchedCount),
                         )
                     }
                     sq.setTransactionSuccessful()
@@ -458,6 +469,44 @@ object ThreadRowStore {
             arrayOf(roomId),
         ).use { cur -> if (cur.moveToFirst() && !cur.isNull(0)) cur.getString(0) else null }
     }.getOrNull()
+
+    /** A room's Part H bookmark as the worker consumes it: resume token +
+     *  fetched count, or null (no bookmark / room done / fresh store). */
+    suspend fun backfillBookmark(c: MatrixClient, roomId: String): Pair<String, Int>? {
+        val db = database(c) ?: return null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val sq = db.openHelper.writableDatabase
+                ensureTable(sq)
+                sq.query(
+                    "SELECT batchBefore, fetchedCount FROM ThreadRowCursor WHERE roomId=?",
+                    arrayOf(roomId),
+                ).use { cur ->
+                    if (cur.moveToFirst() && !cur.isNull(0)) {
+                        cur.getString(0) to cur.getInt(1)
+                    } else null
+                }
+            }.getOrNull()
+        }
+    }
+
+    /** Upgrade guard (SPEC §8 trigger): does Trixnity's OWN timeline store
+     *  hold events? A genuine fresh login has an empty database entirely
+     *  (logout's deleteDatabase wipes it); an upgrade to this build has a
+     *  populated `TimelineEvent` table with a brand-new, EMPTY `ThreadRow`
+     *  table — that combination must NOT read as "fresh login" and fire a
+     *  network bulk backfill (§7 rejected it; §8 excludes upgrades — Part
+     *  G's lazy seed covers them, no network). */
+    suspend fun timelineStoreHasEvents(c: MatrixClient): Boolean {
+        val db = database(c) ?: return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase
+                    .query("SELECT 1 FROM TimelineEvent LIMIT 1", arrayOf<String>())
+                    .use { it.moveToFirst() }
+            }.getOrDefault(false)
+        }
+    }
 
     // --- internals ----------------------------------------------------------
 

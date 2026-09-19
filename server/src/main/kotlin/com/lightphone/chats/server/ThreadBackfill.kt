@@ -1,5 +1,6 @@
 package com.lightphone.chats.server
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -111,12 +112,13 @@ object ThreadBackfill {
     /**
      * Continue the current room from its persisted bookmark (SPEC §8
      * resumable): the walk resumes where the bookmark left off — it does
-     * not restart — and the cap counts events fetched from here on (a
-     * resumed room gets a fresh per-pass budget). No bookmark → no-op.
+     * not restart — and [fetchedCount], the events already fetched toward
+     * the cap before the interruption, carries over (a bookmark restart
+     * must NOT reset the counter). No bookmark → no-op.
      */
-    fun resume(state: State, roomId: String, bookmark: String?): State {
+    fun resume(state: State, roomId: String, bookmark: String?, fetchedCount: Int): State {
         if (state.phase != Phase.RUNNING || state.roomId != roomId || bookmark == null) return state
-        return state.copy(batchBefore = bookmark)
+        return state.copy(batchBefore = bookmark, fetched = fetchedCount)
     }
 
     /**
@@ -124,10 +126,13 @@ object ThreadBackfill {
      * and [batchBefore] is the round's new resume token — null means the
      * chain ended (the room's creation: nothing more server-side).
      * `roomDone` stops the room; `persistCursor` is what the caller must
-     * persist: the advanced token mid-room and at the cap (a capped room
-     * KEEPS its bookmark so a later pass resumes deeper), null at chain end
-     * (the bookmark is cleared — the room is complete). A round for any
-     * room other than the current one is ignored.
+     * persist (alongside `state.fetched`): the advanced token mid-room,
+     * null at BOTH stops — chain end (the room is complete) and the cap
+     * (the room is done for this login; keeping the bookmark would make
+     * `hasBackfillBookmarks` re-trigger a full pass on every app start).
+     * The walk position survives without the bookmark: it lives on the
+     * deepest row's own `batchBefore`. A round for any room other than the
+     * current one is ignored.
      */
     data class Advance(val state: State, val persistCursor: String?, val roomDone: Boolean)
 
@@ -139,7 +144,7 @@ object ThreadBackfill {
         val roomDone = batchBefore == null || fetched >= THREAD_BACKFILL_MAX_EVENTS
         return Advance(
             state = state.copy(fetched = fetched, batchBefore = batchBefore),
-            persistCursor = batchBefore,
+            persistCursor = if (roomDone) null else batchBefore,
             roomDone = roomDone,
         )
     }
@@ -167,8 +172,8 @@ object ThreadBackfill {
         /** Any `ThreadRowCursor` bookmarks — an interrupted pass to resume. */
         suspend fun hasBackfillBookmarks(): Boolean
 
-        suspend fun backfillCursor(roomId: String): String?
-        suspend fun markBackfillCursor(roomId: String, batchBefore: String?)
+        suspend fun backfillBookmark(roomId: String): Pair<String, Int>?
+        suspend fun markBackfillCursor(roomId: String, batchBefore: String?, fetchedCount: Int)
 
         /**
          * One fetch round for [roomId]: chain walk → one gap `/messages`
@@ -187,8 +192,13 @@ object ThreadBackfill {
     /** Launch the worker on [scope]. Fire-and-forget: the trigger probe and
      *  pacing keep it harmless, and logout cancels it with the session. */
     fun start(scope: CoroutineScope, deps: Deps): Job = scope.launch {
-        runCatching { runWorker(deps) }
-            .onFailure { deps.log("backfill: pass ended: ${it.message}") }
+        try {
+            runWorker(deps)
+        } catch (e: CancellationException) {
+            throw e // logout's cancel is not a "pass ended" diagnostic
+        } catch (e: Exception) {
+            deps.log("backfill: pass ended: ${e.message}")
+        }
     }
 
     private suspend fun runWorker(deps: Deps) {
@@ -213,7 +223,8 @@ object ThreadBackfill {
         deps.log("backfill: pass starting (${list.size} rooms, cap $THREAD_BACKFILL_MAX_EVENTS/room)")
         while (state.phase == Phase.RUNNING) {
             val roomId = state.roomId ?: break
-            state = resume(state, roomId, deps.backfillCursor(roomId))
+            val bookmark = deps.backfillBookmark(roomId)
+            state = resume(state, roomId, bookmark?.first, bookmark?.second ?: 0)
             while (true) {
                 val step = deps.stepRoom(roomId)
                 if (step == null) {
@@ -221,11 +232,11 @@ object ThreadBackfill {
                     break
                 }
                 val a = advance(state, roomId, step.fetched, step.batchBefore)
-                deps.markBackfillCursor(roomId, a.persistCursor)
+                deps.markBackfillCursor(roomId, a.persistCursor, a.state.fetched)
                 state = a.state
                 if (a.roomDone) {
                     deps.log(
-                        "backfill: ${roomId.takeLast(12)} done — ${state.fetched} row(s) this pass",
+                        "backfill: ${roomId.takeLast(12)} done — ${state.fetched} row(s) this login",
                     )
                     break
                 }

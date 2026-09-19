@@ -3707,13 +3707,15 @@ object MatrixRepository {
             override suspend fun hasBackfillBookmarks(): Boolean =
                 runCatching { ThreadRowStore.hasBackfillBookmarks(c) }.getOrDefault(false)
 
-            override suspend fun backfillCursor(roomId: String): String? = runCatching {
-                val db = c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class)
-                ThreadRowStore.backfillCursor(db.openHelper.writableDatabase, roomId)
-            }.getOrNull()
+            override suspend fun backfillBookmark(roomId: String): Pair<String, Int>? =
+                runCatching { ThreadRowStore.backfillBookmark(c, roomId) }.getOrNull()
 
-            override suspend fun markBackfillCursor(roomId: String, batchBefore: String?) {
-                ThreadRowStore.markBackfillCursor(c, roomId, batchBefore)
+            override suspend fun markBackfillCursor(
+                roomId: String,
+                batchBefore: String?,
+                fetchedCount: Int,
+            ) {
+                ThreadRowStore.markBackfillCursor(c, roomId, batchBefore, fetchedCount)
             }
 
             override suspend fun stepRoom(roomId: String): ThreadBackfill.RoomStep? =
@@ -10136,9 +10138,16 @@ object MatrixRepository {
         observedClient = c
         // Part H fresh-login probe (SPEC §8): must land before the first sync
         // round writes rows — it's enqueued ahead of every observer below.
+        // Fresh login = EMPTY database entirely (logout deletes it): both the
+        // ThreadRow table AND Trixnity's own timeline store. An upgrade to
+        // this build has a populated timeline store with a brand-new, empty
+        // ThreadRow table — that must NOT read as fresh login and fire a
+        // network bulk backfill (§7/§8: upgrades are Part G's lazy seed's
+        // business, no network).
         scope.launch {
-            threadBackfillStoreEmptyAtAttach =
-                runCatching { !ThreadRowStore.anyRows(c) }.getOrDefault(false)
+            threadBackfillStoreEmptyAtAttach = runCatching {
+                !ThreadRowStore.anyRows(c) && !ThreadRowStore.timelineStoreHasEvents(c)
+            }.getOrDefault(false)
         }
         notificationWatcherJobs.forEach { it.cancel() }
         notificationWatcherJobs.clear()

@@ -79,22 +79,21 @@ class ThreadBackfillCursorTest {
     // --- per-room stop: cap at THREAD_BACKFILL_MAX_EVENTS ---
 
     @Test
-    fun `cap stops the room once 1000 events are fetched and keeps the bookmark`() {
+    fun `cap stops the room once 1000 events are fetched and clears the bookmark`() {
         var s = running(listOf("!a", "!b"))
         repeat(33) { round ->
             val a = ThreadBackfill.advance(s, "!a", 30, "tok$round")
-            if (round < 33) {
-                assertFalse(a.roomDone)
-                assertEquals("tok$round", a.persistCursor)
-                s = a.state
-            }
+            assertFalse(a.roomDone)
+            assertEquals("tok$round", a.persistCursor)
+            s = a.state
         }
         assertEquals(990, s.fetched)
         val a = ThreadBackfill.advance(s, "!a", 30, "tok33")
         assertTrue(a.roomDone)
-        // Capped, NOT chain end — the bookmark stays so a later pass resumes
-        // deeper instead of restarting (SPEC §8 resumable).
-        assertEquals("tok33", a.persistCursor)
+        // Cap stop clears the bookmark — keeping it would make
+        // hasBackfillBookmarks re-trigger a full pass on every app start.
+        // The walk position lives on the deepest row's batchBefore.
+        assertNull(a.persistCursor)
         assertEquals(1020, a.state.fetched)
     }
 
@@ -111,21 +110,22 @@ class ThreadBackfillCursorTest {
     // --- resume: interrupted room continues from its bookmark ---
 
     @Test
-    fun `resume continues an interrupted room from its bookmark with a fresh budget`() {
+    fun `resume continues an interrupted room from its bookmark with its fetch count`() {
         var s = running(listOf("!a", "!b"))
-        s = ThreadBackfill.resume(s, "!a", "bookmark-token")
+        s = ThreadBackfill.resume(s, "!a", "bookmark-token", 640)
         assertEquals("bookmark-token", s.batchBefore)
-        assertEquals(0, s.fetched)
-        // The cap counts events fetched from the bookmark on — the walk
-        // resumes, it does not restart (SPEC §8).
-        val a = ThreadBackfill.advance(s, "!a", ThreadBackfill.THREAD_BACKFILL_MAX_EVENTS, "next")
+        // A bookmark restart must NOT reset the counter (fix-round ruling):
+        // the room's budget continues from the persisted count.
+        assertEquals(640, s.fetched)
+        val a = ThreadBackfill.advance(s, "!a", 400, "next")
         assertTrue(a.roomDone)
-        assertEquals("next", a.persistCursor)
+        assertNull(a.persistCursor)
+        assertEquals(1040, a.state.fetched)
     }
 
     @Test
     fun `resume without a bookmark leaves the room fresh`() {
-        val s = ThreadBackfill.resume(running(listOf("!a", "!b")), "!a", null)
+        val s = ThreadBackfill.resume(running(listOf("!a", "!b")), "!a", null, 640)
         assertNull(s.batchBefore)
         assertEquals(0, s.fetched)
     }
