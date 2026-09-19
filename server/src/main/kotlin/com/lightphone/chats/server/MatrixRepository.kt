@@ -726,9 +726,6 @@ object MatrixRepository {
             when (intent.action) {
                 Intent.ACTION_SCREEN_ON -> {
                     applySyncModeForScreenState()
-                    // A thread was open when the screen went dark — resume
-                    // keeping its page fresh now that it's visible again.
-                    startActiveRoomRefresh()
                     // A message likely landed while the screen was dark — end
                     // the resolver's screen-off sleep so the list is fresh the
                     // moment the user opens it.
@@ -736,11 +733,6 @@ object MatrixRepository {
                 }
                 Intent.ACTION_SCREEN_OFF -> {
                     applySyncModeForScreenState()
-                    // Battery: the active-room refresh was
-                    // running 24/7 with no visibility coupling — every 2s a full
-                    // page rebuild (SQL chain walk + key-backup restore + API
-                    // re-reads). Nobody is looking while the screen is off.
-                    stopActiveRoomRefresh()
                 }
             }
         }
@@ -898,8 +890,6 @@ object MatrixRepository {
         inProcessSyncJob?.cancel()
         inProcessSyncJob = null
         inProcessSyncRunning = false
-        activeRoomRefreshJob?.cancel()
-        activeRoomRefreshJob = null
         PushChannel.stop()
         ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
         Diagnostics.record("sync stopped")
@@ -2562,44 +2552,6 @@ object MatrixRepository {
     )
 
     /**
-     * The patch tail shared by the quiet-page patches ([patchReadReceipts],
-     * [patchSendStatuses], [patchReactionTags]): maps this page's messages
-     * through [f] — return a copy to change a row, null to keep it. Null
-     * when no row changed, so the caller keeps the cache and disk as-is.
-     */
-    private fun MessagesPage.patchedWith(
-        f: (LightServiceMethod.GetMessages.Message) -> LightServiceMethod.GetMessages.Message?,
-    ): MessagesPage? {
-        var changed = false
-        val patched = messages.map { m -> f(m)?.also { changed = true } ?: m }
-        if (!changed) return null
-        return MessagesPage(patched, hasMore, encrypted, nextBeforeEventId)
-    }
-
-    /** One cached newest page: the page plus when it was computed. */
-    private data class MessagePageEntry(
-        val page: MessagesPage,
-        val limit: Int,
-        val refreshedAtMs: Long,
-    )
-
-    /**
-     * Newest-page cache: re-opening a thread within the TTL is
-     * a pure map read instead of a timeline re-collect + key-backup restore.
-     * Recomputed in the background by [refreshMessagePage].
-     */
-    private val messagePageCache =
-        java.util.concurrent.ConcurrentHashMap<String, MessagePageEntry>()
-
-    /** Rooms with a background page refresh currently in flight. */
-    private val messagePageRefreshInFlight =
-        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-
-    /** Room → its last event id at the previous refresh. An unchanged id means
-     *  nothing new arrived — the refresh skips the rebuild (one cheap read). */
-    private val lastRefreshedEventId = java.util.concurrent.ConcurrentHashMap<String, String>()
-
-    /**
      * Event ids this client unsend-redacted, persisted so a redacted ENCRYPTED
      * event can be recognized as a former message in the tombstone branch of
      * [computeMessagesPage]: Trixnity stores a redacted m.room.encrypted event
@@ -2666,11 +2618,6 @@ object MatrixRepository {
      *  sessions back, yet the retry paths re-ran doomed restores every 60-120 s,
      *  ~3 cores continuously.) */
     private val decryptRestoreCooldown = CooldownMap()
-
-    /** Suppresses the quiet-room guard's API-resolve attempts for
-     *  still-unresolved reactions (battery: a key that never arrives must not
-     *  turn the 3 s guard into a decrypt loop — see [patchReactionTags]). */
-    private val reactionResolveRetryAt = CooldownMap()
 
     /** Suppresses a failed gap backfill per room (battery: a fill that errored
      *  (network, token) is retried at most once per [GAP_BACKFILL_COOLDOWN_MS],
@@ -2739,14 +2686,14 @@ object MatrixRepository {
             size > MAX_MEDIA_CACHE_ENTRIES
     }
 
-    // --- Disk cache ----------------------------------------------
-    // The "instant re-open" goal: the room list and each room's newest message
-    // page are persisted as JSON so a cold process (or a thread re-open after
-    // the 5 s memory TTL) serves from disk immediately, while the background
-    // resolver/refresher recomputes fresh data. Bounded to the newest
-    // [DISK_CACHE_MAX_PAGES] rooms — the surface the user actually re-opens.
 
-    /** Last disk-write time per cache key (room list = "", pages = roomId). */
+    // --- Disk cache (room list) -----------------------------------
+    // The room list is persisted as JSON so a cold process shows the
+    // last-known chats immediately; the resolver then refreshes names and
+    // previews. (The per-room message-page half of this cache is retired —
+    // the ThreadRow store serves pages.)
+
+    /** Last disk-write time per cache key. */
     private val diskWriteAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     private fun cacheDir(): java.io.File? =
@@ -2754,15 +2701,6 @@ object MatrixRepository {
 
     private fun roomListCacheFile(): java.io.File? =
         cacheDir()?.let { java.io.File(it, DISK_ROOM_LIST_FILE) }
-
-    private fun messagePageCacheFile(roomId: String): java.io.File? =
-        cacheDir()?.let { java.io.File(it, sanitizeFileName(roomId)) }
-
-    /** Room ids contain `!` and `:` — both legal on ext4, but underscore them
-     *  anyway so the cache dir stays portable. */
-    private val SANITIZE_NAME_REGEX = Regex("[^A-Za-z0-9_-]")
-    private fun sanitizeFileName(roomId: String): String =
-        roomId.replace(SANITIZE_NAME_REGEX, "_")
 
     @Synchronized
     private fun saveRoomListToDisk(rooms: List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>) {
@@ -2788,56 +2726,6 @@ object MatrixRepository {
                 .decodeResponse(file.readText())
                 .rooms
         }.getOrDefault(emptyList())
-    }
-
-    @Synchronized
-    private fun saveMessagePageToDisk(roomId: String, page: MessagesPage) {
-        // A tiny/empty page is a transient artifact of the first poll (the walk
-        // is still filling in past a ghost flood) — persisting it would poison
-        // re-opens with a near-empty thread; the background refresh saves the
-        // real page a moment later.
-        if (page.messages.size < MIN_PERSISTED_PAGE_SIZE) return
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (now - (diskWriteAt[roomId] ?: 0L) < DISK_WRITE_THROTTLE_MS) return
-        val file = messagePageCacheFile(roomId) ?: return
-        runCatching {
-            file.parentFile?.mkdirs()
-            file.writeText(
-                com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.encodeResponse(
-                    com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Response(
-                        messages = page.messages,
-                        hasMore = page.hasMore,
-                        encrypted = page.encrypted,
-                        nextBeforeEventId = page.nextBeforeEventId,
-                    ),
-                ),
-            )
-            diskWriteAt[roomId] = now
-        }
-        pruneMessagePageDiskCache()
-    }
-
-    @Synchronized
-    private fun loadMessagePageFromDisk(roomId: String): MessagesPage? {
-        val file = messagePageCacheFile(roomId) ?: return null
-        return runCatching {
-            val r = com.thelightphone.sdk.shared.LightServiceMethod.GetMessages
-                .decodeResponse(file.readText())
-            MessagesPage(r.messages, r.hasMore, r.encrypted, r.nextBeforeEventId)
-        }.getOrNull()
-    }
-
-    /** Keeps the on-disk page cache to the newest [DISK_CACHE_MAX_PAGES] rooms. */
-    @Synchronized
-    private fun pruneMessagePageDiskCache() {
-        val dir = cacheDir() ?: return
-        val files = dir.listFiles()
-            ?.filter { it.isFile && it.name != DISK_ROOM_LIST_FILE }
-            ?: return
-        if (files.size <= DISK_CACHE_MAX_PAGES) return
-        files.sortedBy { it.lastModified() }
-            .take(files.size - DISK_CACHE_MAX_PAGES)
-            .forEach { it.delete() }
     }
 
     private fun clearDiskCache() {
@@ -2883,366 +2771,11 @@ object MatrixRepository {
         // projection keeps the rows right at the source.)
     }
 
-    @Volatile
-    private var activeRoomRefreshJob: Job? = null
-
-    /** Recomputes and re-stores a room's newest page in the background. */
     /** Shared timeout config for the [MatrixClient.room.getTimelineEvent]
      *  re-reads that nudge a decrypt to land. */
     private val timelineEventConfig: GetTimelineEventConfig.() -> Unit = {
         fetchTimeout = FETCH_TIMEOUT_SECONDS.seconds
         decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
-    }
-
-    private fun refreshMessagePage(roomId: String, limit: Int = THREAD_PAGE_SIZE) {
-        // Battery: never pile up refreshes — a tick that
-        // finds one already in flight is a no-op (the 2s ticker used to launch
-        // unbounded concurrent rebuilds that saturated the CPU).
-        if (!messagePageRefreshInFlight.add(roomId)) return
-        scope.launch {
-            try {
-                val c = client ?: return@launch
-                val lastId = withTimeoutOrNull(ROOM_BUDGET_MS) {
-                    c.room.getById(RoomId(roomId)).firstOrNull()?.lastEventId?.full
-                } ?: return@launch
-                // Nothing new since the last refresh AND the memory cache
-                // still covers the requested limit → keep the cached page; a
-                // quiet room costs one cheap last-event read per tick instead
-                // of a full chain walk + restore + re-reads. The cache check
-                // matters: the incremental cold-open path caches a limit=8
-                // page, and after that every limit=20 poll bounced to the
-                // DISK cache (serving the stale page it held) while this guard
-                // skipped the rebuild — the anni-room misorder stayed on the
-                // LP3 screen long after the page build was fixed.
-                val cached = messagePageCache[roomId]
-
-                fun publish(page: MessagesPage, limit: Int, advanceHead: Boolean) {
-                    messagePageCache[roomId] = MessagePageEntry(
-                        page, limit, android.os.SystemClock.elapsedRealtime(),
-                    )
-                    if (advanceHead) lastRefreshedEventId[roomId] = lastId
-                    saveMessagePageToDisk(roomId, page)
-                    bumpMessagePageRevision(roomId)
-                }
-                if (cached != null && cached.limit >= limit && lastRefreshedEventId[roomId] == lastId) {
-                    // Read receipts are ephemeral — they never move the room's
-                    // last TIMELINE event, so this quiet-room guard would freeze
-                    // the "seen" tag on a room the other party read without
-                    // replying. Reaction tags are the same
-                    // class of quiet event.
-                    // Patch the cached page cheaply (one bounded chain walk +
-                    // a backoff-gated resolve for the unresolved ones) instead
-                    // of a full rebuild; null = nothing changed, so the cache
-                    // and disk stay untouched.
-                    runCatching {
-                        patchQuietPage(c, roomId, cached)?.let { updated ->
-                            publish(updated, cached.limit, advanceHead = false)
-                        }
-                    }
-                    return@launch
-                }
-                // Incremental refresh (PLAN §8.3): when the cache
-                // covers the request and we know the last-refreshed chain head,
-                // append only the events that arrived since — the full
-                // [computeMessagesPage] (SQL chain walk + key-backup restores +
-                // receipt/status walks, 10-40 s on the LP3) is what made a new
-                // message show late in an open thread. Falls back to the full
-                // rebuild whenever the delta isn't trivially appendable.
-                val prevId = lastRefreshedEventId[roomId]
-                val updated = if (cached != null && cached.limit >= limit && prevId != null) {
-                    runCatching { incrementMessagePage(c, roomId, prevId, lastId, cached) }.getOrNull()
-                } else null
-                if (updated != null) {
-                    publish(updated, cached!!.limit, advanceHead = true)
-                } else {
-                    runCatching {
-                        val page = computeMessagesPage(roomId, null, limit)
-                        publish(page, limit, advanceHead = true)
-                    }
-                }
-            } finally {
-                messagePageRefreshInFlight.remove(roomId)
-            }
-        }
-    }
-
-    /**
-     * Recomputes only a cached newest page's "read" flags. Read receipts arrive
-     * via sync ephemeral and never change the room's last timeline event, so
-     * [refreshMessagePage]'s quiet-room guard skips the rebuild and the seen
-     * tag would stay frozen on a room the other party read without replying.
-     * Same receipt walk as the page build over the
-     * cached chain (delta empty); null when nothing changed, so the caller
-     * keeps the cache and disk as-is.
-     */
-    private suspend fun patchReadReceipts(
-        c: MatrixClient,
-        roomId: String,
-        cached: MessagePageEntry,
-    ): MessagesPage? {
-        val prevId = lastRefreshedEventId[roomId] ?: return null
-        val chain = readTimelineChainFromDb(c, RoomId(roomId), prevId, cached.limit + 1)?.first
-            ?.takeLast(cached.limit + 1).orEmpty()
-        if (chain.isEmpty()) return null
-        val readEventIds = readReceiptsByEvent(c, RoomId(roomId), chain)
-        if (readEventIds.isEmpty()) return null
-        return cached.page.patchedWith { m ->
-            if (!m.read && m.id in readEventIds) m.copy(read = true) else null
-        }
-    }
-
-    /**
-     * Quiet-room guard patch: recomputes the cached page's parts that don't
-     * move the room's last event id — read receipts (sync ephemeral),
-     * reaction tags (see [patchReactionTags]) and send-status tags
-     * (see [patchSendStatuses]). null when none changed, so the caller keeps
-     * the cache and disk as-is.
-     */
-    private suspend fun patchQuietPage(
-        c: MatrixClient,
-        roomId: String,
-        cached: MessagePageEntry,
-    ): MessagesPage? {
-        val receiptPatched = runCatching { patchReadReceipts(c, roomId, cached) }.getOrNull()
-        val tagPatched = runCatching {
-            patchReactionTags(
-                c, roomId,
-                receiptPatched?.let { MessagePageEntry(it, cached.limit, cached.refreshedAtMs) } ?: cached,
-            )
-        }.getOrNull()
-        val tagEntry = tagPatched?.let { MessagePageEntry(it, cached.limit, cached.refreshedAtMs) } ?: cached
-        val statusPatched = runCatching { patchSendStatuses(c, roomId, tagEntry) }.getOrNull()
-        return statusPatched ?: tagPatched ?: receiptPatched
-    }
-
-    /**
-     * Recomputes a cached newest page's send-status tags ("SENDING" →
-     * "delivered"). The bridge's ack is its own timeline event: the incremental
-     * refresh that consumed it may have read a stale [sendStatusesByEventIdCached]
-     * map (15 s TTL) and baked SENDING into the rows, after which the room is
-     * quiet — the head never moves again, and the quiet ticks that patch
-     * receipts/reactions never re-read statuses, so the tag sat until the room
-     * was reopened or another message landed. The
-     * map TTL bounds how long the patch trails the ack.
-     */
-    private suspend fun patchSendStatuses(
-        c: MatrixClient,
-        roomId: String,
-        cached: MessagePageEntry,
-    ): MessagesPage? {
-        val sendStatuses = sendStatusesByEventIdCached(c, RoomId(roomId))
-        if (sendStatuses.isEmpty()) return null
-        return cached.page.patchedWith { m ->
-            sendStatuses[m.id]?.takeIf { it != m.sendStatus }?.let { m.copy(sendStatus = it) }
-        }
-    }
-
-    /**
-     * Recomputes a cached newest page's reaction tags ("Name reacted ❤️")
-     * over the cached chain window — the same newest-page-only scope the full
-     * rebuild tags from, so the patch stays consistent with what the page
-     * holds. The reason this exists: an encrypted m.reaction (bridge reactions
-     * land as Megolm) reaches the store with its content unresolved, the
-     * rebuild that ran on its arrival gave up on the decrypt and stamped
-     * lastRefreshedEventId, and every later quiet tick then skipped it — the
-     * tag only appeared when another event forced a rebuild. Events
-     * still unresolved are re-read through the API — that re-read triggers the
-     * decrypt (the mechanism [resolvePendingEcho] relies on) — at most
-     * [REACTION_RESOLVE_MAX] per pass with a per-room backoff after a dry pass,
-     * so a key that never arrives can't turn the 3 s guard into a decrypt loop
-     * (battery). null when nothing changed.
-     */
-    private suspend fun patchReactionTags(
-        c: MatrixClient,
-        roomId: String,
-        cached: MessagePageEntry,
-    ): MessagesPage? {
-        val prevId = lastRefreshedEventId[roomId] ?: return null
-        val matrixRoomId = RoomId(roomId)
-        // Quiet means nothing NEW arrived since the last refresh — the missed
-        // reaction already sits inside the cached window, so this bounded store
-        // walk covers it (the same walk [patchReadReceipts] does for receipts).
-        val chain = readTimelineChainFromDb(c, matrixRoomId, prevId, cached.limit + 1)?.first.orEmpty()
-        if (chain.isEmpty()) return null
-        val unresolved = chain.filter {
-            it.content?.getOrNull() == null && it.event.content is EncryptedMessageEventContent
-        }
-        val resolved = mutableListOf<TimelineEvent>()
-        if (unresolved.isNotEmpty()) {
-            if (reactionResolveRetryAt.allowed(roomId)) {
-                for (te in unresolved.take(REACTION_RESOLVE_MAX)) {
-                    withTimeoutOrNull(DECRYPT_WAIT_MS) {
-                        c.room.getTimelineEvent(matrixRoomId, te.event.id, timelineEventConfig)
-                            .filterNotNull().firstOrNull { it.content?.getOrNull() != null }
-                    }?.let { resolved.add(it) }
-                }
-                // A dry pass backs the resolve attempts off — the walk below
-                // still picks the tag up the moment sync lands the key and the
-                // store row resolves on its own.
-                if (resolved.isEmpty()) reactionResolveRetryAt.park(roomId, REACTION_RESOLVE_RETRY_MS)
-                else reactionResolveRetryAt.remove(roomId)
-            }
-        }
-        val tags = reactionTagsForEvents(c, matrixRoomId, chain + resolved)
-        if (tags.isEmpty()) return null
-        return cached.page.patchedWith { m ->
-            val collapsed = tags[m.id]?.let(::collapseReactionTags) ?: return@patchedWith null
-            if (collapsed != m.reactions) m.copy(reactions = collapsed) else null
-        }
-    }
-
-    /**
-     * Incremental newest-page refresh (PLAN §8.3): collects only the events
-     * that arrived since the last refresh (a bounded SQL chain walk — no
-     * decrypt restores, no receipt/status walks) and appends their rows to the
-     * cached page, patching edits/reactions/read-receipts into existing rows.
-     * Returns null when the delta isn't trivially appendable — the caller then
-     * falls back to the full [computeMessagesPage] (decrypt restores, gap
-     * backfill, the pending-echo dance, timestamp re-sort).
-     */
-    private suspend fun incrementMessagePage(
-        c: MatrixClient,
-        roomId: String,
-        prevId: String,
-        lastId: String,
-        cached: MessagePageEntry,
-    ): MessagesPage? {
-        val matrixRoomId = RoomId(roomId)
-        // The store chain from the current head back to the last-refreshed
-        // head — the same raw-SQL walk the full rebuild uses, bounded.
-        val walked = readTimelineChainFromDb(c, matrixRoomId, lastId, INCREMENTAL_MAX_DELTA) ?: return null
-        val raw = walked.first
-        val delta = raw.takeWhile { it.event.id.full != prevId }
-        // prevId not reached: the boundary is lost (limited-sync truncation)
-        // or the burst exceeds the cap — rebuild from scratch.
-        if (delta.size == raw.size) return null
-        // Bails: anything the incremental path can't resolve exactly.
-        if (delta.any { it.gap != null }) return null
-        if (delta.any { te -> te.content?.getOrNull() == null && te.event.content is EncryptedMessageEventContent }) return null
-        // A redaction REMOVES content the cached page shows (an unsent
-        // reaction's tag must vanish) — the append-only patch below can
-        // only add reaction tags, so bail to the full rebuild (rare; the rebuild
-        // recomputes tags from the window and the redacted one is gone).
-        if (delta.any { te ->
-                te.content?.getOrNull() is RedactionEventContent || te.event.content is RedactionEventContent
-            }) return null
-        // The pending-echo replacement dance (optimistic row → real echo)
-        // stays with the full rebuild.
-        val pendingTxnIds = buildSet {
-            pendingTextEchoes(roomId).forEach { add(it.txnId) }
-            pendingAudioEchoes(roomId).forEach { add(it.txnId) }
-        }
-        if (delta.any { te ->
-                val id = txnIdOf(te)
-                id != null && id in pendingTxnIds
-            }) return null
-        // Broadcast-rooms own-name (same rule as the full rebuild).
-        val ownName = broadcastOwnNameOf(c, matrixRoomId)
-        // Edits: an edit replaces its target — patch body + edited flag. The
-        // delta is newer than the whole cached page, so the newest edit wins
-        // (first occurrence in newest-first order), like the full rebuild.
-        val editByTarget = HashMap<String, Pair<RoomMessageEventContent, Long>>()
-        for (te in delta) {
-            val content = te.content?.getOrNull() as? RoomMessageEventContent ?: continue
-            val replace = content.relatesTo as? RelatesTo.Replace ?: continue
-            val newContent = (replace.newContent as? RoomMessageEventContent)
-                ?.takeIf { it.body.isNotBlank() } ?: continue
-            editByTarget.putIfAbsent(replace.eventId.full, newContent to te.event.originTimestamp)
-        }
-        // Reactions: m.reaction events in the delta patch their target rows.
-        // Same dedup + label shape as the full rebuild's window walk, scoped to
-        // the delta (the target must be in the page for the label to land).
-        val reactionsByTarget = reactionTagsForEvents(c, matrixRoomId, delta)
-        val sendStatuses = sendStatusesByEventIdCached(c, matrixRoomId)
-        // Receipts (cheap — a receipts-repo read, no chain re-walk beyond the
-        // SQL above): the other party's read position, recomputed over the
-        // page chain + delta so existing rows' "read" tags stay fresh.
-        val pageChain = delta + (readTimelineChainFromDb(c, matrixRoomId, prevId, cached.limit + 1)?.first.orEmpty())
-        val readEventIds = readReceiptsByEvent(c, matrixRoomId, pageChain)
-        // New rows, newest-first (delta chain order — same loop as the full
-        // rebuild's, minus the decrypt/status machinery).
-        val newRows = mutableListOf<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>()
-        for (te in delta) {
-            val edit = editByTarget[te.event.id.full]
-            messageFrom(
-                c, matrixRoomId, te,
-                sendStatuses[te.event.id.full],
-                read = te.event.id.full in readEventIds,
-                reactions = reactionsByTarget[te.event.id.full].orEmpty(),
-                editedBody = (edit?.first as? RoomMessageEventContent.TextBased)?.body,
-                editedContent = edit?.first,
-                edited = edit != null,
-                ownName = ownName,
-            )?.let { newRows.add(it) }
-        }
-        // Patch edits + reactions + read state into the existing rows.
-        val patched = cached.page.messages.map { m ->
-            var out = m
-            val edit = editByTarget[m.id]
-            if (edit != null && m.contentType == "text" && !m.id.startsWith(LOCAL_PENDING_ID_PREFIX)) {
-                out = out.copy(
-                    body = stripOwnPrefix(stripForwardHeader(stripReplyQuote(edit.first.body)).first, ownName),
-                    edited = true,
-                )
-            } else if (edit != null) {
-                // A media edit (gmessages: pending m.notice → m.image) must
-                // REBUILD the row, not body-copy: the row's contentType comes
-                // from the original event, so a body-only patch left a centred
-                // system line wearing the bare file name. The
-                // reactions/read/status patches below still apply.
-                c.room.getTimelineEvent(matrixRoomId, EventId(m.id)).firstOrNull()?.let { target ->
-                    messageFrom(
-                        c, matrixRoomId, target,
-                        sendStatuses[m.id],
-                        read = m.id in readEventIds,
-                        reactions = m.reactions,
-                        editedContent = edit.first,
-                        ownName = ownName,
-                    )?.let { out = it }
-                }
-            }
-            val added = reactionsByTarget[m.id]
-            if (added != null) {
-                // A delta reaction replaces the same sender's cached tag (the
-                // incremental patch sees only the delta — the replaced
-                // reaction's tag still sits in the cached page). Collapse
-                // keeps the merged list at most two lines.
-                val merged = collapseReactionTags(mergeReactionTags(out.reactions, added))
-                if (merged != out.reactions) out = out.copy(reactions = merged)
-            }
-            if (!out.read && out.id in readEventIds) out = out.copy(read = true)
-            // Send status arrives in its own later event (bridge ack), usually
-            // a poll round AFTER the message row was appended — re-patch it
-            // here like read state, or the "delivered" tag never appears on
-            // rows already in the page.
-            sendStatuses[m.id]?.takeIf { it != out.sendStatus }?.let { out = out.copy(sendStatus = it) }
-            out
-        }
-        // The page is timestamp-sorted (bridged rooms ingest late — the full
-        // rebuild sorts, the append only holds when the new rows land at the
-        // newest end). Bails otherwise.
-        val newOldestFirst = newRows.reversed()
-        if (newOldestFirst.zipWithNext().any { (a, b) -> a.timestampMs > b.timestampMs }) return null
-        val newestConfirmed = patched.lastOrNull { !it.id.startsWith(LOCAL_PENDING_ID_PREFIX) }
-        if (newestConfirmed != null && newOldestFirst.firstOrNull()?.timestampMs?.let { it < newestConfirmed.timestampMs } == true) {
-            return null
-        }
-        // Append, keeping the cache's size class (limit+1 slack like the full
-        // rebuild); trailing pending rows stay the newest end.
-        val confirmed = patched.filter { !it.id.startsWith(LOCAL_PENDING_ID_PREFIX) }
-        val pendings = patched.filter { it.id.startsWith(LOCAL_PENDING_ID_PREFIX) }
-        val all = confirmed + newOldestFirst
-        val trimmedAway = all.size > cached.limit + 1
-        val kept = if (trimmedAway) all.takeLast(cached.limit + 1) else all
-        if (newOldestFirst.isNotEmpty()) {
-            android.util.Log.d(TAG, "refreshMessagePage: room=$roomId incremental +${newOldestFirst.size} rows (delta=${delta.size} events)")
-            prefetchVoiceNotes(c, matrixRoomId, delta)
-        }
-        return MessagesPage(
-            messages = kept + pendings,
-            hasMore = cached.page.hasMore || trimmedAway,
-            encrypted = cached.page.encrypted,
-        )
     }
 
     /**
@@ -3321,56 +2854,20 @@ object MatrixRepository {
             }
         }
         if (beforeEventId != null) return computeMessagesPage(roomId, beforeEventId, limit)
-        // Fallback newest page: the pre-store cascade, kept verbatim as the
-        // seeding/fallback engine (Task 7 deletes it).
-        val cached = messagePageCache[roomId]
-        if (cached != null && cached.limit >= limit) {
-            // The memory page is never older than disk (disk writes are
-            // throttled/skipped AFTER memory is updated), so a stale page
-            // is served from memory — recompute in the background and the
-            // next poll is fresh. The old path re-read + JSON-decoded the
-            // same page from disk on every TTL expiry (the thread polls
-            // every 3 s vs the 5 s TTL — constant disk churn).
-            if (android.os.SystemClock.elapsedRealtime() - cached.refreshedAtMs >= MESSAGE_PAGE_TTL_MS) {
-                refreshMessagePage(roomId, limit)
-            }
-            return injectPendingEchoes(roomId, cached.page)
-        }
-        // Cold process / first open: serve the persisted page at once and
-        // recompute in the background — the next poll is fresh.
-        loadMessagePageFromDisk(roomId)?.let { disk ->
-            messagePageCache[roomId] = MessagePageEntry(
-                disk,
-                limit,
-                android.os.SystemClock.elapsedRealtime(),
-            )
-            refreshMessagePage(roomId, limit)
-            return injectPendingEchoes(roomId, disk)
-        }
-        // Cold with no disk page (first open of the room): serve a SMALL
-        // page immediately — the decrypt restores + status walks that make
-        // a full page slow are what kept the thread on "Loading messages…"
-        // — then recompute the full page in the background; the thread's
-        // poll swaps it in seconds later.
-        val first = computeMessagesPage(roomId, null, minOf(limit, INCREMENTAL_FIRST_PAGE), fast = true)
-        messagePageCache[roomId] = MessagePageEntry(
-            first,
-            limit,
-            android.os.SystemClock.elapsedRealtime(),
-        )
-        saveMessagePageToDisk(roomId, first)
-        bumpMessagePageRevision(roomId)
-        refreshMessagePage(roomId, limit)
-        return first
+        // Fallback newest page (SPEC §7): the recompute engine IS the fallback —
+        // reached when the client is down, the store is cold (its seed runs in
+        // the background above), or the store read failed. The pre-store
+        // memory/disk page cascade it replaced is retired (Task 7).
+        return injectPendingEchoes(roomId, computeMessagesPage(roomId, null, limit))
     }
 
     /**
-     * Appends the optimistic voice-note/text/photo rows to a SERVED page
-     * (memory cache or disk). The send's sync echo can still be in the outbox
-     * when the page is read — and re-opening a thread served the stale cached
-     * page, so a just-sent message appeared missing until the background
-     * refresh landed. The rows dedup by their "local-…" id; the
-     * refresh's [computeMessagesPage] replaces them with the real echo.
+     * Appends the optimistic voice-note/text/photo rows to a SERVED page.
+     * The send's sync echo can still be in the outbox when the page is
+     * read — and re-opening a thread served the pre-echo store page, so a
+     * just-sent message appeared missing until the next ingest round. The
+     * rows dedup by their "local-…" id; the store's echo row replaces them
+     * on the next poll after the ingest writer writes it through.
      */
     private suspend fun injectPendingEchoes(roomId: String, page: MessagesPage): MessagesPage {
         val c = client ?: return page
@@ -4282,11 +3779,6 @@ object MatrixRepository {
         }
     }
 
-    /**
-     * One room's newest page, computed from the timeline. Shared by the
-     * [getMessages] cache path and the background [refreshMessagePage]; the
-     * body itself is unchanged from the pre-cache implementation.
-     */
     /**
      * Whether a pending echo's real event is decrypted and renderable. The
      * store decode alone can leave an E2EE event's content unresolved (it
@@ -6031,12 +5523,11 @@ object MatrixRepository {
             RoomId(roomId),
             ReactionEventContent(relatesTo = RelatesTo.Annotation(EventId(eventId), key)),
         ).getOrThrow()
-        // The reaction is a timeline event, so the quiet-room guard doesn't
-        // apply — the next rebuild/incremental picks the tag up; this makes
-        // it visible on the next poll instead of one tick later. The page
-        // cache must drop too, or the reload re-reads its own stale map.
+        // The reaction's tag lands when the ingest writer writes the side row
+        // (its revision bump re-serves the thread); the label cache must drop
+        // now, or the reload re-reads its own stale map.
         reactionCache.remove(roomId)
-        refreshMessagePage(roomId)
+        bumpMessagePageRevision(roomId)
     }
 
     /**
@@ -6084,7 +5575,7 @@ object MatrixRepository {
             c.api.room.redactEvent(matrixRoomId, EventId(id)).getOrThrow()
         }
         reactionCache.remove(roomId)
-        refreshMessagePage(roomId)
+        bumpMessagePageRevision(roomId)
         return true
     }
 
@@ -6131,7 +5622,6 @@ object MatrixRepository {
         // Failures surface as the edit never appearing (the
         // outbox keeps retrying); the echo applies it on the next poll.
         wakeAfterSend(matrixRoomId.full)
-        refreshMessagePage(roomId)
     }
 
     /**
@@ -6149,7 +5639,7 @@ object MatrixRepository {
         // redacted message by type — see [unsentMessageIds]).
         rememberUnsentMessage(eventId)
         c.api.room.redactEvent(RoomId(roomId), EventId(eventId)).getOrThrow()
-        refreshMessagePage(roomId)
+        bumpMessagePageRevision(roomId)
     }
 
     // --- Photos --------------------------------------------------
@@ -6211,7 +5701,6 @@ object MatrixRepository {
         // [sendMessage]; the echo (matched by txn id) replaces it.
         val roomPending = pendingImageEcho.computeIfAbsent(matrixRoomId.full) { java.util.concurrent.ConcurrentHashMap() }
         roomPending[txnId] = PendingImageSend(txnId, System.currentTimeMillis(), payload.fileName)
-        messagePageCache.remove(matrixRoomId.full)
         wakeAfterSend(matrixRoomId.full)
         return true
     }
@@ -7822,44 +7311,12 @@ object MatrixRepository {
      */
     fun setActiveRoom(roomId: String?) {
         activeRoomId = roomId
-        // While a thread is open, keep its cached newest page fresh in the
-        // background — sync echoes and Beeper send-status events then reach the
-        // tool's next poll without it blocking on a compute. Stops on thread
-        // close, navigation, SCREEN_OFF and sync-pause.
-        stopActiveRoomRefresh()
-        if (roomId != null) startActiveRoomRefresh()
         // The tool just showed the list (null = list/settings/background) —
         // end the resolver's idle sleep so its next pass publishes promptly
         // instead of waiting out the screen-off 60 s breather.
         if (roomId == null) wakeRoomList()
         val ctx = appContext ?: return
         if (roomId != null) ChatNotifier.cancelRoom(ctx, roomId)
-    }
-
-    /** The active-room page refresh: rebuild the room's newest page cache every
-     *  [ACTIVE_ROOM_REFRESH_MS] while the screen is on and a thread is open.
-     *  [refreshMessagePage] itself skips rooms that haven't changed and never
-     *  piles up, so a quiet room costs one cheap last-event read per tick. */
-    private fun startActiveRoomRefresh() {
-        val roomId = activeRoomId ?: return
-        stopActiveRoomRefresh()
-        activeRoomRefreshJob = scope.launch {
-            while (true) {
-                delay(ACTIVE_ROOM_REFRESH_MS)
-                if (activeRoomId != roomId) break
-                // Sync-ingest gate: a page rebuild walks the whole head chain —
-                // don't race a running sync ingest for the store (SYNC-PERF-SPEC
-                // §Phase 1). Bounded; the room may have changed while waiting.
-                yieldToSyncIngest()
-                if (activeRoomId != roomId) break
-                refreshMessagePage(roomId)
-            }
-        }
-    }
-
-    private fun stopActiveRoomRefresh() {
-        activeRoomRefreshJob?.cancel()
-        activeRoomRefreshJob = null
     }
 
     /** Screen truth for the speculative-work gates. */
@@ -8126,13 +7583,6 @@ object MatrixRepository {
                                         }
                                         if (prev != lastId) {
                                             seen[key] = lastId
-                                            // NO-SEAM: the open thread no longer
-                                            // long-polls the page revision — it rides the
-                                            // pageChanges signal, so an arrival in the ACTIVE
-                                            // room must refresh its page cache NOW (notifyForEvent
-                                            // skips the active room; the active-room tick is only
-                                            // a 30 s backstop). Cheap when nothing changed.
-                                            if (activeRoomId == key) refreshMessagePage(key)
                                             notifyForEvent(c, roomId, lastId, updated)
                                         }
                                     }
@@ -8253,13 +7703,10 @@ object MatrixRepository {
             android.util.Log.d(TAG, "notifyForEvent: skipping bridge-flood event $eventId in $roomId")
             return
         }
-        // A new message means the user may open this thread. Invalidate the
-        // page caches synchronously (an immediate open must recompute, not
-        // serve the pre-message page from disk), then warm the newest page in
-        // the background (debounced).
-        messagePageCache.remove(roomId.full)
-        messagePageCacheFile(roomId.full)?.delete()
-        warmRoomPage(roomId.full)
+        // A new message means the user may open this thread. Bump the page
+        // revision so the open thread re-serves immediately (the store page
+        // the ingest writer wrote is already there or lands with its bump).
+        bumpMessagePageRevision(roomId.full)
         if (te.event.sender == c.userId) {
             // Own account — no notification whether it was sent from THIS
             // device (outbox echo) or from another Beeper/WhatsApp device:
@@ -8295,31 +7742,6 @@ object MatrixRepository {
         // Persist "alerted this event" so a later watcher registration (new
         // process) doesn't re-alert it — the registration-time notify gate.
         recordNotifiedEvent(roomId.full, eventId)
-    }
-
-    /**
-     * Background-warms a room's newest page (fast walk) so the next open is a
-     * cache hit. Debounced per room — a burst of messages triggers one compute;
-     * the active room is skipped (its page already refreshes every 2 s).
-     */
-    private val roomWarmAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
-
-    private fun warmRoomPage(roomKey: String) {
-        if (activeRoomId == roomKey) return
-        val now = android.os.SystemClock.elapsedRealtime()
-        val last = roomWarmAt[roomKey] ?: 0L
-        if (now - last < ROOM_WARM_DEBOUNCE_MS) return
-        roomWarmAt[roomKey] = now
-        scope.launch {
-            runCatching {
-                val page = computeMessagesPage(roomKey, null, THREAD_PAGE_SIZE, fast = true)
-                messagePageCache[roomKey] = MessagePageEntry(
-                    page, THREAD_PAGE_SIZE, android.os.SystemClock.elapsedRealtime(),
-                )
-                saveMessagePageToDisk(roomKey, page)
-                bumpMessagePageRevision(roomKey)
-            }
-        }
     }
 
     // --- Room-list cache ------------------------------------------
@@ -8373,11 +7795,12 @@ object MatrixRepository {
     )
 
     /**
-     * Monotonic revision of a room's cached newest page: bumped
-     * wherever the page cache's content changes (new/edited events,
-     * read-receipt patches, pending-echo state). The thread's 3s poll reads
+     * Monotonic revision of a room's served page: bumped by the ingest
+     * writer whenever new rows are written through (new/edited events,
+     * reactions, send-statuses), plus the send/notify paths' immediate
+     * nudges. The thread's 3s poll reads
      * this instead of pulling a full [getMessages] page while nothing moved.
-     * 0 = no page cached for the room yet.
+     * 0 = no page served for the room yet.
      */
     private val messagePageRevision =
         java.util.concurrent.ConcurrentHashMap<String, Long>()
@@ -8697,10 +8120,7 @@ object MatrixRepository {
         _roomList.value = emptyList()
         roomListJob?.cancel()
         roomListJob = null
-        messagePageCache.clear()
         messagePageRevision.clear()
-        activeRoomRefreshJob?.cancel()
-        activeRoomRefreshJob = null
         flagsOnlyWake = false
         lastRoomsMap = null
         // A new account needs its own initial crawl (see [startRoomListResolver]).
@@ -8869,55 +8289,9 @@ object MatrixRepository {
                             flags = flags,
                         )
                     }
-                    // Publish the resolved list BEFORE the eager page
-                    // pre-compute below: the precompute builds the newest
-                    // rooms' pages first, and a slow page (e.g. a room whose
-                    // history is still undecryptable) used to delay the
-                    // publish — the panel's bump/reorder waited on it.
-                    // The precompute only touches the
-                    // message-page cache, never the room rows, so publishing
-                    // first is safe.
+                    // Publish the resolved list — the store serves every page,
+                    // so there is no eager message-page precompute anymore.
                     publishRoomList()
-                    // Eager page pre-compute: the most-recent rooms'
-                    // newest pages are computed in the background so opening a
-                    // thread is a cache hit instead of a cold walk. A few per
-                    // pass; rooms with a fresh page (memory or disk) are skipped.
-                    // Battery: screen-gated — the slow-sync rounds
-                    // kept the list dirty on the live account, so the resolver
-                    // was rebuilding the hottest room's page on every pass,
-                    // 24/7, screen off or not (the second speculative-work loop
-                    // after the active-room refresh). Nobody opens a thread
-                    // while the screen is dark; the refresh re-arms on wake.
-                    if (isScreenInteractive()) {
-                        var precomputed = 0
-                        for ((roomId, _) in loaded) {
-                            if (precomputed >= EAGER_PAGES_PER_PASS) break
-                            if (android.os.SystemClock.elapsedRealtime() >= passDeadline) break
-                            // Sync-ingest gate: page builds walk the store.
-                            yieldToSyncIngest()
-                            val key = roomId.full
-                            // Any in-memory page (fresh OR stale) already covers
-                            // this room — getMessages serves stale memory and
-                            // refreshes in the background, so pre-computing again
-                            // is redundant. The disk check is a file stat, not a
-                            // JSON decode: the old loadMessagePageFromDisk ran a
-                            // full decode per room per pass just to learn the
-                            // page exists.
-                            if (messagePageCache.containsKey(key)) continue
-                            if (messagePageCacheFile(key)?.exists() == true) continue
-                            val page = runCatching {
-                                computeMessagesPage(key, null, THREAD_PAGE_SIZE, fast = true)
-                            }.getOrNull()
-                            if (page != null) {
-                                messagePageCache[key] = MessagePageEntry(
-                                    page, THREAD_PAGE_SIZE, android.os.SystemClock.elapsedRealtime(),
-                                )
-                                saveMessagePageToDisk(key, page)
-                                bumpMessagePageRevision(key)
-                                precomputed++
-                            }
-                        }
-                    }
                 } catch (e: Exception) {
                     android.util.Log.w(
                         TAG,
@@ -11410,18 +10784,6 @@ object MatrixRepository {
     private const val RESTORE_ROOM_BUDGET_MS = 6_000L
     private const val RESTORE_ROOM_EVENTS = 40L
     private const val FETCH_TIMEOUT_SECONDS = 5L
-    /** The thread's page size (matches the tool's PAGE_SIZE). */
-    private const val THREAD_PAGE_SIZE = 20
-    /** Cold-open first page: a room with no cached
-     *  page opens with this many messages at once — fast, no decrypt/status
-     *  work — while the background refresh fills the full page. 6 ≈ one
-     *  screenful on the LP3 thread. */
-    private const val INCREMENTAL_FIRST_PAGE = 6
-    /** Max events the incremental refresh (PLAN §8.3) walks to find the
-     *  last-refreshed chain head. A burst beyond this — or a lost boundary
-     *  (limited-sync truncation) — bails to the full rebuild, which handles
-     *  the walk itself. 100 ≈ two sync windows at the §8.1 limit. */
-    private const val INCREMENTAL_MAX_DELTA = 100
     /** Max extra chain walks an older page may take to skip a run of dropped
      *  events (the m.replace edit wall) before giving up — bounded so a
      *  pathological chain can't turn one page read into a long walk. The
@@ -11430,12 +10792,6 @@ object MatrixRepository {
     private const val OLDER_PAGE_SKIP_WALKS = 10
     /** Events per guard walk when skipping a dropped-event wall. */
     private const val OLDER_PAGE_SKIP_STEP = 100
-    /** Serve a cached newest page within this window (feedback pass). */
-    private const val MESSAGE_PAGE_TTL_MS = 5_000L
-    /** Recompute the active room's cached newest page at this cadence. The
-     *  tool's own poll (3s) hits the cache, so 30s is invisible — and the
-     *  refresh skips unchanged rooms entirely. */
-    private const val ACTIVE_ROOM_REFRESH_MS = 30_000L
     private const val TYPING_TIMEOUT_MS = 30_000L
     private const val DECRYPT_RETRIES = 3
     private const val DECRYPT_RETRY_DELAY_MS = 1_500L
@@ -11463,10 +10819,6 @@ object MatrixRepository {
      *  timeline (lastRelevantEventId null) before deciding the receipt. */
     private const val HEAD_RESOLVE_RETRIES = 6
     private const val HEAD_RESOLVE_RETRY_MS = 500L
-    /** Quiet-guard reaction patch (see [patchReactionTags]): unresolved events
-     *  API-resolved per pass, and the backoff after a pass that resolved none. */
-    private const val REACTION_RESOLVE_MAX = 2
-    private const val REACTION_RESOLVE_RETRY_MS = 30_000L
     /** Marker store cap (see [unsentMessageIds]) — a marker only matters while
      *  the redacted event sits in a page window. */
     private const val UNSENT_MARKER_MAX = 256
@@ -11621,16 +10973,8 @@ object MatrixRepository {
     // bridge re-import) is never served after an upgrade.
     private const val DISK_CACHE_DIR = "chats_cache_v3"
     private const val DISK_ROOM_LIST_FILE = "room_list.json"
-    /** How many rooms keep an on-disk message page (the re-open surface). */
-    private const val DISK_CACHE_MAX_PAGES = 100
-    /** A page below this size isn't persisted (transient first-poll fragment). */
-    private const val MIN_PERSISTED_PAGE_SIZE = 5
     /** Minimum gap between disk writes per key (the refresher runs every 2 s). */
     private const val DISK_WRITE_THROTTLE_MS = 10_000L
-    /** How many newest pages the resolver pre-computes per pass (background warm-up). */
-    private const val EAGER_PAGES_PER_PASS = 3
-    /** How often a room's page is re-warmed on new messages (debounce). */
-    private const val ROOM_WARM_DEBOUNCE_MS = 10_000L
 
     private const val TAG = "MatrixRepository"
 }
