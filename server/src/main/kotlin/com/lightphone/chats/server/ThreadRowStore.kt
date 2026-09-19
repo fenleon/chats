@@ -165,6 +165,22 @@ object ThreadRowStore {
                                         row.eventId,
                                     ),
                                 )
+                            } else if (existing.prevEventId == null && row.prevEventId != null) {
+                                // Link self-heal: seeded/top-up-written rows
+                                // carry null prevEventId; when a later chain
+                                // walk re-covers them with the real link,
+                                // patch it in place — hasMore at the store's
+                                // bottom depends on it (LP3 2026-09-19).
+                                sq.execSQL(
+                                    "UPDATE ThreadRow SET prevEventId=?,batchBefore=? " +
+                                        "WHERE roomId=? AND eventId=?",
+                                    arrayOf<Any?>(
+                                        row.prevEventId,
+                                        row.batchBefore ?: existing.batchBefore,
+                                        row.roomId,
+                                        row.eventId,
+                                    ),
+                                )
                             }
                             continue
                         }

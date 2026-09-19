@@ -2811,6 +2811,7 @@ object MatrixRepository {
         beforeEventId: String?,
         limit: Int,
     ): MessagesPage = withContext(Dispatchers.Default) {
+        if (debugLogging()) android.util.Log.d(TAG, "getMessages: room=${roomId.takeLast(12)} before=${beforeEventId?.takeLast(14)} limit=$limit")
         // Callers land here off their own dispatcher (the tool's
         // ThreadViewModel runs on Main) — the cold paths below walk +
         // parse the full event chain on CPU, so the whole body is pinned
@@ -3075,9 +3076,25 @@ object MatrixRepository {
         }
         val oldest = oldestFirst.first()
         val allPlaceholders = oldestFirst.all { it.encrypted == 1 }
+        // hasMore: mid-store pages ALWAYS have more below (the store's true
+        // deepest row is deeper than this page's oldest) — only at the store's
+        // bottom do the deepest row's own chain links decide. Row-level links
+        // are unreliable mid-store: seeded/top-up-written rows carry null
+        // prevEventId (LP3 2026-09-19: a 23-row store reported hasMore=false
+        // with 549 chain events behind it — scroll-up dead-ended).
+        val storeDeepest = ThreadRowStore.deepestRow(c, roomId)
+        val hasMore = if (storeDeepest != null && storeDeepest.eventId != oldest.eventId) {
+            true
+        } else {
+            ThreadRowStore.hasMoreFrom(c, roomId, oldest.eventId)
+        }
+        if (debugLogging()) android.util.Log.d(
+            TAG,
+            "store serve: room=${roomId.takeLast(12)} rows=${messages.size} hasMore=$hasMore oldest=${oldest.timestampMs}",
+        )
         return MessagesPage(
             messages = messages,
-            hasMore = ThreadRowStore.hasMoreFrom(c, roomId, oldest.eventId),
+            hasMore = hasMore,
             // An encrypted room whose whole page is still-undecrypted
             // placeholders reads as the decryption notice, not "no messages".
             encrypted = if (beforeEventId == null && allPlaceholders) {
@@ -3117,7 +3134,7 @@ object MatrixRepository {
         if (!gapBackfillCooldown.allowed(roomId)) return
         val matrixRoomId = RoomId(roomId)
         var walk = readTimelineChainFromDb(
-            c, matrixRoomId, deepest.eventId, GAP_BACKFILL_LIMIT.toInt(),
+            c, matrixRoomId, deepest.eventId, THREAD_TOPUP_WALK_MAX,
         ) ?: return // chain walk unavailable — the legacy fallback below keeps working
         val gapEvent = walk.first.firstOrNull { it.gap?.batchBefore != null }
         if (gapEvent != null) {
@@ -11007,6 +11024,13 @@ object MatrixRepository {
     // triggered by the page walk and bounded below so it can't burn battery.
     /** Events fetched per gap fill (one windowed GET /rooms/{id}/messages). */
     private const val GAP_BACKFILL_LIMIT = 30L
+
+    /** Part F top-up: how deep the LOCAL chain walk goes per scroll before
+     *  handing off to the network gap backfill. The walk is cheap raw SQL over
+     *  history Trixnity already has — the 30-event network-page bound made a
+     *  549-event room need dozens of scrolls to absorb history that was local
+     *  all along (LP3, 2026-09-19). 250 ≈ the projection walk cap. */
+    private const val THREAD_TOPUP_WALK_MAX = 250
     /** A fill must complete within this (the sync-aware retry can back off long). */
     private const val GAP_BACKFILL_BUDGET_MS = 8_000L
     /** Wi-Fi fill budget — cold round-trips regularly exceed the cellular one. */
