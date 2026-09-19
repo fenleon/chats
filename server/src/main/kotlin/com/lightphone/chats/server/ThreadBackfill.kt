@@ -114,37 +114,75 @@ object ThreadBackfill {
      * resumable): the walk resumes where the bookmark left off — it does
      * not restart — and [fetchedCount], the events already fetched toward
      * the cap before the interruption, carries over (a bookmark restart
-     * must NOT reset the counter). No bookmark → no-op.
+     * must NOT reset the counter). With no token (a cap sentinel row —
+     * see [ThreadRowStore.BackfillBookmark]) the carried count still seeds
+     * [State.fetched] so [cappedAlready] can skip the room; the worker
+     * passes 0 for a room with no row at all.
      */
     fun resume(state: State, roomId: String, bookmark: String?, fetchedCount: Int): State {
-        if (state.phase != Phase.RUNNING || state.roomId != roomId || bookmark == null) return state
+        if (state.phase != Phase.RUNNING || state.roomId != roomId) return state
         return state.copy(batchBefore = bookmark, fetched = fetchedCount)
+    }
+
+    /**
+     * Is the current room already at the cap for this login? True for a
+     * cap-sentinel bookmark (or a mid-walk bookmark whose carried count
+     * already reaches the cap): a resumed pass must skip such rooms at
+     * zero cost — M process deaths would otherwise re-deepen each capped
+     * room by up to M×1000 (the unbounded class the sentinel exists to
+     * close).
+     */
+    fun cappedAlready(state: State): Boolean =
+        state.phase == Phase.RUNNING && state.fetched >= THREAD_BACKFILL_MAX_EVENTS
+
+    /**
+     * What the caller must persist in `ThreadRowCursor` after a round.
+     * Token readers ([ThreadRowStore.backfillCursor], the worker's
+     * [ThreadRowStore.backfillBookmark]) and the pass trigger
+     * ([ThreadRowStore.hasBackfillBookmarks]) all treat a NULL-token row
+     * as "no resume token" — the sentinel marks "capped this login"
+     * without re-triggering passes.
+     */
+    sealed interface CursorWrite {
+        /** Mid-room: the advanced token + the running fetched count. */
+        data class Token(val batchBefore: String, val fetchedCount: Int) : CursorWrite
+
+        /** Cap stop: the sentinel — token NULL, count = the accumulated
+         *  count. The room is done for this login; resumed passes skip it. */
+        data class Capped(val fetchedCount: Int) : CursorWrite
+
+        /** Chain end (the room's creation reached): the row goes — absence
+         *  means complete, and only then is the room re-walked from its
+         *  (token-less) deepest row on some later trigger. */
+        object Clear : CursorWrite
     }
 
     /**
      * One fetched round's decision. [fetchedN] events arrived for [roomId]
      * and [batchBefore] is the round's new resume token — null means the
      * chain ended (the room's creation: nothing more server-side).
-     * `roomDone` stops the room; `persistCursor` is what the caller must
-     * persist (alongside `state.fetched`): the advanced token mid-room,
-     * null at BOTH stops — chain end (the room is complete) and the cap
-     * (the room is done for this login; keeping the bookmark would make
-     * `hasBackfillBookmarks` re-trigger a full pass on every app start).
-     * The walk position survives without the bookmark: it lives on the
-     * deepest row's own `batchBefore`. A round for any room other than the
-     * current one is ignored.
+     * `roomDone` stops the room; `write` is the cursor write: a [CursorWrite.Token]
+     * mid-room, a [CursorWrite.Capped] sentinel at the cap, a [CursorWrite.Clear]
+     * at chain end. Null write (a stale round for another room) = touch
+     * nothing. The walk position at cap survives on the deepest row's own
+     * `batchBefore`.
      */
-    data class Advance(val state: State, val persistCursor: String?, val roomDone: Boolean)
+    data class Advance(val state: State, val write: CursorWrite?, val roomDone: Boolean)
 
     fun advance(state: State, roomId: String, fetchedN: Int, batchBefore: String?): Advance {
         if (state.phase != Phase.RUNNING || state.roomId != roomId) {
-            return Advance(state, persistCursor = null, roomDone = false)
+            return Advance(state, write = null, roomDone = false)
         }
         val fetched = state.fetched + fetchedN
         val roomDone = batchBefore == null || fetched >= THREAD_BACKFILL_MAX_EVENTS
+        val write = when {
+            batchBefore == null -> CursorWrite.Clear
+            fetched >= THREAD_BACKFILL_MAX_EVENTS -> CursorWrite.Capped(fetched)
+            else -> CursorWrite.Token(batchBefore, fetched)
+        }
         return Advance(
             state = state.copy(fetched = fetched, batchBefore = batchBefore),
-            persistCursor = if (roomDone) null else batchBefore,
+            write = write,
             roomDone = roomDone,
         )
     }
@@ -169,11 +207,13 @@ object ThreadBackfill {
          *  landed yet — treated as not-fresh, the conservative side). */
         suspend fun storeEmpty(): Boolean
 
-        /** Any `ThreadRowCursor` bookmarks — an interrupted pass to resume. */
+        /** Any `ThreadRowCursor` resume tokens — an interrupted pass to
+         *  resume. Cap-sentinel rows (NULL token) are ignored: a capped
+         *  room must not re-trigger passes. */
         suspend fun hasBackfillBookmarks(): Boolean
 
-        suspend fun backfillBookmark(roomId: String): Pair<String, Int>?
-        suspend fun markBackfillCursor(roomId: String, batchBefore: String?, fetchedCount: Int)
+        suspend fun backfillBookmark(roomId: String): ThreadRowStore.BackfillBookmark?
+        suspend fun markBackfillCursor(roomId: String, write: CursorWrite)
 
         /**
          * One fetch round for [roomId]: chain walk → one gap `/messages`
@@ -224,23 +264,31 @@ object ThreadBackfill {
         while (state.phase == Phase.RUNNING) {
             val roomId = state.roomId ?: break
             val bookmark = deps.backfillBookmark(roomId)
-            state = resume(state, roomId, bookmark?.first, bookmark?.second ?: 0)
-            while (true) {
-                val step = deps.stepRoom(roomId)
-                if (step == null) {
-                    deps.log("backfill: ${roomId.takeLast(12)} stalled — resumes next pass")
-                    break
+            state = resume(state, roomId, bookmark?.batchBefore, bookmark?.fetchedCount ?: 0)
+            if (cappedAlready(state)) {
+                // Capped earlier this login (sentinel or a bookmark whose
+                // count reached the cap): zero cost on resumed passes.
+                deps.log(
+                    "backfill: ${roomId.takeLast(12)} already at cap this login — skipped",
+                )
+            } else {
+                while (true) {
+                    val step = deps.stepRoom(roomId)
+                    if (step == null) {
+                        deps.log("backfill: ${roomId.takeLast(12)} stalled — resumes next pass")
+                        break
+                    }
+                    val a = advance(state, roomId, step.fetched, step.batchBefore)
+                    a.write?.let { deps.markBackfillCursor(roomId, it) }
+                    state = a.state
+                    if (a.roomDone) {
+                        deps.log(
+                            "backfill: ${roomId.takeLast(12)} done — ${state.fetched} row(s) this login",
+                        )
+                        break
+                    }
+                    delay(ROUND_DELAY_MS)
                 }
-                val a = advance(state, roomId, step.fetched, step.batchBefore)
-                deps.markBackfillCursor(roomId, a.persistCursor, a.state.fetched)
-                state = a.state
-                if (a.roomDone) {
-                    deps.log(
-                        "backfill: ${roomId.takeLast(12)} done — ${state.fetched} row(s) this login",
-                    )
-                    break
-                }
-                delay(ROUND_DELAY_MS)
             }
             val more = state.remaining.isNotEmpty()
             state = nextRoom(state)

@@ -3707,15 +3707,18 @@ object MatrixRepository {
             override suspend fun hasBackfillBookmarks(): Boolean =
                 runCatching { ThreadRowStore.hasBackfillBookmarks(c) }.getOrDefault(false)
 
-            override suspend fun backfillBookmark(roomId: String): Pair<String, Int>? =
+            override suspend fun backfillBookmark(roomId: String): ThreadRowStore.BackfillBookmark? =
                 runCatching { ThreadRowStore.backfillBookmark(c, roomId) }.getOrNull()
 
-            override suspend fun markBackfillCursor(
-                roomId: String,
-                batchBefore: String?,
-                fetchedCount: Int,
-            ) {
-                ThreadRowStore.markBackfillCursor(c, roomId, batchBefore, fetchedCount)
+            override suspend fun markBackfillCursor(roomId: String, write: ThreadBackfill.CursorWrite) {
+                when (write) {
+                    is ThreadBackfill.CursorWrite.Token ->
+                        ThreadRowStore.markBackfillCursor(c, roomId, write.batchBefore, write.fetchedCount)
+                    is ThreadBackfill.CursorWrite.Capped ->
+                        ThreadRowStore.markBackfillCapped(c, roomId, write.fetchedCount)
+                    ThreadBackfill.CursorWrite.Clear ->
+                        ThreadRowStore.markBackfillCursor(c, roomId, null, 0)
+                }
             }
 
             override suspend fun stepRoom(roomId: String): ThreadBackfill.RoomStep? =

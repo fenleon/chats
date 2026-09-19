@@ -76,6 +76,23 @@ object ThreadRowStore {
         db.execSQL(DDL_IDX_TARGET)
         db.execSQL(DDL_IDX_PENDING)
         db.execSQL(DDL_CURSOR)
+        ensureCursorCountColumn(db)
+    }
+
+    /** In-branch upgrade fallback: installs from before the fetchedCount
+     *  commit created `ThreadRowCursor` without the column. The ALTER fails
+     *  harmlessly (duplicate column) on a table that already has it; the
+     *  once-per-process flag keeps the failed attempt off the hot ingest
+     *  path. */
+    @Volatile
+    private var cursorCountColumnChecked = false
+
+    private fun ensureCursorCountColumn(db: SupportSQLiteDatabase) {
+        if (cursorCountColumnChecked) return
+        runCatching {
+            db.execSQL("ALTER TABLE ThreadRowCursor ADD COLUMN fetchedCount INTEGER NOT NULL DEFAULT 0")
+        }
+        cursorCountColumnChecked = true
     }
 
     /**
@@ -375,17 +392,20 @@ object ThreadRowStore {
         }
     }
 
-    /** Interrupted-pass probe (SPEC §8 resume): any Part H backfill
-     *  bookmarks? Only the backfill worker writes this table, so any row
-     *  means a pass died mid-walk (process death, rate limit, reboot). */
+    /** Interrupted-pass probe (SPEC §8 resume): any Part H resume TOKENS?
+     *  Only the backfill worker writes this table, so any row means a pass
+     *  died mid-walk — except cap sentinels (NULL token): a capped room is
+     *  done for this login and must NOT re-trigger passes. */
     suspend fun hasBackfillBookmarks(c: MatrixClient): Boolean {
         val db = database(c) ?: return false
         return withContext(Dispatchers.IO) {
             runCatching {
                 val sq = db.openHelper.writableDatabase
                 ensureTable(sq)
-                sq.query("SELECT 1 FROM ThreadRowCursor LIMIT 1", arrayOf<String>())
-                    .use { it.moveToFirst() }
+                sq.query(
+                    "SELECT 1 FROM ThreadRowCursor WHERE batchBefore IS NOT NULL LIMIT 1",
+                    arrayOf<String>(),
+                ).use { it.moveToFirst() }
             }.getOrDefault(false)
         }
     }
@@ -460,9 +480,9 @@ object ThreadRowStore {
         }
     }
 
-    /** Read a room's backfill resume token (null = no bookmark / room done).
-     *  Synchronous — the caller runs it on Dispatchers.IO. Returns null when
-     *  the schema isn't there yet (fresh store). */
+    /** Read a room's backfill resume token (null = no bookmark / room done /
+     *  cap sentinel). Synchronous — the caller runs it on Dispatchers.IO.
+     *  Returns null when the schema isn't there yet (fresh store). */
     fun backfillCursor(db: SupportSQLiteDatabase, roomId: String): String? = runCatching {
         db.query(
             "SELECT batchBefore FROM ThreadRowCursor WHERE roomId=?",
@@ -470,9 +490,15 @@ object ThreadRowStore {
         ).use { cur -> if (cur.moveToFirst() && !cur.isNull(0)) cur.getString(0) else null }
     }.getOrNull()
 
-    /** A room's Part H bookmark as the worker consumes it: resume token +
-     *  fetched count, or null (no bookmark / room done / fresh store). */
-    suspend fun backfillBookmark(c: MatrixClient, roomId: String): Pair<String, Int>? {
+    /** A room's Part H bookmark as the worker consumes it. [batchBefore]
+     *  null = the CAP SENTINEL (capped this login — [fetchedCount] reached
+     *  the cap; token readers ignore it and resumed passes skip the room).
+     *  A null [BackfillBookmark] return = no row at all (room complete via
+     *  chain end, never visited, or fresh store). */
+    data class BackfillBookmark(val batchBefore: String?, val fetchedCount: Int)
+
+    /** A room's Part H bookmark, or null (no row / fresh store). */
+    suspend fun backfillBookmark(c: MatrixClient, roomId: String): BackfillBookmark? {
         val db = database(c) ?: return null
         return withContext(Dispatchers.IO) {
             runCatching {
@@ -482,11 +508,40 @@ object ThreadRowStore {
                     "SELECT batchBefore, fetchedCount FROM ThreadRowCursor WHERE roomId=?",
                     arrayOf(roomId),
                 ).use { cur ->
-                    if (cur.moveToFirst() && !cur.isNull(0)) {
-                        cur.getString(0) to cur.getInt(1)
+                    if (cur.moveToFirst()) {
+                        BackfillBookmark(
+                            batchBefore = nullableString(cur, "batchBefore"),
+                            fetchedCount = cur.getInt(cur.getColumnIndexOrThrow("fetchedCount")),
+                        )
                     } else null
                 }
             }.getOrNull()
+        }
+    }
+
+    /** The cap sentinel (fix round 2): a row with a NULL token and the
+     *  accumulated count. Distinguishes "capped this login" (skip on
+     *  resumed passes) from "never visited"; token readers and the pass
+     *  trigger ([hasBackfillBookmarks]) ignore NULL-token rows, so the
+     *  sentinel neither re-triggers passes nor feeds a walk. */
+    suspend fun markBackfillCapped(c: MatrixClient, roomId: String, fetchedCount: Int) {
+        val db = database(c) ?: return
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val sq = db.openHelper.writableDatabase
+                sq.beginTransaction()
+                try {
+                    ensureTable(sq)
+                    sq.execSQL(
+                        "INSERT OR REPLACE INTO ThreadRowCursor(roomId,batchBefore,fetchedCount) " +
+                            "VALUES(?,NULL,?)",
+                        arrayOf<Any?>(roomId, fetchedCount),
+                    )
+                    sq.setTransactionSuccessful()
+                } finally {
+                    sq.endTransaction()
+                }
+            }.onFailure { Log.w(TAG, "cursor write failed: ${it.message}") }
         }
     }
 

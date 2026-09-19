@@ -79,21 +79,25 @@ class ThreadBackfillCursorTest {
     // --- per-room stop: cap at THREAD_BACKFILL_MAX_EVENTS ---
 
     @Test
-    fun `cap stops the room once 1000 events are fetched and clears the bookmark`() {
+    fun `cap stops the room once 1000 events are fetched and writes the sentinel`() {
         var s = running(listOf("!a", "!b"))
         repeat(33) { round ->
             val a = ThreadBackfill.advance(s, "!a", 30, "tok$round")
             assertFalse(a.roomDone)
-            assertEquals("tok$round", a.persistCursor)
+            assertEquals(
+                ThreadBackfill.CursorWrite.Token("tok$round", 30 * (round + 1)),
+                a.write,
+            )
             s = a.state
         }
         assertEquals(990, s.fetched)
         val a = ThreadBackfill.advance(s, "!a", 30, "tok33")
         assertTrue(a.roomDone)
-        // Cap stop clears the bookmark — keeping it would make
-        // hasBackfillBookmarks re-trigger a full pass on every app start.
-        // The walk position lives on the deepest row's batchBefore.
-        assertNull(a.persistCursor)
+        // Cap stop writes the SENTINEL (token NULL, count = accumulated) —
+        // not a delete: the marker distinguishes "capped this login" from
+        // "never visited" so resumed passes skip the room instead of
+        // re-deepening it, while the pass trigger ignores the NULL token.
+        assertEquals(ThreadBackfill.CursorWrite.Capped(1020), a.write)
         assertEquals(1020, a.state.fetched)
     }
 
@@ -104,7 +108,9 @@ class ThreadBackfillCursorTest {
         val s = running(listOf("!a", "!b"))
         val a = ThreadBackfill.advance(s, "!a", 30, null)
         assertTrue(a.roomDone)
-        assertNull(a.persistCursor)
+        // Chain end (the room's creation) = the room is complete: the row
+        // goes. Absence means done — the one stop that re-admits a walk.
+        assertEquals(ThreadBackfill.CursorWrite.Clear, a.write)
     }
 
     // --- resume: interrupted room continues from its bookmark ---
@@ -119,15 +125,42 @@ class ThreadBackfillCursorTest {
         assertEquals(640, s.fetched)
         val a = ThreadBackfill.advance(s, "!a", 400, "next")
         assertTrue(a.roomDone)
-        assertNull(a.persistCursor)
+        assertEquals(ThreadBackfill.CursorWrite.Capped(1040), a.write)
         assertEquals(1040, a.state.fetched)
     }
 
+    // --- cap sentinel: resumed passes skip capped rooms ---
+
     @Test
-    fun `resume without a bookmark leaves the room fresh`() {
-        val s = ThreadBackfill.resume(running(listOf("!a", "!b")), "!a", null, 640)
+    fun `a cap sentinel's carried count marks the room capped on a resumed pass`() {
+        var s = running(listOf("!a", "!b"))
+        // Worker shape: sentinel row → resume with a NULL token but the
+        // carried count → cappedAlready skips before any stepRoom call.
+        s = ThreadBackfill.resume(s, "!a", null, 1020)
+        assertNull(s.batchBefore)
+        assertTrue(ThreadBackfill.cappedAlready(s))
+    }
+
+    @Test
+    fun `a carried count below the cap is not capped`() {
+        var s = running(listOf("!a", "!b"))
+        s = ThreadBackfill.resume(s, "!a", "tok", 640)
+        assertFalse(ThreadBackfill.cappedAlready(s))
+    }
+
+    @Test
+    fun `cappedAlready is false outside a running room`() {
+        assertFalse(ThreadBackfill.cappedAlready(ThreadBackfill.State()))
+    }
+
+    @Test
+    fun `resume with no row leaves the room fresh`() {
+        // No cursor row at all (chain end / never visited): the worker
+        // passes count 0 — the room walks from its deepest row as usual.
+        val s = ThreadBackfill.resume(running(listOf("!a", "!b")), "!a", null, 0)
         assertNull(s.batchBefore)
         assertEquals(0, s.fetched)
+        assertFalse(ThreadBackfill.cappedAlready(s))
     }
 
     // --- room-done transition ---
@@ -151,6 +184,7 @@ class ThreadBackfillCursorTest {
         val s = running(listOf("!a", "!b"))
         val a = ThreadBackfill.advance(s, "!b", 30, "tok")
         assertEquals(s, a.state)
+        assertNull(a.write)
         assertFalse(a.roomDone)
     }
 }
