@@ -3286,6 +3286,10 @@ object MatrixRepository {
 
             override fun progress(done: Int, total: Int) {
                 backfillProgress.value = done to total
+                // The diagnostics log is the only record of this pass when
+                // the debug flag is off — the user-facing status line lives
+                // only while the Account screen is open.
+                Diagnostics.record("backfill $done/$total rooms")
             }
         }
 
@@ -10513,6 +10517,22 @@ object MatrixRepository {
             if (fills.isNotEmpty()) {
                 ThreadRowStore.writeRows(c, fills)
                 filled += fills.size
+                // The fills just made this room's head renderable — but its
+                // RoomProjection row was written while the events were still
+                // pending decryption (fresh login: the projection backfill's
+                // projectRoom pass ran before the key restore landed), so it
+                // holds a null head (lastRealTs=0) and the tool hides the
+                // room as a ts-0 row — the whole list read as "3 pinned
+                // rooms" for the session (LP3 fresh login, 2026-09-20).
+                // Recompute the row now; the resolver/publish path picks the
+                // real recency up (the crawl's own passes read the
+                // projection, and post-crawl the single-room publish runs).
+                runCatching { recomputeProjectionRows(c, listOf(matrixRoomId)) }
+                lastRoomsMap?.get(matrixRoomId)?.let { roomFlow ->
+                    runCatching { roomFlow.filterNotNull().firstOrNull() }.getOrNull()?.let {
+                        publishRoomRowNow(c, matrixRoomId, it)
+                    }
+                }
             }
             // Any pass change (fill or drop) repaints an open thread.
             if (fills.isNotEmpty() || roomDropped > 0) bumpMessagePageRevision(roomId)
