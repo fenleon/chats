@@ -2348,6 +2348,7 @@ object MatrixRepository {
             threadBackfillJob?.cancel() // the walk walks the deleted store — stop it
             threadBackfillJob = null
             threadBackfillStoreEmptyAtAttach = null // the next login re-probes
+            backfillProgress.value = null // the next login's pass re-seeds it
             // The watchers (sync observers + the ThreadRow recheck loop) collect
             // from the old client — cancel them with the session or the recheck
             // keeps spinning against the closed client. The next login
@@ -2495,6 +2496,9 @@ object MatrixRepository {
             restoreCompleted = restore.completed,
             roomsProjected = roomsProjected,
             roomsJoined = roomsTotal,
+            backfillRoomsDone = backfillProgress.value?.first ?: 0,
+            backfillRoomsTotal = backfillProgress.value?.second ?: 0,
+            roomListReady = initialRoomCrawlDone,
         )
     }
 
@@ -3279,6 +3283,10 @@ object MatrixRepository {
             override fun log(message: String) {
                 if (debugLogging()) android.util.Log.d(TAG, message)
             }
+
+            override fun progress(done: Int, total: Int) {
+                backfillProgress.value = done to total
+            }
         }
 
     /**
@@ -3291,6 +3299,12 @@ object MatrixRepository {
     private var threadBackfillStoreEmptyAtAttach: Boolean? = null
 
     private var threadBackfillJob: Job? = null
+
+    /** Fresh-login backfill progress (rooms done, rooms total) for the
+     *  Account status line; null = no pass this session. Fed by the worker's
+     *  [ThreadBackfill.Deps.progress]. */
+    private val backfillProgress =
+        kotlinx.coroutines.flow.MutableStateFlow<Pair<Int, Int>?>(null)
 
     /** Launch the Part H backfill pass, once per client. Called when the
      *  projection backfill completes (fresh login — initial sync done, room
@@ -8131,9 +8145,20 @@ object MatrixRepository {
      *  resolver coroutine reads/writes it. */
     private var roomIterationCursor = 0
 
+    /** The previous wrap's room-map size — the crawl-done gate compares it to
+     *  the current wrap's: the crawl is done only after a full pass over a
+     *  STABLE map. A fresh login's first passes can run while Trixnity's
+     *  initial sync is still streaming rooms in — the old wrap-alone test
+     *  fired on a 3-room snapshot and froze the room list at 3 rooms for the
+     *  whole session (LP3 fresh login, 2026-09-19). */
+    private var lastCrawlMapSize = -1
+
     /** True once the resolver has collected the whole room map (cursor wrapped
-     *  back to 0). Until then the idle gate lets consecutive passes run, so the
-     *  full account gets seeded even with no incoming messages. */
+     *  back to 0 over a stable-size map — see [lastCrawlMapSize]). Until then
+     *  the idle gate lets consecutive passes run, so the full account gets
+     *  seeded even with no incoming messages. Read cross-thread by
+     *  [connectionState]. */
+    @Volatile
     private var initialRoomCrawlDone = false
 
     /** Set when a PIN/MUTE/ARCHIVE write lands locally ([updateRoomFlagsLocal],
@@ -8196,6 +8221,7 @@ object MatrixRepository {
         lastRoomsMap = null
         // A new account needs its own initial crawl (see [startRoomListResolver]).
         roomIterationCursor = 0
+        lastCrawlMapSize = -1
         initialRoomCrawlDone = false
         roomListRevision++ // a reset IS a list change — the tool must re-fetch
         changeSignal.tryEmit(Unit)
@@ -8316,7 +8342,13 @@ object MatrixRepository {
                         loaded += roomId to room
                     }
                     roomIterationCursor = if (entries.isEmpty()) 0 else (roomIterationCursor + visited) % entries.size
-                    if (roomIterationCursor == 0) initialRoomCrawlDone = true
+                    // Crawl done = a wrap over a STABLE map (see
+                    // [lastCrawlMapSize]): a wrap over a still-growing
+                    // snapshot starts another rotation instead.
+                    if (roomIterationCursor == 0) {
+                        if (entries.size == lastCrawlMapSize) initialRoomCrawlDone = true
+                        lastCrawlMapSize = entries.size
+                    }
                     loaded.sortByDescending { it.second.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L }
                     // An unverified device can't decrypt incoming messages, so the
                     // server-computed unread counts are meaningless there (those

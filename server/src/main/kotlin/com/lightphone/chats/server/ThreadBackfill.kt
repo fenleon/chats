@@ -227,6 +227,13 @@ object ThreadBackfill {
         /** Opt-in diagnostics — counts and room suffixes only, never
          *  tokens or bodies. */
         fun log(message: String)
+
+        /** Fresh-login progress for the Account status line: rooms whose
+         *  backfill finished this pass vs the pass's room total. Called at
+         *  pass start, after each room, and at pass end (done = total —
+         *  stalled rooms resume on a later trigger, the line must not hang
+         *  at x<y forever). No-op default keeps unit-test Deps lean. */
+        fun progress(done: Int, total: Int) {}
     }
 
     /** Launch the worker on [scope]. Fire-and-forget: the trigger probe and
@@ -260,6 +267,7 @@ object ThreadBackfill {
             return
         }
         var state = startPass(probed, list)
+        deps.progress(0, list.size)
         deps.log("backfill: pass starting (${list.size} rooms, cap $THREAD_BACKFILL_MAX_EVENTS/room)")
         while (state.phase == Phase.RUNNING) {
             val roomId = state.roomId ?: break
@@ -292,8 +300,10 @@ object ThreadBackfill {
             }
             val more = state.remaining.isNotEmpty()
             state = nextRoom(state)
+            deps.progress(list.size - state.remaining.size, list.size)
             if (more) delay(ROOM_DELAY_MS)
         }
+        deps.progress(list.size, list.size)
         deps.log("backfill: pass complete")
     }
 }

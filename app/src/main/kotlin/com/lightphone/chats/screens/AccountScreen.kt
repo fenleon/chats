@@ -801,20 +801,24 @@ private fun AccountStatus(
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
     ) {
         connection?.let { state ->
-            // Sync caught up = every joined room's store row is materialized
-            // (the P2 stat below). The old gate (every room's display name
-            // resolved) never fired — a few nameless bridge ghost rooms hold
-            // nameResolved=false forever, and the line read "Syncing 358 of
-            // 362 threads" indefinitely while the store was fully caught up
-            // (LP3 2026-09-19). The stale name-resolution counter comes off
-            // this line entirely.
+            // One status line, one question: is the account ready?
+            //   "Syncing messages… x of y" — the fresh-login backfill is
+            //     building the local store (drives the count; y = the pass's
+            //     room total).
+            //   "Synced · up to date" — sync running + store + room list all
+            //     caught up. The old design had three lines (a name-resolution
+            //     counter that never completed — nameless bridge ghost rooms
+            //     hold it back forever — the key-restore verdict, and the
+            //     store stat) answering one question; folded 2026-09-19
+            //     (LP3 fresh login).
+            val backfillRunning = state.backfillRoomsTotal > 0 &&
+                state.backfillRoomsDone < state.backfillRoomsTotal
             val storeCaughtUp = state.roomsJoined > 0 &&
                 state.roomsProjected >= state.roomsJoined
-            // The status line reads plainly — "battery
-            // saver" when background sync is off, "offline" when there's
-            // simply no connection.
             val statusText = when {
-                state.state == "syncing" && storeCaughtUp -> "Synced"
+                backfillRunning ->
+                    "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
+                state.state == "syncing" && storeCaughtUp -> "Synced · up to date"
                 state.state == "syncing" -> "Syncing"
                 !state.syncEnabled -> "battery saver"
                 state.state == "offline" -> "offline"
@@ -825,29 +829,11 @@ private fun AccountStatus(
                 text = statusText,
                 variant = LightTextVariant.Fine,
             )
-            // Key-backup restore crawl: "Recovering… x of y
-            // rooms" while the daily restore runs; "All messages restored"
-            // once it finished AND sync has fully caught up.
+            // Key-backup restore crawl: shown ONLY while it runs — a healthy
+            // restore is silent, not a permanent third line.
             if (state.restoreScanning && state.restoreRoomsTotal > 0) {
                 LightText(
-                    text = "Recovering ${state.restoreScanned} of ${state.restoreRoomsTotal} rooms",
-                    variant = LightTextVariant.Fine,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
-            } else if (state.restoreCompleted && storeCaughtUp) {
-                LightText(
-                    text = "All messages restored",
-                    variant = LightTextVariant.Fine,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
-            }
-            // P2 stat (2026-09-15 design): the honest restore→sync→projecting
-            // aggregate — rooms whose ingest-time projection row is
-            // materialized, vs the joined-room count. Hidden until the room
-            // count is known (n > 0).
-            if (state.roomsJoined > 0) {
-                LightText(
-                    text = "Synced ${state.roomsProjected} of ${state.roomsJoined} rooms",
+                    text = "Restoring history… ${state.restoreScanned} of ${state.restoreRoomsTotal}",
                     variant = LightTextVariant.Fine,
                     modifier = Modifier.padding(top = 1.dp),
                 )
