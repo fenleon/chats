@@ -3237,6 +3237,29 @@ object MatrixRepository {
         val (added, _) = writeThreadRowsThrough(c, roomId, newRows)
         if (added <= 0) return null
         bumpMessagePageRevision(roomId)
+        // The backfill just gave this room its historical rows — recompute its
+        // projection row (the login-time pass ran before the key restore, so
+        // heads were undecryptable and the row wrote lastRealTs=0) and publish
+        // the room-list row: the tool hides ts-0 rows, so without this the
+        // room stays invisible until it happens to receive a live event (LP3
+        // fresh login, 2026-09-20). The list heals in lockstep with the
+        // backfill counter the Account screen shows.
+        recomputeProjectionRows(c, listOf(matrixRoomId))
+        projectionRow(c, roomId)?.let { row ->
+            roomListCache[roomId]?.let { entry ->
+                if (row.lastRealTs > entry.room.lastTimestampMs) {
+                    roomListCache[roomId] = entry.copy(
+                        room = entry.room.copy(
+                            lastTimestampMs = row.lastRealTs,
+                            lastEventId = row.lastRealEventId ?: entry.room.lastEventId,
+                            lastMessage = entry.room.lastMessage.ifBlank { row.preview },
+                            unreadCount = row.unreadCount,
+                        ),
+                    )
+                }
+            }
+        }
+        publishRoomList()
         val token = ThreadRowStore.deepestRow(c, roomId)?.batchBefore
         return ThreadBackfill.RoomStep(added, token)
     }
@@ -3286,6 +3309,10 @@ object MatrixRepository {
 
             override fun progress(done: Int, total: Int) {
                 backfillProgress.value = done to total
+                // The Account screen long-polls the status revision — without
+                // this bump the "Syncing messages… x of y" counter only moves
+                // when the user leaves and re-opens the screen.
+                bumpStatusRevision()
                 // The diagnostics log is the only record of this pass when
                 // the debug flag is off — the user-facing status line lives
                 // only while the Account screen is open.
