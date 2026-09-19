@@ -2788,6 +2788,10 @@ object MatrixRepository {
         decryptionTimeout = FETCH_TIMEOUT_SECONDS.seconds
     }
 
+    /** Rooms with a cold-store seed job in flight — the quiet re-poll that
+     *  lands before the seed completes must not launch a second full compute. */
+    private val threadSeedInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     /**
      * Messages of a room, oldest first. [beforeEventId] pages further back;
      * null returns the newest [limit] messages.
@@ -2855,17 +2859,31 @@ object MatrixRepository {
                     }
                 }
                 if (storeCold) {
-                    // One full recompute serves the first paint AND seeds the
-                    // store from the SAME result (SPEC §7) — computing twice
-                    // (background seed + fallback below) ran the 10-40 s walk
-                    // in parallel twice and saturated the recompute semaphore
-                    // with no fast first paint.
-                    val page = computeMessagesPage(roomId, null, limit)
-                    scope.launch {
-                        runCatching { seedThreadRow(attachedClient, roomId, page) }
-                            .onFailure { android.util.Log.w(TAG, "thread-store seed failed: ${it.message}") }
+                    // Fast first paint (SPEC §7): the full recompute walks the
+                    // room's whole event chain — seconds of "Loading messages…"
+                    // per first open on the LP3. Serve a small page computed
+                    // with the heavy aux work skipped (`fast = true` — no gap
+                    // backfill, no stuck-decrypt key-restore), then seed the
+                    // store with the FULL page in the background and bump the
+                    // revision so the tool's pageChanges push re-serves the
+                    // page from the store once it lands. The fast page keeps
+                    // the legacy event-id cursor, so this session paginates
+                    // through the recompute engine until the store takes over.
+                    val fastPage = computeMessagesPage(roomId, null, minOf(limit, FAST_FIRST_PAGE_ROWS), fast = true)
+                    if (threadSeedInFlight.add(roomId)) {
+                        scope.launch {
+                            try {
+                                runCatching {
+                                    val page = computeMessagesPage(roomId, null, THREAD_SEED_PAGE_ROWS)
+                                    seedThreadRow(attachedClient, roomId, page)
+                                    bumpMessagePageRevision(roomId)
+                                }.onFailure { android.util.Log.w(TAG, "thread-store seed failed: ${it.message}") }
+                            } finally {
+                                threadSeedInFlight.remove(roomId)
+                            }
+                        }
                     }
-                    return@withContext injectPendingEchoes(roomId, page)
+                    return@withContext injectPendingEchoes(roomId, fastPage)
                 }
             }
         }
@@ -10860,6 +10878,11 @@ object MatrixRepository {
     /** Concurrent provision HTTP rounds cap (list fetches + per-contact
      *  resolves share it — see [bridgeHttpPermits]). */
     private const val BRIDGE_HTTP_CONCURRENCY = 3
+    /** Rows served by the cold-open fast first page (heavy aux work skipped),
+     *  while the full page seeds the store in the background. */
+    private const val FAST_FIRST_PAGE_ROWS = 6
+    /** Rows of the background cold-open seed page ([getMessages]). */
+    private const val THREAD_SEED_PAGE_ROWS = 20
     /** Rebuild a bridge's contact list at most this often (the bridge's own
      *  address book — real numbers incl. LID-resolved, usernames; stable
      *  between changes; battery: one fetch per bridge per hour, only when a
