@@ -77,7 +77,10 @@ object ChatNotifier {
         unreadCount: Long,
     ) {
         val manager = context.getSystemService(NotificationManager::class.java)
-        if (!manager.areNotificationsEnabled()) return
+        if (!manager.areNotificationsEnabled()) {
+            Diagnostics.record("notify suppressed — notifications disabled")
+            return
+        }
         ensureChannel(context)
 
         val id = notificationId(roomId)
@@ -101,6 +104,7 @@ object ChatNotifier {
             .setVisibility(Notification.VISIBILITY_PRIVATE)
         if (unreadCount > 1) builder.setNumber(unreadCount.toInt())
         manager.notify(id, builder.build())
+        Diagnostics.record("notify room ${Diagnostics.short(roomId)}")
 
         // The tool asks for this on its next list show (see TakeNotifyRoom) so
         // tapping the notification can land on the right thread.

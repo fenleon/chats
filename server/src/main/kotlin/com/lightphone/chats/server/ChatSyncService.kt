@@ -65,6 +65,7 @@ class ChatSyncService : Service() {
                         "(screen ${if (MatrixRepository.isScreenOn) "on" else "off"}, " +
                         "mode ${if (MatrixRepository.isSlowSyncing) "slow" else "active"})",
                 )
+                Diagnostics.record("sync loop started")
             } else if (syncedClient !== c) {
                 Log.d(
                     TAG,
@@ -123,6 +124,7 @@ class ChatSyncService : Service() {
             // defeat the whole screen → cadence gate.
             if (syncedClient === c && now - stuckSinceMs >= SYNC_RESTART_AFTER_MS && MatrixRepository.isScreenOn) {
                 Log.w(TAG, "sync stuck in $state for ${SYNC_RESTART_AFTER_MS / 1000}s — restarting sync loop")
+                Diagnostics.record("watchdog: sync stuck in $state ${SYNC_RESTART_AFTER_MS / 1000}s — restarting")
                 runCatching { c.stopSync() }
                 c.startSync(Presence.OFFLINE)
                 stuckSinceMs = 0L

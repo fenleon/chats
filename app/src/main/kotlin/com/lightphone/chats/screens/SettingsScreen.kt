@@ -56,11 +56,14 @@ class SettingsViewModel : LightViewModel<Unit>() {
 
     val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
     val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
+    val diagnostics = MutableStateFlow(false)
+    val diagnosticsExport = MutableStateFlow<String?>(null)
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
+        diagnostics.value = ChatClient.diagnosticsEnabled()
         refresh()
     }
 
@@ -93,6 +96,23 @@ class SettingsViewModel : LightViewModel<Unit>() {
             ChatSettings.setDownloadOverMobile(lightContext, value)
         }
     }
+
+    /** Persists the diagnostics-logging toggle (server-side pref, off by default). */
+    fun setDiagnosticsEnabled(value: Boolean) {
+        viewModelScope.launch {
+            diagnostics.value = ChatClient.setDiagnosticsEnabled(value)
+        }
+    }
+
+    /** Copies the diagnostics log to Movies/Chats; the row shows the result. */
+    fun exportDiagnostics() {
+        viewModelScope.launch {
+            diagnosticsExport.value = when (val name = ChatClient.exportDiagnostics()) {
+                null -> if (ChatClient.diagnosticsHasLog()) "Save failed" else "No log yet"
+                else -> "Saved Movies/Chats/$name"
+            }
+        }
+    }
 }
 
 class SettingsScreen(sealedActivity: SealedLightActivity) :
@@ -109,6 +129,8 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
         val connection by viewModel.connection.collectAsState()
         val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
+        val diagnostics by viewModel.diagnostics.collectAsState()
+        val diagnosticsExport by viewModel.diagnosticsExport.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
 
         // Load the persisted toggle once (idempotent) before rendering it.
@@ -169,6 +191,51 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                     viewModel.setDownloadOverMobile(lightContext, !downloadOverMobile)
                                 },
                             )
+                            // Diagnostics (off by default): writes a sanitized
+                            // status/timing log the user can export for
+                            // troubleshooting (send delays, sync dropouts).
+                            ToggleRow(
+                                checked = diagnostics,
+                                title = "Diagnostics",
+                                subtitle = "Write a diagnostic log for troubleshooting",
+                                onToggle = {
+                                    viewModel.setDiagnosticsEnabled(!diagnostics)
+                                },
+                            )
+                            if (diagnostics) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .lightClickable(onClick = { viewModel.exportDiagnostics() })
+                                        .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column {
+                                        LightText(
+                                            text = "Save diagnostics file",
+                                            variant = LightTextVariant.Heading,
+                                        )
+                                        LightText(
+                                            text = "Copy the log to Movies/Chats",
+                                            variant = LightTextVariant.Detail,
+                                        )
+                                        // Transient result line — clears a few
+                                        // seconds after each save attempt.
+                                        diagnosticsExport?.let { result ->
+                                            LightText(
+                                                text = result,
+                                                variant = LightTextVariant.Detail,
+                                            )
+                                        }
+                                    }
+                                }
+                                LaunchedEffect(diagnosticsExport) {
+                                    if (diagnosticsExport != null) {
+                                        kotlinx.coroutines.delay(4000)
+                                        viewModel.diagnosticsExport.value = null
+                                    }
+                                }
+                            }
                         }
                     }
                 }
