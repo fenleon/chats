@@ -9904,6 +9904,11 @@ object MatrixRepository {
             runCatching { repairMissingThreadRows(c) }
                 .onFailure { android.util.Log.w(TAG, "thread-store repair failed: ${it.message}") }
         }
+        scope.launch {
+            delay(THREAD_ROW_REPAIR_DELAY_MS)
+            runCatching { repairMissingThreadRowsDeep(c) }
+                .onFailure { android.util.Log.w(TAG, "thread-store deep repair failed: ${it.message}") }
+        }
     }
 
     /** One-shot per attach: re-ingest recent timeline events that have NO
@@ -9931,6 +9936,67 @@ object MatrixRepository {
                             "of ${missing.size} missing",
                     )
                 }
+            }
+        }
+    }
+
+    /**
+     * The convergent continuation of [repairMissingThreadRows]: walks EVERY
+     * room's full missing history (one bounded batch at a time, oldest-bound
+     * rowid cursor), writing the same ingest-writer rows — undecrypted events
+     * become `encrypted=1` placeholders the recheck loop heals, so the
+     * decrypt recheck's "only heals rows that exist" invariant finally holds
+     * for all history (LP3 2026-09-20: 595 never-re-decrypted events rendered
+     * as scattered "[Encrypted message]" blocks; the heal machinery worked
+     * but nothing ever re-ingested deep history to give it rows). Events the
+     * writer skips (own undecrypted echoes, non-renderable) stay rowless —
+     * the rowid cursor moves past them, and re-ingesting rowed events is the
+     * writer's re-delivery no-op, so each pass converges. The per-room cursor
+     * is in-memory: a process restart re-walks, but post-convergence that
+     * re-walk is a cheap no-op scan.
+     */
+    private suspend fun repairMissingThreadRowsDeep(c: MatrixClient) {
+        val cursors = HashMap<String, Long>()
+        val done = HashSet<String>()
+        while (true) {
+            val rooms = ThreadRowStore.roomIdsWithMissingEvents(c)
+            if (rooms.isEmpty()) {
+                done.clear()
+                cursors.clear()
+                delay(THREAD_ROW_REPAIR_DEEP_IDLE_MS)
+                continue
+            }
+            var worked = false
+            for (roomId in rooms) {
+                if (roomId in done) continue
+                val cursor = cursors[roomId] ?: Long.MAX_VALUE
+                val (ids, oldest) = ThreadRowStore.missingEventIdsPage(
+                    c, roomId, cursor, THREAD_ROW_REPAIR_DEEP_BATCH,
+                )
+                if (ids.isEmpty() || oldest == null) {
+                    done += roomId
+                    cursors.remove(roomId)
+                    continue
+                }
+                worked = true
+                // Newest-first from the store; the writer wants oldest-first input.
+                val rows = threadRowsFromRound(c, RoomId(roomId), ids.asReversed())
+                val (added, _) = writeThreadRowsThrough(c, roomId, rows)
+                if (added > 0) {
+                    bumpMessagePageRevision(roomId)
+                    android.util.Log.i(
+                        TAG,
+                        "thread-store deep repair: ${roomId.takeLast(12)} wrote $added row(s) " +
+                            "of ${ids.size} missing",
+                    )
+                }
+                cursors[roomId] = oldest
+                delay(THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS)
+            }
+            if (!worked) {
+                // Every room exhausted this pass — wait out the idle window
+                // rather than re-scanning hot.
+                delay(THREAD_ROW_REPAIR_DEEP_IDLE_MS)
             }
         }
     }
@@ -11365,6 +11431,13 @@ object MatrixRepository {
     private const val THREAD_ROW_REPAIR_ROOMS = 24
     private const val THREAD_ROW_REPAIR_WINDOW = 250
     private const val THREAD_ROW_REPAIR_DELAY_MS = 15_000L
+    /** Deep repair bounds ([repairMissingThreadRowsDeep]): events written per
+     *  batch, the pause between batches (the pass runs minutes-long over whole
+     *  history — it must never contend with the sync pump), and the idle
+     *  delay once every room's missing history is projected. */
+    private const val THREAD_ROW_REPAIR_DEEP_BATCH = 200
+    private const val THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS = 15_000L
+    private const val THREAD_ROW_REPAIR_DEEP_IDLE_MS = 600_000L
     /** Peek budget for events after the first one failed to decrypt. */
     private const val QUICK_DECRYPT_WAIT_MS = 100L
     /** Older than this at render time, a still-PENDING decrypt (content never

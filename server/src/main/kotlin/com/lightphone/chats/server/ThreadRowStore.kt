@@ -643,6 +643,65 @@ object ThreadRowStore {
         }
     }
 
+    /** Rooms holding TimelineEvents with NO ThreadRow at any depth — the
+     *  deep-repair rotation candidates. The recent-activity repair only
+     *  reaches the newest window; deep history (pre-store installs, fresh-login
+     *  backfill leftovers) never converges otherwise. */
+    suspend fun roomIdsWithMissingEvents(c: MatrixClient): List<String> {
+        val db = database(c) ?: return emptyList()
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase
+                    .query(
+                        "SELECT DISTINCT te.roomId FROM TimelineEvent te " +
+                            "LEFT JOIN ThreadRow r ON r.roomId = te.roomId AND r.eventId = te.eventId " +
+                            "WHERE r.eventId IS NULL",
+                        arrayOf<String>(),
+                    ).use { cur ->
+                        buildList {
+                            while (cur.moveToNext()) add(cur.getString(0))
+                        }
+                    }
+            }.getOrDefault(emptyList())
+        }
+    }
+
+    /** Page of TimelineEvent ids for [roomId] with NO ThreadRow, strictly
+     *  older than [beforeRowid] (start with [Long.MAX_VALUE]), newest-first;
+     *  pairs the ids with the smallest rowid reached — the next cursor, null
+     *  when the room's missing history is exhausted. The cursor walks
+     *  monotonically downward, so events the writer skips (own undecrypted
+     *  echoes, non-renderable) can't loop the repair pass. */
+    suspend fun missingEventIdsPage(
+        c: MatrixClient,
+        roomId: String,
+        beforeRowid: Long,
+        limit: Int,
+    ): Pair<List<String>, Long?> {
+        val db = database(c) ?: return emptyList<String>() to null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase
+                    .query(
+                        "SELECT te.eventId, te.rowid FROM TimelineEvent te " +
+                            "LEFT JOIN ThreadRow r ON r.roomId = te.roomId AND r.eventId = te.eventId " +
+                            "WHERE te.roomId = ? AND r.eventId IS NULL AND te.rowid < ? " +
+                            "ORDER BY te.rowid DESC LIMIT ?",
+                        arrayOf(roomId, beforeRowid.toString(), limit.toString()),
+                    ).use { cur ->
+                        val ids = ArrayList<String>()
+                        var oldest: Long? = null
+                        while (cur.moveToNext()) {
+                            ids += cur.getString(0)
+                            val rowid = cur.getLong(1)
+                            oldest = minOf(oldest ?: rowid, rowid)
+                        }
+                        ids to oldest
+                    }
+            }.getOrDefault(emptyList<String>() to null)
+        }
+    }
+
     // --- internals ----------------------------------------------------------
 
     private fun database(c: MatrixClient): TrixnityRoomDatabase? =
