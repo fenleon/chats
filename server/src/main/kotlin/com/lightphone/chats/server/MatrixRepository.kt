@@ -1004,12 +1004,13 @@ object MatrixRepository {
         val t0 = android.os.SystemClock.elapsedRealtime()
         val result = runCatching { c.syncOnce(Presence.OFFLINE).getOrThrow() }
             .onSuccess {
+                offlinePublishJob?.cancel() // a healthy round cancels a pending offline publish
                 setConnectionState(ChatConnectionState.Syncing)
                 // Any successful sync means the "checking failed" signal (if
                 // any) is stale (WAKE-COMPARISON.md #3).
                 appContext?.let { ChatNotifier.clearSyncPending(it) }
             }
-            .onFailure { setConnectionState(ChatConnectionState.Offline("sync failed")) }
+            .onFailure { publishOfflineDebounced("sync failed") }
         // The round's ingest (parse/decrypt/store) is done once syncOnce
         // returns — release the sync-ingest gate here. In slow mode no further
         // /sync request follows for minutes, so without this stamp the gate
@@ -10044,32 +10045,54 @@ object MatrixRepository {
         android.util.Log.i(TAG, "thread-store deep repair: reconciled ${roomIds.size} ts-0 projection(s)")
     }
 
+    /** Pending debounced Offline publish — cancelled by any healthy-state
+     *  re-assertion. See [publishOfflineDebounced]. */
+    private var offlinePublishJob: Job? = null
+
+    /**
+     * Publishes [ChatConnectionState.Offline] only after a sustained failure:
+     * a WiFi↔radio handoff blips the long-poll / one syncOnce round while the
+     * realtime link stays healthy, and the instant publish flapped the list's
+     * "Can't reach server" banner while messages still flowed (LP3
+     * 2026-09-20). A healthy state inside the window cancels the publish
+     * (the syncState observer cancels on every non-failure emission; the
+     * syncOnce success path cancels explicitly).
+     */
+    private fun publishOfflineDebounced(detail: String) {
+        offlinePublishJob?.cancel()
+        offlinePublishJob = scope.launch {
+            delay(SYNC_OFFLINE_DEBOUNCE_MS)
+            setConnectionState(ChatConnectionState.Offline(detail))
+        }
+    }
+
     private fun observeSyncState(c: MatrixClient) {
         scope.launch {
             c.syncState.collect { state ->
-                setConnectionState(
-                    when (state) {
-                        SyncState.INITIAL_SYNC -> ChatConnectionState.Connecting
-                        SyncState.STARTED, SyncState.RUNNING -> ChatConnectionState.Syncing
-                        SyncState.ERROR, SyncState.TIMEOUT -> ChatConnectionState.Offline("sync $state")
-                        SyncState.STOPPED -> when {
-                            // Slow sync (screen off) stops the long-poll between
-                            // periodic syncOnce rounds — that's still "syncing",
-                            // not an outage.
-                            isSlowSyncing -> ChatConnectionState.Syncing
-                            // Battery saver is the source of truth while it
-                            // has sync stopped — the restored client reports
-                            // STOPPED until the screen comes back on, and
-                            // that must read as "battery saver", not
-                            // "stopped" (or, worse, the race with init's
-                            // explicit assignment).
-                            !syncEnabled -> ChatConnectionState.Offline("battery saver")
-                            c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> ChatConnectionState.Offline("sync stopped")
-                            sessionExpired -> ChatConnectionState.Offline("session expired — sign in again")
-                            else -> ChatConnectionState.LoggedOut
-                        }
-                    },
-                )
+                if (state != SyncState.ERROR && state != SyncState.TIMEOUT) {
+                    offlinePublishJob?.cancel()
+                }
+                when (state) {
+                    SyncState.INITIAL_SYNC -> setConnectionState(ChatConnectionState.Connecting)
+                    SyncState.STARTED, SyncState.RUNNING -> setConnectionState(ChatConnectionState.Syncing)
+                    SyncState.ERROR, SyncState.TIMEOUT -> publishOfflineDebounced("sync $state")
+                    SyncState.STOPPED -> when {
+                        // Slow sync (screen off) stops the long-poll between
+                        // periodic syncOnce rounds — that's still "syncing",
+                        // not an outage.
+                        isSlowSyncing -> setConnectionState(ChatConnectionState.Syncing)
+                        // Battery saver is the source of truth while it
+                        // has sync stopped — the restored client reports
+                        // STOPPED until the screen comes back on, and
+                        // that must read as "battery saver", not
+                        // "stopped" (or, worse, the race with init's
+                        // explicit assignment).
+                        !syncEnabled -> setConnectionState(ChatConnectionState.Offline("battery saver"))
+                        c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> setConnectionState(ChatConnectionState.Offline("sync stopped"))
+                        sessionExpired -> setConnectionState(ChatConnectionState.Offline("session expired — sign in again"))
+                        else -> setConnectionState(ChatConnectionState.LoggedOut)
+                    }
+                }
             }
         }
     }
@@ -11481,6 +11504,11 @@ object MatrixRepository {
     private const val THREAD_ROW_REPAIR_DEEP_BATCH = 200
     private const val THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS = 15_000L
     private const val THREAD_ROW_REPAIR_DEEP_IDLE_MS = 600_000L
+    /** How long a sync failure must persist before the list's "Can't reach
+     *  server" banner publishes — a WiFi↔radio handoff blips the long-poll
+     *  /one syncOnce round while messages keep flowing. See
+     *  [publishOfflineDebounced]. */
+    private const val SYNC_OFFLINE_DEBOUNCE_MS = 15_000L
     /** Peek budget for events after the first one failed to decrypt. */
     private const val QUICK_DECRYPT_WAIT_MS = 100L
     /** Older than this at render time, a still-PENDING decrypt (content never
