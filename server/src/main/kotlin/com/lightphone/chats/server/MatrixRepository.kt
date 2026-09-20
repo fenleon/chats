@@ -477,6 +477,10 @@ object MatrixRepository {
 
     private val _restoreProgress = MutableStateFlow(RestoreProgress())
 
+    /** Serializes [restoreMegolmSessions] — the retry loop, the sync ladder
+     *  and the post-verification relaunch can overlap. */
+    private val restoreMutex = kotlinx.coroutines.sync.Mutex()
+
     /** User pause for the sync loop (Settings → Sync, audit 2026-08-14): when
      *  false, no sync loop / foreground service runs — the battery escape hatch. */
     @Volatile
@@ -2226,7 +2230,18 @@ object MatrixRepository {
      * (collectRelevantTimelineEvents → restoreRoomSessions) still restores when a
      * room is actually read, so the daily crawl is only the preemptive pass.
      */
-    private suspend fun restoreMegolmSessions() {
+    private suspend fun restoreMegolmSessions(attempt: Int = 0) {
+        // One crawl at a time: the retry loop above and the post-Done ladder
+        // can overlap — a second entrant while one is running is a no-op.
+        if (!restoreMutex.tryLock()) return
+        try {
+            restoreMegolmSessionsLocked(attempt)
+        } finally {
+            restoreMutex.unlock()
+        }
+    }
+
+    private suspend fun restoreMegolmSessionsLocked(attempt: Int) {
         val ctx = appContext ?: return
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val c = client ?: return
@@ -2284,8 +2299,22 @@ object MatrixRepository {
             // page path still restores the moment a backup appears. Clear the
             // cooldown: a configured account whose service hadn't warmed must
             // get a retry (the cost of a false bail is one version fetch).
-            android.util.Log.w(TAG, "restore: no server-side key backup configured — skipping the daily crawl")
+            // On a FRESH login this is usually "not yet", not "absent": the
+            // m.megolm_backup.v1 secret is still streaming from the user's
+            // other devices (LP3 2026-09-20: three bails at 01:27–01:29, the
+            // version only ever arriving minutes later — the crawl then never
+            // ran and the ts=0 heal with it). Retry on a slow timer until the
+            // secret lands or the window closes; each retry is one version
+            // fetch + re-request — cheap until the crawl actually runs.
+            android.util.Log.w(
+                TAG,
+                "restore: backup secret not here yet — retry $attempt/$RESTORE_RETRY_MAX",
+            )
             prefs.edit().remove(KEY_RESTORE_LAST_RUN_MS).apply()
+            if (attempt < RESTORE_RETRY_MAX) {
+                delay(RESTORE_RETRY_MS)
+                restoreMegolmSessions(attempt + 1)
+            }
             return
         }
         val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() } ?: return
@@ -2321,12 +2350,13 @@ object MatrixRepository {
                     }
                     roomsTouched++
                     // The projection pass ran before the key restore (fresh
-                    // login), so its row wrote lastRealTs=0 and the tool
-                    // hides the room — recompute the ones whose keys just
-                    // landed, in lockstep with the crawl's counter.
-                    if (projectionRow(c, roomId.full)?.lastRealTs == 0L) {
-                        recomputeAndPublishProjectionRow(c, roomId.full)
-                    }
+                    // login), so its row was written undecryptable (ts=0, or
+                    // the summary-ts stopgap) — recompute it now that this
+                    // room's sessions just landed, in lockstep with the
+                    // crawl's counter. Unconditional: the stopgap ts is
+                    // indistinguishable from a real head, and the helper only
+                    // bumps the published row when the ts actually improves.
+                    recomputeAndPublishProjectionRow(c, roomId.full)
                 }
             }
         } finally {
@@ -10607,6 +10637,14 @@ object MatrixRepository {
         var lastPreviewResolved = false
         var unread = 0L
         var pendingDecryption = false
+        // Any-age undecrypted encrypted event in the walk: drives the row's
+        // summary-ts stopgap below. NOT age-gated — on a fresh login every
+        // historical event is older than STALE_ENCRYPTED_MS, and gating the
+        // stopgap on recency made it a no-op exactly where the list collapsed
+        // (LP3 2026-09-20 round 6). [pendingDecryption] stays age-gated: it
+        // only feeds the 30s recheck loop, which must not churn on stale
+        // history the crawl will heal.
+        var sawUndecrypted = false
         // Existing row's head ts, fetched lazily: only a room whose walk meets
         // a `batch/` txn event (bridge history re-import) pays the one indexed
         // SELECT — the replay rule compares against row existence (null =
@@ -10639,8 +10677,11 @@ object MatrixRepository {
                 isFlood = isFloodGhost(c, te, events),
                 isBatchReplay = isBatchReplay,
             )
-            if (isEncrypted && !decryptedOk && !ProjectionPredicate.encryptedStale(originTs, now)) {
-                pendingDecryption = true
+            if (isEncrypted && !decryptedOk) {
+                sawUndecrypted = true
+                if (!ProjectionPredicate.encryptedStale(originTs, now)) {
+                    pendingDecryption = true
+                }
             }
             if (renders) {
                 if (sender != own && (ownTs == null || originTs > ownTs)) unread++
@@ -10652,6 +10693,19 @@ object MatrixRepository {
                 }
             }
             if (lastId != null && ownTs != null && originTs < ownTs) break
+        }
+        // Undecryptable head (keys still restoring on a fresh login): park the
+        // row at the room summary's timestamp instead of 0 — a 0 row makes the
+        // tool hide the room, which collapsed the fresh-login list to the
+        // pinned rooms the moment names resolved (LP3 2026-09-20, rounds 4–6).
+        // Any-age [sawUndecrypted]: fresh-login history is always older than
+        // STALE_ENCRYPTED_MS. The key-restore crawl's recompute replaces this
+        // with the real head; genuinely content-less rooms (state/notice only,
+        // nothing undecrypted) still write 0, so the tool's ts-0 junk guard is
+        // untouched.
+        if (lastId == null && sawUndecrypted) {
+            lastId = room?.lastEventId?.full
+            lastTs = room?.lastRelevantEventTimestamp?.toEpochMilliseconds() ?: 0L
         }
         val row = ProjectionRow(
             roomId = roomId.full,
@@ -11165,6 +11219,12 @@ object MatrixRepository {
     private const val MESSAGES_BUDGET_MS = 15_000L
     /** Restore-scan cadence: at most one full crawl per day. */
     private const val RESTORE_INTERVAL_MS = 86_400_000L
+
+    /** Fresh-login backup-secret wait (see the version==null bail in
+     *  [restoreMegolmSessionsLocked]): retry cadence + window. The LP3's
+     *  secret stream delivered m.megolm_backup.v1 ~5–7 min after login. */
+    private const val RESTORE_RETRY_MS = 120_000L
+    private const val RESTORE_RETRY_MAX = 15
     /** Per-room budget + window for the restore scan (the shared
      *  [MESSAGES_BUDGET_MS] / 100-event window is fine for reads, wasteful for
      *  the preemptive crawl). */
