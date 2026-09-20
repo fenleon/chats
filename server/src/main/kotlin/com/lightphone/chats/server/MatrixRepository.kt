@@ -10004,7 +10004,10 @@ object MatrixRepository {
                     )
                 }
                 cursors[roomId] = oldest
-                delay(THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS)
+                // Pacing is for real writes; a no-op batch (every event a
+                // writer skip) is two queries — crawl through those at full
+                // speed so the convergence reconcile arrives in minutes.
+                if (added > 0) delay(THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS)
             }
             if (worked) {
                 reconciled = false // new rows landed — reconcile again at the next convergence
