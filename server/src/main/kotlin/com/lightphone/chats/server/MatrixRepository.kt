@@ -10011,6 +10011,10 @@ object MatrixRepository {
                     // speed so the convergence reconcile arrives in minutes.
                     if (added > 0) delay(THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS)
                 }.onFailure {
+                    // Cancellation (logout tearing the session down) must
+                    // propagate — swallowing it made the loop log one dead
+                    // batch per room and then die at the next suspend.
+                    if (it is kotlinx.coroutines.CancellationException) throw it
                     android.util.Log.w(
                         TAG,
                         "thread-store deep repair: ${roomId.takeLast(12)} batch failed: ${it.message}",
@@ -11529,8 +11533,8 @@ object MatrixRepository {
      *  batch, the pause between batches (the pass runs minutes-long over whole
      *  history — it must never contend with the sync pump), and the idle
      *  delay once every room's missing history is projected. */
-    private const val THREAD_ROW_REPAIR_DEEP_BATCH = 200
-    private const val THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS = 15_000L
+    private const val THREAD_ROW_REPAIR_DEEP_BATCH = 500
+    private const val THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS = 2_000L
     private const val THREAD_ROW_REPAIR_DEEP_IDLE_MS = 600_000L
     /** How long a sync failure must persist before the list's "Can't reach
      *  server" banner publishes — a WiFi↔radio handoff blips the long-poll
