@@ -805,23 +805,37 @@ private fun AccountStatus(
             //   "Syncing messages… x of y" — the fresh-login backfill is
             //     building the local store (drives the count; y = the pass's
             //     room total).
-            //   "Synced · up to date" — sync running + store + room list all
-            //     caught up. The old design had three lines (a name-resolution
-            //     counter that never completed — nameless bridge ghost rooms
-            //     hold it back forever — the key-restore verdict, and the
-            //     store stat) answering one question; folded 2026-09-19
-            //     (LP3 fresh login).
+            //   "Syncing" — the key-backup restore crawl is working (the
+            //     "Restoring history… x of y" line below carries the count) or
+            //     the store isn't caught up yet.
+            //   "Synced · up to date" — sync running + store + room list
+            //     caught up AND the fresh-login work settled: the restore flow
+            //     completed (or settled with nothing to restore) and the
+            //     backfill pass ran its rooms. Claiming Synced while the
+            //     restore is still waiting on the backup secret read as a lie
+            //     on the LP3 fresh login (2026-09-20).
             val backfillRunning = state.backfillRoomsTotal > 0 &&
                 state.backfillRoomsDone < state.backfillRoomsTotal
+            val backfillSettled = state.backfillRoomsTotal == 0 ||
+                state.backfillRoomsDone >= state.backfillRoomsTotal
+            val restoreRunning = state.restoreScanning && state.restoreRoomsTotal > 0
             val storeCaughtUp = state.roomsJoined > 0 &&
                 state.roomsProjected >= state.roomsJoined
             val statusText = when {
                 backfillRunning ->
                     "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
-                state.state == "syncing" && storeCaughtUp -> "Synced · up to date"
+                restoreRunning -> "Syncing"
+                state.state == "syncing" && storeCaughtUp && backfillSettled &&
+                    state.restoreCompleted -> "Synced · up to date"
                 state.state == "syncing" -> "Syncing"
                 !state.syncEnabled -> "battery saver"
                 state.state == "offline" -> "offline"
+                // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
+                // the WHOLE first sync round — many minutes on a large
+                // account, while the room list is already visibly populated.
+                // Once rooms have landed, "connecting" reads as a lie: the
+                // sync is actively working — say Syncing.
+                state.state == "connecting" && state.roomsTotal > 0 -> "Syncing"
                 state.state == "connecting" -> "connecting"
                 else -> state.state.replaceFirstChar { it.uppercase() }
             }

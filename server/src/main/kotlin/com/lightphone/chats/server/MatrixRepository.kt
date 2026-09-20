@@ -2230,6 +2230,20 @@ object MatrixRepository {
      * (collectRelevantTimelineEvents → restoreRoomSessions) still restores when a
      * room is actually read, so the daily crawl is only the preemptive pass.
      */
+    /**
+     * The restore flow finished without restoring (no server-side backup, or
+     * the backup secret never arrived within the retry window): mark it
+     * completed so the Account status line's Synced gate opens — nothing
+     * further happens automatically (live key shares still decrypt new
+     * events, and a later trigger can still run the crawl: the last-run
+     * cooldown stays cleared).
+     */
+    private fun settleRestoreFlow(prefs: android.content.SharedPreferences) {
+        prefs.edit().putBoolean(KEY_RESTORE_COMPLETED, true).apply()
+        _restoreProgress.value = RestoreProgress(completed = true)
+        Diagnostics.record("restore flow settled without a backup")
+    }
+
     private suspend fun restoreMegolmSessions(attempt: Int = 0) {
         // One crawl at a time: the retry loop above and the post-Done ladder
         // can overlap — a second entrant while one is running is a no-op.
@@ -2255,6 +2269,7 @@ object MatrixRepository {
         val keyBackup = keyBackupOf(c)
         if (keyBackup == null) {
             android.util.Log.e(TAG, "restore: KeyBackupService not available via DI")
+            settleRestoreFlow(prefs)
             return
         }
         val lastRun = prefs.getLong(KEY_RESTORE_LAST_RUN_MS, 0L)
@@ -2313,11 +2328,35 @@ object MatrixRepository {
             prefs.edit().remove(KEY_RESTORE_LAST_RUN_MS).apply()
             if (attempt < RESTORE_RETRY_MAX) {
                 delay(RESTORE_RETRY_MS)
-                restoreMegolmSessions(attempt + 1)
+                // Locked variant — the mutex is already held here and is not
+                // reentrant: the public entry's tryLock would bail silently
+                // and the retry would never happen (shipped broken 2026-09-20
+                // morning; only "retry 0/15" ever appeared in the LP3 log).
+                restoreMegolmSessionsLocked(attempt + 1)
+            } else {
+                // The window closed without the secret: the restore flow is
+                // settled — the Account status line's Synced gate must open
+                // (nothing further happens automatically; live key shares
+                // still decrypt new events).
+                android.util.Log.w(TAG, "restore: backup secret never arrived — settling")
+                settleRestoreFlow(prefs)
             }
             return
         }
-        val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() } ?: return
+        val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() }
+        if (rooms == null) {
+            // The room map often isn't surfaced yet mid-login — same retry
+            // ladder as the secret wait above, same settle on give-up (a
+            // silent return here would hold the status line at Syncing
+            // forever).
+            if (attempt < RESTORE_RETRY_MAX) {
+                delay(RESTORE_RETRY_MS)
+                restoreMegolmSessionsLocked(attempt + 1)
+            } else {
+                settleRestoreFlow(prefs)
+            }
+            return
+        }
         android.util.Log.d(TAG, "restore: scanning ${rooms.size} rooms")
         _restoreProgress.value = RestoreProgress(scanning = true, roomsTotal = rooms.size)
         var roomsTouched = 0
@@ -8236,6 +8275,17 @@ object MatrixRepository {
     @Volatile
     private var initialRoomCrawlDone = false
 
+    /**
+     * The one-shot network-label heal launched at the crawl-done transition
+     * ([startRoomListResolver]): the Beeper space rooms that carry the
+     * network/community names stream in progressively, and a crawl that
+     * stabilized before they landed stamps every row network=null — the
+     * Networks panel shows only "All" and search rows go unlabeled, forever
+     * (LP3 fresh login 2026-09-20: 362/362 rows null). Reset per account.
+     */
+    @Volatile
+    private var networkHealLaunched = false
+
     /** Set when a PIN/MUTE/ARCHIVE write lands locally ([updateRoomFlagsLocal],
      *  also verification-state changes): the resolver re-stamps the cached
      *  rows with the fresh flags and publishes immediately, then stops —
@@ -8298,6 +8348,7 @@ object MatrixRepository {
         roomIterationCursor = 0
         lastCrawlMapSize = -1
         initialRoomCrawlDone = false
+        networkHealLaunched = false
         roomListRevision++ // a reset IS a list change — the tool must re-fetch
         changeSignal.tryEmit(Unit)
     }
@@ -8372,8 +8423,12 @@ object MatrixRepository {
                 }
                 // After the initial crawl the flags-only re-stamp above is the
                 // whole pass — no steady-state crawl (INGEST-DERIVED-PLAN
-                // Phase C).
+                // Phase C) — except the one-shot network-label heal below.
                 if (initialRoomCrawlDone) {
+                    if (!networkHealLaunched) {
+                        networkHealLaunched = true
+                        scope.launch { healNetworkLabels(c) }
+                    }
                     withTimeoutOrNull(
                         if (isScreenInteractive()) ROOM_LIST_REFRESH_DELAY_MS else SLOW_RESOLVER_DELAY_MS
                     ) {
@@ -8727,6 +8782,52 @@ object MatrixRepository {
      * rooms are older than the room activity) and caches the result, since
      * space membership changes rarely.
      */
+    /**
+     * One-shot late heal for the network/community labels: when the crawl
+     * stabilized before the Beeper space rooms arrived, every cached row
+     * carries network=null and nothing re-stamps it (no steady-state sweep —
+     * INGEST-DERIVED-PLAN C). Rebuilds the map on a slow timer until it has
+     * entries (or the window closes), re-stamps the cached rows and publishes.
+     * Trigger: EVERY row null — a partial map is legitimate (rooms outside any
+     * account space stay ungrouped), so only the all-null case heals.
+     * ponytail: all-null trigger only; a partial-arriving space set that
+     * heals wrong rooms would need per-room tombstones — add if ever observed.
+     */
+    private suspend fun healNetworkLabels(c: MatrixClient, attempt: Int = 0) {
+        if (client !== c) return // logged out mid-wait
+        if (roomListCache.isEmpty() || roomListCache.values.any { it.room.network != null }) return
+        if (attempt >= NETWORK_HEAL_ATTEMPTS_MAX) {
+            android.util.Log.w(TAG, "room list: network labels never arrived — heal gave up")
+            return
+        }
+        delay(NETWORK_HEAL_RETRY_MS)
+        if (client !== c) return
+        yieldToSyncIngest()
+        val rooms = withTimeoutOrNull(ROOMS_BUDGET_MS) { c.room.getAll().first() } ?: run {
+            healNetworkLabels(c, attempt + 1); return
+        }
+        val (networks, communities) = runCatching { networkByRoom(c, rooms) }
+            .getOrDefault(emptyMap<String, String>() to emptyMap())
+        if (networks.isEmpty()) {
+            healNetworkLabels(c, attempt + 1); return
+        }
+        var changed = 0
+        for ((key, entry) in roomListCache) {
+            val n = networks[key] ?: continue
+            val com = communities[key]
+            if (n != entry.room.network || (com != null && com != entry.room.community)) {
+                roomListCache[key] = entry.copy(
+                    room = entry.room.copy(network = n, community = com ?: entry.room.community),
+                )
+                changed++
+            }
+        }
+        if (changed > 0) {
+            android.util.Log.d(TAG, "room list: network heal re-stamped $changed row(s)")
+            publishRoomList()
+        }
+    }
+
     private suspend fun networkByRoom(
         c: MatrixClient,
         rooms: Map<RoomId, Flow<MatrixRoom?>>,
@@ -11184,6 +11285,11 @@ object MatrixRepository {
     private const val FLOOD_CONTEXT_TTL_MS = 10_000L
     /** Rebuild the network map at most this often (space membership is stable). */
     private const val NETWORK_MAP_TTL_MS = 300_000L
+
+    /** Network-label heal cadence (see [networkHealLaunched]): retry every
+     *  2 min up to 20 min — the space rooms land within the initial sync. */
+    private const val NETWORK_HEAL_RETRY_MS = 120_000L
+    private const val NETWORK_HEAL_ATTEMPTS_MAX = 10
     /** Bound for a full network-map build (600+ room flows on a big account). */
     private const val NETWORK_MAP_BUDGET_MS = 15_000L
     /** Re-fetch a failed bridge contact list no sooner than this (a failure is
