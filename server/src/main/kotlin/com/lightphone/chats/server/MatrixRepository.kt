@@ -9992,22 +9992,30 @@ object MatrixRepository {
                     continue
                 }
                 worked = true
+                // Advance first: a poisoned batch must not loop the cursor.
+                cursors[roomId] = oldest
                 // Newest-first from the store; the writer wants oldest-first input.
-                val rows = threadRowsFromRound(c, RoomId(roomId), ids.asReversed())
-                val (added, _) = writeThreadRowsThrough(c, roomId, rows)
-                if (added > 0) {
-                    bumpMessagePageRevision(roomId)
-                    android.util.Log.i(
+                runCatching {
+                    val rows = threadRowsFromRound(c, RoomId(roomId), ids.asReversed())
+                    val (added, _) = writeThreadRowsThrough(c, roomId, rows)
+                    if (added > 0) {
+                        bumpMessagePageRevision(roomId)
+                        android.util.Log.i(
+                            TAG,
+                            "thread-store deep repair: ${roomId.takeLast(12)} wrote $added row(s) " +
+                                "of ${ids.size} missing",
+                        )
+                    }
+                    // Pacing is for real writes; a no-op batch (every event a
+                    // writer skip) is two queries — crawl through those at full
+                    // speed so the convergence reconcile arrives in minutes.
+                    if (added > 0) delay(THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS)
+                }.onFailure {
+                    android.util.Log.w(
                         TAG,
-                        "thread-store deep repair: ${roomId.takeLast(12)} wrote $added row(s) " +
-                            "of ${ids.size} missing",
+                        "thread-store deep repair: ${roomId.takeLast(12)} batch failed: ${it.message}",
                     )
                 }
-                cursors[roomId] = oldest
-                // Pacing is for real writes; a no-op batch (every event a
-                // writer skip) is two queries — crawl through those at full
-                // speed so the convergence reconcile arrives in minutes.
-                if (added > 0) delay(THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS)
             }
             if (worked) {
                 reconciled = false // new rows landed — reconcile again at the next convergence
@@ -10034,10 +10042,21 @@ object MatrixRepository {
      */
     private suspend fun reconcileTs0Projections(c: MatrixClient) {
         val roomIds = ThreadRowStore.ts0ProjectionRoomsWithRows(c)
-        if (roomIds.isEmpty()) return
+        if (roomIds.isEmpty()) {
+            android.util.Log.d(TAG, "thread-store deep repair: ts-0 reconcile — nothing to do")
+            return
+        }
+        android.util.Log.i(TAG, "thread-store deep repair: ts-0 reconcile over ${roomIds.size} room(s)")
+        var healed = 0
+        var failed = 0
         for (roomId in roomIds) {
             val matrixRoomId = RoomId(roomId)
             runCatching { recomputeProjectionRows(c, listOf(matrixRoomId)) }
+                .onSuccess { healed++ }
+                .onFailure {
+                    failed++
+                    android.util.Log.w(TAG, "ts-0 reconcile: ${roomId.takeLast(12)} failed: ${it.message}")
+                }
             lastRoomsMap?.get(matrixRoomId)?.let { roomFlow ->
                 runCatching { roomFlow.filterNotNull().firstOrNull() }.getOrNull()?.let {
                     publishRoomRowNow(c, matrixRoomId, it)
@@ -10045,7 +10064,7 @@ object MatrixRepository {
             }
             delay(200)
         }
-        android.util.Log.i(TAG, "thread-store deep repair: reconciled ${roomIds.size} ts-0 projection(s)")
+        android.util.Log.i(TAG, "thread-store deep repair: reconciled $healed ts-0 projection(s) ($failed failed)")
     }
 
     /** Pending debounced Offline publish — cancelled by any healthy-state
@@ -10898,7 +10917,13 @@ object MatrixRepository {
             var isBatchReplay = false
             if (txn != null && txn.startsWith(ProjectionPredicate.BATCH_TXN_PREFIX)) {
                 if (existingHeadTs == null && !fetchedExistingRow) {
-                    existingHeadTs = projectionRow(c, roomId.full)?.lastRealTs
+                    // A ts-0 row is HEADLESS, not "has a head": the fresh-login
+                    // projection backfill wrote ts-0 rows before bridge batch/
+                    // imports landed, and treating that as an existing head
+                    // excluded every import as replay — the room re-wrote
+                    // ts=0 forever (LP3 2026-09-20: 293 rooms hidden with
+                    // 100%-decrypted history). Only a real head blocks.
+                    existingHeadTs = projectionRow(c, roomId.full)?.lastRealTs?.takeIf { it > 0L }
                     fetchedExistingRow = true
                 }
                 isBatchReplay = ProjectionPredicate.batchReplay(txn, existingHeadTs)
