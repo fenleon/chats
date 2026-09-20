@@ -9958,11 +9958,23 @@ object MatrixRepository {
     private suspend fun repairMissingThreadRowsDeep(c: MatrixClient) {
         val cursors = HashMap<String, Long>()
         val done = HashSet<String>()
+        var reconciled = false
         while (true) {
             val rooms = ThreadRowStore.roomIdsWithMissingEvents(c)
             if (rooms.isEmpty()) {
                 done.clear()
                 cursors.clear()
+                // Converged: one reconcile pass over projections the updater
+                // never completed (lastRealTs=0) despite healed message rows —
+                // the list's ts-0 guard hides exactly these rooms (LP3
+                // 2026-09-20 fresh login: 293 hidden rooms with 100%-decrypted
+                // history). Genuinely eventless rooms recompute to ts=0 again
+                // and stay hidden (junk-guard semantics).
+                if (!reconciled) {
+                    reconciled = true
+                    runCatching { reconcileTs0Projections(c) }
+                        .onFailure { android.util.Log.w(TAG, "ts-0 projection reconcile failed: ${it.message}") }
+                }
                 delay(THREAD_ROW_REPAIR_DEEP_IDLE_MS)
                 continue
             }
@@ -9993,12 +10005,43 @@ object MatrixRepository {
                 cursors[roomId] = oldest
                 delay(THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS)
             }
-            if (!worked) {
-                // Every room exhausted this pass — wait out the idle window
-                // rather than re-scanning hot.
+            if (worked) {
+                reconciled = false // new rows landed — reconcile again at the next convergence
+            } else {
+                // Every room exhausted this pass (rowless skips remain — the
+                // room set never empties on them): this is a convergence
+                // point too, so run the reconcile here as well.
+                if (!reconciled) {
+                    reconciled = true
+                    runCatching { reconcileTs0Projections(c) }
+                        .onFailure { android.util.Log.w(TAG, "ts-0 projection reconcile failed: ${it.message}") }
+                }
+                // Wait out the idle window rather than re-scanning hot.
                 delay(THREAD_ROW_REPAIR_DEEP_IDLE_MS)
             }
         }
+    }
+
+    /**
+     * One reconcile pass: rooms whose RoomProjection row holds `lastRealTs=0`
+     * (the projection updater never completed a pass on them) while the
+     * ThreadRow store holds message rows — recomputed + republished so the
+     * room list picks the real recency up. See [repairMissingThreadRowsDeep].
+     */
+    private suspend fun reconcileTs0Projections(c: MatrixClient) {
+        val roomIds = ThreadRowStore.ts0ProjectionRoomsWithRows(c)
+        if (roomIds.isEmpty()) return
+        for (roomId in roomIds) {
+            val matrixRoomId = RoomId(roomId)
+            runCatching { recomputeProjectionRows(c, listOf(matrixRoomId)) }
+            lastRoomsMap?.get(matrixRoomId)?.let { roomFlow ->
+                runCatching { roomFlow.filterNotNull().firstOrNull() }.getOrNull()?.let {
+                    publishRoomRowNow(c, matrixRoomId, it)
+                }
+            }
+            delay(200)
+        }
+        android.util.Log.i(TAG, "thread-store deep repair: reconciled ${roomIds.size} ts-0 projection(s)")
     }
 
     private fun observeSyncState(c: MatrixClient) {

@@ -702,6 +702,29 @@ object ThreadRowStore {
         }
     }
 
+    /** Rooms whose RoomProjection row holds `lastRealTs=0` (the projection
+     *  updater never completed a pass) while the ThreadRow store holds message
+     *  rows — the ts-0 list guard hides exactly these. See
+     *  [MatrixRepository.reconcileTs0Projections]. RoomProjection may not exist
+     *  yet (created lazily by the repository) — empty list then. */
+    suspend fun ts0ProjectionRoomsWithRows(c: MatrixClient): List<String> {
+        val db = database(c) ?: return emptyList()
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                db.openHelper.writableDatabase
+                    .query(
+                        "SELECT p.roomId FROM RoomProjection p WHERE p.lastRealTs = 0 AND EXISTS (" +
+                            "SELECT 1 FROM ThreadRow r WHERE r.roomId = p.roomId AND r.kind = 'message')",
+                        arrayOf<String>(),
+                    ).use { cur ->
+                        buildList {
+                            while (cur.moveToNext()) add(cur.getString(0))
+                        }
+                    }
+            }.getOrDefault(emptyList())
+        }
+    }
+
     // --- internals ----------------------------------------------------------
 
     private fun database(c: MatrixClient): TrixnityRoomDatabase? =
