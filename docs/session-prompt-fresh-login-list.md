@@ -1,16 +1,14 @@
 # Session prompt — fresh-login room list collapses to the pinned rooms
 
-> **ROUND 4 (2026-09-20, late): root cause found and fixed (`684052b`) — this
-> file's prime suspect (sticky membership prune) was CLEARED by evidence.**
-> The collapse is the tool's ts-0 guard hiding 352/362 `RoomProjection` rows
-> written `lastRealTs=0` because the projection backfill (01:02–01:05) ran
-> before the megolm key restore (backup version fetched 01:06:58). Nothing
-> recomputed them afterwards: the pendingDecryption retry drops events older
-> than 10 min, and the backfill step's instant-done path skipped the
-> recompute. Fix: the key-restore crawl now recomputes each touched room's
-> stale projection via the shared `recomputeAndPublishProjectionRow` — the
-> list heals in lockstep with "Restoring history… x of y". Evidence timeline
-> preserved below; next step is the LP3 fresh-login re-test.
+> **ROUND 7 (2026-09-20): FIXED + user-verified.** The collapse is dead —
+> `projectRoom` never writes a row below the room's summary timestamp
+> (`a6e31f2`), and the restore crawl (now reliably triggered) upgrades rows
+> to real heads. Status line made honest ("Synced" gates on restore+backfill
+> settling; "Syncing" once rooms land), and the network-label race got a
+> one-shot heal (`eb0cb9d`). Ops lessons: killed daemons corrupt Gradle
+> up-to-date state (APK mtime gate before every install), and queued
+> watchers' pgrep self-matches their own cmdline. Remaining: one clean
+> full fresh-login pass (log out → in) as the 0.19.0 release gate.
 
 ## Mission
 
