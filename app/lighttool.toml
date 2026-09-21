@@ -1,6 +1,6 @@
 [tool]
 id = "com.lightphone.chats"
-label = "Chats"
+label = "Messages"
 versionCode = 80
 versionName = "0.19.0"
 permissions = ["android.permission.INTERNET", "android.permission.POST_NOTIFICATIONS"]

@@ -143,7 +143,7 @@ object ChatNotifier {
             PENDING_NOTIFICATION_ID,
             Notification.Builder(context, PENDING_CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.sym_def_app_icon)
-                .setContentTitle("Chats")
+                .setContentTitle("Messages")
                 .setContentText("Checking for messages failed — will retry")
                 .setContentIntent(contentIntent)
                 .setAutoCancel(true)

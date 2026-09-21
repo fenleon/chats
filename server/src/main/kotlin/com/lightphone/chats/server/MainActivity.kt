@@ -146,9 +146,9 @@ private fun DevScreen() {
                         .verticalScroll(rememberScrollState())
                         .padding(2f.gridUnitsAsDp()),
                 ) {
-                    LightText(text = "Chats Server", variant = LightTextVariant.Heading)
+                    LightText(text = "Messages Server", variant = LightTextVariant.Heading)
                     LightText(
-                        text = "Companion for the Chats tool — Matrix core (Phase 2)",
+                        text = "Companion for the Messages tool — Matrix core (Phase 2)",
                         variant = LightTextVariant.Fine,
                         lighten = true,
                         modifier = Modifier.padding(bottom = 1f.gridUnitsAsDp()),

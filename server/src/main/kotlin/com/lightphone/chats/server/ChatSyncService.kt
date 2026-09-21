@@ -151,7 +151,7 @@ class ChatSyncService : Service() {
                 "Sync",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {
-                description = "Keeps Chats synced with your homeserver"
+                description = "Keeps Messages synced with your homeserver"
                 setShowBadge(false)
             },
         )
@@ -203,7 +203,7 @@ class ChatSyncService : Service() {
             )
             return Notification.Builder(context, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.sym_def_app_icon)
-                .setContentTitle("Chats")
+                .setContentTitle("Messages")
                 .setContentText("Syncing messages")
                 .setContentIntent(openStatus)
                 .setOngoing(true)

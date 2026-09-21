@@ -190,7 +190,7 @@ object PushChannel {
             appId = APP_ID,
             pushkey = pushkey!!,
             kind = "http",
-            appDisplayName = "Chats",
+            appDisplayName = "Messages",
             deviceDisplayName = "LP3",
             lang = "en",
             data = data,
