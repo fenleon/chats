@@ -98,6 +98,20 @@ object ThreadRowLogic {
     /** Mirrors MatrixRepository.BEEPER_SEND_STATUS_EVENT_TYPE. */
     const val SEND_STATUS_EVENT_TYPE = "com.beeper.message_send_status"
 
+    /**
+     * Event types [buildRows] can ever turn into a row (message class,
+     * redactions, send-status; anything carrying an m.relates_to — reactions,
+     * edits — is eligible regardless of its type). The deep-repair store
+     * queries filter missing pages to these: everything else (m.room.member,
+     * m.room.topic, …) stays rowless BY DESIGN, and occupying the missing
+     * pages with it kept the deep repair's room set from ever emptying — its
+     * done-set froze rooms marked done before their keys landed, never to be
+     * revisited (LP3 2026-09-21: a room's 96 missing events, 46 of them
+     * buildable, stayed rowless for good).
+     */
+    val ROW_ELIGIBLE_EVENT_TYPES = listOf(TYPE_MESSAGE, TYPE_ENCRYPTED, TYPE_REDACTION, SEND_STATUS_EVENT_TYPE)
+
+
     private const val TYPE_MESSAGE = "m.room.message"
     private const val TYPE_ENCRYPTED = "m.room.encrypted"
     private const val TYPE_REDACTION = "m.room.redaction"

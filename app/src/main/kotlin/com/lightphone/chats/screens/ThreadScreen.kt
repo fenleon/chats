@@ -557,8 +557,24 @@ class ThreadViewModel(
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
             launch {
+                // Fast-paint race (PLAN thread-store follow-up 7): a cold
+                // open's background seed can bump the revision before this
+                // collector subscribes — a signal emitted with no subscriber
+                // is gone, so replay can't recover it. Catch up on the
+                // revision counter instead: any bump newer than the page we
+                // hold re-serves it.
+                if (MatrixRepository.messagePageRevision(room.id) != servedRevision) {
+                    loadNewest(quiet = true)
+                }
                 MatrixRepository.pageChanges.collect { roomId ->
-                    if (roomId == room.id) loadNewest(quiet = true)
+                    if (roomId == room.id) {
+                        loadNewest(quiet = true)
+                        // A bump can also mean scrolled-back rows healed in
+                        // the store (decrypt recheck / deep repair) — older
+                        // pages aren't re-served by [loadNewest], so stale
+                        // "[Encrypted message]" paint must be re-fetched.
+                        refreshStaleOlderPages()
+                    }
                 }
             }
             launch {
@@ -586,10 +602,15 @@ class ThreadViewModel(
         // duplicating and jumping until every send had echoed. A newer call supersedes an in-flight one.
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
+            // Capture before the fetch: a bump landing between here and the
+            // served page means the page predates the bump — the subscribe
+            // catch-up (startPolling) must still see a delta.
+            val revBefore = MatrixRepository.messagePageRevision(room.id)
             if (!quiet) loading.value = true
             var loaded: List<LightServiceMethod.GetMessages.Message>
             try {
                 val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
+                servedRevision = revBefore
                 // Reaction overlay: drop entries the served page now
                 // reflects, then ride the rest on top — the heart (dis)appears
                 // instantly after a toggle instead of waiting on this poll.
@@ -614,7 +635,7 @@ class ThreadViewModel(
                     messages.value = applyMessageOverlays(
                         mergeWithPending(mergeNewestPage(loaded, messages.value)),
                     )
-                    hasMore.value = page?.hasMore ?: false
+                    applyHasMore(page?.hasMore ?: false)
                     // While the visible list is still only newest pages, the
                     // paging cursor is the newest page's own walk position (the
                     // chain-deepest event it read) — never the visible first
@@ -1183,6 +1204,74 @@ class ThreadViewModel(
     private var olderCursor: String? = null
 
     /**
+     * Cursors of every older page fetched this session (fetch order, newest
+     * page first) — the positions [refreshStaleOlderPages] re-reads when the
+     * store healed rows the screen already rendered as placeholders.
+     */
+    private val olderPageCursors = ArrayDeque<String>()
+
+    /**
+     * Cursored rows re-fetched while stale "[Encrypted message]" paint is on
+     * screen. Scroll-into-history fetches land rows as undecrypted
+     * placeholders and the recheck heals the store seconds later — but older
+     * pages aren't re-served by the newest-page poll, so the healed bodies
+     * never reached the screen (LP3 2026-09-21: 2022 rows stuck as blocks
+     * after the store had fully healed). Re-reads each fetched page
+     * (one indexed SELECT apiece) until the placeholder bodies are gone or
+     * the retry budget runs out; the bump collector re-arms it.
+     */
+    private var staleRefetchJob: Job? = null
+
+    private fun refreshStaleOlderPages() {
+        if (!pagedOlder || olderPageCursors.isEmpty()) return
+        if (!messages.value.any { it.body == STUCK_DECRYPT_BODY }) return
+        if (staleRefetchJob?.isActive == true) return
+        staleRefetchJob = viewModelScope.launch {
+            try {
+                var tries = 0
+                while (tries < 12 && messages.value.any { it.body == STUCK_DECRYPT_BODY }) {
+                    // Snapshot: loadOlder appends to the deque from sibling
+                    // coroutines while this loop suspends on fetches — the
+                    // live deque fails fast (CME crash, LP3 2026-09-21).
+                    val cursors = olderPageCursors.toList()
+                    for (cursor in cursors) {
+                        val page = ChatClient.getMessages(room.id, cursor, OLDER_PAGE_SIZE) ?: continue
+                        val older = page.messages
+                        if (older.isEmpty()) continue
+                        // Fresh page rows ride FIRST — distinctBy drops the
+                        // stale copies their ids replace.
+                        val merged = (older + messages.value).distinctBy { it.id }
+                        dropReflectedOverlays(merged)
+                        messages.value = applyMessageOverlays(applyReactionOverlays(merged))
+                    }
+                    if (messages.value.none { it.body == STUCK_DECRYPT_BODY }) break
+                    delay(5_000) // give the store's heal pass a beat
+                    tries++
+                }
+            } finally {
+                staleRefetchJob = null
+            }
+        }
+    }
+
+    /**
+     * Cursors an older-page fetch proved dead (0 events + hasMore=false) —
+     * e.g. a bridge batch token that is no chain event id. The newest-page
+     * poll re-arms [hasMore] from the newest page on every tick; without the
+     * latch it re-armed a dead cursor forever and every tick refetched it,
+     * recomputing the full chain each time (LP3 2026-09-21). Per cursor id:
+     * a page that later gains deeper history serves under a new cursor and
+     * is unaffected.
+     */
+    private val deadCursors = HashSet<String>()
+
+    /** [hasMore] as the fetch reported it, minus the dead-cursor latch. */
+    private fun applyHasMore(raw: Boolean) {
+        val cursor = olderCursor
+        hasMore.value = raw && (cursor == null || cursor !in deadCursors)
+    }
+
+    /**
      * Whether an older page has already been prepended. From that point on only
      * [loadOlder] writes the cursor — a newest-page refresh must not drag it
      * back up into the newest window.
@@ -1204,6 +1293,10 @@ class ThreadViewModel(
                 val page = ChatClient.getMessages(room.id, cursor, OLDER_PAGE_SIZE)
                 page?.nextBeforeEventId?.let { olderCursor = it }
                 val older = page?.messages.orEmpty()
+                // 0 events + hasMore=false from this cursor: latch it dead so
+                // the newest-page poll can't re-arm [hasMore] for it (the
+                // dead-cursor churn loop).
+                if (older.isEmpty() && page?.hasMore == false) deadCursors.add(cursor)
                 if (older.isNotEmpty()) {
                     // distinctBy guards the page boundary: if the timeline changed
                     // between calls, the cursor event can appear at both edges.
@@ -1219,7 +1312,12 @@ class ThreadViewModel(
                     messages.value = applyMessageOverlays(applyReactionOverlays(merged))
                     pagedOlder = true
                 }
-                hasMore.value = page?.hasMore ?: hasMore.value
+                applyHasMore(page?.hasMore ?: hasMore.value)
+                if (older.isNotEmpty()) olderPageCursors.addLast(cursor)
+                // Scroll-into-unfetched-history lands undecrypted placeholders
+                // that the recheck heals seconds later — arm the stale-paint
+                // refetch for this session's pages right away.
+                refreshStaleOlderPages()
             } finally {
                 // A binder failure must not wedge pagination.
                 loadingMore.value = false
@@ -1231,11 +1329,27 @@ class ThreadViewModel(
     /** Coalescing guard for [loadNewest] — one in-flight fetch/merge at a time. */
     private var loadJob: Job? = null
 
+    /**
+     * The page revision ([MatrixRepository.messagePageRevision]) the displayed
+     * newest page was fetched against — captured BEFORE the fetch, so a bump
+     * landing mid-fetch still reads as "newer than what I hold".
+     */
+    private var servedRevision = 0L
+
     private companion object {
         /** Newest-page size (matches the server's THREAD_PAGE_SIZE). */
         const val PAGE_SIZE = 20
-        /** Older-page size: 6 ≈ one screenful per scroll-up load (2026-08-23). */
-        const val OLDER_PAGE_SIZE = 6
+        /** The store's undecrypted-placeholder body (ThreadRowLogic's
+         *  ENCRYPTED_PLACEHOLDER_BODY — :app has no import path to it); the
+         *  marker [refreshStaleOlderPages] re-fetches against. */
+        const val STUCK_DECRYPT_BODY = "[Encrypted message]"
+        /**
+         * Older-page size. Store-served pages are one indexed SELECT (the
+         * thread-store rework), and with the 250-event top-up walk bigger
+         * pages make scroll-back catch-up continuous instead of a 6-row
+         * trickle per load (PLAN follow-up 2, 2026-09-19).
+         */
+        const val OLDER_PAGE_SIZE = 30
         /** Poll cadence while a voice note plays: its position advances
          *  without any page change, and only a poll reads it back. */
         const val THREAD_POLL_MS = 1_500L

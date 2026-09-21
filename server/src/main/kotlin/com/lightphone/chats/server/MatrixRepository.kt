@@ -2886,6 +2886,13 @@ object MatrixRepository {
      * retries). Older pages past the seeded window resume through the
      * recompute engine from the deepest stored row's chain link and write the
      * page through, so the next scroll continues locally.
+     *
+     * Older-page doors (the "every fetched event gets a row" invariant): a
+     * `ts|seq` keyset cursor rides top-up + store serve; a legacy event-id
+     * cursor maps to its ThreadRow (or to the row carrying it as
+     * `batchBefore` — bridge batch tokens are resume links, never chain
+     * cursors) and rides the same path; only a cursor the store can't place
+     * at all computes from itself, seeded behind.
      */
     suspend fun getMessages(
         roomId: String,
@@ -2913,12 +2920,44 @@ object MatrixRepository {
                     serveFromStore(attachedClient, roomId, beforeEventId, limit)?.let { return@withContext it }
                     // Store exhausted below the keyset: deeper history lives
                     // only in the event chain — continue through the recompute
-                    // engine from the deepest stored row's resume link, and
+                    // engine from the deepest stored row's chain link, and
                     // write the page through so FUTURE sessions scroll locally
                     // (this page carries the legacy event-id cursor, so this
-                    // session keeps computing).
-                    val deepest = ThreadRowStore.deepestRow(attachedClient, roomId)
-                    val resume = deepest?.prevEventId ?: deepest?.batchBefore
+                    // session keeps computing). The chain link only: resuming
+                    // from the deepest row's `batchBefore` — a bridge batch
+                    // token, not a chain event id — read 0 chain events
+                    // forever (LP3 2026-09-21 dead-cursor churn).
+                    val resume = ThreadRowStore.deepestRow(attachedClient, roomId)?.prevEventId
+                    if (resume != null) {
+                        val page = computeMessagesPage(roomId, resume, limit)
+                        scope.launch {
+                            runCatching { seedThreadRow(attachedClient, roomId, page) }
+                                .onFailure { android.util.Log.w(TAG, "thread-store write-through failed: ${it.message}") }
+                        }
+                        return@withContext page
+                    }
+                    return@withContext MessagesPage(emptyList(), false)
+                }
+                // Legacy event-id cursor (a page the compute engine served).
+                // The store is the renderer: map the cursor to its ThreadRow
+                // and ride the keyset path — top-up writes fetched events
+                // through the ingest writer at the door (the scroll-fetch door
+                // of the store invariant). A bridge batch token (Instagram's
+                // `e-…`) is a resume link, never a chain event id: it maps to
+                // the row carrying it as batchBefore, and "older than that
+                // row" is the request it encodes (LP3 2026-09-21: a
+                // before=e-149337 cursor recomputed 0 chain events every ~30 s).
+                val cursorRow = ThreadRowStore.rowForEvent(attachedClient, roomId, beforeEventId)
+                    ?: ThreadRowStore.rowForBatchBefore(attachedClient, roomId, beforeEventId)
+                if (cursorRow != null) {
+                    val keysetRaw =
+                        ThreadRowLogic.keysetBefore(cursorRow.timestampMs, cursorRow.ingestSeq)
+                    topUpOlderPage(attachedClient, roomId, ThreadRowLogic.parseKeyset(keysetRaw), limit)
+                    serveFromStore(attachedClient, roomId, keysetRaw, limit)?.let { return@withContext it }
+                    // Store exhausted below the cursor row: one compute page
+                    // from its real chain link, written through (same as the
+                    // keyset branch above).
+                    val resume = cursorRow.prevEventId
                     if (resume != null) {
                         val page = computeMessagesPage(roomId, resume, limit)
                         scope.launch {
@@ -2969,7 +3008,27 @@ object MatrixRepository {
                 }
             }
         }
-        if (beforeEventId != null) return@withContext computeMessagesPage(roomId, beforeEventId, limit)
+        // LAST-RESORT compute page (the only remaining legacy fallback):
+        // the client is down (no store access) or the legacy event-id cursor
+        // maps to no row (below store coverage). With a client present the
+        // page is seeded through the ingest writer, so the NEXT scroll serves
+        // locally — the compute engine renders a region once; the store owns
+        // it afterwards. (Remaining compute entry points: client-down newest
+        // page below, cold-store fast paint above, and these two legacy-cursor
+        // computes — all written through when a client exists. Nothing serves
+        // ciphertext as "[Encrypted message]" while the session key is held
+        // locally: the recheck/heal machinery is the only renderer of stuck
+        // store rows.)
+        if (beforeEventId != null) {
+            val page = computeMessagesPage(roomId, beforeEventId, limit)
+            attachedClient?.let { c ->
+                scope.launch {
+                    runCatching { seedThreadRow(c, roomId, page) }
+                        .onFailure { android.util.Log.w(TAG, "thread-store write-through failed: ${it.message}") }
+                }
+            }
+            return@withContext page
+        }
         // Fallback newest page (SPEC §7): the recompute engine IS the fallback —
         // reached when the client is down or the store read failed (a cold
         // store computed and seeded above, then returned). The pre-store
@@ -3212,8 +3271,17 @@ object MatrixRepository {
         limit: Int,
     ) {
         val rows = ThreadRowStore.olderPage(c, roomId, keyset, limit)
-        if (rows.isEmpty() || rows.size >= limit) return
-        val deepest = rows.last() // newest-first — the deepest served row
+        if (rows.size >= limit) return
+        // An EMPTY page (the store is exhausted below the cursor) still tops
+        // up: the walk anchors at the store's deepest row — the gap BEYOND it
+        // is exactly what's missing. The old early-return made every deeper
+        // scroll fall to the compute engine, whose resume link is the deepest
+        // row's `batchBefore` — a bridge batch token (e-…), not a chain event
+        // id — and the walk from it read 0 events forever (LP3 2026-09-21
+        // dead-cursor churn).
+        val deepest = rows.lastOrNull()
+            ?: ThreadRowStore.deepestRow(c, roomId)
+            ?: return // nothing in the store to anchor on — caller falls back
         if (!ThreadRowStore.hasMoreFrom(c, roomId, deepest.eventId)) return
         if (!gapBackfillCooldown.allowed(roomId)) return
         val matrixRoomId = RoomId(roomId)
@@ -9980,6 +10048,10 @@ object MatrixRepository {
                 continue
             }
             var worked = false
+            android.util.Log.i(
+                TAG,
+                "thread-store deep repair: pass rooms=${rooms.size} done=${done.size}",
+            )
             for (roomId in rooms) {
                 if (roomId in done) continue
                 val cursor = cursors[roomId] ?: Long.MAX_VALUE
@@ -9987,6 +10059,13 @@ object MatrixRepository {
                     c, roomId, cursor, THREAD_ROW_REPAIR_DEEP_BATCH,
                 )
                 if (ids.isEmpty() || oldest == null) {
+                    if (debugLogging()) {
+                        android.util.Log.d(
+                            TAG,
+                            "thread-store deep repair: ${roomId.takeLast(12)} page exhausted at " +
+                                "rowid<$cursor — done",
+                        )
+                    }
                     done += roomId
                     cursors.remove(roomId)
                     continue
@@ -9998,13 +10077,16 @@ object MatrixRepository {
                 runCatching {
                     val rows = threadRowsFromRound(c, RoomId(roomId), ids.asReversed())
                     val (added, _) = writeThreadRowsThrough(c, roomId, rows)
+                    // Ungated (the idle/skip case must be visible): built=0
+                    // means the row builder dropped every event (skip rules),
+                    // built>0/added=0 means the writer skipped them.
+                    android.util.Log.i(
+                        TAG,
+                        "thread-store deep repair: ${roomId.takeLast(12)} ids=${ids.size} " +
+                            "built=${rows.size} added=$added",
+                    )
                     if (added > 0) {
                         bumpMessagePageRevision(roomId)
-                        android.util.Log.i(
-                            TAG,
-                            "thread-store deep repair: ${roomId.takeLast(12)} wrote $added row(s) " +
-                                "of ${ids.size} missing",
-                        )
                     }
                     // Pacing is for real writes; a no-op batch (every event a
                     // writer skip) is two queries — crawl through those at full
@@ -10024,6 +10106,14 @@ object MatrixRepository {
             if (worked) {
                 reconciled = false // new rows landed — reconcile again at the next convergence
             } else {
+                // Reset the pass state: the eligible-missing scan re-opens
+                // every room next pass. Rooms marked done before their keys
+                // landed (own-undecrypted skips heal later, decrypts land
+                // late) are revisited here instead of frozen until process
+                // restart — post-convergence the re-walk is a cheap no-op
+                // scan (row-eligible events only, see ROW_ELIGIBLE_SQL).
+                done.clear()
+                cursors.clear()
                 // Every room exhausted this pass (rowless skips remain — the
                 // room set never empties on them): this is a convergence
                 // point too, so run the reconcile here as well.
@@ -10553,6 +10643,13 @@ object MatrixRepository {
         val renderedMap: HashMap<String, LightServiceMethod.GetMessages.Message> =
             rendered?.let { HashMap(it) } ?: HashMap(stored.size)
         val inputs = ArrayList<RawEventInput>(stored.size)
+        // healOwnEcho pays one bounded API re-read per own unresolved echo —
+        // 3 s each, sequential. Capped per batch: an own-undecrypted-heavy
+        // room (fresh-login key restore) otherwise stalls the batch (and the
+        // deep repair's crawl behind it) for minutes. Capped echoes stay
+        // skipped (the optimistic row covers display; the deep repair's next
+        // pass retries — its done-state resets at every idle convergence).
+        var healBudget = OWN_ECHO_HEALS_PER_BATCH
         for (storedEvent in stored) {
             val eventId = storedEvent.event.event.id.full
             // An OWN event whose stored content is still unresolved (the sync
@@ -10566,7 +10663,10 @@ object MatrixRepository {
             // the send's pending echo degrades into a stuck SENDING row
             // (Note-to-self sends, LP3 2026-09-19).
             val event = if (storedEvent.event.content?.getOrNull() == null) {
-                healOwnEcho(c, roomId, storedEvent.event) ?: storedEvent.event
+                if (healBudget > 0 && storedEvent.event.event.sender.full == c.userId.full) {
+                    healBudget--
+                    healOwnEcho(c, roomId, storedEvent.event) ?: storedEvent.event
+                } else storedEvent.event
             } else storedEvent.event
             val resolved = event.content?.getOrNull()
             if (rendered == null && resolved != null) {
@@ -11387,7 +11487,17 @@ object MatrixRepository {
             // the head (unread flag stuck — LP3 window), so the
             // placeholder renders and the row exists; a late-arriving key
             // re-renders it as real content.
-            te.content?.isFailure == true -> ThreadRowLogic.ENCRYPTED_PLACEHOLDER_BODY
+            te.content?.isFailure == true &&
+                // A failed wrapper on an UNENCRYPTED raw event is not stuck
+                // encryption — it is an unmapped type (Beeper's
+                // com.beeper.message_send_status, which keeps its parsed
+                // content inside the raw event JSON) and renders nothing,
+                // same as the store path's side-row classification. Keying
+                // off wrapper absence alone painted "[Encrypted message]"
+                // blocks interleaved with real rows below store coverage
+                // (PLAN thread-store follow-up 5, 2026-09-20).
+                te.event.content is EncryptedMessageEventContent ->
+                ThreadRowLogic.ENCRYPTED_PLACEHOLDER_BODY
             else ->
                 if (System.currentTimeMillis() - te.event.originTimestamp >
                     DECRYPT_PENDING_PLACEHOLDER_AFTER_MS &&
@@ -11536,6 +11646,11 @@ object MatrixRepository {
     private const val THREAD_ROW_REPAIR_DEEP_BATCH = 500
     private const val THREAD_ROW_REPAIR_DEEP_BATCH_DELAY_MS = 2_000L
     private const val THREAD_ROW_REPAIR_DEEP_IDLE_MS = 600_000L
+
+    /** Max own-echo heal attempts ([healOwnEcho], 3 s each) per
+     *  [threadRowsFromRound] batch — bounds one batch's decrypt-nudge cost. */
+    private const val OWN_ECHO_HEALS_PER_BATCH = 8
+
     /** How long a sync failure must persist before the list's "Can't reach
      *  server" banner publishes — a WiFi↔radio handoff blips the long-poll
      *  /one syncOnce round while messages keep flowing. See

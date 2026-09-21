@@ -417,6 +417,38 @@ object ThreadRowStore {
         }
     }
 
+    /** The row holding [eventId] as its own event — the legacy-cursor mapping:
+     *  a compute-engine event-id cursor rides the keyset serve path when the
+     *  store holds the event ([MatrixRepository.getMessages]). */
+    suspend fun rowForEvent(c: MatrixClient, roomId: String, eventId: String): ThreadRowValues? {
+        val db = database(c) ?: return null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                queryFirst(
+                    db.openHelper.writableDatabase,
+                    "SELECT * FROM ThreadRow WHERE roomId=? AND eventId=? LIMIT 1",
+                    arrayOf(roomId, eventId),
+                )
+            }.getOrNull()
+        }
+    }
+
+    /** The row whose gap-resume link (`batchBefore`) is [token] — a bridge
+     *  batch token (Instagram's `e-…`) is a resume link, never a chain event
+     *  id: "older than the row carrying it" is the request it encodes. */
+    suspend fun rowForBatchBefore(c: MatrixClient, roomId: String, token: String): ThreadRowValues? {
+        val db = database(c) ?: return null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                queryFirst(
+                    db.openHelper.writableDatabase,
+                    "SELECT * FROM ThreadRow WHERE roomId=? AND batchBefore=? LIMIT 1",
+                    arrayOf(roomId, token),
+                )
+            }.getOrNull()
+        }
+    }
+
     /** Fresh-login probe (SPEC §8 trigger): does the store hold ANY rows?
      *  The probe is taken at client attach — before the first sync round can
      *  write — so an empty store means a fresh login, not an unwritten one. */
@@ -631,7 +663,7 @@ object ThreadRowStore {
                     .query(
                         "SELECT te.eventId FROM TimelineEvent te " +
                             "LEFT JOIN ThreadRow r ON r.roomId = te.roomId AND r.eventId = te.eventId " +
-                            "WHERE te.roomId = ? AND r.eventId IS NULL " +
+                            "WHERE te.roomId = ? AND r.eventId IS NULL AND $ROW_ELIGIBLE_SQL " +
                             "ORDER BY te.rowid DESC LIMIT ?",
                         arrayOf(roomId, window.toString()),
                     ).use { cur ->
@@ -643,10 +675,14 @@ object ThreadRowStore {
         }
     }
 
-    /** Rooms holding TimelineEvents with NO ThreadRow at any depth — the
-     *  deep-repair rotation candidates. The recent-activity repair only
-     *  reaches the newest window; deep history (pre-store installs, fresh-login
-     *  backfill leftovers) never converges otherwise. */
+    /** Rooms holding row-eligible TimelineEvents with NO ThreadRow at any
+     *  depth — the deep-repair rotation candidates. The recent-activity repair
+     *  only reaches the newest window; deep history (pre-store installs,
+     *  fresh-login backfill leftovers) never converges otherwise. Events that
+     *  can never gain a row (state events) are excluded — unfiltered, the
+     *  room set never empties and the deep repair's done-set freezes rooms
+     *  marked done before their keys landed (see [ROW_ELIGIBLE_SQL] and
+     *  ThreadRowLogic.ROW_ELIGIBLE_EVENT_TYPES). */
     suspend fun roomIdsWithMissingEvents(c: MatrixClient): List<String> {
         val db = database(c) ?: return emptyList()
         return withContext(Dispatchers.IO) {
@@ -655,7 +691,7 @@ object ThreadRowStore {
                     .query(
                         "SELECT DISTINCT te.roomId FROM TimelineEvent te " +
                             "LEFT JOIN ThreadRow r ON r.roomId = te.roomId AND r.eventId = te.eventId " +
-                            "WHERE r.eventId IS NULL",
+                            "WHERE r.eventId IS NULL AND $ROW_ELIGIBLE_SQL",
                         arrayOf<String>(),
                     ).use { cur ->
                         buildList {
@@ -685,7 +721,7 @@ object ThreadRowStore {
                     .query(
                         "SELECT te.eventId, te.rowid FROM TimelineEvent te " +
                             "LEFT JOIN ThreadRow r ON r.roomId = te.roomId AND r.eventId = te.eventId " +
-                            "WHERE te.roomId = ? AND r.eventId IS NULL AND te.rowid < ? " +
+                            "WHERE te.roomId = ? AND r.eventId IS NULL AND te.rowid < ? AND $ROW_ELIGIBLE_SQL " +
                             "ORDER BY te.rowid DESC LIMIT ?",
                         arrayOf(roomId, beforeRowid.toString(), limit.toString()),
                     ).use { cur ->
@@ -726,6 +762,22 @@ object ThreadRowStore {
     }
 
     // --- internals ----------------------------------------------------------
+
+    /** Missing-page filter: only events [ThreadRowLogic.buildRows] can ever
+     *  give a row to (message class / redaction / send-status, or anything
+     *  carrying an m.relates_to). Matches the serialized event's
+     *  `"type":"…"` — Android's framework SQLite ships WITHOUT JSON1 (the
+     *  standalone `sqlite3` binary has it; SQLiteDatabase does not — the
+     *  json_extract variant silently failed via runCatching), and Trixnity
+     *  serializes compact JSON, so the substring match is exact. False
+     *  positives only cost the writer's skip; there are no false negatives
+     *  for the eligible types. */
+    private val ROW_ELIGIBLE_SQL =
+        "(" +
+            ThreadRowLogic.ROW_ELIGIBLE_EVENT_TYPES.joinToString(" OR ") {
+                "te.value LIKE '%\"type\":\"$it\"%'"
+            } +
+            " OR te.value LIKE '%\"m.relates_to\"%')"
 
     private fun database(c: MatrixClient): TrixnityRoomDatabase? =
         runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
