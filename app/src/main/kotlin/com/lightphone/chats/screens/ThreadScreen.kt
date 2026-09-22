@@ -251,6 +251,14 @@ class ThreadViewModel(
     val loading = MutableStateFlow(true)
     val loadingMore = MutableStateFlow(false)
     val hasMore = MutableStateFlow(false)
+    /**
+     * The newest page served EMPTY off a warm store that may still be filling
+     * ([LightServiceMethod.GetMessages.Response.pendingSeed]): the thread
+     * keeps "Loading messages…" instead of "No messages yet." until a
+     * page-revision bump delivers rows or the one-shot backstop retry
+     * ([pendingSeedRetryFired]) lands. Cleared on any non-empty merge.
+     */
+    val pendingSeed = MutableStateFlow(false)
     /** True until the newest page has been shown scrolled to the bottom. */
     val jumpToBottom = MutableStateFlow(true)
     /** Whether this device is E2EE-verified (false = encrypted rooms can't decrypt yet). */
@@ -578,6 +586,19 @@ class ThreadViewModel(
                 }
             }
             launch {
+                // One-shot backstop for the pending-seed empty page: a FAILED
+                // background seed bumps nothing (the cold open's seed failure
+                // path), so the collector above would wait forever. If the
+                // spinner state is still up after one retry window, fire ONE
+                // quiet loadNewest — the flag keeps it from looping.
+                delay(PENDING_SEED_RETRY_MS)
+                if (pendingSeed.value && messages.value.isEmpty() && !pendingSeedRetryFired) {
+                    pendingSeedRetryFired = true
+                    pendingSeed.value = false
+                    loadNewest(quiet = true)
+                }
+            }
+            launch {
                 while (true) {
                     playingEventId.first { it != null } // wait for playback to start
                     while (playingEventId.value != null) {
@@ -618,6 +639,10 @@ class ThreadViewModel(
                 dropReflectedOverlays(fetched)
                 fetched = applyReactionOverlays(fetched)
                 loaded = fetched
+                // Pending-seed spinner state: only while the served page is
+                // empty AND the server says the warm store may still be
+                // filling (and the one-shot backstop hasn't already fired).
+                pendingSeed.value = page?.pendingSeed == true && loaded.isEmpty() && !pendingSeedRetryFired
                 roomEncrypted.value = page?.encrypted ?: false
                 playingEventId.value = page?.audioPlayingEventId
                 if (page?.audioPositionMs != null) {
@@ -1343,6 +1368,11 @@ class ThreadViewModel(
      */
     private var servedRevision = 0L
 
+    /** One-shot guard for the pending-seed backstop retry (startPolling) —
+     *  once fired, empty pending-seed pages fall back to "No messages yet."
+     *  instead of re-arming the spinner. */
+    private var pendingSeedRetryFired = false
+
     private companion object {
         /** Newest-page size (matches the server's THREAD_PAGE_SIZE). */
         const val PAGE_SIZE = 20
@@ -1367,6 +1397,9 @@ class ThreadViewModel(
         const val MEDIA_RETRY_DELAY_MS = 2_000L
         /** How long a failed voice-note play error stays on the row. */
         const val VOICE_ERROR_DISMISS_MS = 3_000L
+        /** Wait before the one-shot backstop retry for a pending-seed empty
+         *  page (a failed background seed bumps nothing). */
+        const val PENDING_SEED_RETRY_MS = 5_000L
     }
 }
 
@@ -1424,6 +1457,7 @@ class ThreadScreen(
     override fun Content() {
         val messages by viewModel.messages.collectAsState()
         val loading by viewModel.loading.collectAsState()
+        val pendingSeed by viewModel.pendingSeed.collectAsState()
         val jumpToBottom by viewModel.jumpToBottom.collectAsState()
         val e2eeVerified by viewModel.e2eeVerified.collectAsState()
         val roomEncrypted by viewModel.roomEncrypted.collectAsState()
@@ -1607,7 +1641,10 @@ class ThreadScreen(
                 )
                 Box(modifier = Modifier.weight(1f)) {
                     when {
-                        loading && messages.isEmpty() -> StatusText("Loading messages…")
+                        // A pending-seed empty serve (warm store still
+                        // filling) keeps the loading state — "No messages
+                        // yet." only when the serve genuinely returned empty.
+                        messages.isEmpty() && (loading || pendingSeed) -> StatusText("Loading messages…")
                         // An encrypted room whose content can't be decrypted
                         // returns an empty page — say why instead of "No
                         // messages yet." (the text differs: unverified device

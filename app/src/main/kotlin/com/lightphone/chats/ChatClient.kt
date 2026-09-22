@@ -6,6 +6,7 @@ import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.callRemoteServiceMethod
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.getOrNull
+import kotlinx.coroutines.CancellationException
 
 /**
  * The app-side API over [MatrixRepository]. Chats is single-APK/single-process
@@ -83,9 +84,14 @@ object ChatClient {
                 hasMore = page.hasMore,
                 encrypted = page.encrypted,
                 nextBeforeEventId = page.nextBeforeEventId,
+                pendingSeed = page.pendingSeed,
                 audioPlayingEventId = MatrixRepository.audioPlayingEventId(),
                 audioPositionMs = MatrixRepository.audioPositionMs(),
             )
+        }.onFailure {
+            // A cancelled collector (screen hidden, superseded load) must not
+            // read as a served empty page — rethrow before the catch-all.
+            if (it is CancellationException) throw it
         }.getOrNull()
 
     /**

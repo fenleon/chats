@@ -2635,12 +2635,17 @@ object MatrixRepository {
      * without fetching when the room needs decryption the device can't do.
      * [nextBeforeEventId] is the chain position the walk stopped at — the
      * value to pass back as `beforeEventId` to continue further back.
+     * [pendingSeed] marks an EMPTY newest page served off a warm store whose
+     * serve read nothing (the tool keeps showing "Loading messages…" instead
+     * of "No messages yet." until a page-revision bump or its one-shot retry
+     * lands).
      */
     data class MessagesPage(
         val messages: List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>,
         val hasMore: Boolean,
         val encrypted: Boolean = false,
         val nextBeforeEventId: String? = null,
+        val pendingSeed: Boolean = false,
     )
 
     /**
@@ -2979,6 +2984,18 @@ object MatrixRepository {
                     serveFromStore(attachedClient, roomId, null, limit)?.let {
                         return@withContext injectPendingEchoes(roomId, it)
                     }
+                    // Warm store, empty serve (a failed store read surfaces as
+                    // empty, or the rows moved under us): return the
+                    // pending-seed empty page instead of falling through to
+                    // the full compute — the recompute walk (seed walk,
+                    // restore, retries, backfill, skip-walks) is the "Loading
+                    // messages…" stall; a page-revision bump or the tool's
+                    // one-shot retry repaints this page when the store has
+                    // rows again.
+                    return@withContext injectPendingEchoes(
+                        roomId,
+                        MessagesPage(emptyList(), false, pendingSeed = true),
+                    )
                 }
                 if (storeCold) {
                     // Fast first paint (SPEC §7): the full recompute walks the
@@ -3084,7 +3101,7 @@ object MatrixRepository {
             )
         }
         return if (result.size == page.messages.size) page
-        else MessagesPage(result, page.hasMore, page.encrypted, page.nextBeforeEventId)
+        else MessagesPage(result, page.hasMore, page.encrypted, page.nextBeforeEventId, page.pendingSeed)
     }
 
     // --- ThreadRow read path (docs/THREAD-STORE-SPEC.md §3/§7) ----------------
@@ -3235,6 +3252,19 @@ object MatrixRepository {
         if (debugLogging()) android.util.Log.d(
             TAG,
             "store serve: room=${roomId.takeLast(12)} rows=${messages.size} hasMore=$hasMore oldest=${oldest.timestampMs}",
+        )
+        // On-demand placeholder heal (the read-path half of the recheck
+        // machinery): a served page carrying placeholders older than the
+        // pending threshold heals exactly those event ids fire-and-forget —
+        // an open room never waits for the 30 s recheck loop to rotate to it.
+        // Runs for the newest page AND the older pages (the scroll-up serve
+        // follows [topUpOlderPage], so the fetched window is covered too).
+        maybeHealPlaceholdersOnDemand(
+            c, roomId,
+            oldestFirst.filter {
+                it.encrypted == 1 &&
+                    System.currentTimeMillis() - it.timestampMs > DECRYPT_PENDING_PLACEHOLDER_AFTER_MS
+            },
         )
         return MessagesPage(
             messages = messages,
@@ -10976,8 +11006,11 @@ object MatrixRepository {
      *  ([recheckPass]): the fixed `ORDER BY roomId, ingestSeq` head let >8
      *  permanently-stuck rooms occupy the [THREAD_ROW_RECHECK_ROOMS] window
      *  forever and starve every room after them — the recheck is the only
-     *  healer left (the read-path restore was retired), so every placeholder
-     *  must eventually get a pass. */
+     *  healer left (the read-path restore was retired, modulo the on-demand
+     *  heal below), so every placeholder must eventually get a pass. Rooms
+     *  the read path served/healed on-demand recently are skipped — they
+     *  heal themselves at open ([maybeHealPlaceholdersOnDemand]); the loop
+     *  sweeps the never-opened rooms. */
     private suspend fun recheckThreadStorePlaceholders(c: MatrixClient) {
         val total = ThreadRowStore.pendingCount(c)
         if (total == 0) return
@@ -10988,68 +11021,151 @@ object MatrixRepository {
         var filled = 0
         var dropped = 0
         for ((roomId, roomRows) in pending.groupBy { it.roomId }.entries.take(THREAD_ROW_RECHECK_ROOMS)) {
-            val matrixRoomId = RoomId(roomId)
-            // Same pre-strip convention as the live ingest: filled bodies are
-            // what the read path serves.
-            val ownName = broadcastOwnNameOf(c, matrixRoomId)
-            val eventIds = roomRows.map { it.eventId }
-            // Key-backup restore, bounded: only the pass's placeholder events,
-            // same park-on-zero dance as the read path (the park gates the
-            // backup network round-trip inside restoreRoomSessions).
-            val stuck = readStoredTimelineEvents(c, matrixRoomId, eventIds).map { it.event }
-            if (stuck.isNotEmpty() &&
-                runCatching { restoreRoomSessions(c, matrixRoomId, stuck) }.getOrDefault(0) == 0
-            ) {
-                decryptRestoreCooldown.park(roomId, DECRYPT_RESTORE_COOLDOWN_MS)
-            }
-            val fills = ArrayList<ThreadRowValues>(roomRows.size)
-            var roomDropped = 0
-            for (stored in readStoredTimelineEvents(c, matrixRoomId, eventIds)) {
-                val row = roomRows.first { it.eventId == stored.event.event.id.full }
-                if (stored.event.content?.getOrNull() == null) continue // still pending — next pass
-                val msg = messageFrom(c, matrixRoomId, stored.event, ownName = ownName)
-                if (msg == null) {
-                    // Decrypted to something the page would not render (blank
-                    // text, tombstone) — drop the placeholder, same rule the
-                    // read path applies to such events.
-                    ThreadRowStore.deleteRow(c, roomId, row.eventId)
-                    roomDropped++
-                    dropped++
-                    continue
-                }
-                fills += row.copy(
-                    body = msg.body,
-                    formattedHtml = msg.formattedHtml,
-                    contentType = msg.contentType,
-                    mediaMeta = mediaMetaJsonOf(msg),
-                    encrypted = 0,
-                )
-            }
-            if (fills.isNotEmpty()) {
-                ThreadRowStore.writeRows(c, fills)
-                filled += fills.size
-                // The fills just made this room's head renderable — but its
-                // RoomProjection row was written while the events were still
-                // pending decryption (fresh login: the projection backfill's
-                // projectRoom pass ran before the key restore landed), so it
-                // holds a null head (lastRealTs=0) and the tool hides the
-                // room as a ts-0 row — the whole list read as "3 pinned
-                // rooms" for the session (LP3 fresh login, 2026-09-20).
-                // Recompute the row now; the resolver/publish path picks the
-                // real recency up (the crawl's own passes read the
-                // projection, and post-crawl the single-room publish runs).
-                runCatching { recomputeProjectionRows(c, listOf(matrixRoomId)) }
-                lastRoomsMap?.get(matrixRoomId)?.let { roomFlow ->
-                    runCatching { roomFlow.filterNotNull().firstOrNull() }.getOrNull()?.let {
-                        publishRoomRowNow(c, matrixRoomId, it)
-                    }
-                }
-            }
-            // Any pass change (fill or drop) repaints an open thread.
-            if (fills.isNotEmpty() || roomDropped > 0) bumpMessagePageRevision(roomId)
+            if (onDemandHealedRecently(roomId)) continue
+            val healed = healPlaceholderRoomRows(c, roomId, roomRows)
+            filled += healed.first
+            dropped += healed.second
         }
         if (debugLogging() && (filled > 0 || dropped > 0)) {
             android.util.Log.d(TAG, "thread-store recheck: $filled filled, $dropped dropped")
+        }
+    }
+
+    /**
+     * One per-room placeholder heal, shared by the recheck loop
+     * ([recheckThreadStorePlaceholders]) and the read path's on-demand heal
+     * ([maybeHealPlaceholdersOnDemand]): local re-decrypt → key-backup
+     * restore ([restoreRoomSessions], parked on zero like the read path) →
+     * fill each healed placeholder row in place / re-classify ones that
+     * decrypt to a side row ([threadRowsFromRound] — messageFrom nulls every
+     * replace edit, so an undecrypted edit placeholder would otherwise be
+     * dropped and the edit lost) / drop ones that decrypt to nothing
+     * renderable → recompute the touched room's projection. Returns
+     * (filled, dropped) — any change bumps the page revision once, so an
+     * open thread repaints.
+     */
+    private suspend fun healPlaceholderRoomRows(
+        c: MatrixClient,
+        roomId: String,
+        roomRows: List<ThreadRowValues>,
+    ): Pair<Int, Int> {
+        val matrixRoomId = RoomId(roomId)
+        // Same pre-strip convention as the live ingest: filled bodies are
+        // what the read path serves.
+        val ownName = broadcastOwnNameOf(c, matrixRoomId)
+        val eventIds = roomRows.map { it.eventId }
+        // Key-backup restore, bounded: only the pass's placeholder events,
+        // same park-on-zero dance as the read path (the park gates the
+        // backup network round-trip inside restoreRoomSessions).
+        val stuck = readStoredTimelineEvents(c, matrixRoomId, eventIds).map { it.event }
+        if (stuck.isNotEmpty() &&
+            runCatching { restoreRoomSessions(c, matrixRoomId, stuck) }.getOrDefault(0) == 0
+        ) {
+            decryptRestoreCooldown.park(roomId, DECRYPT_RESTORE_COOLDOWN_MS)
+        }
+        val fills = ArrayList<ThreadRowValues>(roomRows.size)
+        val reclassifyIds = ArrayList<String>()
+        var roomDropped = 0
+        for (stored in readStoredTimelineEvents(c, matrixRoomId, eventIds)) {
+            val row = roomRows.first { it.eventId == stored.event.event.id.full }
+            if (stored.event.content?.getOrNull() == null) continue // still pending — next pass
+            val msg = messageFrom(c, matrixRoomId, stored.event, ownName = ownName)
+            if (msg == null) {
+                // Not a renderable message — but messageFrom nulls every
+                // replace edit (edits never become a row), so the event may
+                // still classify as a side row now that it decrypted.
+                // Re-classify below instead of dropping the placeholder.
+                reclassifyIds += row.eventId
+                continue
+            }
+            fills += row.copy(
+                body = msg.body,
+                formattedHtml = msg.formattedHtml,
+                contentType = msg.contentType,
+                mediaMeta = mediaMetaJsonOf(msg),
+                encrypted = 0,
+            )
+        }
+        if (reclassifyIds.isNotEmpty()) {
+            // The same per-event row-building the ingest path runs
+            // ([threadRowsFromRound] → [ThreadRowLogic.buildRows] +
+            // [editRowForStore]): a side row (in practice an EDIT; the
+            // rendered-map gate drops message-class rows messageFrom
+            // nulls) replaces the placeholder, and the write below folds
+            // it into its target. writeRows skips rows that already
+            // exist, so the placeholder delete must land first.
+            val sideRows = threadRowsFromRound(c, matrixRoomId, reclassifyIds)
+                .filter { it.kind != RowKind.MESSAGE.wire }
+            val sideIds = sideRows.map { it.eventId }.toHashSet()
+            for (id in reclassifyIds) ThreadRowStore.deleteRow(c, roomId, id)
+            fills += sideRows
+            roomDropped += reclassifyIds.size - sideIds.size
+        }
+        if (fills.isNotEmpty()) {
+            ThreadRowStore.writeRows(c, fills)
+            // The fills just made this room's head renderable — but its
+            // RoomProjection row was written while the events were still
+            // pending decryption (fresh login: the projection backfill's
+            // projectRoom pass ran before the key restore landed), so it
+            // holds a null head (lastRealTs=0) and the tool hides the
+            // room as a ts-0 row — the whole list read as "3 pinned
+            // rooms" for the session (LP3 fresh login, 2026-09-20).
+            // Recompute the row now; the resolver/publish path picks the
+            // real recency up (the crawl's own passes read the
+            // projection, and post-crawl the single-room publish runs).
+            runCatching { recomputeProjectionRows(c, listOf(matrixRoomId)) }
+            lastRoomsMap?.get(matrixRoomId)?.let { roomFlow ->
+                runCatching { roomFlow.filterNotNull().firstOrNull() }.getOrNull()?.let {
+                    publishRoomRowNow(c, matrixRoomId, it)
+                }
+            }
+        }
+        // Any change (fill or drop) repaints an open thread.
+        if (fills.isNotEmpty() || roomDropped > 0) bumpMessagePageRevision(roomId)
+        return fills.size to roomDropped
+    }
+
+    /**
+     * Rooms the read path triggered an on-demand heal for
+     * ([maybeHealPlaceholdersOnDemand]): roomId → last trigger time. The
+     * recheck loop skips rooms younger than [ON_DEMAND_HEAL_RECHECK_SKIP_MS]
+     * — an open room heals itself at serve; the loop only sweeps rooms that
+     * were never opened.
+     */
+    private val onDemandHealAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Rooms with an on-demand heal already in flight — one heal per room at
+     *  a time; the recheck loop covers anything the heal leaves behind. */
+    private val onDemandHealInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun onDemandHealedRecently(roomId: String): Boolean {
+        val at = onDemandHealAt[roomId] ?: return false
+        return System.currentTimeMillis() - at < ON_DEMAND_HEAL_RECHECK_SKIP_MS
+    }
+
+    /**
+     * Fire-and-forget heal for the placeholder rows of a page the read path
+     * just served ([serveFromStore]) — the same per-room mechanism the 30 s
+     * recheck loop uses ([healPlaceholderRoomRows]), scoped to exactly the
+     * served stale rows, off the open path (the serve returns immediately;
+     * a successful heal bumps the page revision and the tool repaints).
+     * Network-bound keys still fill late: no waiting here.
+     */
+    private fun maybeHealPlaceholdersOnDemand(
+        c: MatrixClient,
+        roomId: String,
+        staleRows: List<ThreadRowValues>,
+    ) {
+        if (staleRows.isEmpty()) return
+        onDemandHealAt[roomId] = System.currentTimeMillis()
+        if (!onDemandHealInFlight.add(roomId)) return
+        scope.launch {
+            try {
+                runCatching { healPlaceholderRoomRows(c, roomId, staleRows) }
+                    .onFailure { android.util.Log.w(TAG, "on-demand heal failed: ${it.message}") }
+            } finally {
+                onDemandHealInFlight.remove(roomId)
+            }
         }
     }
 
@@ -11748,6 +11864,9 @@ object MatrixRepository {
      *  Younger events keep the skip — live traffic never flashes the
      *  placeholder. */
     private const val DECRYPT_PENDING_PLACEHOLDER_AFTER_MS = 60_000L
+    /** How long after an on-demand heal trigger ([maybeHealPlaceholdersOnDemand])
+     *  the recheck loop skips the room — an open room heals itself at serve. */
+    private const val ON_DEMAND_HEAL_RECHECK_SKIP_MS = 10 * 60_000L
     /** markRead cold-start race: retries while Trixnity's room view loads its
      *  timeline (lastRelevantEventId null) before deciding the receipt. */
     private const val HEAD_RESOLVE_RETRIES = 6
