@@ -30,6 +30,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.ChatSettings
 import com.lightphone.chats.R
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightText
@@ -37,6 +38,7 @@ import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightThemeTokens
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.delay
+import androidx.compose.runtime.collectAsState
 
 /** What the context window is showing for the long-pressed message. */
 private enum class ContextLevel {
@@ -94,6 +96,9 @@ fun ContextWindowOverlay(
     modifier: Modifier = Modifier,
 ) {
     if (message == null) return
+    // Reactions off (Features panel): LIKE/REACT/EDIT REACTION/REMOVE
+    // REACTION rows drop (feedback 2026-09-22).
+    val reactionsOn by ChatSettings.showReactions.collectAsState()
     // Declared after the null check: closing the panel drops this slot, so a
     // reopened window always starts at the action rows.
     var level by remember { mutableStateOf(ContextLevel.Actions) }
@@ -145,23 +150,28 @@ fun ContextWindowOverlay(
                             if (message.canUnsend) add("UNSEND" to { onUnsend(); onDismiss() })
                         }
                         // Received: LIKE / REPLY / REACT … / COPY last (feedback
-                        // 2026-09-09).
+                        // 2026-09-09). Reactions off (Features): the LIKE/REACT
+                        // rows drop entirely (feedback 2026-09-22).
                         else -> {
-                            // LIKE is the ❤️ shortcut; once the message carries
-                            // the reader's own reaction it is redundant — and a
-                            // no-op (setReaction replaces, one own reaction at a
-                            // time) — so the row is dropped and EDIT REACTION /
-                            // REMOVE REACTION below take its place (LP3 feedback
-                            // 2026-09-12).
-                            if (ownReaction == null) {
-                                add("LIKE" to { onLike(); onDismiss() })
+                            if (reactionsOn) {
+                                // LIKE is the ❤️ shortcut; once the message carries
+                                // the reader's own reaction it is redundant — and a
+                                // no-op (setReaction replaces, one own reaction at a
+                                // time) — so the row is dropped and EDIT REACTION /
+                                // REMOVE REACTION below take its place (LP3 feedback
+                                // 2026-09-12).
+                                if (ownReaction == null) {
+                                    add("LIKE" to { onLike(); onDismiss() })
+                                }
                             }
                             add("REPLY" to { onReply(); onDismiss() })
-                            if (ownReaction == null) {
-                                add("REACT" to { level = ContextLevel.Reactions })
-                            } else {
-                                add("EDIT REACTION" to { level = ContextLevel.Reactions })
-                                add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
+                            if (reactionsOn) {
+                                if (ownReaction == null) {
+                                    add("REACT" to { level = ContextLevel.Reactions })
+                                } else {
+                                    add("EDIT REACTION" to { level = ContextLevel.Reactions })
+                                    add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
+                                }
                             }
                             if (copyText.isNotBlank()) {
                                 add("COPY" to { ChatClient.copyToClipboard(copyText); onCopy(); onDismiss() })

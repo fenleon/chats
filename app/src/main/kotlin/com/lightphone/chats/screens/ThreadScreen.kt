@@ -130,50 +130,82 @@ internal object chatsBitmapCache {
 
 /** Parser for the companion's video-flipbook container ("FLIP" magic — see
  *  MatrixRepository.videoFlipbook): animated WhatsApp GIFs arrive as silent
- *  short mp4 loops, and the companion packs ~10fps extracted JPEG frames
- *  ("FLIP", version 0, frame count, ms/frame, then 4-byte length + JPEG per
- *  frame). Plain JPEGs / raw gifs parse null — callers fall back to
- *  BitmapFactory. */
+ *  short mp4 loops. Two container versions —
+ *  v0: "FLIP", 0, frame count, ms/frame, then 4-byte length + JPEG per frame
+ *  (the legacy extracted-frames pack);
+ *  v1: "FLIP", 1, 4-byte thumbnail length, thumbnail JPEG, then the RAW mp4 —
+ *  the tool decodes it on demand ([Mp4GifDecoder]; no frame cap, no
+ *  extract-time ANR, one-frame memory).
+ *  Plain JPEGs / raw gifs parse null — callers fall back to BitmapFactory. */
+internal sealed interface Flipbook {
+    /** v0: every frame already extracted; the viewer cycles [frames]. */
+    data class Frames(val frames: List<ImageBitmap>, val frameMs: Int) : Flipbook
+
+    /** v1: the raw silent-mp4 loop; the viewer decodes frames on demand. */
+    class Mp4(val payload: ByteArray) : Flipbook
+}
+
 internal object chatsFlipbook {
-    /** Returns ms/frame, or null when [bytes] isn't a flipbook container. */
-    private fun header(bytes: ByteArray): Int? {
-        if (bytes.size < 14) return null
+    private fun version(bytes: ByteArray): Int? {
+        if (bytes.size < 5) return null
         if (bytes[0] != 'F'.code.toByte() || bytes[1] != 'L'.code.toByte() ||
-            bytes[2] != 'I'.code.toByte() || bytes[3] != 'P'.code.toByte() ||
-            bytes[4] != 0.toByte()
+            bytes[2] != 'I'.code.toByte() || bytes[3] != 'P'.code.toByte()
         ) return null
-        val count = bytes[5].toInt() and 0xFF
-        val ms = readInt(bytes, 6)
-        return if (count >= 2 && ms > 0) ms else null
+        val v = bytes[4].toInt() and 0xFF
+        return if (v in 0..1) v else null
     }
 
-    /** All frames — the fullscreen viewer animates these. */
-    fun parse(bytes: ByteArray): Pair<List<ImageBitmap>, Int>? {
-        val frameMs = header(bytes) ?: return null
-        val count = bytes[5].toInt() and 0xFF
-        val frames = ArrayList<ImageBitmap>(count)
-        var pos = 10
-        repeat(count) {
-            if (pos + 4 > bytes.size) return null
-            val len = readInt(bytes, pos)
-            pos += 4
-            if (len <= 0 || pos + len > bytes.size) return null
-            BitmapFactory.decodeByteArray(bytes, pos, len)
-                ?.asImageBitmap()?.let { frames.add(it) }
-            pos += len
+    /** All frames / the mp4 payload — the fullscreen viewer animates these. */
+    fun parse(bytes: ByteArray): Flipbook? = when (version(bytes)) {
+        0 -> {
+            val frameMs = readInt(bytes, 6)
+            if (frameMs <= 0) null else {
+                val count = bytes[5].toInt() and 0xFF
+                val frames = ArrayList<ImageBitmap>(count)
+                var pos = 10
+                var ok = true
+                repeat(count) {
+                    if (pos + 4 > bytes.size) { ok = false; return@repeat }
+                    val len = readInt(bytes, pos)
+                    pos += 4
+                    if (len <= 0 || pos + len > bytes.size) { ok = false; return@repeat }
+                    BitmapFactory.decodeByteArray(bytes, pos, len)
+                        ?.asImageBitmap()?.let { frames.add(it) }
+                    pos += len
+                }
+                if (ok && frames.size >= 2) Flipbook.Frames(frames, frameMs) else null
+            }
         }
-        return if (frames.size >= 2) frames to frameMs else null
+        1 -> {
+            // v1 header: magic 0-3, version 4, thumbnail length 5-8, thumb 9…,
+            // mp4 payload after the thumbnail.
+            if (bytes.size < 9) return null
+            val thumbLen = readInt(bytes, 5)
+            val start = 9 + thumbLen
+            if (thumbLen <= 0 || start >= bytes.size) null
+            else Flipbook.Mp4(bytes.copyOfRange(start, bytes.size))
+        }
+        else -> null
     }
 
-    /** Frame 0 only — the thread row's static still (skips the other frames).
+    /** Frame 0 only — the thread row's static still (skips the rest).
      *  Flagged `fromFlipbook = true` so callers can treat these as gifs. */
-    fun firstFrame(bytes: ByteArray): DecodedBitmap? {
-        if (header(bytes) == null) return null
-        val len = readInt(bytes, 10)
-        return if (len in 1..bytes.size - 14)
-            BitmapFactory.decodeByteArray(bytes, 14, len)
-                ?.asImageBitmap()?.let { DecodedBitmap(it, true) }
-        else null
+    fun firstFrame(bytes: ByteArray): DecodedBitmap? = when (version(bytes)) {
+        0 -> {
+            val len = readInt(bytes, 10)
+            if (len in 1..bytes.size - 14)
+                BitmapFactory.decodeByteArray(bytes, 14, len)
+                    ?.asImageBitmap()?.let { DecodedBitmap(it, true) }
+            else null
+        }
+        1 -> {
+            val thumbLen = readInt(bytes, 5)
+            if (thumbLen in 1..bytes.size - 9)
+                BitmapFactory.decodeByteArray(bytes, 9, thumbLen)
+                    ?.asImageBitmap()?.let { DecodedBitmap(it, true) }
+            else null
+        }
+        else -> null
     }
 
     private fun readInt(b: ByteArray, off: Int) =
@@ -2120,14 +2152,16 @@ private fun OutgoingBodyText(
 
 /** Incoming message body: LightText for plain rows, the rendered
  *  [formattedMessage] spans (same paragraph typography/color) for rows whose
- *  event carried a formatted variant. Heading spans size off the same scaled
- *  paragraph ([formattedMessage]'s paragraphSp). */
+ *  event carried a formatted variant (and Basic Markdown is on). */
 @Composable
 private fun IncomingBodyText(
     message: LightServiceMethod.GetMessages.Message,
     modifier: Modifier = Modifier,
 ) {
-    val html = message.formattedHtml
+    // Basic Markdown off (Features): the plain body renders, no spans
+    // (feedback 2026-09-22).
+    val showMarkdown by ChatSettings.showMarkdown.collectAsState()
+    val html = message.formattedHtml.takeIf { showMarkdown }
     if (html == null) {
         LightText(
             text = message.body,
@@ -2139,7 +2173,6 @@ private fun IncomingBodyText(
             text = formattedMessage(
                 html,
                 message.body,
-                LightThemeTokens.typography.paragraph.scaledForScreenHeight().fontSize.value,
             ),
             style = LightThemeTokens.typography.paragraph.scaledForScreenHeight(),
             color = LightThemeTokens.colors.content,
@@ -2188,6 +2221,10 @@ private fun MessageRow(
     onOpenContext: (LightServiceMethod.GetMessages.Message) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
 ) {
+    // Features toggles (feedback 2026-09-22): reaction tags/double-tap like,
+    // and markdown body rendering.
+    val showReactions by ChatSettings.showReactions.collectAsState()
+    val showMarkdown by ChatSettings.showMarkdown.collectAsState()
     // A buffer keeps message text off the far screen edge. Outgoing
     // messages sit on the right and incoming on the left — the built-in Phone
     // app's layout — each capped at ~7/8 of the row width so long text never
@@ -2285,6 +2322,10 @@ private fun MessageRow(
                         // first-composed row snapshot, so a toggle computed
                         // against stale reactions re-SENT the like every time.
                         val gestureMessage by rememberUpdatedState(message)
+                        // The double-tap like dies with the Reactions toggle;
+                        // rememberUpdatedState keeps the gesture block (keyed by
+                        // the stable event id) reading the live flag.
+                        val reactionsEnabled by rememberUpdatedState(showReactions)
                         // (the Phone tool's native
                         // half-panel grammar): NO vibration on finger-down —
                         // the haptic fires on actual gestures. A
@@ -2313,7 +2354,7 @@ private fun MessageRow(
                                         val now = System.currentTimeMillis()
                                         if (now - lastTapMs < doubleTapMs) {
                                             lastTapMs = 0L
-                                            onToggleLike(gestureMessage)
+                                            if (reactionsEnabled) onToggleLike(gestureMessage)
                                         } else {
                                             lastTapMs = now
                                         }
@@ -2451,9 +2492,8 @@ private fun MessageRow(
                                 // row width and squeezed the glyph to nothing.
                                 OutgoingBodyText(
                                     formattedMessage(
-                                        message.formattedHtml ?: "",
+                                        if (showMarkdown) message.formattedHtml ?: "" else "",
                                         message.body,
-                                        LightThemeTokens.typography.paragraph.scaledForScreenHeight().fontSize.value,
                                     ),
                                     bodyMaxWidthPx,
                                     modifier = Modifier.weight(1f, fill = false),
@@ -2479,10 +2519,9 @@ private fun MessageRow(
                     // [OutgoingBodyText]).
                     OutgoingBodyText(
                         formattedMessage(
-                                        message.formattedHtml ?: "",
-                                        message.body,
-                                        LightThemeTokens.typography.paragraph.scaledForScreenHeight().fontSize.value,
-                                    ),
+                            if (showMarkdown) message.formattedHtml ?: "" else "",
+                            message.body,
+                        ),
                         bodyMaxWidthPx,
                     )
                 } else if (message.body.startsWith("Incoming call")) {
@@ -2541,8 +2580,9 @@ private fun MessageRow(
                 }
             // Reactions, as a quiet tag under the message (same
             // grammar as the "not delivered" marker). Each entry reads
-            // "Name reacted ❤️" (or "You reacted …" for own) —
-            if (message.reactions.isNotEmpty()) {
+            // "Name reacted ❤️" (or "You reacted …" for own) — hidden with
+            // the Reactions toggle (Features, feedback 2026-09-22).
+            if (showReactions && message.reactions.isNotEmpty()) {
                 LightText(
                     text = message.reactions.joinToString(" · "),
                     variant = LightTextVariant.Superfine,

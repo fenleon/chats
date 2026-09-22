@@ -1,5 +1,6 @@
 package com.lightphone.chats
 
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import com.thelightphone.sdk.SealedLightContext
@@ -8,21 +9,35 @@ import kotlinx.coroutines.flow.first
 
 /**
  * Tool-local settings, persisted in the SDK's DataStore
- * ([SealedLightContext.dataStore]). The "seen" marker + data-saver
- * preferences live here: Settings toggles them, the thread reads the flows.
+ * ([SealedLightContext.dataStore]). All are plain on/off toggles (default
+ * ON) shown under Settings → Features; the screens read the flows.
  */
 object ChatSettings {
 
-    private val KEY_SHOW_READ_STATUS = booleanPreferencesKey("chats.show_read_status")
-    private val KEY_DOWNLOAD_OVER_MOBILE = booleanPreferencesKey("chats.download_over_mobile")
-
-    /** Whether the thread shows "seen" under outgoing messages. Default on. */
+    /** Whether the thread shows "seen" under outgoing messages. */
     val showReadStatus = MutableStateFlow(true)
 
     /** Data Saver Mode: true = media downloads restricted to Wi-Fi. The Settings
      *  toggle shows the inverse of this flag (checked = saver ON). Defaults to
      *  mobile-allowed (feedback 2026-08-19: "Data Saver Mode … default OFF"). */
     val downloadOverMobile = MutableStateFlow(true)
+
+    /** Reactions: the "… reacted" tags and the LIKE/REACT actions. */
+    val showReactions = MutableStateFlow(true)
+
+    /** Latest-message timestamps on the main room list. */
+    val showTimestamps = MutableStateFlow(true)
+
+    /** Render formatted (markdown) message bodies as bold/italic/bullets. */
+    val showMarkdown = MutableStateFlow(true)
+
+    private val KEYS: Map<MutableStateFlow<Boolean>, Preferences.Key<Boolean>> = mapOf(
+        showReadStatus to booleanPreferencesKey("chats.show_read_status"),
+        downloadOverMobile to booleanPreferencesKey("chats.download_over_mobile"),
+        showReactions to booleanPreferencesKey("chats.show_reactions"),
+        showTimestamps to booleanPreferencesKey("chats.show_timestamps"),
+        showMarkdown to booleanPreferencesKey("chats.show_markdown"),
+    )
 
     private var loaded = false
 
@@ -32,24 +47,15 @@ object ChatSettings {
         loaded = true
         runCatching {
             val prefs = lightContext.dataStore.data.first()
-            showReadStatus.value = prefs[KEY_SHOW_READ_STATUS] ?: true
-            downloadOverMobile.value = prefs[KEY_DOWNLOAD_OVER_MOBILE] ?: true
+            for ((flow, key) in KEYS) flow.value = prefs[key] ?: true
         }
     }
 
-    /** Persists and publishes the show-read-status toggle value. */
-    suspend fun setShowReadStatus(lightContext: SealedLightContext, value: Boolean) {
-        showReadStatus.value = value
+    /** Persists and publishes a toggle value. */
+    suspend fun set(lightContext: SealedLightContext, flow: MutableStateFlow<Boolean>, value: Boolean) {
+        flow.value = value
         runCatching {
-            lightContext.dataStore.edit { it[KEY_SHOW_READ_STATUS] = value }
-        }
-    }
-
-    /** Persists and publishes the mobile-data-downloads toggle value. */
-    suspend fun setDownloadOverMobile(lightContext: SealedLightContext, value: Boolean) {
-        downloadOverMobile.value = value
-        runCatching {
-            lightContext.dataStore.edit { it[KEY_DOWNLOAD_OVER_MOBILE] = value }
+            lightContext.dataStore.edit { it[KEYS.getValue(flow)] = value }
         }
     }
 }

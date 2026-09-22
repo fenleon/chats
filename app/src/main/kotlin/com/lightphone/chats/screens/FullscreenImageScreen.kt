@@ -51,6 +51,7 @@ import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -105,7 +106,7 @@ class FullscreenImageScreen(
                 }
             }
         }
-        val flipbook by produceState<Pair<List<ImageBitmap>, Int>?>(null, bytes) {
+        val flipbook by produceState<Flipbook?>(null, bytes) {
             if (value == null && !gif) {
                 value = withContext(Dispatchers.Default) { chatsFlipbook.parse(bytes) }
             }
@@ -166,11 +167,54 @@ class FullscreenImageScreen(
                         contentScale = ContentScale.Fit,
                         modifier = imageModifier,
                     )
+                } else if (flipbook is Flipbook.Mp4) {
+                    // v1 flipbook: the raw silent-mp4 loop, decoded on demand
+                    // ([Mp4GifDecoder]) — full native fps, one frame in memory.
+                    val mp4 = (flipbook as Flipbook.Mp4).payload
+                    val frame by produceState<ImageBitmap?>(null, mp4) {
+                        val decoder = withContext(Dispatchers.Default) {
+                            runCatching { Mp4GifDecoder(mp4) }.getOrNull()
+                        }
+                        if (decoder == null) {
+                            value = null
+                        } else try {
+                            while (isActive) {
+                                val decoded = withContext(Dispatchers.Default) {
+                                    runCatching { decoder.nextFrame() }.getOrNull()
+                                }
+                                if (decoded == null) {
+                                    decoder.rewind()
+                                    continue
+                                }
+                                value = decoded.first.asImageBitmap()
+                                delay(decoded.second.coerceAtLeast(16))
+                            }
+                        } finally {
+                            withContext(Dispatchers.Default) { decoder.release() }
+                        }
+                    }
+                    frame?.let { current ->
+                        Image(
+                            bitmap = current,
+                            contentDescription = null,
+                            contentScale = ContentScale.Fit,
+                            modifier = imageModifier,
+                        )
+                    } ?: image?.let { still ->
+                        // First decode hasn't landed (or the codec failed) —
+                        // the static thumbnail holds the space.
+                        Image(
+                            bitmap = still,
+                            contentDescription = null,
+                            contentScale = ContentScale.Fit,
+                            modifier = imageModifier,
+                        )
+                    }
                 } else if (flipbook != null) {
-                    // Flipbook: cycle the extracted frames at the pace the
-                    // companion measured out of the video.
-                    val frames = flipbook!!.first
-                    val frameMs = flipbook!!.second
+                    // v0 flipbook (cached rows): cycle the extracted frames at
+                    // the pace the companion measured out of the video.
+                    val frames = (flipbook as Flipbook.Frames).frames
+                    val frameMs = (flipbook as Flipbook.Frames).frameMs
                     var frameIdx by remember(bytes) { mutableIntStateOf(0) }
                     LaunchedEffect(bytes) {
                         while (true) {

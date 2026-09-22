@@ -4,47 +4,33 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDecoration
-import androidx.compose.ui.unit.sp
 
 /**
  * HTML subset → [AnnotatedString] for incoming formatted messages (chats
- * markdown): strong/b → Bold, em/i → Italic, del/strike/s → Strikethrough,
- * u → Underline, code → plain (no mono font in the Light design), br →
- * newline, p/li → line breaks, ul/ol → "• "/"1. " prefixes (one level).
- * h1–h6 render as a BOLD span at distinct sizes stepped around the paragraph
- * size ([paragraphSp] — the caller passes its scaled paragraph size; 0 keeps
- * every heading at the paragraph size): h1 reads as a heading, h6 barely
- * smaller than the body (LP3 feedback 2026-09-09: all six were identical).
- * `a` keeps its text (no clickable links on the LP3, and outgoing links
- * already strip the URL); unknown tags drop the TAG but keep their inner
- * text; script/style drop tag AND content; the named + numeric entities
- * unescape. When the HTML parses to nothing, [fallback] (the event's plain
- * body) renders instead.
+ * markdown): strong/b → Bold, em/i → Italic, br → newline, p/h1–h6/li →
+ * line breaks, ul → "• " prefixes (one level). Everything else —
+ * headings' sizes, strikethrough, underline, ordered lists (feedback
+ * 2026-09-22: "only bold, italic, and dot points") — drops the TAG but
+ * keeps their inner text; `a` keeps its text (no clickable links on the
+ * LP3, and outgoing links already strip the URL); script/style drop tag
+ * AND content; the named + numeric entities unescape. When the HTML
+ * parses to nothing, [fallback] (the event's plain body) renders instead.
  */
-fun formattedMessage(html: String, fallback: String, paragraphSp: Float = 0f): AnnotatedString {
+fun formattedMessage(html: String, fallback: String): AnnotatedString {
     if (html.isBlank()) return AnnotatedString(fallback)
-    val parsed = parseHtml(html, paragraphSp)
+    val parsed = parseHtml(html)
     return if (parsed.text.isBlank()) AnnotatedString(fallback) else parsed
 }
 
-/** Heading size steps, as multiples of the paragraph size. */
-private val HEADING_SCALES = mapOf(
-    "h1" to 1.55f,
-    "h2" to 1.3f,
-    "h3" to 1.15f,
-    "h4" to 1.0f,
-    "h5" to 0.85f,
-    "h6" to 0.75f,
-)
+/** Block tags that render as a line break, no styling. */
+private val HEADING_TAGS = setOf("h1", "h2", "h3", "h4", "h5", "h6")
 
-private fun parseHtml(html: String, paragraphSp: Float): AnnotatedString {
+private fun parseHtml(html: String): AnnotatedString {
     val text = StringBuilder()
     val spans = mutableListOf<Triple<Int, Int, SpanStyle>>() // start, end, style
     // Open-tag frames: the tag, the style it contributes (null = tag with no
-    // visual effect), the text offset it opened at, and the ordered-list
-    // counter (lists only).
-    data class Frame(val tag: String, val style: SpanStyle?, val startAt: Int, val counter: Int = 0)
+    // visual effect), and the text offset it opened at.
+    data class Frame(val tag: String, val style: SpanStyle?, val startAt: Int)
     val frames = ArrayDeque<Frame>()
     var dropping: String? = null // inside <script>/<style>: drop content too
     var i = 0
@@ -94,45 +80,26 @@ private fun parseHtml(html: String, paragraphSp: Float): AnnotatedString {
                         spans.add(Triple(frame.startAt, text.length, frame.style))
                     }
                     when (frame.tag) {
-                        "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol" -> breakLine()
+                        "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul" -> breakLine()
                     }
                 }
             }
             tag == "br" -> text.append('\n')
             tag == "script" || tag == "style" -> dropping = tag
-            tag == "p" -> {
+            tag == "p" || tag in HEADING_TAGS -> {
                 breakLine()
                 frames.addLast(Frame(tag, null, text.length))
             }
-            tag == "ul" || tag == "ol" -> {
+            tag == "ul" -> {
                 breakLine()
                 frames.addLast(Frame(tag, null, text.length))
             }
             tag == "li" -> {
                 breakLine()
-                val listIndex = frames.indexOfLast { it.tag == "ul" || it.tag == "ol" }
-                if (listIndex >= 0) {
-                    val list = frames[listIndex]
-                    frames[listIndex] = list.copy(counter = list.counter + 1)
-                    text.append(if (list.tag == "ul") "• " else "${list.counter + 1}. ")
-                }
-            }
-            tag in HEADING_SCALES -> {
-                breakLine()
-                val size = paragraphSp.takeIf { it > 0f }
-                    ?.let { HEADING_SCALES[tag]?.times(it) }
-                frames.addLast(
-                    Frame(
-                        tag,
-                        if (size != null) BOLD_STYLE.copy(fontSize = size.sp) else BOLD_STYLE,
-                        text.length,
-                    ),
-                )
+                if (frames.indexOfLast { it.tag == "ul" } >= 0) text.append("• ")
             }
             tag == "strong" || tag == "b" -> frames.addLast(Frame(tag, BOLD_STYLE, text.length))
             tag == "em" || tag == "i" -> frames.addLast(Frame(tag, ITALIC_STYLE, text.length))
-            tag == "del" || tag == "strike" || tag == "s" -> frames.addLast(Frame(tag, STRIKE_STYLE, text.length))
-            tag == "u" -> frames.addLast(Frame(tag, UNDERLINE_STYLE, text.length))
             tag == "code" || tag == "a" -> frames.addLast(Frame(tag, null, text.length)) // text only
             else -> Unit // unknown tag: drop the tag, keep the inner text
         }
@@ -155,8 +122,6 @@ private fun parseHtml(html: String, paragraphSp: Float): AnnotatedString {
 
 private val BOLD_STYLE = SpanStyle(fontWeight = FontWeight.Bold)
 private val ITALIC_STYLE = SpanStyle(fontStyle = FontStyle.Italic)
-private val STRIKE_STYLE = SpanStyle(textDecoration = TextDecoration.LineThrough)
-private val UNDERLINE_STYLE = SpanStyle(textDecoration = TextDecoration.Underline)
 
 /** Named + numeric (&#..;) entities — the set that survives markdown→HTML. */
 private fun unescapeEntity(entity: String): String = when (entity) {

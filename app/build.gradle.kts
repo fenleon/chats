@@ -73,4 +73,9 @@ dependencies {
     // serverPackage = com.lightphone.chats) and binds to itself. Everything
     // the tool runtime forbids lives in this library module.
     implementation(project(":server"))
+
+    // Unit tests for the tool-side YUV→RGB converter (kotlin-test only — the
+    // workspace's only sanctioned test framework; the JUnit runner comes in
+    // transitively via kotlin-test, declared junit is plugin-blocked).
+    testImplementation(libs.kotlin.test)
 }

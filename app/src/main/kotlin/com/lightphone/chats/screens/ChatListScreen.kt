@@ -31,6 +31,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
+import com.lightphone.chats.ChatSettings
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.formatRelativeTimestamp
 import com.lightphone.chats.server.MatrixRepository
@@ -741,8 +742,9 @@ private fun RoomRow(
             // The latest-message time sits at the row's right, on the name
             // line like the built-in list, with the short hand format.
             // Solid white, same as everything else.
-            // Pinned rows drop the latest-message time.
-            if (!room.pinned) {
+            // Pinned rows drop the latest-message time — and so does the
+            // Timestamps toggle (Features, feedback 2026-09-22).
+            if (!room.pinned && ChatSettings.showTimestamps.collectAsState().value) {
                 LightText(
                     text = formatRelativeTimestamp(room.lastTimestampMs),
                     variant = LightTextVariant.Fine,

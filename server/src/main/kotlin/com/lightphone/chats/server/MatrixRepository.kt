@@ -7170,14 +7170,16 @@ object MatrixRepository {
     }
 
     /**
-     * Frame flipbook for an animated-video attachment: WhatsApp GIFs arrive
+     * Flipbook container for an animated-video attachment: WhatsApp GIFs arrive
      * as silent short mp4 loops (mautrix bridges) with no distinguishing
      * flag, so the heuristic is content-shaped — mp4, ≤15 s, no audio track
      * — and everything else falls back to the static [videoThumbnail].
-     * Extracts ~10fps frames at [FLIPBOOK_MAX_DIMENSION], JPEGs them, and
-     * packs the container the tool's [com.lightphone.chats.screens.chatsFlipbook]
-     * parses: "FLIP" magic, version 0, frame count, ms/frame, then per frame
-     * a 4-byte big-endian length + JPEG bytes.
+     * Packs version 1 of the container the tool's
+     * [com.lightphone.chats.screens.chatsFlipbook] parses: "FLIP" magic,
+     * version 1, 4-byte big-endian thumbnail length, the JPEG first frame
+     * ([FLIPBOOK_MAX_DIMENSION] — the thread row's still), then the RAW mp4.
+     * The tool decodes the mp4 on demand (MediaCodec — one frame of memory,
+     * full native fps); v0's extracted-frame pack and its frame cap are gone.
      */
     private fun videoFlipbook(bytes: ByteArray): ByteArray? {
         val retriever = android.media.MediaMetadataRetriever()
@@ -7189,25 +7191,14 @@ object MatrixRepository {
             val hasAudio = retriever
                 .extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"
             if (hasAudio || durationMs !in 1..FLIPBOOK_MAX_DURATION_MS) return null
-            val count = (durationMs / 100).toInt().coerceIn(2, FLIPBOOK_MAX_FRAMES)
-            val frames = ArrayList<ByteArray>(count)
-            val stepUs = durationMs * 1000 / count
-            for (i in 0 until count) {
-                val frame = retriever.getFrameAtTime(
-                    i * stepUs, android.media.MediaMetadataRetriever.OPTION_CLOSEST
-                ) ?: continue
-                frames += scaledJpeg(frame, FLIPBOOK_MAX_DIMENSION)
-            }
-            if (frames.size < 2) return null
+            val thumb = retriever.getFrameAtTime(0L) ?: return null
+            val thumbJpeg = scaledJpeg(thumb, FLIPBOOK_MAX_DIMENSION)
             val out = java.io.ByteArrayOutputStream()
             out.write("FLIP".toByteArray(Charsets.US_ASCII))
-            out.write(0) // version
-            out.write(frames.size)
-            out.write((durationMs / frames.size).toInt().beBytes())
-            frames.forEach { frame ->
-                out.write(frame.size.beBytes())
-                out.write(frame)
-            }
+            out.write(1) // version: raw-mp4 payload (tool decodes on demand)
+            out.write(thumbJpeg.size.beBytes())
+            out.write(thumbJpeg)
+            out.write(bytes)
             out.toByteArray()
         } catch (e: Exception) {
             null
@@ -11990,7 +11981,6 @@ object MatrixRepository {
     const val DISPLAY_MAX_DIMENSION = 1024
     const val DISPLAY_JPEG_QUALITY = 78
     private const val FLIPBOOK_MAX_DURATION_MS = 15_000L
-    private const val FLIPBOOK_MAX_FRAMES = 10
     private const val FLIPBOOK_MAX_DIMENSION = 640
     /** Longest side (px) of the compressed photo uploaded to the room. */
     const val SENT_PHOTO_MAX_DIMENSION = 2048

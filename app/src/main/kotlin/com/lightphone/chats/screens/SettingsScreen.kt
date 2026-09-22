@@ -83,17 +83,10 @@ class SettingsViewModel : LightViewModel<Unit>() {
         }
     }
 
-    /** Persists the show-read-status toggle (the screen supplies its DataStore). */
-    fun setShowReadStatus(lightContext: SealedLightContext, value: Boolean) {
+    /** Persists a tool toggle (the screen supplies its DataStore). */
+    fun setSetting(lightContext: SealedLightContext, flow: MutableStateFlow<Boolean>, value: Boolean) {
         viewModelScope.launch {
-            ChatSettings.setShowReadStatus(lightContext, value)
-        }
-    }
-
-    /** Persists the data-saver toggle (the screen supplies its DataStore). */
-    fun setDownloadOverMobile(lightContext: SealedLightContext, value: Boolean) {
-        viewModelScope.launch {
-            ChatSettings.setDownloadOverMobile(lightContext, value)
+            ChatSettings.set(lightContext, flow, value)
         }
     }
 
@@ -127,7 +120,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
     override fun Content() {
         val account by viewModel.account.collectAsState()
         val connection by viewModel.connection.collectAsState()
-        val showReadStatus by ChatSettings.showReadStatus.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
         val diagnostics by viewModel.diagnostics.collectAsState()
         val diagnosticsExport by viewModel.diagnosticsExport.collectAsState()
@@ -167,14 +159,25 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                             // Battery Saver: on = no sync while the screen is
                             // dark; messages arrive whenever the screen is on.
                             val syncEnabled = connection?.syncEnabled ?: true
-                            ToggleRow(
-                                checked = showReadStatus,
-                                title = "Seen Status",
-                                subtitle = "visible under your messages",
-                                onToggle = {
-                                    viewModel.setShowReadStatus(lightContext, !showReadStatus)
-                                },
-                            )
+                            // Features panel: the display toggles (reactions,
+                            // seen status, room-list timestamps, markdown)
+                            // moved there (feedback 2026-09-22).
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .lightClickable(onClick = {
+                                        navigateTo(screenFactory = { FeaturesScreen(it) })
+                                    })
+                                    .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                            ) {
+                                Column {
+                                    LightText(text = "Features", variant = LightTextVariant.Heading)
+                                    LightText(
+                                        text = "Reactions, seen status, timestamps, markdown",
+                                        variant = LightTextVariant.Detail,
+                                    )
+                                }
+                            }
                             ToggleRow(
                                 checked = !syncEnabled,
                                 title = "Battery Saver",
@@ -188,7 +191,7 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                 title = "Data Saver Mode",
                                 subtitle = "Only use Wifi for downloading media",
                                 onToggle = {
-                                    viewModel.setDownloadOverMobile(lightContext, !downloadOverMobile)
+                                    viewModel.setSetting(lightContext, ChatSettings.downloadOverMobile, !downloadOverMobile)
                                 },
                             )
                             // Diagnostics (off by default): writes a sanitized
@@ -287,9 +290,9 @@ private fun SettingsRow(
     }
 }
 
-/** A toggle row (the show-read-status switch). */
+/** A toggle row (the show-read-status switch); shared with [FeaturesScreen]. */
 @Composable
-private fun ToggleRow(
+internal fun ToggleRow(
     checked: Boolean,
     title: String,
     subtitle: String,
