@@ -76,25 +76,21 @@ class FeaturesScreen(sealedActivity: SealedLightActivity) :
                                 ToggleRow(
                                     checked = showReactions,
                                     title = "Reactions",
-                                    subtitle = "Like and react to messages",
                                     onToggle = { toggle(ChatSettings.showReactions, showReactions) },
                                 )
                                 ToggleRow(
                                     checked = showReadStatus,
                                     title = "Seen Status",
-                                    subtitle = "visible under your messages",
                                     onToggle = { toggle(ChatSettings.showReadStatus, showReadStatus) },
                                 )
                                 ToggleRow(
                                     checked = showTimestamps,
                                     title = "Timestamps",
-                                    subtitle = "latest-message time on the chats list",
                                     onToggle = { toggle(ChatSettings.showTimestamps, showTimestamps) },
                                 )
                                 ToggleRow(
                                     checked = showMarkdown,
                                     title = "Basic Markdown",
-                                    subtitle = "bold, italic and dot points in messages",
                                     onToggle = { toggle(ChatSettings.showMarkdown, showMarkdown) },
                                 )
                             }

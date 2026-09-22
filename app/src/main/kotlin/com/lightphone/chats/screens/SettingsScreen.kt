@@ -170,13 +170,7 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                     })
                                     .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
                             ) {
-                                Column {
-                                    LightText(text = "Features", variant = LightTextVariant.Heading)
-                                    LightText(
-                                        text = "Reactions, seen status, timestamps, markdown",
-                                        variant = LightTextVariant.Detail,
-                                    )
-                                }
+                                LightText(text = "Features", variant = LightTextVariant.Heading)
                             }
                             ToggleRow(
                                 checked = !syncEnabled,
@@ -295,7 +289,7 @@ private fun SettingsRow(
 internal fun ToggleRow(
     checked: Boolean,
     title: String,
-    subtitle: String,
+    subtitle: String? = null,
     onToggle: () -> Unit,
 ) {
     Row(
@@ -329,10 +323,12 @@ internal fun ToggleRow(
             )
             // Settings sub-caption — Detail (20 sp) per DESIGN.md §6-7; full
             // color like the labels, sitting almost touching the title.
-            LightText(
-                text = subtitle,
-                variant = LightTextVariant.Detail,
-            )
+            if (subtitle != null) {
+                LightText(
+                    text = subtitle,
+                    variant = LightTextVariant.Detail,
+                )
+            }
         }
     }
 }

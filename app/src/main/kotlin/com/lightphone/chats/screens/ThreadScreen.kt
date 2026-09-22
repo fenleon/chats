@@ -2101,6 +2101,20 @@ private fun replyExcerptOf(body: String): String? =
         ?.takeIf { it.isNotEmpty() }
         ?.let { if (it.length > 80) it.take(79) + "…" else it }
 
+/** Hard display cap for a quoted reply excerpt: keeps the whole
+ *  `reply to "…" ` line (prefix + closing quote included) inside one
+ *  Superfine line on the LP3. ponytail: char-count heuristic, not measured —
+ *  bump down if the closing quote ever clips. */
+internal const val REPLY_EXCERPT_DISPLAY_MAX = 32
+
+/** `reply to "first 32 chars…"` — capped so the closing quote always shows. */
+internal fun cappedReplyExcerpt(excerpt: String): String =
+    if (excerpt.length >= REPLY_EXCERPT_DISPLAY_MAX) {
+        excerpt.take(REPLY_EXCERPT_DISPLAY_MAX - 1) + "…"
+    } else {
+        excerpt
+    }
+
 /**
  * Outgoing message body: left-aligned text in a block sized to the WIDEST
  * line (measured without a width cap, then clipped to the message column's
@@ -2439,8 +2453,9 @@ private fun MessageRow(
                 }
             } else {
                 // Reply excerpt header: one line quoting the original —
-                // `reply to "Message from the…"` — above the body, indented one
-                // grid unit from the text edge. No name prefix (feedback
+                // `reply to "Message from the…"` — above the body, flush with
+                // the text edge (no indent — feedback 2026-09-22). No name
+                // prefix (feedback
                 // 2026-09-12): the quote alone identifies the target; the
                 // composer's reply toptag shows the quote alone, where the
                 // "reply to" prefix is redundant under the "Replying To" title.
@@ -2449,13 +2464,13 @@ private fun MessageRow(
                 // pending echo carries the id only) renders nothing.
                 message.replyToId?.takeIf { message.contentType == "text" }?.let {
                     val excerpt = message.replyToExcerpt?.takeIf { it.isNotBlank() }
-                    val header = excerpt?.let { "reply to \"$it\"" }.orEmpty()
+                    val header = excerpt?.let { "reply to \"${cappedReplyExcerpt(it)}\"" }.orEmpty()
                     if (header.isNotBlank()) {
                         LightText(
                             text = header,
                             variant = LightTextVariant.Superfine,
                             maxLines = 1,
-                            modifier = Modifier.padding(top = 1.dp, start = 1f.gridUnitsAsDp()),
+                            modifier = Modifier.padding(top = 1.dp),
                         )
                     }
                 }

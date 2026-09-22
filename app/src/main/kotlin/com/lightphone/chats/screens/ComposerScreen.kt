@@ -280,7 +280,7 @@ class ComposerScreen(
                             val excerpt = replyTarget?.body?.lineSequence()
                                 ?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
                             LightText(
-                                text = if (excerpt.isEmpty()) "\"…\"" else "\"$excerpt\"",
+                                text = if (excerpt.isEmpty()) "\"…\"" else "\"${cappedReplyExcerpt(excerpt)}\"",
                                 variant = LightTextVariant.Superfine,
                                 maxLines = 1,
                                 modifier = Modifier
