@@ -113,12 +113,19 @@ object Diagnostics {
             return null
         }
         return runCatching {
+            // The Video collection with a video/* MIME: MediaProvider rejects
+            // any other MIME there ("expected MIME type under video/*", LP3
+            // 2026-09-21 — the export always failed with "Save failed"), and
+            // the Files collection only allows Download/Documents, which the
+            // LP3's MTP surface does not expose (root AGENTS.md: MTP shows
+            // only Pictures/Movies). The extension stays .log; the post-commit
+            // scan corrects the row's MIME from the extension.
             val name = "chats-diagnostics-${exportNameFormat.format(Date())}.log"
             val values = android.content.ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, name)
-                put(MediaStore.Video.Media.MIME_TYPE, "application/octet-stream")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Chats")
-                put(MediaStore.Video.Media.IS_PENDING, 1)
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/Chats")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
             val resolver = ctx.contentResolver
             val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
@@ -134,7 +141,12 @@ object Diagnostics {
                 null,
                 null,
             )
-            name
+            // MediaProvider appends ".mp4" when the display name's extension
+            // doesn't match the video/* MIME — report the ACTUAL stored name
+            // (it is what the Settings row shows and what MTP serves).
+            resolver.query(
+                uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null,
+            )?.use { cur -> if (cur.moveToFirst()) cur.getString(0) else null } ?: name
         }.onFailure {
             android.util.Log.w("Diagnostics", "diagnostics export failed: ${it.message}")
             record("export failed: ${err(it)}")

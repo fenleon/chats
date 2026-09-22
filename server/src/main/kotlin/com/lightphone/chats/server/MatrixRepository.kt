@@ -228,6 +228,7 @@ object MatrixRepository {
     private const val KEY_LOGIN_MODE = "login_mode"
     private const val KEY_BEEPER_REQUEST_ID = "beeper_request_id"
     private const val KEY_SYNC_ENABLED = "sync_enabled"
+    private const val KEY_MEDIA_EDIT_HEAL_DONE = "threadstore_media_edit_heal_done"
     /** When the one-shot megolm restore scan last ran (daily gate, 2026-08-15). */
     private const val KEY_RESTORE_LAST_RUN_MS = "restore_last_run_ms"
     /** True when a full restore crawl completed. Persisted so the
@@ -9975,6 +9976,11 @@ object MatrixRepository {
         }
         scope.launch {
             delay(THREAD_ROW_REPAIR_DELAY_MS)
+            runCatching { repairStoreMediaEdits(c) }
+                .onFailure { android.util.Log.w(TAG, "media-edit heal failed: ${it.message}") }
+        }
+        scope.launch {
+            delay(THREAD_ROW_REPAIR_DELAY_MS)
             runCatching { repairMissingThreadRowsDeep(c) }
                 .onFailure { android.util.Log.w(TAG, "thread-store deep repair failed: ${it.message}") }
         }
@@ -10007,6 +10013,50 @@ object MatrixRepository {
                 }
             }
         }
+    }
+
+    /** One-shot per install (pref-gated): re-fold edit side rows written
+     *  before the media-edit reclassification (2026-09-21) — bridge
+     *  notice→media replace edits (gmessages/RCS photos) folded as body-only
+     *  text swaps, leaving "Waiting for attachment" notice rows wearing the
+     *  raw file name as text. Re-derives each media edit's classification
+     *  from its stored event and rewrites side row + target in place
+     *  ([ThreadRowStore.applyMediaEditHeal], idempotent); new edits classify
+     *  correctly at ingest, so one convergent pass is enough. */
+    private suspend fun repairStoreMediaEdits(c: MatrixClient) {
+        val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return
+        if (prefs.getBoolean(KEY_MEDIA_EDIT_HEAL_DONE, false)) return
+        val edits = ThreadRowStore.editRows(c)
+        if (edits.isNotEmpty()) {
+            val healedRooms = HashSet<String>()
+            for ((roomId, group) in edits.groupBy { it.roomId }) {
+                val stored = readStoredTimelineEvents(c, RoomId(roomId), group.map { it.eventId })
+                    .associateBy { it.event.event.id.full }
+                for (row in group) {
+                    val replace = stored[row.eventId]?.event?.content?.getOrNull()
+                        ?.let { content ->
+                            (content as? RoomMessageEventContent)?.relatesTo as? RelatesTo.Replace
+                        } ?: continue
+                    val media = (replace.newContent as? RoomMessageEventContent.FileBased)
+                        ?.let { mediaRowOf(it) } ?: continue
+                    val target = row.targetEventId ?: continue
+                    if (ThreadRowStore.applyMediaEditHeal(
+                            c, roomId, row.eventId, target, media.first, media.second,
+                        )
+                    ) {
+                        healedRooms += roomId
+                    }
+                }
+            }
+            for (roomId in healedRooms) bumpMessagePageRevision(roomId)
+            if (healedRooms.isNotEmpty()) {
+                android.util.Log.i(
+                    TAG,
+                    "thread-store media-edit heal: ${healedRooms.size} room(s) reclassified",
+                )
+            }
+        }
+        prefs.edit().putBoolean(KEY_MEDIA_EDIT_HEAL_DONE, true).apply()
     }
 
     /**
@@ -10769,15 +10819,27 @@ object MatrixRepository {
      * the edit's own formatted HTML on `mediaMeta` — the store has no edit
      * html column, and today's page rewrites formattedHtml from the edit
      * (or nulls it when the edit is plain), which the serving path mirrors.
+     *
+     * A MEDIA edit (the bridge's notice→media replace, gmessages/RCS photos)
+     * reclassifies instead: the side row carries [mediaRowOf]'s media body +
+     * contentType and [ThreadRowLogic.applySideRow] applies both to the
+     * target — without this the "Waiting for attachment" notice row keeps
+     * its system-line type while wearing the raw file name as its body (the
+     * 2026-09-03 compute-path fix, mirrored here for the store fold).
      */
     private fun editRowForStore(
         row: ThreadRowValues,
         storedEvent: StoredTimelineEvent?,
         ownName: String?,
     ): ThreadRowValues {
-        val newContent = storedEvent?.event?.content?.getOrNull()
+        val replace = storedEvent?.event?.content?.getOrNull()
             ?.let { content -> (content as? RoomMessageEventContent)?.relatesTo as? RelatesTo.Replace }
-            ?.newContent as? RoomMessageEventContent.TextBased
+            ?: return row
+        (replace.newContent as? RoomMessageEventContent.FileBased)?.let { media ->
+            val (body, contentType) = mediaRowOf(media)
+            return row.copy(payload = body, contentType = contentType)
+        }
+        val newContent = replace.newContent as? RoomMessageEventContent.TextBased
             ?: return row
         val stripped = stripOwnPrefix(stripForwardHeader(stripReplyQuote(newContent.body)).first, ownName)
         val html = newContent.takeIf { it.format == "org.matrix.custom.html" }
@@ -10787,6 +10849,25 @@ object MatrixRepository {
             ?.takeIf { it.isNotBlank() }
             ?.let { stripForwardHeaderFromHtml(it).first.takeIf { h -> !h.isNullOrBlank() } }
         return row.copy(payload = stripped, mediaMeta = html)
+    }
+
+    /** The store's media row values for a FileBased content — the fallback
+     *  body label + contentType, the same mapping [messageFrom] applies to
+     *  media (2026-09-02: the RCS bridge sends direct photos as `m.file`
+     *  with an image mimetype; no media uri at all can never fetch). */
+    private fun mediaRowOf(content: RoomMessageEventContent.FileBased): Pair<String, String> {
+        val photoUnavailable = content.url.isNullOrBlank() && content.file?.url.isNullOrBlank()
+        return when (content) {
+            is RoomMessageEventContent.FileBased.Image ->
+                (if (photoUnavailable) "[Photo — unavailable]" else "[Photo]") to "image"
+            is RoomMessageEventContent.FileBased.Video -> "[Video]" to "video"
+            is RoomMessageEventContent.FileBased.Audio ->
+                (content.fileName?.takeIf { it.isNotBlank() } ?: "Voice note") to "audio"
+            is RoomMessageEventContent.FileBased.File ->
+                if (content.info?.mimeType?.startsWith("image/", ignoreCase = true) == true)
+                    (if (photoUnavailable) "[Photo — unavailable]" else "[Photo]") to "image"
+                else "[File]" to "text"
+        }
     }
 
     /** One persisted `TimelineEvent` row: the decoded event plus the raw
@@ -11593,7 +11674,7 @@ object MatrixRepository {
      *  account (see [migrateSyncFilterIfNeeded]) — e.g. when a new room
      *  account-data type joins the filter's whitelist and existing clients'
      *  cached filters would strip it. */
-    private const val SYNC_FILTER_MAPPINGS_VERSION = 7
+    private const val SYNC_FILTER_MAPPINGS_VERSION = 8
     private const val ROOMS_BUDGET_MS = 15_000L
     private const val ROOM_BUDGET_MS = 3_000L
     private const val MESSAGES_BUDGET_MS = 15_000L

@@ -650,16 +650,23 @@ class ThreadViewModel(
                 // "Loading messages…" — the flag always clears.
                 if (!quiet) loading.value = false
             }
-            if (!quiet && !restoreScroll) {
-                jumpToBottom.value = true
+            if (!quiet) {
+                // The mark is NOT gated on [restoreScroll]: a scroll-restoring
+                // re-open has already seen the newest row (the user scrolled up
+                // FROM it), and the 09-06 poll-tick deletion left this open-time
+                // mark as the only read trigger — gating it here kept every
+                // re-opened long thread unread forever, its notification up
+                // (LP3 2026-09-21). Only the jump-to-newest is restore-gated.
+                if (!restoreScroll) jumpToBottom.value = true
                 // Opening the thread marks it read up to the newest event; the
                 // room list's unread count drops on its next refresh. Optimistic
                 // "local-…" rows are skipped — a receipt at a fake id never
                 // confirms and leaves the badge logic flapping.
                 val markEventId = loaded.lastOrNull {
                     !it.id.startsWith(LOCAL_ROW_PREFIX)
-                }?.id ?: room.lastEventId ?: return@launch
-                ChatClient.markRead(room.id, markEventId)
+                }?.id ?: room.lastEventId
+                android.util.Log.i("ThreadScreen", "open mark: loaded=${loaded.size} markEventId=$markEventId restore=$restoreScroll")
+                markEventId?.let { ChatClient.markRead(room.id, it) }
                 lastMarkedId = markEventId
             }
             // The quiet poll re-marks when the newest message changes: the

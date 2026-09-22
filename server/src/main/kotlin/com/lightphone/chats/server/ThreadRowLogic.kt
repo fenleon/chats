@@ -266,7 +266,16 @@ object ThreadRowLogic {
         if (target.kind != RowKind.MESSAGE.wire) return target
         return when (side.kind) {
             RowKind.EDIT.wire ->
-                if (side.targetEventId == target.eventId) target.copy(body = side.payload)
+                // side.contentType is the media-edit reclassification channel:
+                // a bridge notice→media replace edit (gmessages/RCS photos)
+                // reclassifies the target row; text edits leave it null and
+                // keep the target's type. Folded targets re-apply every side
+                // row in ingest order, so thumbnail→full-size edit chains
+                // converge on the newest classification.
+                if (side.targetEventId == target.eventId) target.copy(
+                    body = side.payload,
+                    contentType = side.contentType ?: target.contentType,
+                )
                 else target
             RowKind.REDACTION.wire -> {
                 var out = target

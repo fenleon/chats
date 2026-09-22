@@ -288,6 +288,26 @@ class ThreadRowLogicTest {
     }
 
     @Test
+    fun `media edit reclassifies target`() {
+        val target = msg("m1", body = "Waiting for attachment IMG_0897.heic").copy(contentType = "notice")
+        val edit = target.copy(
+            kind = "edit", targetEventId = "m1", payload = "[Photo]", contentType = "image",
+        )
+        val out = ThreadRowLogic.applySideRow(target, edit, emptyList())
+        assertEquals("[Photo]", out.body)
+        assertEquals("image", out.contentType)
+    }
+
+    @Test
+    fun `text edit keeps target classification`() {
+        val target = msg("m1").copy(contentType = "notice")
+        val edit = target.copy(kind = "edit", targetEventId = "m1", payload = "edited!")
+        val out = ThreadRowLogic.applySideRow(target, edit, emptyList())
+        assertEquals("edited!", out.body)
+        assertEquals("notice", out.contentType)
+    }
+
+    @Test
     fun `redaction blanks body and sets contentType`() {
         val target = msg("m1", body = "secret")
         val redaction = target.copy(kind = "redaction", targetEventId = "m1")

@@ -449,6 +449,76 @@ object ThreadRowStore {
         }
     }
 
+    /** All edit side rows, any room — the media-edit heal's scan input. */
+    suspend fun editRows(c: MatrixClient): List<ThreadRowValues> {
+        val db = database(c) ?: return emptyList()
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                queryRows(
+                    db.openHelper.writableDatabase,
+                    "SELECT * FROM ThreadRow WHERE kind='edit' ORDER BY roomId, ingestSeq",
+                    arrayOf<String>(),
+                )
+            }.getOrDefault(emptyList())
+        }
+    }
+
+    /**
+     * One media-edit heal write ([MatrixRepository.repairStoreMediaEdits]):
+     * correct the stored edit side row (payload/type/mediaMeta) and
+     * reclassify its message target in place. The target is skipped when it
+     * already carries a media classification, is redacted, or is an
+     * undecrypted placeholder (the recheck re-folds it once resolved).
+     * Returns true when either write changed a row.
+     */
+    suspend fun applyMediaEditHeal(
+        c: MatrixClient,
+        roomId: String,
+        editEventId: String,
+        targetEventId: String,
+        body: String,
+        contentType: String,
+    ): Boolean {
+        val db = database(c) ?: return false
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val sq = db.openHelper.writableDatabase
+                var changed = false
+                val side = queryFirst(
+                    sq,
+                    "SELECT * FROM ThreadRow WHERE roomId=? AND eventId=? AND kind='edit' LIMIT 1",
+                    arrayOf(roomId, editEventId),
+                )
+                if (side != null && (side.payload != body || side.contentType != contentType)) {
+                    sq.execSQL(
+                        "UPDATE ThreadRow SET payload=?,contentType=?,mediaMeta=NULL " +
+                            "WHERE roomId=? AND eventId=? AND kind='edit'",
+                        arrayOf<Any?>(body, contentType, roomId, editEventId),
+                    )
+                    changed = true
+                }
+                val target = queryFirst(
+                    sq,
+                    "SELECT * FROM ThreadRow WHERE roomId=? AND eventId=? AND kind='message' LIMIT 1",
+                    arrayOf(roomId, targetEventId),
+                )
+                val mediaType = target?.contentType in
+                    listOf("image", "video", "audio", ThreadRowLogic.CONTENT_REDACTED)
+                if (target != null && target.encrypted == 0 && !mediaType &&
+                    (target.body != body || target.contentType != contentType)
+                ) {
+                    sq.execSQL(
+                        "UPDATE ThreadRow SET body=?,contentType=? " +
+                            "WHERE roomId=? AND eventId=? AND kind='message'",
+                        arrayOf<Any?>(body, contentType, roomId, targetEventId),
+                    )
+                    changed = true
+                }
+                changed
+            }.getOrDefault(false)
+        }
+    }
+
     /** Fresh-login probe (SPEC §8 trigger): does the store hold ANY rows?
      *  The probe is taken at client attach — before the first sync round can
      *  write — so an empty store means a fresh login, not an unwritten one. */
