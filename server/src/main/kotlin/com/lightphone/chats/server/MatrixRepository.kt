@@ -40,6 +40,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -259,8 +262,24 @@ object MatrixRepository {
     /** Main-thread handler for the delayed sync-service stop (see [scheduleSyncStop]). */
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
+    private var cacheSessionGenerationValue = 0L
+    val cacheSessionGeneration: Long get() = synchronized(mediaCache) { cacheSessionGenerationValue }
+
     @Volatile
     private var client: MatrixClient? = null
+        set(value) {
+            synchronized(mediaCache) {
+                if (field !== value) {
+                    // HTTP self-healing replaces the client for the SAME account.
+                    // Keep its open view models usable; login/logout still invalidate caches.
+                    val accountChanged = field == null || value == null || field?.userId != value.userId
+                    projectionSession?.work?.cancel()
+                    field = value
+                    if (accountChanged) cacheSessionGenerationValue++
+                    mediaCache.clear()
+                }
+            }
+        }
 
     @Volatile
     private var appContext: Context? = null
@@ -431,6 +450,15 @@ object MatrixRepository {
         (pendingTextEcho[roomId]?.values?.maxByOrNull { it.timestampMs })
             ?: (pendingAudioEcho[roomId]?.values?.maxByOrNull { it.timestampMs })
             ?: (pendingImageEcho[roomId]?.values?.maxByOrNull { it.timestampMs })
+
+    private data class ProjectionSession(val client: MatrixClient, val work: ProjectionWork<RoomId>)
+    @Volatile private var projectionSession: ProjectionSession? = null
+
+    private suspend fun stopProjectionSession() {
+        val previous = projectionSession ?: return
+        projectionSession = null
+        previous.work.stop()
+    }
 
     /** Client the sync-state + notification observers are currently attached to. */
     @Volatile
@@ -1306,6 +1334,7 @@ object MatrixRepository {
      * exchange leaves the old session stopped.
      */
     private suspend fun stopPreviousSession() {
+        stopProjectionSession()
         client?.let { old ->
             runCatching { old.stopSync() }
             client = null
@@ -2422,6 +2451,7 @@ object MatrixRepository {
         initMutex.withLock {
             manualLogout = true
             val old = client
+            stopProjectionSession()
             client = null
             threadBackfillJob?.cancel() // the walk walks the deleted store — stop it
             threadBackfillJob = null
@@ -2773,16 +2803,8 @@ object MatrixRepository {
         return readTimelineChainFromDb(c, matrixRoomId, startEventId, limit + 1)
     }
 
-    /**
-     * Display JPEGs served to the tool for image rows, keyed by
-     * "roomId/eventId". LRU-capped — each entry is a compressed ~100-300 KB
-     * display image, so the cap bounds the memory.
-     */
-    private val mediaCache = object : LinkedHashMap<String, ByteArray>(32, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>): Boolean =
-            size > MAX_MEDIA_CACHE_ENTRIES
-    }
-
+    /** Encoded display media, bounded by bytes; cleared atomically with session replacement. */
+    private val mediaCache = BoundedCache<ByteArray>(8L * 1024 * 1024) { it.size.toLong() }
 
     // --- Disk cache (room list) -----------------------------------
     // The room list is persisted as JSON so a cold process shows the
@@ -2790,8 +2812,8 @@ object MatrixRepository {
     // previews. (The per-room message-page half of this cache is retired —
     // the ThreadRow store serves pages.)
 
-    /** Last disk-write time per cache key. */
-    private val diskWriteAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** Accessed only by the synchronized room-list writer. */
+    private var lastRoomListWriteAt = 0L
 
     private fun cacheDir(): java.io.File? =
         appContext?.let { java.io.File(it.filesDir, DISK_CACHE_DIR) }
@@ -2802,7 +2824,7 @@ object MatrixRepository {
     @Synchronized
     private fun saveRoomListToDisk(rooms: List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>) {
         val now = android.os.SystemClock.elapsedRealtime()
-        if (now - (diskWriteAt["list"] ?: 0L) < DISK_WRITE_THROTTLE_MS) return
+        if (now - lastRoomListWriteAt < DISK_WRITE_THROTTLE_MS) return
         val file = roomListCacheFile() ?: return
         runCatching {
             file.parentFile?.mkdirs()
@@ -2811,7 +2833,7 @@ object MatrixRepository {
                     com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Response(rooms),
                 ),
             )
-            diskWriteAt["list"] = now
+            lastRoomListWriteAt = now
         }
     }
 
@@ -3835,18 +3857,20 @@ object MatrixRepository {
         }
     }
 
-    /** Density fallback: a txn-id event inside a >=30-per-window flood. The
-     *  count is decided by [ProjectionPredicate.floodGhost] — the caller
-     *  (walk or live event) supplies the window's events. */
-    private fun isFloodGhost(c: MatrixClient, te: TimelineEvent, context: List<TimelineEvent>): Boolean {
+    /** Density fallback shared by projection and live notifications. */
+    private fun isFloodGhost(te: TimelineEvent, context: List<TimelineEvent>): Boolean {
         if (txnIdOf(te) == null) return false
         val ts = te.event.originTimestamp
-        return ProjectionPredicate.floodGhost(
-            context.count { other ->
-                other.event.id != te.event.id && txnIdOf(other) != null &&
-                    kotlin.math.abs(other.event.originTimestamp - ts) < GHOST_BURST_WINDOW_MS
-            },
-        )
+        var neighbors = 0
+        // ponytail: sparse windows still scan fully; index timestamps only if profiling warrants it.
+        for (other in context) {
+            if (other.event.id != te.event.id && txnIdOf(other) != null &&
+                kotlin.math.abs(other.event.originTimestamp - ts) < GHOST_BURST_WINDOW_MS
+            ) {
+                if (ProjectionPredicate.floodGhost(++neighbors)) return true
+            }
+        }
+        return false
     }
 
     /**
@@ -6104,6 +6128,7 @@ object MatrixRepository {
                     // fresh engine for that next create.
                     return@withLock
                 }
+                stopProjectionSession()
                 client = restored
                 observeClient(restored)
                 // Close the wedged stack now that its replacement is live
@@ -7006,10 +7031,9 @@ object MatrixRepository {
         if (eventId.startsWith(LOCAL_PENDING_ID_PREFIX)) return null
         val cacheKey = "$roomId/$eventId"
         // The cache is local — serve it regardless of the connection state.
-        mediaCache[cacheKey]?.let { return it }
-        if (!allowMobileData && isOnCellularData()) {
-            android.util.Log.d(TAG, "getMessageMedia: $eventId skipped (mobile data, allow=$allowMobileData)")
-            return null
+        synchronized(mediaCache) {
+            if (client !== c) return null
+            mediaCache[cacheKey]?.let { return it }
         }
         val matrixRoomId = RoomId(roomId)
         // The event's content can lag its first read on encrypted rooms (the
@@ -7076,8 +7100,12 @@ object MatrixRepository {
             mime == "image/gif" -> bytes
             else -> compressImage(bytes, DISPLAY_MAX_DIMENSION, DISPLAY_JPEG_QUALITY)
         } ?: return null
-        mediaCache[cacheKey] = display
-        return display
+        return synchronized(mediaCache) {
+            if (client !== c) null else {
+                mediaCache.put(cacheKey, display)
+                display
+            }
+        }
     }
 
     /**
@@ -7989,7 +8017,7 @@ object MatrixRepository {
         // Bridge re-import floods (the 7am wall) must not notify — a real
         // conversation almost never reaches 30 messages per minute, so the
         // density fallback skips the flood without touching real messages.
-        if (isFloodGhost(c, te, ghostContext(c, roomId))) {
+        if (isFloodGhost(te, ghostContext(c, roomId))) {
             android.util.Log.d(TAG, "notifyForEvent: skipping bridge-flood event $eventId in $roomId")
             return
         }
@@ -9954,6 +9982,11 @@ object MatrixRepository {
     private fun observeClient(c: MatrixClient) {
         if (observedClient === c) return
         observedClient = c
+        projectionSession?.work?.cancel()
+        val work = ProjectionWork<RoomId>(scope, PROJECTION_RECHECK_MS,
+            onFailure = { android.util.Log.w(TAG, "projection refresh failed: ${it.message}") },
+        ) { rooms -> computeProjectionRows(c, rooms) }
+        projectionSession = ProjectionSession(c, work)
         // Part H fresh-login probe (SPEC §8): must land before the first sync
         // round writes rows — it's enqueued ahead of every observer below.
         // Fresh login = EMPTY database entirely (logout deletes it): both the
@@ -9962,7 +9995,7 @@ object MatrixRepository {
         // ThreadRow table — that must NOT read as fresh login and fire a
         // network bulk backfill (§7/§8: upgrades are Part G's lazy seed's
         // business, no network).
-        scope.launch {
+        work.scope.launch {
             threadBackfillStoreEmptyAtAttach = runCatching {
                 !ThreadRowStore.anyRows(c) && !ThreadRowStore.timelineStoreHasEvents(c)
             }.getOrDefault(false)
@@ -9981,7 +10014,7 @@ object MatrixRepository {
         // seam feeding the ThreadRow ingest writer + its 30 s decrypt recheck.
         observeThreadStoreIngest(c)
         startThreadStoreRecheckLoop(c)
-        scope.launch {
+        work.scope.launch {
             runCatching { backfillProjection(c) }
         }
         // The room-list resolver's first pass seeds + warms the full room map,
@@ -9989,18 +10022,18 @@ object MatrixRepository {
         startRoomListResolver(c)
         // Re-seed the in-memory pending maps from the outbox after a process
         // restart, so queued/acked-but-not-yet-echoed sends still show a row.
-        scope.launch { reconstructOutboxPendings(c) }
-        scope.launch {
+        work.scope.launch { reconstructOutboxPendings(c) }
+        work.scope.launch {
             delay(THREAD_ROW_REPAIR_DELAY_MS) // let the attach + initial sync settle first
             runCatching { repairMissingThreadRows(c) }
                 .onFailure { android.util.Log.w(TAG, "thread-store repair failed: ${it.message}") }
         }
-        scope.launch {
+        work.scope.launch {
             delay(THREAD_ROW_REPAIR_DELAY_MS)
             runCatching { repairStoreMediaEdits(c) }
                 .onFailure { android.util.Log.w(TAG, "media-edit heal failed: ${it.message}") }
         }
-        scope.launch {
+        work.scope.launch {
             delay(THREAD_ROW_REPAIR_DELAY_MS)
             runCatching { repairMissingThreadRowsDeep(c) }
                 .onFailure { android.util.Log.w(TAG, "thread-store deep repair failed: ${it.message}") }
@@ -10449,19 +10482,17 @@ object MatrixRepository {
     /** The serial sync-event seam: the join map IS the changed-room list of
      *  one sync round (timeline, receipts, state, counts). Same Flow the
      *  notification watcher collects, run post-store-persist (DEFAULT
-     *  priority). One batched recompute+write per round, O(changed rooms). */
+     *  priority). Pending rounds coalesce by room before a serialized refresh. */
     private fun observeProjectionIngest(c: MatrixClient) {
-        scope.launch {
+        val session = projectionSession?.takeIf { it.client === c } ?: return
+        session.work.scope.launch {
             try {
                 c.api.sync.subscribeAsFlow().collect { syncEvents ->
-                    val join = syncEvents.syncResponse.room?.join ?: return@collect
-                    val changed = join.keys.toList()
-                    if (changed.isEmpty()) return@collect
-                    scope.launch {
-                        yieldToSyncIngest()
-                        recomputeProjectionRows(c, changed)
-                    }
+                    val changed = syncEvents.syncResponse.room?.join?.keys ?: return@collect
+                    session.work.enqueue(changed)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "projection ingest observer ended: ${e.message}")
             }
@@ -10473,6 +10504,8 @@ object MatrixRepository {
      *  DB). Retried a few times — a fresh login's room store may not be
      *  populated until the initial sync lands. */
     private suspend fun backfillProjection(c: MatrixClient, attempt: Int = 0) {
+        val session = projectionSession?.takeIf { it.client === c } ?: return
+        currentCoroutineContext().ensureActive()
         // Mark the table ready immediately: the rows persist in the DB across
         // restarts, and the notification gate registers ~10 s in — before the
         // first sync round would ensure the table. Without this, every
@@ -10498,7 +10531,7 @@ object MatrixRepository {
         }.getOrNull()
         if (rooms == null) {
             if (attempt < 5) {
-                scope.launch { delay(30_000L); backfillProjection(c, attempt + 1) }
+                session.work.scope.launch { delay(30_000L); backfillProjection(c, attempt + 1) }
             } else {
                 android.util.Log.w(TAG, "projection: backfill gave up — room map never surfaced")
             }
@@ -10533,7 +10566,7 @@ object MatrixRepository {
         // An empty store (fresh login, initial sync not landed yet) is not
         // "done" — retry until rooms exist or the attempt cap hits.
         if ((written < roomIds.size || roomIds.isEmpty()) && attempt < 3) {
-            scope.launch {
+            session.work.scope.launch {
                 delay(60_000L)
                 backfillProjection(c, attempt + 1)
             }
@@ -10547,60 +10580,67 @@ object MatrixRepository {
     }
 
     private suspend fun recomputeProjectionRows(c: MatrixClient, roomIds: List<RoomId>): Int {
+        val session = projectionSession?.takeIf { it.client === c } ?: return 0
+        return session.work.refresh(roomIds)
+    }
+
+    /** Called only through ProjectionWork, with session ownership and serialized reads/writes. */
+    private suspend fun computeProjectionRows(c: MatrixClient, roomIds: List<RoomId>): ProjectionResult<RoomId> {
+        currentCoroutineContext().ensureActive()
+        if (client !== c) return ProjectionResult(0, emptyList())
+        yieldToSyncIngest()
         val db = runCatching { c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class) }.getOrNull()
-            ?: return 0
+            ?: return ProjectionResult(0, roomIds)
         ensureProjectionTable(db)
-        if (!projectionTableReady) return 0
+        if (!projectionTableReady) return ProjectionResult(0, roomIds)
         val rows = ArrayList<ProjectionRow>(roomIds.size)
         val pendingDecrypt = ArrayList<RoomId>()
         for (roomId in roomIds) {
-            val projected = runCatching { projectRoom(c, roomId) }.getOrNull() ?: continue
+            currentCoroutineContext().ensureActive()
+            val projected = try {
+                projectRoom(c, roomId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+            if (projected == null) continue
             if (projected.row != null) rows += projected.row
             if (projected.pendingDecryption) pendingDecrypt += roomId
         }
         if (rows.isNotEmpty()) {
             withContext(Dispatchers.IO) {
-                runCatching {
-                    val sq = db.openHelper.writableDatabase
-                    sq.beginTransaction()
-                    try {
-                        for (r in rows) {
-                            sq.execSQL(
-                                "INSERT OR REPLACE INTO RoomProjection" +
-                                    "(roomId,lastRealEventId,lastRealTs,unreadCount,preview,previewResolved) " +
-                                    "VALUES(?,?,?,?,?,?)",
-                                arrayOf<Any?>(
-                                    r.roomId,
-                                    r.lastRealEventId,
-                                    r.lastRealTs,
-                                    r.unreadCount,
-                                    r.preview,
-                                    if (r.previewResolved) 1 else 0,
-                                ),
-                            )
-                        }
-                        sq.setTransactionSuccessful()
-                    } finally {
-                        sq.endTransaction()
+                currentCoroutineContext().ensureActive()
+                if (client !== c) throw CancellationException("Projection client replaced")
+                val sq = db.openHelper.writableDatabase
+                sq.beginTransaction()
+                try {
+                    for (r in rows) {
+                        currentCoroutineContext().ensureActive()
+                        sq.execSQL(
+                            "INSERT OR REPLACE INTO RoomProjection" +
+                                "(roomId,lastRealEventId,lastRealTs,unreadCount,preview,previewResolved) " +
+                                "VALUES(?,?,?,?,?,?)",
+                            arrayOf<Any?>(
+                                r.roomId,
+                                r.lastRealEventId,
+                                r.lastRealTs,
+                                r.unreadCount,
+                                r.preview,
+                                if (r.previewResolved) 1 else 0,
+                            ),
+                        )
                     }
-                }.onFailure { android.util.Log.w(TAG, "projection: write failed: ${it.message}") }
+                    sq.setTransactionSuccessful()
+                } finally {
+                    sq.endTransaction()
+                }
             }
             if (debugLogging()) {
                 android.util.Log.d(TAG, "projection: ${rows.size} row(s) updated")
             }
         }
-        // One decrypt-retry wait feeding the predicate: pending encrypted
-        // events aren't admitted yet; a real message decrypts within seconds.
-        // No loop — a room that stays pending re-enters via its next sync
-        // round, and once stale the predicate drops it for good.
-        if (pendingDecrypt.isNotEmpty()) {
-            scope.launch {
-                delay(PROJECTION_RECHECK_MS)
-                yieldToSyncIngest()
-                recomputeProjectionRows(c, pendingDecrypt)
-            }
-        }
-        return rows.size
+        return ProjectionResult(rows.size, pendingDecrypt)
     }
 
     // -------------------------------------------------------------------------
@@ -10611,19 +10651,22 @@ object MatrixRepository {
     // of a read-time recompute.
 
     /** The serial sync-event seam, the exact flow + DEFAULT priority of
-     *  [observeProjectionIngest]: changed rooms = `room.join` keys, one
-     *  yield-gated ingest launch per round. */
+     *  [observeProjectionIngest]: changed rooms = `room.join` keys, with
+     *  ordered, buffered processing of every round. */
     private fun observeThreadStoreIngest(c: MatrixClient) {
-        scope.launch {
+        val session = projectionSession?.takeIf { it.client === c } ?: return
+        session.work.scope.launch {
             try {
-                c.api.sync.subscribeAsFlow().collect { syncEvents ->
+                // Keep emission cheap, but process every batch in order (no conflation).
+                c.api.sync.subscribeAsFlow().buffer(Channel.BUFFERED).collect { syncEvents ->
                     val join = syncEvents.syncResponse.room?.join ?: return@collect
                     if (join.isEmpty()) return@collect
-                    scope.launch {
-                        yieldToSyncIngest()
-                        ingestThreadStoreRound(c, join)
-                    }
+                    yieldToSyncIngest()
+                    currentCoroutineContext().ensureActive()
+                    ingestThreadStoreRound(c, join)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 android.util.Log.w(TAG, "thread-store ingest observer ended: ${e.message}")
             }
@@ -10982,7 +11025,8 @@ object MatrixRepository {
      *  revision so an open thread repaints. The loop ends when the store has
      *  no placeholders left; new ones arrive via the ingest hook. */
     private fun startThreadStoreRecheckLoop(c: MatrixClient) {
-        scope.launch {
+        val session = projectionSession?.takeIf { it.client === c } ?: return
+        session.work.scope.launch {
             while (isActive) {
                 delay(THREAD_ROW_RECHECK_MS)
                 yieldToSyncIngest()
@@ -11227,7 +11271,7 @@ object MatrixRepository {
                 now = now,
                 isEncrypted = isEncrypted,
                 decryptedOk = decryptedOk,
-                isFlood = isFloodGhost(c, te, events),
+                isFlood = isFloodGhost(te, events),
                 isBatchReplay = isBatchReplay,
             )
             if (isEncrypted && !decryptedOk) {
@@ -11998,8 +12042,6 @@ object MatrixRepository {
     private const val MEDIA_STALL_HEAL_MIN_INTERVAL_MS = 300_000L
     /** How long a play waits for an in-flight self-heal before fetching anyway. */
     private const val MEDIA_HEAL_WAIT_MS = 6_000L
-    /** How many display JPEGs the LRU keeps (each ~100-300 KB). */
-    private const val MAX_MEDIA_CACHE_ENTRIES = 24
     /** Voice-note cache bound (each file ~30-200 KB at 32 kbps Opus). */
     private const val VOICE_CACHE_MAX_FILES = 30
     /** Newest audio notes to prefetch when a thread page is built. */

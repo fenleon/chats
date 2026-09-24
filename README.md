@@ -59,6 +59,11 @@ tools/build --dir chats :app:assembleRelease    # release (R8-minified)
 
 The build consumes `../light-sdk` as a composite build; the SDK's chat service methods are additive patches carried in the workspace's fork of the SDK.
 
+The app reuses `:server`'s `VolumePanelOverlay` and `VolumePanelState`. If you
+run the workspace's external `tools/sync-volume-panel`, configure Chats to
+receive only the server copy; do not regenerate an app copy. That generator
+is maintained outside this repository.
+
 ## Limitations
 
 - Bridged networks (WhatsApp, Instagram, ...) arrive through Beeper, an unofficial path, not an official Meta client.
@@ -77,4 +82,3 @@ Chats is an independent, unofficial open-source project, not affiliated with or 
 </p>
 
 <p align="center">Support my work by leaving me a <a href="https://ko-fi.com/fenleon">tip</a> or  <a href=https://github.com/sponsors/fenleon">sponsoring me</a>. A little goes a long way.</p>
-

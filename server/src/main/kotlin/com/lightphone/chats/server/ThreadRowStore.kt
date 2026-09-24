@@ -100,7 +100,8 @@ object ThreadRowStore {
      * Dispatchers.IO, `INSERT OR REPLACE`, with the per-room `ingestSeq`
      * rebased inside the transaction (`SELECT COALESCE(MAX(ingestSeq),0)+1`)
      * so concurrent writers can't collide. Input order is preserved — the
-     * rebased seqs stay monotonic over the list. Rows come from one room
+     * maximum is read once per room per batch, and only new inserts advance
+     * it. Rebased seqs stay monotonic over the list. Rows come from one room
      * ([ThreadRowLogic.buildRows] contract).
      *
      * Re-delivery idempotency (Task 3 review ruling): an eventId already in
@@ -133,6 +134,7 @@ object ThreadRowStore {
                 sq.beginTransaction()
                 try {
                     ensureTable(sq)
+                    val nextSeqByRoom = mutableMapOf<String, Int>()
                     for (row in rows) {
                         val existing = queryFirst(
                             sq,
@@ -188,14 +190,17 @@ object ThreadRowStore {
                             }
                             continue
                         }
-                        val seq = sq.query(
-                            "SELECT COALESCE(MAX(ingestSeq),0)+1 FROM ThreadRow WHERE roomId=?",
-                            arrayOf(row.roomId),
-                        ).use { cur ->
-                            check(cur.moveToFirst())
-                            cur.getInt(0)
+                        val seq = nextSeqByRoom.getOrPut(row.roomId) {
+                            sq.query(
+                                "SELECT COALESCE(MAX(ingestSeq),0)+1 FROM ThreadRow WHERE roomId=?",
+                                arrayOf(row.roomId),
+                            ).use { cur ->
+                                check(cur.moveToFirst())
+                                cur.getInt(0)
+                            }
                         }
                         insert(sq, row.copy(ingestSeq = seq))
+                        nextSeqByRoom[row.roomId] = seq + 1
                         inserted++
                     }
                     foldTargets(sq, rows)

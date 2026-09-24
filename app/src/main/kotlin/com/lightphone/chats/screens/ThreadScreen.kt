@@ -26,7 +26,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -50,8 +49,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
-import com.lightphone.chats.VolumePanelOverlay
-import com.lightphone.chats.VolumePanelState
+import com.lightphone.chats.MediaLoader
+import com.lightphone.chats.server.VolumePanelOverlay
+import com.lightphone.chats.server.VolumePanelState
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
@@ -94,39 +94,8 @@ import kotlin.math.roundToInt
 /** Newest image messages whose bytes start downloading on page arrival. */
 private const val MEDIA_PREFETCH_COUNT = 4
 
-/**
- * Process-wide display-JPEG cache, shared by every ThreadViewModel: a photo
- * fetched once renders instantly in later opens (same or other room) with no
- * re-fetch RPC. Keyed by event id, which is globally
- * unique.
- */
-private val chatsMediaCache = MutableStateFlow<Map<String, ByteArray>>(emptyMap())
-
-/**
- * Decoded display bitmaps per image event id. The BYTES live in
- * [chatsMediaCache] and survive navigation; the decode does not — returning
- * from the fullscreen viewer re-enters the row's composition, and the
- * re-decode started from a null frame, flashing the "[Photo]" fallback before
- * the image popped back in. Bounded: full-res photos decode
- * to tens of MB, so only the most recent few are kept (eviction is
- * insertion-order, fine for a handful of photos; ponytail: LRU if the count
- * ever matters).
- */
+/** Decoded pixels retained separately from encoded media. */
 internal class DecodedBitmap(val bitmap: ImageBitmap, val fromFlipbook: Boolean)
-
-internal object chatsBitmapCache {
-    private val map = java.util.concurrent.ConcurrentHashMap<String, DecodedBitmap>()
-    private const val MAX_ENTRIES = 4
-
-    fun get(eventId: String): DecodedBitmap? = map[eventId]
-
-    fun put(eventId: String, decoded: DecodedBitmap) {
-        if (map.size >= MAX_ENTRIES && !map.containsKey(eventId)) {
-            map.remove(map.keys.first())
-        }
-        map[eventId] = decoded
-    }
-}
 
 /** Parser for the companion's video-flipbook container ("FLIP" magic — see
  *  MatrixRepository.videoFlipbook): animated WhatsApp GIFs arrive as silent
@@ -214,40 +183,6 @@ internal object chatsFlipbook {
 }
 
 /**
- * Loaded message pages + last scroll position per room id. The thread's
- * [ThreadViewModel] is recreated on every open, so paged-in history and the
- * scroll position were lost on exit — re-opening re-fetched the newest page
- * and re-paged from the server ("exit and come back, it has to load again").
- * Kept process-wide (like [chatsMediaCache]) so a re-open
- * renders the already-loaded history instantly and restores the position.
- * Room ids are server-scoped, so a different account can't collide.
- */
-internal object threadStateCache {
-    private val messageFlows = mutableMapOf<String, MutableStateFlow<List<LightServiceMethod.GetMessages.Message>>>()
-    private val scroll = mutableMapOf<String, Pair<Int, Int>>()
-
-    /** The room's message list — the SAME flow across re-opens of the room. */
-    fun messagesFlow(roomId: String): MutableStateFlow<List<LightServiceMethod.GetMessages.Message>> =
-        messageFlows.getOrPut(roomId) { MutableStateFlow(emptyList()) }
-
-    fun saveScroll(roomId: String, index: Int, offset: Int) {
-        scroll[roomId] = index to offset
-    }
-
-    fun takeScroll(roomId: String): Pair<Int, Int>? = scroll[roomId]
-}
-
-/**
- * Process-wide optimistic edit/unsend overlays: survives the
- * thread's ViewModel so an exit + re-enter inside the page-cache refresh
- * window keeps showing the edited body (see [ThreadViewModel]'s overlay doc).
- */
-internal object editEchoCache {
-    val edits = MutableStateFlow<Map<String, String>>(emptyMap())
-    val unsent = MutableStateFlow<Set<String>>(emptySet())
-}
-
-/**
  * Resend-attempt counter per message id: "not delivered. tap to
  * resend" caps at [MAX_RESEND_ATTEMPTS] — each tap sends the body as a NEW
  * message, so an endless loop would spam duplicates. The count propagates to
@@ -256,10 +191,12 @@ internal object editEchoCache {
  * app start resets the counter (the rows offer resend again — acceptable; the
  * cap is about duplicate spam within a session).
  */
-internal object resendChainState {
+internal class ResendChainState {
     private val attempts = MutableStateFlow<Map<String, Int>>(emptyMap())
 
     fun observe() = attempts
+
+    fun clear() { attempts.value = emptyMap() }
 
     fun attemptsFor(messageId: String): Int = attempts.value[messageId] ?: 0
 
@@ -274,12 +211,15 @@ class ThreadViewModel(
     private val room: LightServiceMethod.GetRooms.Room,
 ) : LightViewModel<Unit>() {
 
+    internal val caches = threadCaches()
+    private val retainedThread = caches.threads.get(room.id)
+    private val resendChainState = caches.resends
+
     /**
      * Oldest-first page of messages; older pages are prepended by [loadOlder].
-     * Process-wide per room ([threadStateCache]) — re-opening the thread keeps
-     * the already-loaded history instead of re-fetching it.
+     * A bounded snapshot seeds reopens; active pagination remains view-model-owned.
      */
-    val messages = threadStateCache.messagesFlow(room.id)
+    val messages = MutableStateFlow(retainedThread?.messages.orEmpty())
     val loading = MutableStateFlow(true)
     val loadingMore = MutableStateFlow(false)
     val hasMore = MutableStateFlow(false)
@@ -363,13 +303,12 @@ class ThreadViewModel(
         flagSyncJob = null
     }
 
-    /**
-     * Display JPEG bytes per image-message event id. This is a view
-     * of the process-wide [chatsMediaCache] (event ids are globally unique), so
-     * a photo already fetched in any thread renders instantly on re-open — no
-     * re-fetch RPC — and each thread's poll just adds the new arrivals.
-     */
-    val mediaBytes = chatsMediaCache
+    private val mediaLoader = MediaLoader(caches.media, viewModelScope, caches::isCurrent) { eventId, allowMobileData ->
+        ChatClient.getMessageMedia(room.id, eventId, allowMobileData)
+    }
+
+    suspend fun loadMedia(eventId: String, allowMobileData: Boolean): ByteArray? =
+        mediaLoader.load(eventId, allowMobileData)
 
     /**
      * Component name of the companion's photo-picker activity to launch, set
@@ -445,10 +384,10 @@ class ThreadViewModel(
      * text survives for a retry). Process-wide: the page cache
      * can serve a pre-echo page after the ViewModel died (exit + re-enter),
      * which reverted the row to its unedited body until the rebuild landed —
-     * the overlays now survive the round-trip like [threadStateCache].
+     * the overlays now survive the round-trip in the current cache session.
      */
-    private val editOverlays get() = editEchoCache.edits
-    private val unsentOverlays get() = editEchoCache.unsent
+    private val editOverlays get() = caches.edits
+    private val unsentOverlays get() = caches.unsent
 
     /**
      * In-app volume panel state (null = hidden), the shared LightOS replica
@@ -521,11 +460,11 @@ class ThreadViewModel(
      * Thread scroll position, saved continuously by the screen and restored on
      * show — returning from the fullscreen photo viewer must land where the
      * photo was, not the newest messages. Persisted
-     * process-wide ([threadStateCache]) so a full re-open of the thread also
+     * in the bounded reopening snapshot so a full re-open of the thread also
      * lands where the user left off.
      */
-    private var savedScrollIndex = threadStateCache.takeScroll(room.id)?.first ?: 0
-    private var savedScrollOffset = threadStateCache.takeScroll(room.id)?.second ?: 0
+    private var savedScrollIndex = retainedThread?.scroll?.first ?: 0
+    private var savedScrollOffset = retainedThread?.scroll?.second ?: 0
     private var scrollToRestore: Pair<Int, Int>? = null
     /** Newest event id already marked read — dedup for the poll's re-mark. */
     private var lastMarkedId: String? = null
@@ -533,7 +472,6 @@ class ThreadViewModel(
     fun saveScroll(index: Int, offset: Int) {
         savedScrollIndex = index
         savedScrollOffset = offset
-        threadStateCache.saveScroll(room.id, index, offset)
     }
 
     /** The position to restore on show (consume-once), or null when at the newest. */
@@ -566,8 +504,15 @@ class ThreadViewModel(
         startFlagSync()
     }
 
+    private fun retainThread() {
+        if (caches.isCurrent()) {
+            caches.threads.save(room.id, messages.value, savedScrollIndex to savedScrollOffset)
+        }
+    }
+
     override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
         super.onScreenHide(screen)
+        retainThread()
         // Message polling stops when covered (e.g. the contact panel), but the
         // flag sync deliberately keeps running — the panel needs Beeper-side
         // pin/mute/archive changes live.
@@ -576,6 +521,7 @@ class ThreadViewModel(
 
     override fun onAppPause() {
         super.onAppPause()
+        retainThread()
         // The tool is no longer visible (standby/another app); messages in
         // this room may notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
@@ -1230,23 +1176,12 @@ class ThreadViewModel(
     }
 
     /** Fetches an image message's display bytes if they aren't cached yet. */
-    fun ensureMedia(eventId: String, allowMobileData: Boolean) {        if (mediaBytes.value.containsKey(eventId)) return
+    fun ensureMedia(eventId: String, allowMobileData: Boolean) {
         // IO: the server side downloads + decodes media inline (video frame
         // extraction via MediaMetadataRetriever is seconds of blocking work) —
         // on the default Main dispatcher this ANRs the app (LP3, 2026-09-19).
         viewModelScope.launch(Dispatchers.IO) {
-            // Retry a few times: the first read can hit a still-decrypting
-            // event or a transient download failure, and a null result is not
-            // cached — the row would otherwise stay on its text fallback.
-            var bytes: ByteArray? = null
-            repeat(MEDIA_RETRIES) {
-                bytes = ChatClient.getMessageMedia(room.id, eventId, allowMobileData)
-                if (bytes != null) return@repeat
-                delay(MEDIA_RETRY_DELAY_MS)
-            }
-            if (bytes != null) {
-                mediaBytes.value = mediaBytes.value + (eventId to bytes)
-            }
+            mediaLoader.load(eventId, allowMobileData)
         }
     }
 
@@ -1424,9 +1359,6 @@ class ThreadViewModel(
         const val THREAD_POLL_MS = 1_500L
         /** How close (ms) a real echo's timestamp must be to a "local-…" row. */
         const val OPTIMISTIC_MATCH_WINDOW_MS = 5 * 60 * 1000L
-        /** Media fetch retries when the first read comes back null. */
-        const val MEDIA_RETRIES = 3
-        const val MEDIA_RETRY_DELAY_MS = 2_000L
         /** How long a failed voice-note play error stays on the row. */
         const val VOICE_ERROR_DISMISS_MS = 3_000L
         /** Wait before the one-shot backstop retry for a pending-seed empty
@@ -1493,7 +1425,6 @@ class ThreadScreen(
         val jumpToBottom by viewModel.jumpToBottom.collectAsState()
         val e2eeVerified by viewModel.e2eeVerified.collectAsState()
         val roomEncrypted by viewModel.roomEncrypted.collectAsState()
-        val mediaBytes by viewModel.mediaBytes.collectAsState()
         val attachComponent by viewModel.pendingAttachComponent.collectAsState()
         val voiceComponent by viewModel.pendingVoiceComponent.collectAsState()
         val playingEventId by viewModel.playingEventId.collectAsState()
@@ -1524,7 +1455,7 @@ class ThreadScreen(
         // Row-state bundles collected once here instead of a 10-parameter
         // wall on [MessageRow]: the image fetch state, and the raw voice-note
         // playback state (the per-row id comparisons happen in [MessageRow]).
-        val media = MediaState(mediaBytes, downloadOverMobile, viewModel::ensureMedia)
+        val media = MediaState(viewModel.caches, downloadOverMobile, viewModel::loadMedia)
         val voice = VoiceState(
             playingEventId, playingPositionMs, playingPositionAtMs, counterPending,
             pausedEventId, pausedPositionMs, voiceError, viewModel::playVoiceNote,
@@ -2195,14 +2126,11 @@ private fun IncomingBodyText(
     }
 }
 
-/** Image-row state shared by every row: the fetched display bytes by message
- *  id, the mobile-data download toggle, and the fetch callback (see
- *  [ImageMessageContent]). One immutable object collected once in
- *  [ThreadScreen.Content] instead of a parameter trio per row. */
+/** Visible rows own their bytes; shared caches only retain bounded reopening data. */
 private data class MediaState(
-    val mediaBytes: Map<String, ByteArray>,
+    val caches: ThreadCaches,
     val allowMobile: Boolean,
-    val onEnsureMedia: (String, Boolean) -> Unit,
+    val load: suspend (String, Boolean) -> ByteArray?,
 )
 
 /** Voice-note row state shared by every row: the raw playback state from the
@@ -2297,7 +2225,7 @@ private fun MessageRow(
         // [MAX_RESEND_ATTEMPTS] — or once the message is older than
         // [RESEND_MAX_AGE_MS] — the row turns static "failed to deliver":
         // no more duplicate sends.
-        val resendAttempts by resendChainState.observe().collectAsState()
+        val resendAttempts by media.caches.resends.observe().collectAsState()
         val resendExhausted = retryableNew && (
             (resendAttempts[message.id] ?: 0) >= MAX_RESEND_ATTEMPTS ||
                 System.currentTimeMillis() - message.timestampMs >= RESEND_MAX_AGE_MS
@@ -2747,24 +2675,33 @@ private fun ImageMessageContent(
 ) {
     // The toggle is part of the key: flipping "Mobile data downloads" (or
     // moving off cellular) re-attempts rows that were skipped as Wi-Fi-only.
-    LaunchedEffect(message.id, media.allowMobile) { media.onEnsureMedia(message.id, media.allowMobile) }
-    val bytes = media.mediaBytes[message.id]
+    var retry by remember(media.caches, message.id) { mutableStateOf(0) }
+    var loadedBytes by remember(media.caches, message.id) {
+        mutableStateOf(media.caches.media[message.id])
+    }
+    LaunchedEffect(media.caches, message.id, media.allowMobile, retry) {
+        if (loadedBytes == null) loadedBytes = media.load(message.id, media.allowMobile)
+    }
+    val bytes = loadedBytes
     // Decode off the main thread: the in-composition decode blocked the UI
     // thread's first paint for every visible photo.
     // The text fallback below renders until the bitmap lands. Seeded from the
-    // process-wide [chatsBitmapCache]: returning from the fullscreen viewer
+    // process-wide [ThreadCaches.bitmaps]: returning from the fullscreen viewer
     // re-enters this composition, and re-decoding started from a null frame
     // (a "[Photo]" flash before the image popped back in).
-    val bitmap by produceState<DecodedBitmap?>(chatsBitmapCache.get(message.id), bytes) {
-        if (bytes != null && value == null) {
-            value = withContext(Dispatchers.Default) {
+    var bitmap by remember(media.caches, message.id) {
+        mutableStateOf(media.caches.bitmaps[message.id])
+    }
+    LaunchedEffect(media.caches, message.id, bytes) {
+        if (bytes != null && bitmap == null) {
+            bitmap = withContext(Dispatchers.Default) {
                 // Flipbook containers (WhatsApp GIFs) render their first
                 // frame here; plain JPEGs/gifs decode whole. The flag drives
                 // the row's [Video] tag (gifs don't carry it).
                 chatsFlipbook.firstFrame(bytes)
                     ?: BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         ?.asImageBitmap()?.let { DecodedBitmap(it, false) }
-            }?.also { chatsBitmapCache.put(message.id, it) }
+            }?.also { if (media.caches.isCurrent()) media.caches.bitmaps.put(message.id, it) }
         }
     }
     val decoded = bitmap
@@ -2782,7 +2719,7 @@ private fun ImageMessageContent(
         // re-run it without leaving the thread. Decode failures (bytes but no bitmap) stay
         // dead text; re-fetching would not help.
         val bodyModifier =
-            if (bytes == null) Modifier.lightClickable(onClick = { media.onEnsureMedia(message.id, media.allowMobile) })
+            if (bytes == null) Modifier.lightClickable(onClick = { retry++ })
             else Modifier
         LightText(
             text = message.body,

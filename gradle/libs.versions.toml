@@ -20,8 +20,6 @@ trixnity-media-okio = { module = "de.connect2x.trixnity:trixnity-client-media-ok
 # libOlm crypto driver (same pickle format as v4 — no crypto migration).
 trixnity-cryptodriver-libolm = { module = "de.connect2x.trixnity:trixnity-client-cryptodriver-libolm", version.ref = "trixnity" }
 ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
-ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
-ktor-serialization-json = { module = "io.ktor:ktor-serialization-kotlinx-json", version.ref = "ktor" }
 androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
 androidx-room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
 # Consumed from the included ../light-sdk build via dependencySubstitution;

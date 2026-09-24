@@ -66,13 +66,15 @@ import kotlinx.coroutines.withContext
 class FullscreenImageScreen(
     sealedActivity: SealedLightActivity,
     private val roomId: String,
-    /** Image event id — keys the shared decoded-bitmap cache ([chatsBitmapCache]). */
+    /** Image event id — keys the shared decoded-bitmap cache ([ThreadCaches.bitmaps]). */
     private val eventId: String,
     private val bytes: ByteArray,
     /** Video rows: the viewer shows the extracted frame(s) — SAVE hidden
      *  (it would save a thumbnail frame, not the media). */
     private val video: Boolean = false,
 ) : SimpleLightScreen<Unit>(sealedActivity) {
+
+    private val caches = threadCaches()
 
     @Composable
     override fun Content() {
@@ -85,7 +87,7 @@ class FullscreenImageScreen(
         // decodes to a still, seeded from the shared decode cache so the
         // thread row finds the bitmap already decoded when this viewer closes.
         val gif = isGif(bytes)
-        val bitmap by produceState<ImageBitmap?>(chatsBitmapCache.get(eventId)?.bitmap, bytes) {
+        val bitmap by produceState<ImageBitmap?>(caches.bitmaps[eventId]?.bitmap, bytes) {
             if (value == null && !gif) {
                 value = withContext(Dispatchers.Default) {
                     // Keep the flipbook flag intact — the thread row reads it
@@ -93,7 +95,7 @@ class FullscreenImageScreen(
                     val decoded = chatsFlipbook.firstFrame(bytes)
                         ?: BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                             ?.asImageBitmap()?.let { DecodedBitmap(it, false) }
-                    decoded?.also { chatsBitmapCache.put(eventId, it) }?.bitmap
+                    decoded?.also { if (caches.isCurrent()) caches.bitmaps.put(eventId, it) }?.bitmap
                 }
             }
         }

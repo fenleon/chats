@@ -7,6 +7,7 @@ import com.thelightphone.sdk.callRemoteServiceMethod
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.getOrNull
 import kotlinx.coroutines.CancellationException
+import com.lightphone.chats.screens.clearThreadCaches
 
 /**
  * The app-side API over [MatrixRepository]. Chats is single-APK/single-process
@@ -26,6 +27,7 @@ object ChatClient {
     ): LightServiceMethod.SetAccount.Response? =
         runCatching {
             MatrixRepository.loginAsUnit(homeserver, user, passwordOrToken, tokenLogin).getOrThrow()
+            clearThreadCaches()
             LightServiceMethod.SetAccount.Response(
                 userId = MatrixRepository.lastLoginUserId ?: "",
                 deviceId = MatrixRepository.lastLoginDeviceId ?: "",
@@ -44,6 +46,7 @@ object ChatClient {
      */
     suspend fun beeperLogin(email: String, code: String): Result<LightServiceMethod.SetBeeperAccount.Response> =
         MatrixRepository.beeperLoginAsUnit(email, code).mapCatching { _ ->
+            clearThreadCaches()
             LightServiceMethod.SetBeeperAccount.Response(
                 userId = MatrixRepository.lastLoginUserId ?: "",
                 deviceId = MatrixRepository.lastLoginDeviceId ?: "",
@@ -55,16 +58,15 @@ object ChatClient {
         runCatching { MatrixRepository.accountState() }.getOrNull()
 
     suspend fun logout() {
-        runCatching { MatrixRepository.logout() }
+        try {
+            runCatching { MatrixRepository.logout() }
+        } finally {
+            clearThreadCaches()
+        }
     }
 
     suspend fun getRooms(): List<LightServiceMethod.GetRooms.Room> =
         MatrixRepository.getRooms()
-
-    /** Every room the repository knows (full census, trimmed rows — no preview
-     *  or unread). The contacts list + search need any room, old or quiet. */
-    suspend fun getAllRooms(): List<LightServiceMethod.GetRooms.Room> =
-        MatrixRepository.getAllRooms()
 
     /**
      * A page of messages, oldest first; [beforeEventId] pages further back.
@@ -227,7 +229,13 @@ object ChatClient {
         eventId: String,
         allowMobileData: Boolean,
     ): ByteArray? =
-        runCatching { MatrixRepository.getMessageMedia(roomId, eventId, allowMobileData) }.getOrNull()
+        try {
+            MatrixRepository.getMessageMedia(roomId, eventId, allowMobileData)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
 
     /** Saves an image message to the device's Pictures/Chats album
      *  (photo viewer save button, 2026-09-03). */
