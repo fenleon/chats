@@ -31,6 +31,9 @@ class ChatSyncService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        // Re-arm the backstop on every service start (UPDATE policy — cheap
+        // and idempotent; catches a service restart that outlived the worker).
+        runCatching { DeliveryBackstopWorker.ensure(this) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

@@ -144,6 +144,11 @@ class ServerBootstrapProvider : ContentProvider() {
         }.start()
         // Restores a stored session (if any) and starts the sync service.
         MatrixRepository.init(context)
+        // Independent delivery backstop (WorkManager): scheduled at every
+        // process start with UPDATE policy so the spec stays fresh; a
+        // rebooted LP3 with no process gets the chain back when the first
+        // provider run happens (and BootReceiver restarts the FGS directly).
+        runCatching { DeliveryBackstopWorker.ensure(context) }
         return true
     }
 

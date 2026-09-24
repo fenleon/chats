@@ -2646,6 +2646,25 @@ object MatrixRepository {
         val pushConnected: Boolean,
     )
 
+    /** True when a live (non-expired) session exists — the backstop worker's
+     *  do-nothing gate (a dead token must not be restarted into). */
+    fun isLoggedIn(): Boolean = client != null && !sessionExpired
+
+    /**
+     * One independent catch-up round for [DeliveryBackstopWorker]: a single
+     * syncOnce when slow sync owns the cadence (the screen-on long-poll is
+     * already delivering — a concurrent round would double-consume the sync
+     * stream), then the durable push queue is re-checked with its
+     * once-per-process flag reset, so a worker firing deep into a process's
+     * life can still re-wake a push whose catch-up never landed.
+     */
+    suspend fun backstopCatchUp(reason: String) {
+        val c = client ?: return
+        if (syncMode == SyncMode.SLOW) timedSyncOnce(c, reason)
+        pushQueueDrained = false
+        drainPushQueue()
+    }
+
     fun connectionState(): com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response {
         val state = _connectionState.value
         val roomsTotal = roomListCache.size

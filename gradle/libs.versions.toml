@@ -5,6 +5,7 @@ compose-activity = "1.13.0"
 kotlinx-coroutines = "1.11.0"
 ktor = "3.5.2"
 room = "2.8.4"
+work = "2.10.0"
 trixnity = "5.8.0"
 sdk = "0.1.0"
 connector = "3.3.2"
@@ -22,6 +23,9 @@ trixnity-cryptodriver-libolm = { module = "de.connect2x.trixnity:trixnity-client
 ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
 androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
 androidx-room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
+# Delivery backstop (Task: independent of the FGS/push failure modes) — plain
+# WorkManager in the unscanned :server library.
+androidx-work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
 # Consumed from the included ../light-sdk build via dependencySubstitution;
 # versions must match light-sdk/gradle.properties sdkGroup/sdkVersion.
 sdk-ui = { module = "com.thelightphone:sdk-ui", version.ref = "sdk" }
