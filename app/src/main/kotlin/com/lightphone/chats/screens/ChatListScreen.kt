@@ -67,6 +67,10 @@ import kotlinx.coroutines.launch
 /** Grow the list slice when the last visible row is within this many of the end. */
 private const val REVEAL_THRESHOLD = 4
 
+/** "Can't reach server" shows only after offline persists this long —
+ *  transient reconnects and restore-time flips never reach it. */
+private const val OFFLINE_BANNER_DEBOUNCE_MS = 5_000L
+
 /** Shown while the initial sync pulls the whole account (can take minutes). */
 private const val DOWNLOADING_TEXT = "Downloading your chat history…"
 
@@ -574,11 +578,28 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         // A "Can't reach server" banner during the cold restore (no first sync
         // pass yet) is a lie — the first attempt hasn't even failed — so it
         // stays quiet until the restore has settled. Session-expired is a
-        // settled fact and shows immediately.
+        // settled fact and shows immediately. Transient offline blips
+        // (reconnect handshakes, a cold start whose snapshot-painted list
+        // voids the old empty-list gate) only earn the banner after
+        // [OFFLINE_BANNER_DEBOUNCE_MS] of CONTINUOUS offline — every flip out
+        // of offline (or detail change) restarts the wait.
+        var offlineStable by remember { mutableStateOf(false) }
+        val offlineNow = connection?.state == "offline" &&
+            connection?.detail?.startsWith("session expired") != true
+        LaunchedEffect(offlineNow, connection?.detail) {
+            if (offlineNow) {
+                delay(OFFLINE_BANNER_DEBOUNCE_MS)
+                offlineStable = true
+            } else {
+                offlineStable = false
+            }
+        }
         val offlineText = connection?.takeIf { it.state == "offline" }?.let { state ->
             if (state.detail?.startsWith("session expired") == true) {
                 "Session expired — sign in again"
             } else if (loading && rooms.isEmpty()) {
+                null
+            } else if (!offlineStable) {
                 null
             } else {
                 "Can't reach server"
