@@ -769,6 +769,10 @@ object MatrixRepository {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 Intent.ACTION_SCREEN_ON -> {
+                    // Stall repair FIRST, while syncMode still reads SLOW —
+                    // applySyncModeForScreenState() hands sync to the active
+                    // long-poll and the mode gate below would skip the round.
+                    maybeCatchUpOnScreenOn()
                     applySyncModeForScreenState()
                     // A message likely landed while the screen was dark — end
                     // the resolver's screen-off sleep so the list is fresh the
@@ -780,6 +784,32 @@ object MatrixRepository {
                 }
             }
         }
+    }
+
+    /**
+     * Stall repair on screen-on (BrightChat watchForWake): the cheapest
+     * possible repair moment — the CPU is running and the user hasn't reached
+     * the app yet. A healthy chain costs one timestamp comparison. Only a
+     * chain whose last proven success is older than 3× the current expected
+     * cadence (push-gated: 900 s lazy / 300 s plain — the same two constants
+     * [startSlowSyncRounds] runs on) runs one immediate catch-up round, and
+     * only while slow sync owns the cadence: the active long-poll delivering
+     * already re-stamps the success, and a concurrent syncOnce next to it
+     * would double-consume the sync stream (the push-wake path gates the same
+     * way). A wedged active long-poll stays the existing watchdog's business.
+     */
+    private fun maybeCatchUpOnScreenOn() {
+        if (!syncEnabled) return
+        val expected = if (PushChannel.isConnected) SLOW_SYNC_LAZY_INTERVAL_MS else SLOW_SYNC_INTERVAL_MS
+        if (!SyncHealth.isStalled(lastSyncOkAtMs, System.currentTimeMillis(), expected)) return
+        val c = client ?: return
+        if (syncMode != SyncMode.SLOW) return
+        android.util.Log.w(
+            TAG,
+            "screen-on stall repair: last ok ${System.currentTimeMillis() - lastSyncOkAtMs}ms ago (expected ≤${SyncHealth.STALL_MULTIPLIER * expected}ms)",
+        )
+        Diagnostics.record("screen-on stall repair: catching up")
+        scope.launch { timedSyncOnce(c, "screen-on stall repair") }
     }
 
     /**
