@@ -493,6 +493,22 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
             }
         }
 
+        // The cold-restore "loading…" text only earns its pixels when the
+        // restore is genuinely slow — a fast restore paints rooms within the
+        // grace window, and flashing a second, differently-styled loading
+        // state right after the system splash reads as jank. Slow restores
+        // (large bridged accounts) still get the indicator.
+        var showRestoreText by remember { mutableStateOf(false) }
+        val coldRestoring = loading && rooms.isEmpty()
+        LaunchedEffect(coldRestoring) {
+            if (coldRestoring) {
+                delay(LOADING_TEXT_GRACE_MS)
+                showRestoreText = true
+            } else {
+                showRestoreText = false
+            }
+        }
+
         // A new-message bump reorders the list; when the user
         // was at (or within a row of) the top, keep the newest conversation
         // pinned at index 0 — LazyColumn anchors by key, so the room that slid
@@ -506,9 +522,15 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
 
         // Offline: the list still shows cached rooms, with a status line on top
         // ("Can't reach server"); an expired session points at Settings instead.
+        // A "Can't reach server" banner during the cold restore (no first sync
+        // pass yet) is a lie — the first attempt hasn't even failed — so it
+        // stays quiet until the restore has settled. Session-expired is a
+        // settled fact and shows immediately.
         val offlineText = connection?.takeIf { it.state == "offline" }?.let { state ->
             if (state.detail?.startsWith("session expired") == true) {
                 "Session expired — sign in again"
+            } else if (loading && rooms.isEmpty()) {
+                null
             } else {
                 "Can't reach server"
             }
@@ -546,13 +568,19 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                         Box(modifier = Modifier.weight(1f)) {
                             val connecting = connection?.state == "connecting"
                             when {
+                                // Grace window: the restore hasn't exceeded the
+                                // placeholder delay yet — paint nothing rather
+                                // than flash a second loading style (or a false
+                                // "No account"/"No conversations.") right under
+                                // the system splash.
+                                loading && rooms.isEmpty() && !showRestoreText -> {}
                                 // First login / restored session: the initial sync
                                 // pulls the whole account (all rooms + history) and
                                 // can take minutes on a large bridged account —
                                 // say so instead of a blank "Loading…", and never
                                 // flash "No conversations" while it's still running
                                 // (the retry budget can exhaust before rooms land).
-                                loading && rooms.isEmpty() -> StatusText(
+                                loading && rooms.isEmpty() && showRestoreText -> StatusText(
                                     if (connecting) DOWNLOADING_TEXT else "loading…",
                                 )
                                 filteredRooms.isNotEmpty() -> LightLazyScrollView(
