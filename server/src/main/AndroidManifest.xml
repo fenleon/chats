@@ -46,6 +46,20 @@
             android:authorities="com.lightphone.chats.server.bootstrap"
             android:exported="false" />
 
+        <!-- WorkManager: androidx.startup's WorkManagerInitializer races our own
+             ServerBootstrapProvider (provider install order differs per device — on
+             the LP3 ours runs first, so the startup initializer then crashed with
+             "already initialized" and killed every process start). Our explicit
+             initialize in DeliveryBackstopWorker.ensure is the only path. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                tools:node="remove" />
+        </provider>
+
         <!-- Shows the system photo picker and sends the chosen photo; started
              by the tool via StartPhotoSend + startServerActivity (the tool
              runtime forbids startActivity, the server can't launch activities
