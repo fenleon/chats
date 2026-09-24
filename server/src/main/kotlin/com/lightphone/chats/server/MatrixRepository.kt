@@ -240,6 +240,12 @@ object MatrixRepository {
      *  the crawl runs at most once per 24h, so the in-memory flag alone could
      *  never show after a reboot/install/force-stop. Cleared at login. */
     private const val KEY_RESTORE_COMPLETED = "restore_completed"
+    /** Wall-clock of the last successful syncOnce round (any reason: slow
+     *  round, push wake, send wake, backstop). Persisted — the Account
+     *  screen's health line must survive process restarts, and the screen-on
+     *  stall check reads it before a fresh process's first round. 0 = never. */
+    private const val KEY_LAST_SYNC_OK_MS = "last_sync_ok_ms"
+    private const val KEY_SYNC_FAILURES = "sync_failures"
     /** Per-room event id the notification watcher last alerted (prefix + roomId.full),
      *  persisted so a watcher re-attach — every process start / app launch — does not
      *  re-alert the same newest event a previous run already dinged (ghost burst
@@ -833,6 +839,11 @@ object MatrixRepository {
             completed = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getBoolean(KEY_RESTORE_COMPLETED, false),
         )
+        // Delivery-health seeds (Account screen line + screen-on stall check).
+        lastSyncOkAtMs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getLong(KEY_LAST_SYNC_OK_MS, 0L)
+        consecutiveSyncFailures = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_SYNC_FAILURES, 0)
         // Screen-driven cadence: long-poll while the screen is on, periodic
         // syncOnce after it's been off for a while (battery, 2026-08-14).
         app.registerReceiver(
@@ -1039,8 +1050,12 @@ object MatrixRepository {
                 // Any successful sync means the "checking failed" signal (if
                 // any) is stale (WAKE-COMPARISON.md #3).
                 appContext?.let { ChatNotifier.clearSyncPending(it) }
+                recordSyncRoundOk()
             }
-            .onFailure { publishOfflineDebounced("sync failed") }
+            .onFailure {
+                recordSyncRoundFailed()
+                publishOfflineDebounced("sync failed")
+            }
         // The round's ingest (parse/decrypt/store) is done once syncOnce
         // returns — release the sync-ingest gate here. In slow mode no further
         // /sync request follows for minutes, so without this stamp the gate
@@ -1050,6 +1065,25 @@ object MatrixRepository {
         android.util.Log.d(TAG, "syncOnce took ${android.os.SystemClock.elapsedRealtime() - t0}ms ($reason)")
         Diagnostics.record("syncOnce took ${android.os.SystemClock.elapsedRealtime() - t0}ms ($reason)")
         return result
+    }
+
+    /** Delivery-health stamping: one successful round resets the failure
+     *  count and moves the last-success wall clock (persisted — the Account
+     *  line and the stall check outlive the process). */
+    private fun recordSyncRoundOk() {
+        lastSyncOkAtMs = System.currentTimeMillis()
+        consecutiveSyncFailures = 0
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()
+            ?.putLong(KEY_LAST_SYNC_OK_MS, lastSyncOkAtMs)
+            ?.putInt(KEY_SYNC_FAILURES, 0)
+            ?.apply()
+    }
+
+    private fun recordSyncRoundFailed() {
+        consecutiveSyncFailures++
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()
+            ?.putInt(KEY_SYNC_FAILURES, consecutiveSyncFailures)
+            ?.apply()
     }
 
     /** The periodic syncOnce rounds (also restarted by a push-wake — see [onPushDelivered]). */
@@ -2568,6 +2602,19 @@ object MatrixRepository {
             loginMode = prefs?.getString(KEY_LOGIN_MODE, null),
         )
     }
+
+    /** Background-delivery health for the Account screen's status line. */
+    fun deliveryHealth(): DeliveryHealth = DeliveryHealth(
+        lastSuccessfulRoundAtMs = lastSyncOkAtMs,
+        consecutiveFailures = consecutiveSyncFailures,
+        pushConnected = PushChannel.isConnected,
+    )
+
+    data class DeliveryHealth(
+        val lastSuccessfulRoundAtMs: Long,
+        val consecutiveFailures: Int,
+        val pushConnected: Boolean,
+    )
 
     fun connectionState(): com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response {
         val state = _connectionState.value
@@ -8335,6 +8382,11 @@ object MatrixRepository {
 
     @Volatile
     private var syncRoundEndedAt = 0L
+
+    @Volatile
+    private var lastSyncOkAtMs: Long = 0L
+    @Volatile
+    private var consecutiveSyncFailures: Int = 0
 
     private fun syncIngestInFlight(): Boolean = syncRoundStartedAt > syncRoundEndedAt
 

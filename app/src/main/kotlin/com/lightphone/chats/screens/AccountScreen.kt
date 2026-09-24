@@ -27,6 +27,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.R
+import com.lightphone.chats.server.MatrixRepository
+import com.lightphone.chats.server.SyncHealth
 import com.thelightphone.lp3Keyboard.ui.KeyboardOptions
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -80,6 +82,7 @@ class AccountViewModel : LightViewModel<Unit>() {
 
     val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
     val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
+    val delivery = MutableStateFlow<MatrixRepository.DeliveryHealth?>(null)
     val e2ee = MutableStateFlow<LightServiceMethod.GetE2eeState.Response?>(null)
     /**
      * Whether the e2ee verdict has settled. The first read on a cold trust
@@ -140,6 +143,7 @@ class AccountViewModel : LightViewModel<Unit>() {
             val state = ChatClient.accountState()
             account.value = state
             connection.value = ChatClient.connectionState()
+            delivery.value = ChatClient.deliveryHealth()
             val newE2ee = ChatClient.e2eeState()
             val prev = e2ee.value
             e2ee.value = newE2ee
@@ -296,6 +300,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
         val tokenLogin by viewModel.tokenLogin.collectAsState()
         val account by viewModel.account.collectAsState()
         val connection by viewModel.connection.collectAsState()
+        val delivery by viewModel.delivery.collectAsState()
         val e2ee by viewModel.e2ee.collectAsState()
         val e2eeSettled by viewModel.e2eeSettled.collectAsState()
         val verification by viewModel.verification.collectAsState()
@@ -343,6 +348,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 onClick = if (e2ee?.verified == true || !e2eeSettled) null else goVerify,
                             )
                             AccountStatus(connection = connection)
+                            DeliveryHealthLine(delivery = delivery)
                         } else {
                             // Logged out: if the session just expired, say so
                             // instead of showing a bare login form (the user
@@ -791,6 +797,24 @@ class LogoutConfirmPanel(
             }
         }
     }
+}
+
+/** Background-delivery health: last successful sync round, consecutive
+ *  failures, push-channel state. Status-only — a healthy chain is one Fine
+ *  line; failures surface as "3 failed" in the same line. */
+@Composable
+private fun DeliveryHealthLine(delivery: MatrixRepository.DeliveryHealth?) {
+    delivery ?: return
+    LightText(
+        text = SyncHealth.healthLine(
+            lastOkAtMs = delivery.lastSuccessfulRoundAtMs,
+            failures = delivery.consecutiveFailures,
+            pushConnected = delivery.pushConnected,
+            nowMs = System.currentTimeMillis(),
+        ),
+        variant = LightTextVariant.Fine,
+        modifier = Modifier.padding(top = 1.dp),
+    )
 }
 
 @Composable

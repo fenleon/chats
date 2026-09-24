@@ -175,6 +175,10 @@ object ChatClient {
     suspend fun connectionState(): LightServiceMethod.GetConnectionState.Response? =
         runCatching { MatrixRepository.connectionState() }.getOrNull()
 
+    /** Background-delivery health for the Account screen's status line. */
+    suspend fun deliveryHealth(): MatrixRepository.DeliveryHealth? =
+        runCatching { MatrixRepository.deliveryHealth() }.getOrNull()
+
     /** Pauses/resumes the sync loop (Settings → Sync, audit 2026-08-14). */
     suspend fun setSyncEnabled(enabled: Boolean): Boolean =
         runCatching { MatrixRepository.setSyncEnabled(enabled) }.isSuccess
