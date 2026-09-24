@@ -603,6 +603,11 @@ object MatrixRepository {
      *  real-message push so a burst coalesces to one syncOnce. */
     private var pushWakeJob: Job? = null
 
+    /** Pending screen-on stall-repair round (see [maybeCatchUpOnScreenOn]);
+     *  cancelled and restarted per SCREEN_ON so a wedged repair cannot run
+     *  next to a fresh one. */
+    private var stallRepairJob: Job? = null
+
     /** Screen must stay off this long before dropping to slow sync. */
     private const val SLOW_SYNC_GRACE_MS = 60_000L
 
@@ -681,7 +686,7 @@ object MatrixRepository {
 
     /** Serializes drain attempts — the check-and-set of [pushQueueDrained]
      *  and the backstop's reset-then-drain must not interleave with a drain
-     *  already in flight (two drains = two concurrent wake syncOunces). */
+     *  already in flight (two drains = two concurrent wake syncOnce). */
     private val pushQueueDrainMutex = Mutex()
 
     /** The queue lives as one JSON array in SharedPreferences — a bounded,
@@ -777,8 +782,10 @@ object MatrixRepository {
             when (intent.action) {
                 Intent.ACTION_SCREEN_ON -> {
                     // Stall repair FIRST, while syncMode still reads SLOW —
-                    // applySyncModeForScreenState() hands sync to the active
-                    // long-poll and the mode gate below would skip the round.
+                    // the receive-time gate inside must see slow mode.
+                    // applySyncModeForScreenState() below hands sync to the
+                    // active long-poll; the repair's in-coroutine re-check
+                    // then skips if the long-poll won the race.
                     maybeCatchUpOnScreenOn()
                     applySyncModeForScreenState()
                     // A message likely landed while the screen was dark — end
@@ -804,6 +811,15 @@ object MatrixRepository {
      * already re-stamps the success, and a concurrent syncOnce next to it
      * would double-consume the sync stream (the push-wake path gates the same
      * way). A wedged active long-poll stays the existing watchdog's business.
+     *
+     * Follows the push-wake single-flight shape: the launch is held in
+     * [stallRepairJob] (any previous one cancelled first), gated on
+     * `syncMode == SyncMode.SLOW` at receive time, and RE-CHECKED inside the
+     * coroutine right before [timedSyncOnce] — [applySyncModeForScreenState]
+     * runs immediately after this call in the same SCREEN_ON branch and
+     * engages the active long-poll, so the receive-time check alone does not
+     * hold through execution. If the mode changed in between, the long-poll
+     * owns sync and the repair skips silently.
      */
     private fun maybeCatchUpOnScreenOn() {
         if (!syncEnabled) return
@@ -816,7 +832,11 @@ object MatrixRepository {
             "screen-on stall repair: last ok ${System.currentTimeMillis() - lastSyncOkAtMs}ms ago (expected ≤${SyncHealth.STALL_MULTIPLIER * expected}ms)",
         )
         Diagnostics.record("screen-on stall repair: catching up")
-        scope.launch { timedSyncOnce(c, "screen-on stall repair") }
+        stallRepairJob?.cancel()
+        stallRepairJob = scope.launch {
+            if (syncMode != SyncMode.SLOW) return@launch // active long-poll owns sync now
+            timedSyncOnce(c, "screen-on stall repair")
+        }
     }
 
     /**
@@ -2663,28 +2683,39 @@ object MatrixRepository {
      * already delivering — a concurrent round would double-consume the sync
      * stream), then the durable push queue is re-checked with its
      * once-per-process flag reset, so a worker firing deep into a process's
-     * life can still re-wake a push whose catch-up never landed.
+     * life can still re-wake a push whose catch-up never landed. The forced
+     * drain runs only while slow sync owns sync — with the screen on the
+     * long-poll is delivering and a forced drain's wake could run beside it.
+     * Battery saver (sync toggle off) makes this a no-op: without the gate a
+     * slow-mode race could leave the worker re-arming a cadence battery
+     * saver explicitly stopped.
      *
      * Follows the out-of-band-syncOnce invariant ([runPushWake],
      * [enterActiveSync], the send-wake): in slow mode the rounds loop is a
-     * live timedSyncOnce caller, so it is cancelled before the round and
+     * live timedSyncOnce caller, so it — and any in-flight screen-on stall
+     * repair ([stallRepairJob]) — is cancelled before the round and
      * re-engaged afterwards — the cadence keeps running once this returns.
      */
     suspend fun backstopCatchUp(reason: String) {
+        if (!syncEnabled) return
         val c = client ?: return
         val wasSlow = syncMode == SyncMode.SLOW
         slowSyncJob?.cancel()
         slowSyncJob = null
+        stallRepairJob?.cancel()
         try {
             if (wasSlow) timedSyncOnce(c, reason)
-            drainPushQueue(forceReset = true)
+            // Slow sync owns sync: the queue's whole net. With the screen on,
+            // the active long-poll is delivering — a forced drain can fire
+            // runPushWake next to it (a drain's wake runs its own syncOnce).
+            if (wasSlow) drainPushQueue(forceReset = true)
         } finally {
             // Re-engage the cadence the way the wake pattern does: only while
-            // slow mode still owns sync and the screen is still dark (an
-            // active long-poll — or enterActiveSync — owns sync when the
-            // screen is on). Skipped when the drain's push-wake already
-            // restarted the rounds (slowSyncJob != null).
-            if (wasSlow && syncMode == SyncMode.SLOW && slowSyncJob == null &&
+            // battery saver is off, slow mode still owns sync and the screen
+            // is still dark (an active long-poll — or enterActiveSync — owns
+            // sync when the screen is on). Skipped when the drain's push-wake
+            // already restarted the rounds (slowSyncJob != null).
+            if (syncEnabled && wasSlow && syncMode == SyncMode.SLOW && slowSyncJob == null &&
                 !isScreenInteractive()
             ) {
                 slowSyncJob = startSlowSyncRounds(c)
@@ -7791,8 +7822,9 @@ object MatrixRepository {
     }
 
     /** Trixnity external-notification update id → roomId.full, so a Remove
-     *  can cancel a posted alert (cross-device read). Entries live only for
-     *  the alert's short life; the cap clears instead of growing. */
+     *  can cancel a posted alert (cross-device read). Entries live until the
+     *  cap clears the map or the process dies — not merely the alert's short
+     *  life. */
     private val externalNotificationRooms = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** Events the account's push rules suppressed (eventId → decided-at),
