@@ -2,6 +2,7 @@ package com.lightphone.chats.server
 
 import android.content.Context
 import android.util.Log
+import androidx.work.Configuration
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -54,8 +55,23 @@ class DeliveryBackstopWorker(context: Context, params: WorkerParameters) :
          * process start; KEEP freezes the spec at whatever the first install
          * enqueued. UPDATE keeps the running schedule and applies the current
          * spec — call it from every start path.
+         *
+         * WorkManager is initialized here, not by androidx.startup: the
+         * InitializationProvider is merged into the manifest but never runs
+         * in this process on LightOS, so [WorkManager.getInstance] throws
+         * until [WorkManager.initialize] has been called — the probe below
+         * makes the backstop self-sufficient (and idempotent: getInstance
+         * succeeds on later calls, so initialize is reached once).
          */
         fun ensure(context: Context) {
+            try {
+                WorkManager.getInstance(context)
+            } catch (e: IllegalStateException) {
+                WorkManager.initialize(
+                    context.applicationContext,
+                    Configuration.Builder().build(),
+                )
+            }
             val request = PeriodicWorkRequestBuilder<DeliveryBackstopWorker>(PERIOD_MINUTES, TimeUnit.MINUTES)
                 .setConstraints(
                     // The only constraint: no network, no point waking.
