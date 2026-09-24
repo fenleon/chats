@@ -3,6 +3,7 @@ package com.lightphone.chats
 import com.lightphone.chats.server.ChatsClipboard
 import com.lightphone.chats.server.Diagnostics
 import com.lightphone.chats.server.MatrixRepository
+import com.lightphone.chats.Snapshots
 import com.thelightphone.sdk.callRemoteServiceMethod
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.getOrNull
@@ -28,6 +29,7 @@ object ChatClient {
         runCatching {
             MatrixRepository.loginAsUnit(homeserver, user, passwordOrToken, tokenLogin).getOrThrow()
             clearThreadCaches()
+            Snapshots.clearAll()
             LightServiceMethod.SetAccount.Response(
                 userId = MatrixRepository.lastLoginUserId ?: "",
                 deviceId = MatrixRepository.lastLoginDeviceId ?: "",
@@ -47,6 +49,7 @@ object ChatClient {
     suspend fun beeperLogin(email: String, code: String): Result<LightServiceMethod.SetBeeperAccount.Response> =
         MatrixRepository.beeperLoginAsUnit(email, code).mapCatching { _ ->
             clearThreadCaches()
+            Snapshots.clearAll()
             LightServiceMethod.SetBeeperAccount.Response(
                 userId = MatrixRepository.lastLoginUserId ?: "",
                 deviceId = MatrixRepository.lastLoginDeviceId ?: "",
@@ -62,6 +65,7 @@ object ChatClient {
             runCatching { MatrixRepository.logout() }
         } finally {
             clearThreadCaches()
+            Snapshots.clearAll()
         }
     }
 

@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
+import com.lightphone.chats.Snapshots
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.formatRelativeTimestamp
 import com.lightphone.chats.server.MatrixRepository
@@ -207,6 +208,30 @@ class ChatListViewModel : LightViewModel<Unit>() {
     private var refreshJob: Job? = null
     private var pollJob: Job? = null
 
+    /**
+     * True while [rooms] holds the disk-snapshot seed (replaced by the first
+     * settled fetch result). A quiet refresh racing the restore can serve an
+     * empty page while the cold room cache warms — dropping the painted
+     * snapshot rows for it would flash the list empty, so empty results only
+     * replace painted rooms once the account is settled (logged out / expired).
+     */
+    private var showingSnapshotRooms = false
+
+    /**
+     * Called once from createViewModel, before the first frame: seeds [rooms]
+     * from the last-known disk snapshot so cold start paints the previous
+     * list immediately. The snapshot is account-tagged; [refresh] reconciles
+     * the tag against the live account at its first account state.
+     */
+    fun seedRoomsFromSnapshot(filesDir: java.io.File) {
+        Snapshots.init(filesDir)
+        val seeded = Snapshots.seedRooms()
+        if (seeded.isNotEmpty()) {
+            rooms.value = seeded
+            showingSnapshotRooms = true
+        }
+    }
+
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
         // No thread is on screen here; let the companion notify again.
@@ -291,7 +316,30 @@ class ChatListViewModel : LightViewModel<Unit>() {
                     if (account?.loggedIn == true) result = ChatClient.getRooms()
                 }
                 this@ChatListViewModel.account.value = account
-                rooms.value = result
+                // Snapshot/account reconciliation: the snapshot is tagged with
+                // the account it was saved under. A mismatch means the process
+                // died between an account switch and the snapshot clear — the
+                // painted rows belong to a different account; drop them now
+                // that the live identity is known.
+                val seededUser = Snapshots.seededRoomsUserId
+                if (showingSnapshotRooms && seededUser != null &&
+                    account?.userId != null && account.userId != seededUser
+                ) {
+                    showingSnapshotRooms = false
+                    rooms.value = emptyList()
+                    Snapshots.clearAll()
+                }
+                if (result.isNotEmpty()) {
+                    rooms.value = result
+                    showingSnapshotRooms = false
+                    // Persist the last-known list (content-deduped inside):
+                    // the next cold start paints it before the first fetch.
+                    Snapshots.saveRooms(account?.userId, result)
+                } else if (!showingSnapshotRooms || account?.loggedIn != true) {
+                    // Keep the painted snapshot rows over an empty result while
+                    // the account is still settling (see [showingSnapshotRooms]).
+                    rooms.value = result
+                }
                 this@ChatListViewModel.connection.value = connection
                 // POST_NOTIFICATIONS stays denied until requested at runtime
                 // (targetSdk 33+ — a fresh install never prompts on its own),
@@ -366,7 +414,8 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
     override val viewModelClass: Class<ChatListViewModel>
         get() = ChatListViewModel::class.java
 
-    override fun createViewModel(): ChatListViewModel = ChatListViewModel()
+    override fun createViewModel(): ChatListViewModel =
+        ChatListViewModel().also { it.seedRoomsFromSnapshot(lightContext.filesDir) }
 
     /** For consume-once launch-extras (notification-tap handoff). */
     private val activityRef = sealedActivity

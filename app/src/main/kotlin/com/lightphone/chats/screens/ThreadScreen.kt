@@ -2039,8 +2039,9 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
 /** Consecutive same-sender messages closer than this share one timestamp. */
 private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
 /** Grace before the "Loading messages…" placeholder shows — a warm-store
- *  serve paints faster than this; showing the text for it is a flash. */
-private const val LOADING_TEXT_GRACE_MS = 300L
+ *  serve paints faster than this; showing the text for it is a flash.
+ *  Shared with the list's restore-text grace (same window, same rationale). */
+internal const val LOADING_TEXT_GRACE_MS = 300L
 
 /** One-line excerpt of a reply target's body for an optimistic row's header
  *  (the sync echo re-resolves it server-side): the first non-empty line,
