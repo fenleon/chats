@@ -16,9 +16,12 @@ object SyncHealth {
      *  on purpose — normal system deferral must not read as a fault. */
     const val STALL_MULTIPLIER = 3
 
-    /** The account's push rules decided this event must not alert
-     *  (dont_notify, mention-only without a mention, …). */
-    fun shouldSuppress(actions: Set<PushAction>): Boolean = PushAction.Notify !in actions
+    /** The account's push rules decided this event must not alert. `null`
+     *  means no rule matched or the matching rule lacks Notify — per the
+     *  Matrix spec both mean don't alert (mention-only without a mention,
+     *  a room rule with `actions: []`, …). */
+    fun shouldSuppress(actions: Set<PushAction>?): Boolean =
+        actions == null || PushAction.Notify !in actions
 
     /** True when the sync chain looks dead: never succeeded (0), the clock
      *  went backwards (negative elapsed), or the last success is more than

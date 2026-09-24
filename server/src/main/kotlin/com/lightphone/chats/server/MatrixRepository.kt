@@ -92,10 +92,12 @@ import de.connect2x.trixnity.core.subscribeAsFlow
 import de.connect2x.trixnity.core.model.events.MessageEventContent
 import de.connect2x.trixnity.core.model.events.RoomAccountDataEventContent
 import de.connect2x.trixnity.core.model.events.m.PushRulesEventContent
+import de.connect2x.trixnity.core.MSC4354
 import de.connect2x.trixnity.core.model.events.m.ReceiptEventContent
 import de.connect2x.trixnity.core.model.events.m.TagEventContent
 import de.connect2x.trixnity.core.model.push.PushAction
 import de.connect2x.trixnity.core.model.push.PushRuleKind
+import de.connect2x.trixnity.core.model.push.toList
 import de.connect2x.trixnity.core.serialization.events.EventContentSerializerMappings
 import de.connect2x.trixnity.core.serialization.events.UnknownEventContentSerializer
 import de.connect2x.trixnity.core.serialization.events.default
@@ -120,6 +122,7 @@ import de.connect2x.trixnity.client.key.OutgoingRoomKeyRequestEventHandler
 import de.connect2x.trixnity.client.media.MediaService
 import de.connect2x.trixnity.client.media.MediaStore
 import de.connect2x.trixnity.client.media.okio.okio
+import de.connect2x.trixnity.client.notification.EvaluatePushRules
 import de.connect2x.trixnity.client.notification.NotificationUpdate
 import de.connect2x.trixnity.client.notification
 import de.connect2x.trixnity.client.room
@@ -191,6 +194,7 @@ import de.connect2x.trixnity.core.model.events.m.space.ChildEventContent
 import de.connect2x.trixnity.core.model.events.m.secretstorage.DefaultSecretKeyEventContent
 import de.connect2x.trixnity.core.model.events.m.secretstorage.SecretKeyEventContent
 import de.connect2x.trixnity.core.model.events.ClientEvent
+import de.connect2x.trixnity.core.model.events.mergeContentOrNull
 import de.connect2x.trixnity.core.model.events.RedactedEventContent
 import de.connect2x.trixnity.core.model.events.UnknownEventContent
 import de.connect2x.trixnity.core.subscribeEventList
@@ -7826,27 +7830,20 @@ object MatrixRepository {
      *  cap clears the map or the process dies — not merely the alert's short
      *  life. */
     private val externalNotificationRooms = java.util.concurrent.ConcurrentHashMap<String, String>()
-
-    /** Events the account's push rules suppressed (eventId → decided-at),
-     *  consulted by [notifyForEvent]. Process death clears it — the next
-     *  round's stream re-decides, and the hand-rolled rule read stays. */
-    private val externalSuppressedEvents = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private const val EXTERNAL_NOTIFICATION_MAP_MAX = 256
 
     /** Records one external-notification New/Update: the room (for a later
-     *  Remove) and, when the rules suppress this event, the suppression. */
+     *  Remove). The stream carries no suppression signal — Trixnity only
+     *  emits Notify-worthy events (EvaluatePushRules skips the rest), so
+     *  suppression is evaluated directly in [notifyForEvent]. */
     private fun rememberExternalNotification(
         updateId: String,
-        actions: Set<PushAction>,
         content: NotificationUpdate.Content,
     ) {
         val te = (content as? NotificationUpdate.Content.Message)?.timelineEvent
-        if (externalNotificationRooms.size >= EXTERNAL_NOTIFICATION_MAP_MAX) externalNotificationRooms.clear()
-        if (te != null) externalNotificationRooms[updateId] = te.event.roomId.full
-        if (te != null && SyncHealth.shouldSuppress(actions)) {
-            if (externalSuppressedEvents.size >= EXTERNAL_NOTIFICATION_MAP_MAX) externalSuppressedEvents.clear()
-            externalSuppressedEvents[te.event.id.full] = System.currentTimeMillis()
-            android.util.Log.d(TAG, "external notification: rules suppress ${te.event.id.full}")
+        if (te != null) {
+            if (externalNotificationRooms.size >= EXTERNAL_NOTIFICATION_MAP_MAX) externalNotificationRooms.clear()
+            externalNotificationRooms[updateId] = te.event.roomId.full
         }
     }
 
@@ -7893,13 +7890,14 @@ object MatrixRepository {
                     .get(PushRulesEventContent::class).collect { invalidateAllRoomFlags() }
             }
             // External-notification stream (enableExternalNotifications — see
-            // [clientConfiguration]): the account's push rules, evaluated by
-            // Trixnity. New/Update without a Notify action = the rules mute
-            // this event (room-level dont_notify is only the common case;
-            // mention-only without a mention is the new coverage). Remove =
-            // the event was read on this phone or elsewhere — cancel the
-            // posted alert. Ambiguous updates (no message content) change
-            // nothing: [isRoomMutedByPushRule] stays the fallback.
+            // [clientConfiguration]): the account's push rules as evaluated by
+            // Trixnity — the stream ONLY carries Notify-worthy events (its
+            // evaluator skips suppressed ones), so it signals nothing about
+            // muting; [notifyForEvent] evaluates the rules directly instead.
+            // New/Update record the event's room so a later Remove can find
+            // it; Remove = the event was read on this phone or elsewhere —
+            // cancel the posted alert (cross-device read). Ambiguous updates
+            // (no message content) change nothing.
             watch("external-notification collector ended") {
                 c.notification.getAllUpdates().collect { update ->
                     when (update) {
@@ -7909,9 +7907,9 @@ object MatrixRepository {
                             appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
                         }
                         is NotificationUpdate.New ->
-                            rememberExternalNotification(update.id, update.actions, update.content)
+                            rememberExternalNotification(update.id, update.content)
                         is NotificationUpdate.Update ->
-                            rememberExternalNotification(update.id, update.actions, update.content)
+                            rememberExternalNotification(update.id, update.content)
                     }
                 }
             }
@@ -8197,15 +8195,6 @@ object MatrixRepository {
             android.util.Log.d(TAG, "notifyForEvent: skipping muted (cold-cache read) room $roomId")
             return
         }
-        // Trixnity's push-rule evaluation (external notifications) decided
-        // this event must not alert — a mention-only room without a mention,
-        // or a server-side rule change the local rules cache hasn't caught up
-        // with. Absent entry = the stream hasn't spoken for this event (race
-        // or ambiguity) — the checks above still decide, as before.
-        if (externalSuppressedEvents.containsKey(eventId)) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping push-rule-suppressed event $eventId in $roomId")
-            return
-        }
         // Wait briefly for decryption so the preview shows the real text (the
         // raw m.room.encrypted payload resolves within milliseconds for live
         // events once the megolm session is in the store).
@@ -8214,6 +8203,34 @@ object MatrixRepository {
                 it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
             }
         } ?: return
+        // The account's push rules, evaluated directly with Trixnity's own
+        // evaluator (the external-notification stream never reports
+        // suppression — it only emits Notify-worthy events). Evaluated on the
+        // DECRYPTED event, the same shape Trixnity's pipeline feeds it
+        // (mergedEvent): rules match on plaintext (msgtype, mentions), and the
+        // raw event would stay m.room.encrypted and never match. No matching
+        // rule or a match without Notify means the rules say don't alert (a
+        // room rule with `actions: []`, mention-only without a mention, …) —
+        // an undecryptable event suppresses the same way (no preview would
+        // notify anyway). Resolution/evaluation failure does NOT suppress —
+        // the checks above still decide, as before (fail open).
+        @OptIn(MSC4354::class)
+        val evaluationEvent =
+            te.content?.getOrNull()?.let { te.event.mergeContentOrNull(it) } ?: te.event
+        val rulesDecision = try {
+            val allRules = c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
+                .get(PushRulesEventContent::class).first()?.content?.global?.toList().orEmpty()
+            SyncHealth.shouldSuppress(
+                c.di.get<EvaluatePushRules>(EvaluatePushRules::class)(evaluationEvent, allRules),
+            )
+        } catch (e: Exception) {
+            android.util.Log.d(TAG, "notifyForEvent: push-rule evaluation failed (${e.message}) — not suppressing")
+            false
+        }
+        if (rulesDecision) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping push-rule-suppressed event $eventId in $roomId")
+            return
+        }
         // Beeper re-imports old media as m.replace edits — each used to surface
         // as a fresh image row + notification. Matrix semantics: an edit
         // replaces its target, never a new message. Don't notify.
@@ -10145,10 +10162,13 @@ object MatrixRepository {
         // Push-rule-driven notifications (BrightChat BeeperEngine.kt): Trixnity
         // evaluates the account's server-side push rules and streams
         // [NotificationUpdate]s to the external-notification collector in
-        // [observeNotifications]. Mute / mention-only come from the account's
-        // own rules (changeable on any device), and Remove clears an alert the
-        // user read elsewhere — our biggest notification gap. Posting stays
-        // with [notifyForEvent]; the stream only suppresses and cancels.
+        // [observeNotifications]. The stream only carries Notify-worthy events
+        // (its evaluator skips suppressed ones), so it is used for the
+        // cross-device Remove only — the rules' suppression decision is
+        // evaluated directly in [notifyForEvent] ([EvaluatePushRules]). Mute /
+        // mention-only come from the account's own rules (changeable on any
+        // device) — our biggest notification gap. Posting stays with
+        // [notifyForEvent]; the stream only cancels.
         enableExternalNotifications = true
     }
 

@@ -8,7 +8,7 @@ import kotlin.test.assertTrue
 
 class SyncHealthTest {
 
-    // --- shouldSuppress (push-rule decision, Trixnity external notifications) ---
+    // --- shouldSuppress (push-rule decision, direct evaluation in notifyForEvent) ---
 
     @Test
     fun `no Notify action means the rules suppress the event`() {
@@ -18,6 +18,11 @@ class SyncHealthTest {
     @Test
     fun `Notify action means the event may alert`() {
         assertFalse(SyncHealth.shouldSuppress(setOf(PushAction.Notify)))
+    }
+
+    @Test
+    fun `null result means the rules say don't alert`() {
+        assertTrue(SyncHealth.shouldSuppress(null))
     }
 
     // --- isStalled (screen-on stall repair, BrightChat PollAlarm heuristic) ---
