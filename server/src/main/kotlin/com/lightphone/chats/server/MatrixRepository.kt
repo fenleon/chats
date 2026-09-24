@@ -120,6 +120,7 @@ import de.connect2x.trixnity.client.key.OutgoingRoomKeyRequestEventHandler
 import de.connect2x.trixnity.client.media.MediaService
 import de.connect2x.trixnity.client.media.MediaStore
 import de.connect2x.trixnity.client.media.okio.okio
+import de.connect2x.trixnity.client.notification.NotificationUpdate
 import de.connect2x.trixnity.client.notification
 import de.connect2x.trixnity.client.room
 import de.connect2x.trixnity.client.room.GetTimelineEventConfig
@@ -7666,6 +7667,34 @@ object MatrixRepository {
             ?.edit()?.putString(KEY_LAST_NOTIFIED_PREFIX + roomKey, eventId)?.apply()
     }
 
+    /** Trixnity external-notification update id → roomId.full, so a Remove
+     *  can cancel a posted alert (cross-device read). Entries live only for
+     *  the alert's short life; the cap clears instead of growing. */
+    private val externalNotificationRooms = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Events the account's push rules suppressed (eventId → decided-at),
+     *  consulted by [notifyForEvent]. Process death clears it — the next
+     *  round's stream re-decides, and the hand-rolled rule read stays. */
+    private val externalSuppressedEvents = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private const val EXTERNAL_NOTIFICATION_MAP_MAX = 256
+
+    /** Records one external-notification New/Update: the room (for a later
+     *  Remove) and, when the rules suppress this event, the suppression. */
+    private fun rememberExternalNotification(
+        updateId: String,
+        actions: Set<PushAction>,
+        content: NotificationUpdate.Content,
+    ) {
+        val te = (content as? NotificationUpdate.Content.Message)?.timelineEvent
+        if (externalNotificationRooms.size >= EXTERNAL_NOTIFICATION_MAP_MAX) externalNotificationRooms.clear()
+        if (te != null) externalNotificationRooms[updateId] = te.event.roomId.full
+        if (te != null && SyncHealth.shouldSuppress(actions)) {
+            if (externalSuppressedEvents.size >= EXTERNAL_NOTIFICATION_MAP_MAX) externalSuppressedEvents.clear()
+            externalSuppressedEvents[te.event.id.full] = System.currentTimeMillis()
+            android.util.Log.d(TAG, "external notification: rules suppress ${te.event.id.full}")
+        }
+    }
+
     /** Read marker this device last sent for [roomKey] ([markRead]), persisted
      *  across process restarts. The background sync filter drops m.receipt
      *  echoes, so the store's own receipt can't prove "already read" at a later
@@ -7707,6 +7736,29 @@ object MatrixRepository {
             watch("flag watcher: push-rule collector ended") {
                 c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
                     .get(PushRulesEventContent::class).collect { invalidateAllRoomFlags() }
+            }
+            // External-notification stream (enableExternalNotifications — see
+            // [clientConfiguration]): the account's push rules, evaluated by
+            // Trixnity. New/Update without a Notify action = the rules mute
+            // this event (room-level dont_notify is only the common case;
+            // mention-only without a mention is the new coverage). Remove =
+            // the event was read on this phone or elsewhere — cancel the
+            // posted alert. Ambiguous updates (no message content) change
+            // nothing: [isRoomMutedByPushRule] stays the fallback.
+            watch("external-notification collector ended") {
+                c.notification.getAllUpdates().collect { update ->
+                    when (update) {
+                        is NotificationUpdate.Remove -> {
+                            val roomId = externalNotificationRooms.remove(update.id) ?: return@collect
+                            android.util.Log.d(TAG, "external notification: remove — cancel alert for $roomId")
+                            appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
+                        }
+                        is NotificationUpdate.New ->
+                            rememberExternalNotification(update.id, update.actions, update.content)
+                        is NotificationUpdate.Update ->
+                            rememberExternalNotification(update.id, update.actions, update.content)
+                    }
+                }
             }
             // Settle flags (first-message ping drop fix): a room whose
             // newest message is already unread when its collector starts — or whose
@@ -7988,6 +8040,15 @@ object MatrixRepository {
         // GET per event, and an archived room's unread event is rare.
         if (flags == null && isRoomMutedByPushRule(c, roomId.full)) {
             android.util.Log.d(TAG, "notifyForEvent: skipping muted (cold-cache read) room $roomId")
+            return
+        }
+        // Trixnity's push-rule evaluation (external notifications) decided
+        // this event must not alert — a mention-only room without a mention,
+        // or a server-side rule change the local rules cache hasn't caught up
+        // with. Absent entry = the stream hasn't spoken for this event (race
+        // or ambiguity) — the checks above still decide, as before.
+        if (externalSuppressedEvents.containsKey(eventId)) {
+            android.util.Log.d(TAG, "notifyForEvent: skipping push-rule-suppressed event $eventId in $roomId")
             return
         }
         // Wait briefly for decryption so the preview shows the real text (the
@@ -9921,6 +9982,14 @@ object MatrixRepository {
             val isMessage = content is RoomMessageEventContent || content is EncryptedMessageEventContent
             (!isReplace) && isMessage
         }
+        // Push-rule-driven notifications (BrightChat BeeperEngine.kt): Trixnity
+        // evaluates the account's server-side push rules and streams
+        // [NotificationUpdate]s to the external-notification collector in
+        // [observeNotifications]. Mute / mention-only come from the account's
+        // own rules (changeable on any device), and Remove clears an alert the
+        // user read elsewhere — our biggest notification gap. Posting stays
+        // with [notifyForEvent]; the stream only suppresses and cancels.
+        enableExternalNotifications = true
     }
 
     /**
