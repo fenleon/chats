@@ -2,6 +2,7 @@ package com.lightphone.chats.server
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -97,7 +98,7 @@ private fun DevScreen() {
     //   --es password alicepass [--es sendTo <roomId> --es sendBody <text>]
     // Push cleanup: --es pushclear 1 removes the pusher + config (chats/push/README.md).
     // Runs even when a session is restored, so the send can use the existing client.
-    val launchExtras = (LocalContext.current as? MainActivity)?.intent?.extras
+    val launchExtras = (LocalActivity.current as? MainActivity)?.intent?.extras
     val devContext = LocalContext.current
     LaunchedEffect(Unit) {
         if (launchExtras?.getString("homeserver") != null) {

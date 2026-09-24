@@ -1,6 +1,7 @@
 package com.lightphone.chats.server
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.media.MediaRecorder
 import android.os.Bundle
@@ -320,6 +321,7 @@ class VoiceNoteActivity : ComponentActivity() {
      * the in-app volume panel replica — the native LightOS panel is ringer-only
      * for third-party tools.
      */
+    @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
         val volumeKey = event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
             event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
