@@ -50,6 +50,7 @@ import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
 import com.lightphone.chats.MediaLoader
+import com.lightphone.chats.Snapshots
 import com.lightphone.chats.server.VolumePanelOverlay
 import com.lightphone.chats.server.VolumePanelState
 import com.lightphone.chats.contactIdentifier
@@ -220,6 +221,20 @@ class ThreadViewModel(
      * A bounded snapshot seeds reopens; active pagination remains view-model-owned.
      */
     val messages = MutableStateFlow(retainedThread?.messages.orEmpty())
+
+    /**
+     * Seeds [messages] from the disk snapshot (process-restart reopen: the
+     * in-process retained thread already seeded the constructor). Called
+     * synchronously from createViewModel — the first frame paints the last
+     * known page and the fetch refreshes it through the normal merge. Empty
+     * when no snapshot exists: the grace/loading state covers the fetch.
+     */
+    fun seedThreadFromSnapshot() {
+        if (messages.value.isNotEmpty()) return
+        val seeded = Snapshots.seedThread(room.id)
+        if (seeded.isNotEmpty()) messages.value = seeded
+    }
+
     val loading = MutableStateFlow(true)
     val loadingMore = MutableStateFlow(false)
     val hasMore = MutableStateFlow(false)
@@ -507,6 +522,9 @@ class ThreadViewModel(
     private fun retainThread() {
         if (caches.isCurrent()) {
             caches.threads.save(room.id, messages.value, savedScrollIndex to savedScrollOffset)
+            // Hide/pause is where a process death would strike; refresh the
+            // disk snapshot with the live rows (content-deduped inside).
+            Snapshots.saveThread(MatrixRepository.lastLoginUserId, room.id, messages.value)
         }
     }
 
@@ -568,11 +586,14 @@ class ThreadViewModel(
                 // background seed bumps nothing (the cold open's seed failure
                 // path), so the collector above would wait forever. If the
                 // spinner state is still up after one retry window, fire ONE
-                // quiet loadNewest — the flag keeps it from looping.
+                // quiet loadNewest — the flag keeps it from looping. The
+                // pendingSeed flag itself stays up through the retry fetch
+                // (loadNewest clears it once the retry lands): clearing it
+                // here would render "No messages yet." for the retry's
+                // in-flight window — blank beats a lie.
                 delay(PENDING_SEED_RETRY_MS)
                 if (pendingSeed.value && messages.value.isEmpty() && !pendingSeedRetryFired) {
                     pendingSeedRetryFired = true
-                    pendingSeed.value = false
                     loadNewest(quiet = true)
                 }
             }
@@ -647,6 +668,13 @@ class ThreadViewModel(
                     // [loadOlder] owns the cursor and a refresh must not drag it
                     // back up into the newest window.
                     if (!pagedOlder) olderCursor = page?.nextBeforeEventId
+                }
+                // A successful non-empty serve updates the disk snapshot
+                // (content-deduped inside — a quiet open rewrites nothing), so
+                // the room's last-known page paints instantly after a process
+                // death.
+                if (loaded.isNotEmpty()) {
+                    Snapshots.saveThread(MatrixRepository.lastLoginUserId, room.id, messages.value)
                 }
             } finally {
                 // A binder exception mid-fetch must not leave the thread stuck on
@@ -1415,7 +1443,11 @@ class ThreadScreen(
     override val viewModelClass: Class<ThreadViewModel>
         get() = ThreadViewModel::class.java
 
-    override fun createViewModel(): ThreadViewModel = ThreadViewModel(room)
+    override fun createViewModel(): ThreadViewModel =
+        ThreadViewModel(room).also {
+            Snapshots.init(lightContext.filesDir)
+            it.seedThreadFromSnapshot()
+        }
 
     @Composable
     override fun Content() {
@@ -1619,10 +1651,14 @@ class ThreadScreen(
                 )
                 Box(modifier = Modifier.weight(1f)) {
                     when {
-                        // A pending-seed empty serve (warm store still
-                        // filling) keeps the loading state — "No messages
-                        // yet." only when the serve genuinely returned empty.
-                        messages.isEmpty() && showLoadingText && (loading || pendingSeed) -> StatusText("Loading messages…")
+                        // Serve still in flight (loading or pending-seed): the
+                        // grace window paints nothing; past the grace the
+                        // loading text shows. "No messages yet." must never
+                        // render here — the serve can still land rows or retry.
+                        messages.isEmpty() && (loading || pendingSeed) && showLoadingText -> StatusText("Loading messages…")
+                        // Grace window: no placeholder at all (blank beats a
+                        // false "No messages yet." flash while the fetch runs).
+                        messages.isEmpty() && (loading || pendingSeed) -> {}
                         // An encrypted room whose content can't be decrypted
                         // returns an empty page — say why instead of "No
                         // messages yet." (the text differs: unverified device
@@ -1630,6 +1666,9 @@ class ThreadScreen(
                         needsDecryptionNotice && messages.isEmpty() -> StatusText(
                             if (e2eeVerified == false) DECRYPTION_NOTICE else DECRYPTION_NOTICE_KEYS_PENDING
                         )
+                        // Genuinely settled empty: the serve completed (and the
+                        // pending-seed backstop, if it ran, landed) with no
+                        // rows, and no snapshot seed existed to paint instead.
                         messages.isEmpty() -> StatusText("No messages yet.")
                         else -> Column(modifier = Modifier.fillMaxSize()) {
                             if (needsDecryptionNotice) DecryptionNotice(
