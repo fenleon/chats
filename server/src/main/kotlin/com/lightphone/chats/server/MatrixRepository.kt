@@ -8212,8 +8212,11 @@ object MatrixRepository {
         // rule or a match without Notify means the rules say don't alert (a
         // room rule with `actions: []`, mention-only without a mention, …) —
         // an undecryptable event suppresses the same way (no preview would
-        // notify anyway). Resolution/evaluation failure does NOT suppress —
-        // the checks above still decide, as before (fail open).
+        // notify anyway) — in practice unreachable, since the decrypt-wait
+        // filter above only passes events with resolved (or unencrypted)
+        // content; suppressing is the safe fallback. Resolution/evaluation
+        // failure does NOT suppress — the checks above still decide, as
+        // before (fail open).
         @OptIn(MSC4354::class)
         val evaluationEvent =
             te.content?.getOrNull()?.let { te.event.mergeContentOrNull(it) } ?: te.event
@@ -8224,7 +8227,7 @@ object MatrixRepository {
                 c.di.get<EvaluatePushRules>(EvaluatePushRules::class)(evaluationEvent, allRules),
             )
         } catch (e: Exception) {
-            android.util.Log.d(TAG, "notifyForEvent: push-rule evaluation failed (${e.message}) — not suppressing")
+            android.util.Log.d(TAG, "notifyForEvent: push-rule evaluation failed (${e::class.java.simpleName}) — not suppressing")
             false
         }
         if (rulesDecision) {
