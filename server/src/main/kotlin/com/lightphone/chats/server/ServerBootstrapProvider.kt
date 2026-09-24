@@ -145,9 +145,13 @@ class ServerBootstrapProvider : ContentProvider() {
         // Restores a stored session (if any) and starts the sync service.
         MatrixRepository.init(context)
         // Independent delivery backstop (WorkManager): scheduled at every
-        // process start with UPDATE policy so the spec stays fresh; a
-        // rebooted LP3 with no process gets the chain back when the first
-        // provider run happens (and BootReceiver restarts the FGS directly).
+        // process start with UPDATE policy so the spec stays fresh. This
+        // enqueue is best-effort at boot: WorkManager's androidx.startup
+        // InitializationProvider may initialize after this provider runs, in
+        // which case the enqueue here is a silent no-op — the service-path
+        // re-arm (ChatSyncService.onCreate) covers a restarted process, and
+        // previously enqueued periodic work persists across reboots in
+        // JobScheduler. BootReceiver restarts the FGS directly.
         runCatching { DeliveryBackstopWorker.ensure(context) }
         return true
     }

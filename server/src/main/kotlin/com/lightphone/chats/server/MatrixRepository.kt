@@ -679,6 +679,11 @@ object MatrixRepository {
     @Volatile
     private var pushQueueDrained = false
 
+    /** Serializes drain attempts — the check-and-set of [pushQueueDrained]
+     *  and the backstop's reset-then-drain must not interleave with a drain
+     *  already in flight (two drains = two concurrent wake syncOunces). */
+    private val pushQueueDrainMutex = Mutex()
+
     /** The queue lives as one JSON array in SharedPreferences — a bounded,
      *  ids-only file. */
     private fun loadPushQueue(): List<QueuedPush> =
@@ -721,21 +726,23 @@ object MatrixRepository {
      * wake covers the whole queue: the syncOnce runs to the present, so
      * everything queued before it landed too.
      */
-    private suspend fun drainPushQueue() {
-        if (pushQueueDrained) return
-        val c = client ?: return
-        pushQueueDrained = true
-        val pending = loadPushQueue()
-        val missing = pending.firstOrNull { !isEventStored(c, it.roomId, it.eventId) }
-        if (missing == null) {
-            if (pending.isNotEmpty()) clearPushQueue()
-            return
+    private suspend fun drainPushQueue(forceReset: Boolean = false) {
+        pushQueueDrainMutex.withLock {
+            if (!forceReset && pushQueueDrained) return
+            val c = client ?: return
+            pushQueueDrained = true
+            val pending = loadPushQueue()
+            val missing = pending.firstOrNull { !isEventStored(c, it.roomId, it.eventId) }
+            if (missing == null) {
+                if (pending.isNotEmpty()) clearPushQueue()
+                return
+            }
+            android.util.Log.i(TAG, "push queue: ${pending.size} pending — catching up")
+            runPushWake(c, missing.eventId, missing.roomId) // clears the queue when caught up
+            // Fallback rounds own anything the wake couldn't reach; keeping the
+            // ids would only re-wake on stale evidence (the age bound caps both).
+            clearPushQueue()
         }
-        android.util.Log.i(TAG, "push queue: ${pending.size} pending — catching up")
-        runPushWake(c, missing.eventId, missing.roomId) // clears the queue when caught up
-        // Fallback rounds own anything the wake couldn't reach; keeping the
-        // ids would only re-wake on stale evidence (the age bound caps both).
-        clearPushQueue()
     }
 
 
@@ -2657,12 +2664,32 @@ object MatrixRepository {
      * stream), then the durable push queue is re-checked with its
      * once-per-process flag reset, so a worker firing deep into a process's
      * life can still re-wake a push whose catch-up never landed.
+     *
+     * Follows the out-of-band-syncOnce invariant ([runPushWake],
+     * [enterActiveSync], the send-wake): in slow mode the rounds loop is a
+     * live timedSyncOnce caller, so it is cancelled before the round and
+     * re-engaged afterwards — the cadence keeps running once this returns.
      */
     suspend fun backstopCatchUp(reason: String) {
         val c = client ?: return
-        if (syncMode == SyncMode.SLOW) timedSyncOnce(c, reason)
-        pushQueueDrained = false
-        drainPushQueue()
+        val wasSlow = syncMode == SyncMode.SLOW
+        slowSyncJob?.cancel()
+        slowSyncJob = null
+        try {
+            if (wasSlow) timedSyncOnce(c, reason)
+            drainPushQueue(forceReset = true)
+        } finally {
+            // Re-engage the cadence the way the wake pattern does: only while
+            // slow mode still owns sync and the screen is still dark (an
+            // active long-poll — or enterActiveSync — owns sync when the
+            // screen is on). Skipped when the drain's push-wake already
+            // restarted the rounds (slowSyncJob != null).
+            if (wasSlow && syncMode == SyncMode.SLOW && slowSyncJob == null &&
+                !isScreenInteractive()
+            ) {
+                slowSyncJob = startSlowSyncRounds(c)
+            }
+        }
     }
 
     fun connectionState(): com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response {
