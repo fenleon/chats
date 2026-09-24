@@ -1435,6 +1435,21 @@ class ThreadScreen(
         val pausedPositionMs by viewModel.pausedPositionMs.collectAsState()
         val voiceError by viewModel.voiceError.collectAsState()
         val reactionError by viewModel.reactionError.collectAsState()
+        // The "Loading messages…" placeholder only earns its pixels when the
+        // serve is genuinely slow: a warm-store read paints in well under
+        // this window, and flashing the text for it reads as jank. Quick
+        // opens render silent; slow ones (cold room, store filling) still
+        // get the indicator after the grace period.
+        var showLoadingText by remember { mutableStateOf(false) }
+        val waitingForFirstPage = messages.isEmpty() && (loading || pendingSeed)
+        LaunchedEffect(waitingForFirstPage) {
+            if (waitingForFirstPage) {
+                delay(LOADING_TEXT_GRACE_MS)
+                showLoadingText = true
+            } else {
+                showLoadingText = false
+            }
+        }
         // Context window: the long-pressed message
         // (null = the panel is hidden). Own rows (EDIT / UNSEND) park their
         // target here for the confirm panel.
@@ -1607,7 +1622,7 @@ class ThreadScreen(
                         // A pending-seed empty serve (warm store still
                         // filling) keeps the loading state — "No messages
                         // yet." only when the serve genuinely returned empty.
-                        messages.isEmpty() && (loading || pendingSeed) -> StatusText("Loading messages…")
+                        messages.isEmpty() && showLoadingText && (loading || pendingSeed) -> StatusText("Loading messages…")
                         // An encrypted room whose content can't be decrypted
                         // returns an empty page — say why instead of "No
                         // messages yet." (the text differs: unverified device
@@ -2023,6 +2038,9 @@ private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Messag
 
 /** Consecutive same-sender messages closer than this share one timestamp. */
 private const val GROUP_WINDOW_MS = 15 * 60 * 1000L
+/** Grace before the "Loading messages…" placeholder shows — a warm-store
+ *  serve paints faster than this; showing the text for it is a flash. */
+private const val LOADING_TEXT_GRACE_MS = 300L
 
 /** One-line excerpt of a reply target's body for an optimistic row's header
  *  (the sync echo re-resolves it server-side): the first non-empty line,
