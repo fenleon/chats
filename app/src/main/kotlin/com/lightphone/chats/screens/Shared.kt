@@ -9,6 +9,7 @@ import com.lightphone.chats.server.MatrixRepository
 import com.thelightphone.sdk.ui.LocalHapticsEnabled
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
@@ -61,5 +62,11 @@ fun CoroutineScope.toggleAndPersist(
 ) {
     val next = !flow.value
     flow.value = next
-    roomId()?.let { id -> launch { persist(id, next) } }
+    roomId()?.let { id ->
+        // NonCancellable: the persist must survive the screen going away —
+        // leaving the panel right after the tap cancelled the PUT mid-flight
+        // and the failure handler reverted the optimistic flip (the
+        // "archive did nothing" report; unarchive LP3 2026-09-28).
+        launch(NonCancellable) { persist(id, next) }
+    }
 }

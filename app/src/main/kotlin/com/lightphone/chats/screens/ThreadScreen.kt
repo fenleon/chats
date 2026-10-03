@@ -248,6 +248,12 @@ class ThreadViewModel(
     val pendingSeed = MutableStateFlow(false)
     /** True until the newest page has been shown scrolled to the bottom. */
     val jumpToBottom = MutableStateFlow(true)
+    /** Newest row id the pin logic has already seen. A changed id while the
+     *  reader sits at the bottom (savedScrollIndex == 0) re-pins the view —
+     *  photo/voice-note sends land via the poll with no navigation event to
+     *  scroll (the composer's optimistic echo gets its scroll elsewhere),
+     *  so the new row stayed below the fold (LP3 feedback 2026-09-25). */
+    private var pinnedNewestId: String? = null
     /** Whether this device is E2EE-verified (false = encrypted rooms can't decrypt yet). */
     val e2eeVerified = MutableStateFlow<Boolean?>(null)
     /** Whether the room needs decryption (set from the first getMessages response). */
@@ -669,6 +675,15 @@ class ThreadViewModel(
                     // back up into the newest window.
                     if (!pagedOlder) olderCursor = page?.nextBeforeEventId
                 }
+                // Pin-on-new-row: a message landing while the reader is at the
+                // bottom keeps the view there. Old pages prepended by
+                // [loadOlder] never change the newest id, so scroll-back is
+                // untouched.
+                val newestId = messages.value.lastOrNull()?.id
+                if (newestId != null && newestId != pinnedNewestId && savedScrollIndex == 0) {
+                    jumpToBottom.value = true
+                }
+                pinnedNewestId = newestId
                 // A successful non-empty serve updates the disk snapshot
                 // (content-deduped inside — a quiet open rewrites nothing), so
                 // the room's last-known page paints instantly after a process
@@ -2386,6 +2401,12 @@ private fun MessageRow(
             // When the server confirms it, the served page swaps in the real
             // row: grouped → it merges under the shared timestamp; otherwise
             // it carries its own. A failed send shows its time, not SENDING.
+            // Bridged call notice ("Incoming call. Use the … app to answer.",
+            // lowercased to "incoming call" on the row — LP3 feedback
+            // 2026-09-25). Timestamp stays above; the glyph+text line gets
+            // extra air below it (feedback: the default 1 dp line gap read
+            // as cramped under the glyph).
+            val incomingCallNotice = !message.isMine && message.body.startsWith("Incoming call")
             if (showTime || (inFlight && !failed)) {
                 LightText(
                     text = if (inFlight && !failed) {
@@ -2525,13 +2546,12 @@ private fun MessageRow(
                         ),
                         bodyMaxWidthPx,
                     )
-                } else if (message.body.startsWith("Incoming call")) {
-                    // Bridged call notices ("Incoming call. Use the WhatsApp
-                    // app to answer." — Beeper's bridges can't relay calls, so
-                    // the contact's ghost posts a plain m.text; the phone icon
-                    // marks the row as a call, like the built-in Phone tool.
+                } else if (incomingCallNotice) {
+                    // Two lines like every row — timestamp above, glyph+text
+                    // below — with extra air between them (LP3 feedback
+                    // 2026-09-25: the 1 dp line gap was too tight).
                     Row(
-                        modifier = Modifier.padding(top = 1.dp),
+                        modifier = Modifier.padding(top = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         LightIcon(
@@ -2540,7 +2560,7 @@ private fun MessageRow(
                             contentDescription = null, // the text carries it
                         )
                         LightText(
-                            text = message.body,
+                            text = "incoming call",
                             variant = LightTextVariant.Paragraph,
                             modifier = Modifier.padding(start = 0.75f.gridUnitsAsDp()),
                         )

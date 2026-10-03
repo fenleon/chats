@@ -71,7 +71,7 @@ class SyncHealthTest {
     @Test
     fun `healthy line is last-round age plus push state`() {
         assertEquals(
-            "Sync 2m ago · push connected",
+            "2m ago · push connected",
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = true, nowMs = 1_000L + 120_000L),
         )
     }
@@ -79,11 +79,11 @@ class SyncHealthTest {
     @Test
     fun `failures appear only when above zero`() {
         assertEquals(
-            "Sync 14m ago · 3 failed · push disconnected",
+            "14m ago · 3 failed · push disconnected",
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 3, pushConnected = false, nowMs = 1_000L + 14 * 60_000L),
         )
         assertEquals(
-            "Sync 14m ago · push disconnected",
+            "14m ago · push disconnected",
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = false, nowMs = 1_000L + 14 * 60_000L),
         )
     }
@@ -91,7 +91,7 @@ class SyncHealthTest {
     @Test
     fun `under a minute reads as less than one minute`() {
         assertEquals(
-            "Sync <1m ago · push connected",
+            "<1m ago · push connected",
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = true, nowMs = 1_000L + 5_000L),
         )
     }

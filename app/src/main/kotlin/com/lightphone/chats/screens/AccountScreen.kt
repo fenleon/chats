@@ -347,8 +347,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                     verification !in VERIFICATION_TERMINAL_STATES,
                                 onClick = if (e2ee?.verified == true || !e2eeSettled) null else goVerify,
                             )
-                            AccountStatus(connection = connection)
-                            DeliveryHealthLine(delivery = delivery)
+                            AccountStatus(connection = connection, delivery = delivery)
                         } else {
                             // Logged out: if the session just expired, say so
                             // instead of showing a bare login form (the user
@@ -799,45 +798,32 @@ class LogoutConfirmPanel(
     }
 }
 
-/** Background-delivery health: last successful sync round, consecutive
- *  failures, push-channel state. Status-only — a healthy chain is one Fine
- *  line; failures surface as "3 failed" in the same line. */
-@Composable
-private fun DeliveryHealthLine(delivery: MatrixRepository.DeliveryHealth?) {
-    delivery ?: return
-    LightText(
-        text = SyncHealth.healthLine(
-            lastOkAtMs = delivery.lastSuccessfulRoundAtMs,
-            failures = delivery.consecutiveFailures,
-            pushConnected = delivery.pushConnected,
-            nowMs = System.currentTimeMillis(),
-        ),
-        variant = LightTextVariant.Fine,
-        modifier = Modifier.padding(top = 1.dp),
-    )
-}
-
+/** Background-delivery health folded into the status line — the separate
+ *  "Sync 3m ago…" line read as two statuses (LP3 feedback 2026-09-25). */
 @Composable
 private fun AccountStatus(
     connection: LightServiceMethod.GetConnectionState.Response?,
+    delivery: MatrixRepository.DeliveryHealth?,
 ) {
     Column(
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
     ) {
-        connection?.let { state ->
-            // One status line, one question: is the account ready?
-            //   "Syncing messages… x of y" — the fresh-login backfill is
-            //     building the local store (drives the count; y = the pass's
-            //     room total).
-            //   "Syncing" — the key-backup restore crawl is working (the
-            //     "Restoring history… x of y" line below carries the count) or
-            //     the store isn't caught up yet.
-            //   "Synced · up to date" — sync running + store + room list
-            //     caught up AND the fresh-login work settled: the restore flow
-            //     completed (or settled with nothing to restore) and the
-            //     backfill pass ran its rooms. Claiming Synced while the
-            //     restore is still waiting on the backup secret read as a lie
-            //     on the LP3 fresh login (2026-09-20).
+        // One line: the account status word joined with the delivery health
+        // suffix ("Syncing · 3m ago · push connected"). Either half can be
+        // absent (state/delivery not fetched yet). Status word semantics:
+        //   "Syncing messages… x of y" — the fresh-login backfill is
+        //     building the local store (drives the count; y = the pass's
+        //     room total).
+        //   "Syncing" — the key-backup restore crawl is working (the
+        //     "Restoring history… x of y" line below carries the count) or
+        //     the store isn't caught up yet.
+        //   "Synced · up to date" — sync running + store + room list
+        //     caught up AND the fresh-login work settled: the restore flow
+        //     completed (or settled with nothing to restore) and the
+        //     backfill pass ran its rooms. Claiming Synced while the
+        //     restore is still waiting on the backup secret read as a lie
+        //     on the LP3 fresh login (2026-09-20).
+        val statusText = connection?.let { state ->
             val backfillRunning = state.backfillRoomsTotal > 0 &&
                 state.backfillRoomsDone < state.backfillRoomsTotal
             val backfillSettled = state.backfillRoomsTotal == 0 ||
@@ -845,7 +831,7 @@ private fun AccountStatus(
             val restoreRunning = state.restoreScanning && state.restoreRoomsTotal > 0
             val storeCaughtUp = state.roomsJoined > 0 &&
                 state.roomsProjected >= state.roomsJoined
-            val statusText = when {
+            when {
                 backfillRunning ->
                     "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
                 restoreRunning -> "Syncing"
@@ -863,12 +849,25 @@ private fun AccountStatus(
                 state.state == "connecting" -> "connecting"
                 else -> state.state.replaceFirstChar { it.uppercase() }
             }
+        }
+        val healthText = delivery?.let {
+            SyncHealth.healthLine(
+                lastOkAtMs = it.lastSuccessfulRoundAtMs,
+                failures = it.consecutiveFailures,
+                pushConnected = it.pushConnected,
+                nowMs = System.currentTimeMillis(),
+            )
+        }
+        val line = listOfNotNull(statusText, healthText).joinToString(" · ")
+        if (line.isNotBlank()) {
             LightText(
-                text = statusText,
+                text = line,
                 variant = LightTextVariant.Fine,
             )
-            // Key-backup restore crawl: shown ONLY while it runs — a healthy
-            // restore is silent, not a permanent third line.
+        }
+        // Key-backup restore crawl: shown ONLY while it runs — a healthy
+        // restore is silent, not a permanent third line.
+        connection?.let { state ->
             if (state.restoreScanning && state.restoreRoomsTotal > 0) {
                 LightText(
                     text = "Restoring history… ${state.restoreScanned} of ${state.restoreRoomsTotal}",

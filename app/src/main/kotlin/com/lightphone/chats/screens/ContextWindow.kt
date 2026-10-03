@@ -40,6 +40,11 @@ import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.delay
 import androidx.compose.runtime.collectAsState
 
+/** Media rows (photo/video/voice note) carry no copyable text — the body is
+ *  a "[Photo]"/"[Video]"/duration marker, so the COPY row drops for them
+ *  (LP3 feedback 2026-09-25). */
+private val MEDIA_CONTENT_TYPES = setOf("image", "video", "audio")
+
 /** What the context window is showing for the long-pressed message. */
 private enum class ContextLevel {
     /** The stacked action rows (received: LIKE/REACT; own: EDIT/UNSEND). */
@@ -144,7 +149,9 @@ fun ContextWindowOverlay(
                         // to self (feedback 2026-09-09).
                         message.isMine -> {
                             if (message.canEdit) add("EDIT" to { onEdit(); onDismiss() })
-                            if (copyText.isNotBlank()) {
+                            if (copyText.isNotBlank() &&
+                                message.contentType !in MEDIA_CONTENT_TYPES
+                            ) {
                                 add("COPY" to { ChatClient.copyToClipboard(copyText); onCopy(); onDismiss() })
                             }
                             if (message.canUnsend) add("UNSEND" to { onUnsend(); onDismiss() })
@@ -173,7 +180,9 @@ fun ContextWindowOverlay(
                                     add("REMOVE REACTION" to { onRemoveReaction(); onDismiss() })
                                 }
                             }
-                            if (copyText.isNotBlank()) {
+                            if (copyText.isNotBlank() &&
+                                message.contentType !in MEDIA_CONTENT_TYPES
+                            ) {
                                 add("COPY" to { ChatClient.copyToClipboard(copyText); onCopy(); onDismiss() })
                             }
                         }

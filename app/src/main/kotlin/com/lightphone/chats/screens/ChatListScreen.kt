@@ -71,8 +71,10 @@ private const val REVEAL_THRESHOLD = 4
  *  transient reconnects and restore-time flips never reach it. */
 private const val OFFLINE_BANNER_DEBOUNCE_MS = 5_000L
 
-/** Shown while the initial sync pulls the whole account (can take minutes). */
-private const val DOWNLOADING_TEXT = "Downloading your chat history…"
+/** The only cold-restore placeholder — the initial "loading…" stays for the
+ *  whole restore; the old second "Downloading your chat history…" state that
+ *  replaced it mid-restore read as two loadings (LP3 feedback 2026-09-25). */
+private const val LOADING_TEXT = "loading…"
 
 /**
  * Launch-intent extra carrying the room a notification tap should open
@@ -650,9 +652,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                 // say so instead of a blank "Loading…", and never
                                 // flash "No conversations" while it's still running
                                 // (the retry budget can exhaust before rooms land).
-                                loading && rooms.isEmpty() && showRestoreText -> StatusText(
-                                    if (connecting) DOWNLOADING_TEXT else "loading…",
-                                )
+                                loading && rooms.isEmpty() && showRestoreText -> StatusText(LOADING_TEXT)
                                 filteredRooms.isNotEmpty() -> LightLazyScrollView(
                                     // Rows are ~70dp; a uniform estimate keeps the lazy
                                     // scrollbar sane (the SDK computes it per-item).
@@ -679,7 +679,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
                                         "No account. Open Settings to sign in with Beeper or a Matrix homeserver."
                                     },
                                 )
-                                connecting -> StatusText(DOWNLOADING_TEXT)
+                                connecting -> StatusText(LOADING_TEXT)
                                 else -> StatusText("No conversations.")
                             }
                         }

@@ -33,15 +33,17 @@ object SyncHealth {
         return elapsed > STALL_MULTIPLIER * expectedIntervalMs
     }
 
-    /** The one Account-screen line: last successful round age, consecutive
-     *  failures when any, push-channel state. */
+    /** The one Account-screen status suffix: last successful round age,
+     *  consecutive failures when any, push-channel state. Combined with the
+     *  account status word on a single line ("Syncing · 2m ago · push
+     *  connected"), so it carries no "Sync" prefix of its own. */
     fun healthLine(lastOkAtMs: Long, failures: Int, pushConnected: Boolean, nowMs: Long): String {
         val push = if (pushConnected) "push connected" else "push disconnected"
         return when {
             lastOkAtMs == 0L -> "No sync round yet · $push"
             else -> {
                 val failuresPart = if (failures > 0) " · $failures failed" else ""
-                "Sync ${ago(nowMs - lastOkAtMs)} ago$failuresPart · $push"
+                "${ago(nowMs - lastOkAtMs)} ago$failuresPart · $push"
             }
         }
     }

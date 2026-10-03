@@ -10861,6 +10861,16 @@ object MatrixRepository {
             if (projected.pendingDecryption) pendingDecrypt += roomId
         }
         if (rows.isNotEmpty()) {
+            // Prior rows, read pre-replace: only rooms whose row actually
+            // changed get a room-list republish below. The steady-state
+            // publish (sync fan-out → publishRoomRowNow) can race this
+            // recompute and serve a stale unread (cross-device receipt:
+            // receipt stored → fan-out publishes the old row → recompute
+            // zeroes it → nothing republished; LP3 2026-09-27 stuck star).
+            // During the initial crawl the publishes are no-ops
+            // (publishRoomRowNow gates on initialRoomCrawlDone) and the
+            // startup passes cover the list — skip the reads entirely.
+            val priorRows = if (initialRoomCrawlDone) priorProjectionRows(db, rows) else emptyMap()
             withContext(Dispatchers.IO) {
                 currentCoroutineContext().ensureActive()
                 if (client !== c) throw CancellationException("Projection client replaced")
@@ -10886,6 +10896,23 @@ object MatrixRepository {
                     sq.setTransactionSuccessful()
                 } finally {
                     sq.endTransaction()
+                }
+            }
+            val changedRooms = rows.filter { r ->
+                val prior = priorRows[r.roomId]
+                prior == null ||
+                    prior.lastRealEventId != r.lastRealEventId ||
+                    prior.lastRealTs != r.lastRealTs ||
+                    prior.unreadCount != r.unreadCount ||
+                    prior.preview != r.preview ||
+                    prior.previewResolved != r.previewResolved
+            }
+            for (r in changedRooms) {
+                scope.launch {
+                    val room = withTimeoutOrNull(ROOM_BUDGET_MS) {
+                        c.room.getById(RoomId(r.roomId)).firstOrNull()
+                    } ?: return@launch
+                    publishRoomRowNow(c, RoomId(r.roomId), room)
                 }
             }
             if (debugLogging()) {
@@ -11598,6 +11625,35 @@ object MatrixRepository {
             }
         }
     }
+
+    /** Batched prior-row read for the republish-diff in [computeProjectionRows]. */
+    private fun priorProjectionRows(
+        db: TrixnityRoomDatabase,
+        rows: List<ProjectionRow>,
+    ): Map<String, ProjectionRow> = runCatching {
+        db.openHelper.writableDatabase.query(
+            "SELECT roomId,lastRealEventId,lastRealTs,unreadCount,preview,previewResolved " +
+                "FROM RoomProjection WHERE roomId IN (" + rows.joinToString(",") { "?" } + ")",
+            rows.map { it.roomId as Any }.toTypedArray(),
+        ).use { cur ->
+            buildMap {
+                while (cur.moveToNext()) {
+                    val roomId = cur.getString(0)
+                    put(
+                        roomId,
+                        ProjectionRow(
+                            roomId = roomId,
+                            lastRealEventId = if (cur.isNull(1)) null else cur.getString(1),
+                            lastRealTs = cur.getLong(2),
+                            unreadCount = cur.getLong(3),
+                            preview = cur.getString(4) ?: "",
+                            previewResolved = cur.getInt(5) != 0,
+                        ),
+                    )
+                }
+            }
+        }
+    }.getOrDefault(emptyMap())
 
     /** Optimistic badge clear at [markRead]: zero the row now; the receipt
      *  echo round recomputes to the same value. */
