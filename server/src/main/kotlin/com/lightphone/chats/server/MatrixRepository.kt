@@ -1535,7 +1535,11 @@ object MatrixRepository {
             val emailReq = http.post("$BEEPER_API_BASE/user/login/email") {
                 header("Authorization", "Bearer $BEEPER_API_TOKEN")
                 contentType(ContentType.Application.Json)
-                setBody("""{"request":"$requestId","email":"$email"}""")
+                // appType is required since Beeper's client gate (2026-10):
+                // sessions without a known appType get 400 "Your client is out
+                // of date" at the code exchange and the session is killed.
+                // "bbctl" is Beeper's own CLI's client id — probed live.
+                setBody("""{"request":"$requestId","email":"$email","appType":"bbctl","onlyExistingAccounts":true}""")
             }
             if (emailReq.status.value !in 200..299) {
                 error("Beeper code request failed (HTTP ${emailReq.status.value})")
@@ -1570,6 +1574,7 @@ object MatrixRepository {
         beeperLogin(email, code).map { }
 
     suspend fun beeperLogin(email: String, code: String): Result<MatrixClient> = runCatching {
+        if (code.isBlank()) error("Enter the code from your email")
         val ctx = appContext ?: error("companion not initialized")
         initMutex.withLock {
             stopPreviousSession()
@@ -1584,10 +1589,39 @@ object MatrixRepository {
                 val resp = http.post("$BEEPER_API_BASE/user/login/response") {
                     header("Authorization", "Bearer $BEEPER_API_TOKEN")
                     contentType(ContentType.Application.Json)
-                    setBody("""{"request":"$requestId","response":"$code"}""")
+                    setBody("""{"request":"$requestId","response":"$code","appType":"bbctl","onlyExistingAccounts":true}""")
                 }
                 if (resp.status.value !in 200..299) {
-                    error("Beeper code verification failed (HTTP ${resp.status.value})")
+                    // Error bodies are human-readable ({error: "..."} or
+                    // {retries: N}) — surface them instead of a bare status.
+                    // API semantics (probed 2026-10-03): 400 = malformed code
+                    // field; 403 = wrong code, retryable with the SAME request
+                    // id (Beeper's own bbctl does); 404 = login session dead
+                    // (expired ~30 min or stale id) — a retry can never
+                    // succeed, so drop the stored request id.
+                    val body = runCatching { resp.bodyAsText() }.getOrNull()
+                    val bodyJson = body?.let {
+                        runCatching { pushQueueJson.parseToJsonElement(it).jsonObject }.getOrNull()
+                    }
+                    val detail = bodyJson?.get("error")?.jsonPrimitive?.content
+                    when (resp.status.value) {
+                        400 -> error(detail ?: "Enter the code from your email")
+                        403 -> {
+                            val retries = bodyJson?.get("retries")?.jsonPrimitive
+                                ?.content?.toIntOrNull()
+                            error(if (retries != null && retries > 0) {
+                                "Wrong code — $retries tries left"
+                            } else {
+                                "Wrong code — try again or request a new code"
+                            })
+                        }
+                        404 -> {
+                            prefs.edit().remove(KEY_BEEPER_REQUEST_ID).apply()
+                            error("Code session expired — request a new code")
+                        }
+                        else -> error(detail?.let { "Beeper code verification failed: $it" }
+                            ?: "Beeper code verification failed (HTTP ${resp.status.value})")
+                    }
                 }
                 val json = pushQueueJson.parseToJsonElement(resp.bodyAsText()).jsonObject
                 val whoami = json["whoami"]?.jsonObject ?: error("missing whoami")
