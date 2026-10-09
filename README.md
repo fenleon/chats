@@ -64,6 +64,13 @@ run the workspace's external `tools/sync-volume-panel`, configure Chats to
 receive only the server copy; do not regenerate an app copy. That generator
 is maintained outside this repository.
 
+## Branches & releases
+
+- **`main`** — the Light-built release line: the stripped Tool Library build. Sync runs while the app is open; notifications and photo/voice-note sending are planned follow-ups there.
+- **`dev`** — the full-featured development build for sideloading (this README): background sync, notifications, photo/voice-note sending.
+
+Both are released together when an update affects them, under one shared, increasing version code. Which build you have is easiest to tell by behavior (notifications on = `dev`).
+
 ## Limitations
 
 - Bridged networks (WhatsApp, Instagram, ...) arrive through Beeper, an unofficial path, not an official Meta client.
