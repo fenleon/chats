@@ -300,4 +300,7 @@ object ChatClient {
     /** Uploads a recorded voice note (ogg/opus, MSC3245) to [roomId]. */
     suspend fun sendVoiceNote(roomId: String, file: java.io.File): Boolean =
         runCatching { MatrixRepository.sendVoiceNote(roomId, file) }.getOrDefault(false)
+
+    /** Kicks one immediate sync round (Manual Sync Now). */
+    fun syncNow() = MatrixRepository.syncNow()
 }

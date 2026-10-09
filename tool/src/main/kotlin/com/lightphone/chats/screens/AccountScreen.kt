@@ -354,10 +354,12 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 connection = connection,
                                 delivery = delivery,
                                 onManualSync = {
-                                    // Kick a round (open-only sync is
-                                    // idempotent — a no-op while the loop
-                                    // runs) and confirm with the popover.
-                                    ChatClient.startSync()
+                                    // Kick a real round now (startSync is
+                                    // idempotent — the loop is already
+                                    // running): the success stamps
+                                    // last-updated and bumps the revision,
+                                    // which refetches this screen.
+                                    ChatClient.syncNow()
                                     navigateTo(screenFactory = { SyncingPanel(it) })
                                 },
                             )

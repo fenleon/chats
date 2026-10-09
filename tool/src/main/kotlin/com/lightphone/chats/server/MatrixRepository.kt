@@ -714,7 +714,11 @@ object MatrixRepository {
 
     /** Delivery-health stamping: one successful round resets the failure
      *  count and moves the last-success wall clock (persisted — the Account
-     *  line and the stall check outlive the process). */
+     *  line and the stall check outlive the process). Bumps the status
+     *  revision: the Account screen's poll only refetches on a revision
+     *  change, and rounds otherwise commit no connection fact — without the
+     *  bump its "Last updated" age froze at the last status change (LP3
+     *  2026-10-09, Manual Sync Now feedback). */
     private fun recordSyncRoundOk() {
         lastSyncOkAtMs = System.currentTimeMillis()
         consecutiveSyncFailures = 0
@@ -722,6 +726,7 @@ object MatrixRepository {
             ?.putLong(KEY_LAST_SYNC_OK_MS, lastSyncOkAtMs)
             ?.putInt(KEY_SYNC_FAILURES, 0)
             ?.apply()
+        bumpStatusRevision()
     }
 
     private fun recordSyncRoundFailed() {
@@ -729,6 +734,20 @@ object MatrixRepository {
         lightContext?.chatsPrefs()?.edit()
             ?.putInt(KEY_SYNC_FAILURES, consecutiveSyncFailures)
             ?.apply()
+        // The failure count shows on the Account line too — same poll rule.
+        bumpStatusRevision()
+    }
+
+    /** Manual Sync Now: one immediate round outside the loop (the same
+     *  concurrent-round pattern as the send wake), so the Account line's
+     *  last-updated moves within seconds instead of waiting for the running
+     *  loop's next round. No-op with no client. */
+    fun syncNow() {
+        val c = client ?: return
+        scope.launch {
+            timedSyncOnce(c, "manual")
+                .onFailure { android.util.Log.w(TAG, "manual sync failed: ${it.message}") }
+        }
     }
 
     /**
