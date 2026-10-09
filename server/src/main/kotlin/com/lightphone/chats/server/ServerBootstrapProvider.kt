@@ -50,7 +50,11 @@ class ServerBootstrapProvider : ContentProvider() {
             defaultClientFilterLevel = ClientFilterLevel.AllowLightSignedApks
             // Haptics answer from LightOS's real setting via the relay (PLATFORM-RELAY).
             provideSdkSettings = { RelaySdkServerSettings(it) }
-            checkCert = { callingPackage -> checkLightSdkCert(context, callingPackage) }
+            // SDK 0.2.0: the checkCert hook became isLightSigned/isLightApproved
+            // (trust-bundle based); dev-keystore APKs pass via isLightSigned.
+            isLightSigned = { callingPackage, _ ->
+                checkLightSdkCert(context, callingPackage) != ClientCertType.Unknown
+            }
             customServiceMethodResolver = { callingId, methodId, payload ->
                 ChatServiceMethods.dispatch(methodId, payload)
             }

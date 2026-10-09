@@ -53,8 +53,8 @@ The APK is signed with a development key, so it needs the community-ADB sideload
 ## Build
 
 ```bash
-tools/build --dir chats :app:assembleDebug      # from the workspace root
-tools/build --dir chats :app:assembleRelease    # release (R8-minified)
+tools/build --dir chats :tool:assembleDebug      # from the workspace root
+tools/build --dir chats :tool:assembleRelease    # release (R8-minified)
 ```
 
 The build consumes `../light-sdk` as a composite build; the SDK's chat service methods are additive patches carried in the workspace's fork of the SDK.
