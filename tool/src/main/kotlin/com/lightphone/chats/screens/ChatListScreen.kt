@@ -1,6 +1,5 @@
 package com.lightphone.chats.screens
 
-import android.Manifest
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
@@ -41,8 +40,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.checkPermission
-import com.thelightphone.sdk.rememberPermissionRequestLauncher
 import com.thelightphone.sdk.shared.LightResult
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
@@ -76,28 +73,6 @@ private const val OFFLINE_BANNER_DEBOUNCE_MS = 5_000L
  *  replaced it mid-restore read as two loadings (LP3 feedback 2026-09-25). */
 private const val LOADING_TEXT = "loading…"
 
-/**
- * Launch-intent extra carrying the room a notification tap should open
- * (matches the companion's ChatNotifier.EXTRA_NOTIFY_ROOM; the app cannot
- * reference the server's class).
- */
-private const val EXTRA_NOTIFY_ROOM = "chats.notifyRoomId"
-
-/**
- * Flattened component of the companion's POST_NOTIFICATIONS trampoline
- * activity (matches its manifest entry; the app cannot reference the server's
- * classes — same constraint as [EXTRA_NOTIFY_ROOM]).
- */
-private const val NOTIFICATION_PERMISSION_ACTIVITY =
-    "com.lightphone.chats/.server.NotificationPermissionActivity"
-
-/**
- * Process-wide "prompt already issued" latch: the ViewModel is recreated on
- * navigation (each show is a fresh screen), so a per-screen flag would
- * re-prompt on every return to the list.
- */
-private var notificationPermissionPrompted = false
-
 class ChatListViewModel : LightViewModel<Unit>() {
 
     val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
@@ -115,12 +90,6 @@ class ChatListViewModel : LightViewModel<Unit>() {
      * view model once the room is loaded.
      */
     val openRoom = MutableStateFlow<LightServiceMethod.GetRooms.Room?>(null)
-    /**
-     * Room id a notification tap asked to open (from the launch-intent extra —
-     * consume-once). Only a real tap carries it: returning from a thread or a
-     * plain list refresh never sets it, so the list never auto-opens a room.
-     */
-    var pendingNotifyRoomId: String? = null
     /** Selected bridged-network label (Phase 7); null = all networks. */
     val networkFilter = MutableStateFlow<String?>(null)
 
@@ -181,30 +150,12 @@ class ChatListViewModel : LightViewModel<Unit>() {
         viewModelScope.toggleAndPersist(panelArchived, { panelRoomId }, ChatClient::setRoomArchived)
 
     /**
-     * One-shot launch request for the companion's POST_NOTIFICATIONS
-     * trampoline (the attach-photo/voice-note startServerActivity pattern):
-     * set by [refresh] on the first settled logged-in account, consumed by
-     * the screen once the activity is started.
-     */
-    val notificationPermissionComponent = MutableStateFlow<String?>(null)
-
-    fun consumeNotificationPermissionComponent() {
-        notificationPermissionComponent.value = null
-    }
-
-    /**
      * Room-list scroll position, persisted across navigation so a thread exit
      * returns the list to where it was instead of the top. The screen saves it continuously and the list re-creates its
      * LazyListState seeded from it on show.
      */
     var savedScrollIndex = 0
     var savedScrollOffset = 0
-
-    /**
-     * One POST_NOTIFICATIONS runtime request per process run. The request itself
-     * goes through the SDK flow (ChatsPermissionActivity in the server).
-     */
-    var notificationPermissionRequested = false
 
     fun saveScroll(index: Int, offset: Int) {
         savedScrollIndex = index
@@ -346,39 +297,12 @@ class ChatListViewModel : LightViewModel<Unit>() {
                     // the account is still settling (see [showingSnapshotRooms]).
                     rooms.value = result
                 }
-                this@ChatListViewModel.connection.value = connection
-                // POST_NOTIFICATIONS stays denied until requested at runtime
-                // (targetSdk 33+ — a fresh install never prompts on its own),
-                // and the tool runtime forbids permission requests, so the
-                // first settled logged-in account launches the companion's
-                // trampoline, once per process. Prompting while logged out
-                // would ask a user who has no account yet.
-                if (!notificationPermissionPrompted && account?.loggedIn == true) {
-                    notificationPermissionPrompted = true
-                    notificationPermissionComponent.value = NOTIFICATION_PERMISSION_ACTIVITY
-                }
-                // A notification tap asked for a thread; open it once its room is
-                // loaded (a cold start may have to wait for the first room-list pass).
-                consumeNotifyRoom(result)
             } finally {
                 // A binder exception mid-fetch must not leave the list stuck on
                 // "Loading…" (same guard as the thread, feedback 2026-08-19).
                 if (!quiet) loading.value = false
             }
         }
-    }
-
-    /**
-     * Opens the thread a notification tap requested, when the room is loaded.
-     * Waits for a settled list (rooms arrived, or a genuine logged-out state)
-     * so a cold start doesn't drop the request while rooms are still restoring.
-     */
-    fun consumeNotifyRoom(rooms: List<LightServiceMethod.GetRooms.Room>) {
-        val pending = pendingNotifyRoomId ?: return
-        val settled = isSettled(account.value, rooms, connection.value)
-        if (!settled) return
-        pendingNotifyRoomId = null
-        openRoom.value = rooms.firstOrNull { it.id == pending }
     }
 
     /** Settled = really logged in with rooms, or a genuine logged-out account
@@ -423,42 +347,14 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
     override fun createViewModel(): ChatListViewModel =
         ChatListViewModel().also { it.seedRoomsFromSnapshot(lightContext.filesDir) }
 
-    /** For consume-once launch-extras (notification-tap handoff). */
-    private val activityRef = sealedActivity
-
-    override fun willShow() {
-        super.willShow()
-        // A notification tap arrives with its room in the launch intent
-        // (consume-once). Only a real tap carries the extra — returning from a
-        // thread and plain list refreshes never set it, so the list never
-        // auto-opens a room on its own.
-        activityRef.takeLaunchExtra(EXTRA_NOTIFY_ROOM)?.let {
-            viewModel.pendingNotifyRoomId = it
-        }
-    }
-
     @Composable
     override fun Content() {
-        // Runtime permission for the server's message notifications. The SDK flow routes
-        // the request through the server's ChatsPermissionActivity (AOSP
-        // dialog). One request per process run.
-        val permissionLauncher = rememberPermissionRequestLauncher(Manifest.permission.POST_NOTIFICATIONS)
-        LaunchedEffect(Unit) {
-            if (!viewModel.notificationPermissionRequested) {
-                viewModel.notificationPermissionRequested = true
-                val res = checkPermission(Manifest.permission.POST_NOTIFICATIONS)
-                val granted = res is LightResult.Success &&
-                    res.data.permissionResult == LightServiceMethod.GetPermission.Result.Granted
-                if (!granted) permissionLauncher?.launch()
-            }
-        }
         val rooms by viewModel.rooms.collectAsState()
         val loading by viewModel.loading.collectAsState()
         val account by viewModel.account.collectAsState()
         val connection by viewModel.connection.collectAsState()
         val visibleCount by viewModel.visibleCount.collectAsState()
         val pendingRoom by viewModel.openRoom.collectAsState()
-        val permissionComponent by viewModel.notificationPermissionComponent.collectAsState()
         val networkFilter by viewModel.networkFilter.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
         // The saved position seeds the list state directly. The ViewModel keeps the position across
@@ -496,16 +392,6 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
             val room = pendingRoom ?: return@LaunchedEffect
             viewModel.openRoom.value = null
             openThread(room)
-        }
-
-        // Notification-permission handoff (same startServerActivity pattern
-        // as the attach-photo/voice-note components on the thread screen):
-        // the first settled logged-in load asks the companion's trampoline to
-        // request POST_NOTIFICATIONS.
-        LaunchedEffect(permissionComponent) {
-            val component = permissionComponent ?: return@LaunchedEffect
-            startServerActivity(component)
-            viewModel.consumeNotificationPermissionComponent()
         }
 
         // Reveal more rooms when the user scrolls near the end of the current

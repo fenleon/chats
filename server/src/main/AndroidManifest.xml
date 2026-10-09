@@ -2,27 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Merged into the tool APK (single-APK build, 2026-08-19): the former
-         companion is a library whose manifest contributes the persistent
-         Matrix connection (sync loop, storage, notifications) — everything the
-         tool runtime forbids — as components + permissions in the same APK. -->
+    <!-- Merged into the tool APK (single-APK build, 2026-08-19). Rung 1:
+         open-only sync — no FGS, no boot receiver, no push, no notifications,
+         no server-hosted activities; the library contributes only the
+         bootstrap provider and the basic permissions. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Restarts the sync service after a reboot (WAKE-COMPARISON.md #1). -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- Media downloads are gated on the connection type (Settings toggle). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- Voice notes are recorded in the server library (RECORD_AUDIO is granted
-         at runtime by VoiceNoteActivity). -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- Photo attach fallback (2026-08-19 feedback round): devices without a
-         system photo picker (the LP3's stripped firmware) fall back to an
-         in-app gallery over DCIM/Pictures; granted at runtime by
-         PhotoSendActivity. -->
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
     <!-- sdk:ui merges CAMERA for its QR scanner; this is a chat server. -->
     <uses-permission
@@ -38,113 +25,13 @@
         android:usesCleartextTraffic="true"
         android:largeHeap="true">
 
-        <!-- Wires the SDK server (settings, cert check, chat methods) and
-             initializes MatrixRepository (session restore + sync service) at
-             process start, before the tool's first binder call. -->
+        <!-- Wires the SDK server (cert check) and initializes MatrixRepository
+             (session restore + the open-only sync lifecycle driver) at process
+             start, before the tool starts. -->
         <provider
             android:name=".ServerBootstrapProvider"
             android:authorities="com.lightphone.chats.server.bootstrap"
             android:exported="false" />
-
-        <!-- WorkManager: androidx.startup's WorkManagerInitializer races our own
-             ServerBootstrapProvider (provider install order differs per device — on
-             the LP3 ours runs first, so the startup initializer then crashed with
-             "already initialized" and killed every process start). Our explicit
-             initialize in DeliveryBackstopWorker.ensure is the only path. -->
-        <provider
-            android:name="androidx.startup.InitializationProvider"
-            android:authorities="${applicationId}.androidx-startup"
-            tools:node="merge">
-            <meta-data
-                android:name="androidx.work.WorkManagerInitializer"
-                tools:node="remove" />
-        </provider>
-
-        <!-- Shows the system photo picker and sends the chosen photo; started
-             by the tool via StartPhotoSend + startServerActivity (the tool
-             runtime forbids startActivity, the server can't launch activities
-             from the background). -->
-        <activity
-            android:name=".PhotoSendActivity"
-            android:exported="true"
-            android:excludeFromRecents="true"
-            android:screenOrientation="portrait"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
-
-        <!-- Requests POST_NOTIFICATIONS at runtime — declaring it in the
-             manifest is not enough on targetSdk 33+ (it stays denied until
-             requested, so message notifications were silently blocked on
-             fresh installs). Started by the tool from the chat list via
-             startServerActivity; finishes immediately once granted. -->
-        <activity
-            android:name=".NotificationPermissionActivity"
-            android:exported="true"
-            android:excludeFromRecents="true"
-            android:screenOrientation="portrait"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
-
-        <!-- Records a voice note (AAC/m4a) and sends it as an m.audio message;
-             started by the tool via StartVoiceNoteSend + startServerActivity. -->
-        <activity
-            android:name=".VoiceNoteActivity"
-            android:exported="true"
-            android:excludeFromRecents="true"
-            android:screenOrientation="portrait"
-            android:theme="@android:style/Theme.Black.NoTitleBar"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
-
-        <!-- Dev control surface (2026-08-21, re-added): drives the push channel
-             from adb via launch extras (pushsse/pushnotify/pushkey overrides,
-             pushclear cleanup, debugLog, scripted login/send — see
-             chats/push/README.md). Exported so adb shell can start it; the
-             tool is the launcher. -->
-        <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:excludeFromRecents="true"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
-
-        <!-- AOSP runtime-permission host for the SDK permission flow (the tool
-             requests POST_NOTIFICATIONS through it; see ChatsPermissionActivity).
-             Translucent so the system dialog is the only thing visible. -->
-        <activity
-            android:name=".ChatsPermissionActivity"
-            android:exported="false"
-            android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
-
-        <!-- Keeps the Matrix sync loop alive in the background. Uses cleartext
-             HTTP so a self-hosted LAN homeserver (e.g. 10.0.2.2 in dev) works. -->
-        <service
-            android:name=".ChatSyncService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-
-        <!-- Reboot recovery (WAKE-COMPARISON.md #1): a rebooted LP3 has no
-             process, so sync stays dead until the app is opened. Restarts the
-             sync service after first unlock (a protected broadcast — only the
-             system sends BOOT_COMPLETED). -->
-        <receiver
-            android:name=".BootReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
-
-        <!-- Dev probe (2026-08-21): receives the endpoint LightOS's UP
-             distributor issues for the "light-push" instance (see
-             ServerBootstrapProvider). Removed with the probe. -->
-        <service
-            android:name=".UpProbeService"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT"/>
-            </intent-filter>
-        </service>
 
         <!-- sdk:client merges its UnifiedPush service + file-share provider;
              chats is a local Matrix client and uses neither. -->
@@ -156,20 +43,10 @@
             tools:node="remove" />
 
         <!-- sdk:server merges the UnifiedPush distributor (an EXPORTED receiver —
-             any app can start the process with it) and the connector's
-             receiver/activity/foreground service; chats delivers messages via
-             its own sync loop, so strip them all. (MessagingReceiverImpl is
-             un-stripped while the UP probe is active — the distributor's
-             NEW_ENDPOINT reply needs it; the connector's own receiver is not
-             exported, so no exposure.) -->
+             any app can start the process with it); chats delivers messages via
+             its own in-tool sync loop, so strip it. -->
         <receiver
             android:name="com.thelightphone.sdk.server.LightPushDistributor"
-            tools:node="remove" />
-        <activity
-            android:name="org.unifiedpush.android.connector.internal.LinkActivity"
-            tools:node="remove" />
-        <service
-            android:name="org.unifiedpush.android.connector.internal.RaiseToForegroundService"
             tools:node="remove" />
     </application>
 

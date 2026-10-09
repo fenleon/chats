@@ -95,11 +95,4 @@ class SyncHealthTest {
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = true, nowMs = 1_000L + 5_000L),
         )
     }
-
-    // --- delivery backstop (WorkManager periodic worker, BrightChat DeliveryWorker) ---
-
-    @Test
-    fun `backstop period constant is the 15-minute floor`() {
-        assertEquals(15L, DeliveryBackstopWorker.PERIOD_MINUTES)
-    }
 }

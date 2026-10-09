@@ -4,8 +4,8 @@ import android.content.ClipboardManager
 import android.content.Context
 
 /**
- * App-clipboard access for copy/paste. Bound at bootstrap like
- * [PlatformRelay] — the tool module can't touch Context/ClipboardManager
+ * App-clipboard access for copy/paste. Bound at bootstrap (ServerBootstrapProvider)
+ * — the tool module can't touch Context/ClipboardManager
  * (plugin-scanned), so the server holds the context and serves reads/writes.
  * Clipboard ops are fast; the calls are plain functions, not suspend.
  *

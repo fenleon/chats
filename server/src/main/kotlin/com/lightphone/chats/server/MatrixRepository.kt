@@ -1,5 +1,7 @@
 package com.lightphone.chats.server
 
+import android.app.Activity
+import android.app.Application
 import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -123,7 +125,6 @@ import de.connect2x.trixnity.client.media.MediaService
 import de.connect2x.trixnity.client.media.MediaStore
 import de.connect2x.trixnity.client.media.okio.okio
 import de.connect2x.trixnity.client.notification.EvaluatePushRules
-import de.connect2x.trixnity.client.notification.NotificationUpdate
 import de.connect2x.trixnity.client.notification
 import de.connect2x.trixnity.client.room
 import de.connect2x.trixnity.client.room.GetTimelineEventConfig
@@ -214,11 +215,12 @@ import org.koin.dsl.module
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * The Chats companion's Matrix core. Owns the [MatrixClient] lifecycle — login,
- * session restore from the Room store, logout — and exposes snapshot queries for
- * the binder methods (rooms, messages, send, read, typing). The persistent sync
- * loop lives in [ChatSyncService]; this object is the single source of truth the
- * service and the binder methods share.
+ * The Chats Matrix core. Owns the [MatrixClient] lifecycle — login, session
+ * restore from the Room store, logout — and exposes snapshot queries for the
+ * tool (rooms, messages, send, read, typing). Open-only sync (Rung 1): the
+ * loop runs while the tool is foreground ([startSync], driven by the tool
+ * activity's resume/pause via ServerBootstrapProvider) and stops when it
+ * backgrounds — no FGS, no push, no notifications.
  */
 object MatrixRepository {
 
@@ -250,11 +252,6 @@ object MatrixRepository {
      *  stall check reads it before a fresh process's first round. 0 = never. */
     private const val KEY_LAST_SYNC_OK_MS = "last_sync_ok_ms"
     private const val KEY_SYNC_FAILURES = "sync_failures"
-    /** Per-room event id the notification watcher last alerted (prefix + roomId.full),
-     *  persisted so a watcher re-attach — every process start / app launch — does not
-     *  re-alert the same newest event a previous run already dinged (ghost burst
-     *  fix). Cleared with the prefs at logout. */
-    private const val KEY_LAST_NOTIFIED_PREFIX = "last_notified_"
     private const val KEY_LAST_READ_PREFIX = "last_read_"
     private const val DB_NAME = "matrix_client"
     private const val MEDIA_DIR = "matrix_media"
@@ -270,7 +267,7 @@ object MatrixRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val initMutex = Mutex()
 
-    /** Main-thread handler for the delayed sync-service stop (see [scheduleSyncStop]). */
+    /** Main-thread handler for the delayed sync stop (see [scheduleSyncStop]). */
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private var cacheSessionGenerationValue = 0L
@@ -299,16 +296,9 @@ object MatrixRepository {
     @Volatile
     private var restoreAttempted = false
 
-    /** The room currently shown in the tool; notifications for it are suppressed. */
+    /** The room currently shown in the tool (drives the unread suppression). */
     @Volatile
     private var activeRoomId: String? = null
-
-    /**
-     * Room the tool should open next time its list shows (set when a message
-     * notification is posted — see [ChatNotifier]); consumed by [takeNotifyRoom].
-     */
-    @Volatile
-    var pendingNotifyRoomId: String? = null
 
     // --- Voice-note playback -------------------------------------
     // The companion plays m.audio messages (the tool runtime forbids audio
@@ -354,26 +344,6 @@ object MatrixRepository {
     private var audioFocusRequest: android.media.AudioFocusRequest? = null
 
     fun audioPlayingEventId(): String? = playingAudioEventId
-
-    /** True while a voice note is playing OR paused — the volume rocker then
-     *  controls the media stream in-app instead of relaying to LightOS.
-     */
-    fun isVoiceNoteActive(): Boolean = playingAudioEventId != null || pausedAudioEventId != null
-
-    /** Whether a thread is currently on screen (the tool's SetActiveRoom) — the
-     *  server-side half of the volume-panel gate (feedback 2026-08-30). */
-    fun isThreadOnScreen(): Boolean = activeRoomId != null
-
-    /** Media volume (level, max) — the tool's in-app volume panel bar
-     *  (feedback 2026-08-30). */
-    fun mediaVolumeLevel(): LightServiceMethod.GetVolumeLevel.Response? {
-        val audio = appContext?.getSystemService(android.content.Context.AUDIO_SERVICE)
-            as? android.media.AudioManager ?: return null
-        return LightServiceMethod.GetVolumeLevel.Response(
-            level = audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC),
-            max = audio.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC),
-        )
-    }
 
     /** Playback position (ms) of the playing voice note, or null when idle. */
     fun audioPositionMs(): Long? =
@@ -492,14 +462,12 @@ object MatrixRepository {
     private var sessionExpired = false
 
     /**
-     * True while the in-process path owns the sync arm (see [startSyncLoop]) —
-     * lets ChatSyncService skip arming a second loop on the same client when
-     * the foreground-service promotion finally lands.
+     * True while the open-only sync loop owns the arm (see [startSyncLoop]).
      */
     @Volatile
     private var inProcessSyncRunning = false
 
-    /** Lets [ChatSyncService] skip starting a second loop when the fallback owns it. */
+    /** Lets a second arm skip starting a loop when one already runs. */
     val isInProcessSyncRunning: Boolean get() = inProcessSyncRunning
 
     private val _connectionState = MutableStateFlow<ChatConnectionState>(ChatConnectionState.LoggedOut)
@@ -522,49 +490,32 @@ object MatrixRepository {
     private val restoreMutex = kotlinx.coroutines.sync.Mutex()
 
     /** User pause for the sync loop (Settings → Sync, audit 2026-08-14): when
-     *  false, no sync loop / foreground service runs — the battery escape hatch. */
+     *  false, no sync loop runs at all — the battery escape hatch. */
     @Volatile
     private var syncEnabled = true
 
     val isSyncEnabled: Boolean get() = syncEnabled
 
-    /** Sync cadence. ACTIVE = continuous long-poll while the screen is on;
-     *  SLOW = periodic [de.connect2x.trixnity.client.MatrixClient.syncOnce] once
-     *  the screen's been off for a while — the long-poll's per-response
-     *  parse/decrypt/store processing is the main standby cost on an
-     *  always-active bridged account. */
-    enum class SyncMode { ACTIVE, SLOW }
-
+    /**
+     * Open-only sync (Rung 1): true while the tool is foreground. Set by
+     * [startSync] (the tool activity's resume, wired in ServerBootstrapProvider)
+     * and cleared by [stopSync] (its pause). Background sync machinery — the
+     * FGS, slow-sync rounds, push wakes — is gone; when this is false nothing
+     * syncs.
+     */
     @Volatile
-    private var syncMode = SyncMode.ACTIVE
-
-    /** True while the periodic slow-sync loop owns sync. The FGS/watchdog must
-     *  not restart a long-poll then (ChatSyncService reads this). */
-    val isSlowSyncing: Boolean get() = syncMode == SyncMode.SLOW
-
-    /** Screen truth for the sync-cadence decision. ChatSyncService reads this
-     *  so it never starts a long-poll while the screen is dark. */
-    val isScreenOn: Boolean get() = isScreenInteractive()
-
-    private var slowSyncJob: Job? = null
-    private var screenOffJob: Job? = null
+    private var syncWanted = false
 
     /**
-     * The in-process sync arm (see [startSyncLoop]): a short-lived job that
-     * calls [de.connect2x.trixnity.client.MatrixClient.startSync] once. Under
+     * The sync arm: a short-lived job that calls
+     * [de.connect2x.trixnity.client.MatrixClient.startSync] once. Under
      * Trixnity v5 that call just arms the client's internal sync loop — the
      * /sync rounds run inside the client, which retries errors itself — so no
-     * restart supervision lives here; [ChatSyncService]'s state watchdog
-     * covers a wedged loop after the foreground-service promotion. Kept
-     * cancellable so teardown paths can drop a queued arm.
+     * restart supervision lives here; [networkCallback] resets a loop left
+     * dead by a transport drop. Kept cancellable so teardown paths can drop a
+     * queued arm.
      */
     private var inProcessSyncJob: Job? = null
-
-    /** Elapsed-realtime of the last push-wake syncOnce. Read-receipt/unread-
-     *  count push bursts collapse against this (see [onPushDelivered]): every
-     *  group member's reads POST one push, and each syncOnce costs ~30-50 s of
-     *  CPU on this account. */
-    private var lastPushWakeSyncAtMs = 0L
 
     // --- Verification-first sync ----------------------------
 
@@ -603,157 +554,8 @@ object MatrixRepository {
     @Volatile
     private var lastNetworkResetAtMs = 0L
 
-    /** Pending debounced push-wake sync (see [onPushDelivered]); restarted per
-     *  real-message push so a burst coalesces to one syncOnce. */
-    private var pushWakeJob: Job? = null
-
-    /** Pending screen-on stall-repair round (see [maybeCatchUpOnScreenOn]);
-     *  cancelled and restarted per SCREEN_ON so a wedged repair cannot run
-     *  next to a fresh one. */
-    private var stallRepairJob: Job? = null
-
-    /** Screen must stay off this long before dropping to slow sync. */
-    private const val SLOW_SYNC_GRACE_MS = 60_000L
-
-    /** Slow-sync cadence: one sync round every 5 min.
-     *  ponytail: 5 min is a session value — tighten if message latency feels
-     *  too high, loosen if battery still burns. */
-    private const val SLOW_SYNC_INTERVAL_MS = 300_000L
-
-    /** Push-gated lazy cadence: while the SSE push channel is
-     *  provably connected, rounds stretch to 15 min — the push is the
-     *  zero-latency wake for real messages, so rounds are only the redundancy
-     *  net. A dead channel flips [PushChannel.isConnected] false within its
-     *  90s read timeout and the next round drops back to
-     *  [SLOW_SYNC_INTERVAL_MS]; the per-round re-check self-heals, so a
-     *  silently-dead push costs at most one 15-min gap (the 08-28 30-min
-     *  stretch failed because it never re-checked).
-     *  ponytail: 15 min is a session value — tighten if the monitor shows
-     *  receive latency, loosen if battery still burns. */
-    private const val SLOW_SYNC_LAZY_INTERVAL_MS = 900_000L
-
-    /** Events stamped more than this far into the future are bridge clock
-     *  skew — never notified, never counted (the same rule lives in
-     *  ProjectionPredicate as FUTURE_SKEW_MS). */
-    private const val UNREAD_FUTURE_SKEW_MS = 300_000L
-
-    /** Foreground-service promotion cadence. */
-    private const val FGS_PROMOTE_INTERVAL_MS = 5_000L
-
-    /** Min gap between read-receipt-push wakeups (see [onPushDelivered]). One
-     *  sync per window is enough — the unread badge is at most this stale, and
-     *  the next event push / slow round catches up. Matches the old 5-min round
-     *  cadence, which was proven acceptable for badge freshness. */
-    private const val COUNTS_WAKE_MIN_INTERVAL_MS = 300_000L
-
-    /** Real-message push-wake debounce: a burst of messages is N
-     *  wakes but needs one syncOnce — the trailing-edge debounce drains the
-     *  window's pending wakes into a single sync, at ~1s latency. */
-    private const val PUSH_WAKE_DEBOUNCE_MS = 1_000L
-
-    /** Max syncOnce attempts per push wake (1 + 2 retries, WAKE-COMPARISON.md
-     *  #2): a wake whose sync didn't reach the pushed event retries with
-     *  backoff instead of silently dropping to the 5-min round (Beeper's
-     *  NotCaughtUp retry, in-process — no WorkManager needed while the FGS
-     *  holds the process). */
-    private const val PUSH_WAKE_ATTEMPTS = 3
-
-    /** Backoff base between push-wake retries. */
-    private const val PUSH_WAKE_RETRY_DELAY_MS = 2_000L
-
-    // ---- Durable push queue (SYNC-PERF-SPEC §3.2) ---------------------------
-    //
-    // A push delivered over SSE whose catch-up never completed must survive a
-    // process death: the queue persists it (ids only) until a sync is proven
-    // to have caught up. ntfy's `?since=` replay is the only other net, and
-    // only for ntfy URLs.
-
-    /** A delivered-but-not-caught-up push. Ids only — the push payload itself
-     *  carries no content (push/README.md), so neither does the queue. */
-    @Serializable
-    private data class QueuedPush(val eventId: String, val roomId: String, val at: Long)
-
-    private const val PUSH_QUEUE_PREFS = "push_queue"
-    private const val PUSH_QUEUE_KEY = "pending"
-    /** Age bound: ntfy replays the stream ~12h (push/README.md) — an older gap
-     *  is unreachable anyway, and the entry would only ever wake on stale
-     *  evidence. Entries beyond this age out of the queue. */
-    private const val PUSH_QUEUE_MAX_AGE_MS = 12L * 60 * 60 * 1000
-    private const val PUSH_QUEUE_MAX_ENTRIES = 50
-
-    private val pushQueueJson = Json { ignoreUnknownKeys = true }
-    private val pushQueueLock = Any()
-
-    /** One drain attempt per process (retried while the client is still null). */
-    @Volatile
-    private var pushQueueDrained = false
-
-    /** Serializes drain attempts — the check-and-set of [pushQueueDrained]
-     *  and the backstop's reset-then-drain must not interleave with a drain
-     *  already in flight (two drains = two concurrent wake syncOnce). */
-    private val pushQueueDrainMutex = Mutex()
-
-    /** The queue lives as one JSON array in SharedPreferences — a bounded,
-     *  ids-only file. */
-    private fun loadPushQueue(): List<QueuedPush> =
-        runCatching {
-            appContext?.getSharedPreferences(PUSH_QUEUE_PREFS, Context.MODE_PRIVATE)
-                ?.getString(PUSH_QUEUE_KEY, null)
-                ?.let { pushQueueJson.decodeFromString<List<QueuedPush>>(it) }
-        }.getOrNull().orEmpty()
-            .filter { it.at > System.currentTimeMillis() - PUSH_QUEUE_MAX_AGE_MS }
-
-    private fun savePushQueue(queue: List<QueuedPush>) {
-        appContext?.getSharedPreferences(PUSH_QUEUE_PREFS, Context.MODE_PRIVATE)?.edit()
-            ?.putString(
-                PUSH_QUEUE_KEY,
-                queue.takeLast(PUSH_QUEUE_MAX_ENTRIES)
-                    .takeIf { it.isNotEmpty() }
-                    ?.let { pushQueueJson.encodeToString(it) },
-            )
-            ?.apply()
-    }
-
-    private fun enqueuePush(eventId: String, roomId: String) {
-        synchronized(pushQueueLock) {
-            savePushQueue(
-                loadPushQueue().filterNot { it.eventId == eventId } +
-                    QueuedPush(eventId, roomId, System.currentTimeMillis()),
-            )
-        }
-    }
-
-    private fun clearPushQueue() {
-        synchronized(pushQueueLock) { savePushQueue(emptyList()) }
-    }
-
-    /**
-     * Re-wake a push that was delivered over SSE but never proven caught up —
-     * the process died between delivery and sync (SYNC-PERF-SPEC §3.2). Runs
-     * once per process when slow sync first engages; entries the restore's
-     * initial sync already delivered cost one store query each. One catch-up
-     * wake covers the whole queue: the syncOnce runs to the present, so
-     * everything queued before it landed too.
-     */
-    private suspend fun drainPushQueue(forceReset: Boolean = false) {
-        pushQueueDrainMutex.withLock {
-            if (!forceReset && pushQueueDrained) return
-            val c = client ?: return
-            pushQueueDrained = true
-            val pending = loadPushQueue()
-            val missing = pending.firstOrNull { !isEventStored(c, it.roomId, it.eventId) }
-            if (missing == null) {
-                if (pending.isNotEmpty()) clearPushQueue()
-                return
-            }
-            android.util.Log.i(TAG, "push queue: ${pending.size} pending — catching up")
-            runPushWake(c, missing.eventId, missing.roomId) // clears the queue when caught up
-            // Fallback rounds own anything the wake couldn't reach; keeping the
-            // ids would only re-wake on stale evidence (the age bound caps both).
-            clearPushQueue()
-        }
-    }
-
+    /** Lenient JSON for Beeper API payloads (unknown keys tolerated). */
+    private val lenientJson = Json { ignoreUnknownKeys = true }
 
     /** Min gap between network-triggered sync restarts (flappy-radio guard,
      *  — see [networkCallback]). */
@@ -771,83 +573,18 @@ object MatrixRepository {
 
     /**
      * Background-only timeline window (SYNC-PERF-SPEC §Phase 1):
-     * the syncOnce filter (slow rounds / push wakes / send-wakes) serves steady
+     * the syncOnce filter (send-wakes) serves steady
      * incremental deltas, not gap-fill, so a slimmer window parses, decrypts
      * and stores less per round. 20, not 10: a burst deeper than the window
-     * truncates (the incident), and the wake's [isEventStored]
-     * verification then misses → retries → a false sync-pending notification.
+     * truncates (the incident).
      */
     private const val SYNC_TIMELINE_LIMIT_BACKGROUND = 20L
 
-    /** Screen on/off → sync cadence. Registered on the app context in [init],
-     *  so it lives as long as the process (which the FGS keeps alive). */
-    private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                Intent.ACTION_SCREEN_ON -> {
-                    // Stall repair FIRST, while syncMode still reads SLOW —
-                    // the receive-time gate inside must see slow mode.
-                    // applySyncModeForScreenState() below hands sync to the
-                    // active long-poll; the repair's in-coroutine re-check
-                    // then skips if the long-poll won the race.
-                    maybeCatchUpOnScreenOn()
-                    applySyncModeForScreenState()
-                    // A message likely landed while the screen was dark — end
-                    // the resolver's screen-off sleep so the list is fresh the
-                    // moment the user opens it.
-                    wakeRoomList()
-                }
-                Intent.ACTION_SCREEN_OFF -> {
-                    applySyncModeForScreenState()
-                }
-            }
-        }
-    }
-
-    /**
-     * Stall repair on screen-on (BrightChat watchForWake): the cheapest
-     * possible repair moment — the CPU is running and the user hasn't reached
-     * the app yet. A healthy chain costs one timestamp comparison. Only a
-     * chain whose last proven success is older than 3× the current expected
-     * cadence (push-gated: 900 s lazy / 300 s plain — the same two constants
-     * [startSlowSyncRounds] runs on) runs one immediate catch-up round, and
-     * only while slow sync owns the cadence: the active long-poll delivering
-     * already re-stamps the success, and a concurrent syncOnce next to it
-     * would double-consume the sync stream (the push-wake path gates the same
-     * way). A wedged active long-poll stays the existing watchdog's business.
-     *
-     * Follows the push-wake single-flight shape: the launch is held in
-     * [stallRepairJob] (any previous one cancelled first), gated on
-     * `syncMode == SyncMode.SLOW` at receive time, and RE-CHECKED inside the
-     * coroutine right before [timedSyncOnce] — [applySyncModeForScreenState]
-     * runs immediately after this call in the same SCREEN_ON branch and
-     * engages the active long-poll, so the receive-time check alone does not
-     * hold through execution. If the mode changed in between, the long-poll
-     * owns sync and the repair skips silently.
-     */
-    private fun maybeCatchUpOnScreenOn() {
-        if (!syncEnabled) return
-        val expected = if (PushChannel.isConnected) SLOW_SYNC_LAZY_INTERVAL_MS else SLOW_SYNC_INTERVAL_MS
-        if (!SyncHealth.isStalled(lastSyncOkAtMs, System.currentTimeMillis(), expected)) return
-        val c = client ?: return
-        if (syncMode != SyncMode.SLOW) return
-        android.util.Log.w(
-            TAG,
-            "screen-on stall repair: last ok ${System.currentTimeMillis() - lastSyncOkAtMs}ms ago (expected ≤${SyncHealth.STALL_MULTIPLIER * expected}ms)",
-        )
-        Diagnostics.record("screen-on stall repair: catching up")
-        stallRepairJob?.cancel()
-        stallRepairJob = scope.launch {
-            if (syncMode != SyncMode.SLOW) return@launch // active long-poll owns sync now
-            timedSyncOnce(c, "screen-on stall repair")
-        }
-    }
-
     /**
      * Network-loss recovery: a transport drop can leave
-     * Trixnity's sync loop dead until its internal retry or the watchdog
-     * fires — reset it as soon as the network is back. Registered on the app
-     * context in [init], process-lifetime like [screenReceiver].
+     * Trixnity's sync loop dead until its internal retry —
+     * reset it as soon as the network is back. Registered on the app
+     * context in [init], process-lifetime.
      */
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onLost(network: android.net.Network) {
@@ -867,29 +604,25 @@ object MatrixRepository {
                 runCatching { c.stopSync() }
                 android.util.Log.d(TAG, "network back after loss — resetting sync loop")
                 Diagnostics.record("network back after loss — sync reset")
-                if (isScreenInteractive()) {
-                    // Re-arm through the shared entry point (the stopSync above
-                    // un-armed the slot, so [startSyncLoop] must re-arm it). A
-                    // dark screen must NOT start a long-poll: that branch goes
-                    // through the shared screen → cadence entry point (the
-                    // battery-saver and slow-sync gates live in it).
-                    inProcessSyncRunning = false
-                    startSyncLoop(appContext ?: return@launch)
-                } else {
-                    applySyncModeForScreenState()
-                }
+                // The stopSync above un-armed the slot, so [startSyncLoop]
+                // must re-arm it. Never outside the open-tool window
+                // (open-only sync).
+                inProcessSyncRunning = false
+                if (syncWanted) startSyncLoop()
             }
         }
     }
 
-    /** Called once from [ServerApplication]; restores a stored session if there is one. */
+    /** Called once from [ServerBootstrapProvider] at process start; restores a
+     *  stored session if there is one. Sync itself is NOT started here — the
+     *  tool activity's resume/pause drives it (open-only sync). */
     fun init(context: Context) {
         val app = context.applicationContext
         if (appContext == null) appContext = app
         Diagnostics.init(app)
         enableTrixnityLogging()
-        // Settings → Sync pause (audit 2026-08-14): a paused companion starts
-        // no sync loop and no foreground service — the battery escape hatch.
+        // Settings → Sync pause (audit 2026-08-14): a paused app starts
+        // no sync loop — the battery escape hatch.
         syncEnabled = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_SYNC_ENABLED, true)
         // Seed the restore-completed flag from prefs: the crawl is
@@ -900,197 +633,87 @@ object MatrixRepository {
             completed = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getBoolean(KEY_RESTORE_COMPLETED, false),
         )
-        // Delivery-health seeds (Account screen line + screen-on stall check).
+        // Delivery-health seeds (Account screen line).
         lastSyncOkAtMs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getLong(KEY_LAST_SYNC_OK_MS, 0L)
         consecutiveSyncFailures = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getInt(KEY_SYNC_FAILURES, 0)
-        // Screen-driven cadence: long-poll while the screen is on, periodic
-        // syncOnce after it's been off for a while (battery, 2026-08-14).
-        app.registerReceiver(
-            screenReceiver,
-            IntentFilter().apply {
-                addAction(Intent.ACTION_SCREEN_ON)
-                addAction(Intent.ACTION_SCREEN_OFF)
-            },
-            Context.RECEIVER_NOT_EXPORTED,
-        )
         // Network-loss recovery: reset the sync loop when the
         // transport returns — Trixnity can sit dead until its internal retry.
         // The initial onAvailable for the current default network is a no-op
         // (networkWasLost starts false).
         (app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
             ?.registerDefaultNetworkCallback(networkCallback)
-        // Booted with the screen already dark: no SCREEN_OFF broadcast is
-        // coming — drop to slow sync after the grace instead of long-polling
-        // with nobody watching.
-        val power = app.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        if (power?.isInteractive == false) scheduleSlowSync()
+        // Open-only sync driver: the tool activity's resume starts the loop,
+        // its pause stops it. In-tool navigation never pauses the activity,
+        // so the loop spans whole tool sessions; leaving the tool (toolbox /
+        // home) pauses the activity and ends sync. [startSync] re-checks the
+        // battery-saver toggle.
+        (app as? Application)?.registerActivityLifecycleCallbacks(
+            object : Application.ActivityLifecycleCallbacks {
+                override fun onActivityResumed(activity: Activity) = startSync()
+                override fun onActivityPaused(activity: Activity) = stopSync()
+                override fun onActivityStarted(activity: Activity) = Unit
+                override fun onActivityStopped(activity: Activity) = Unit
+                override fun onActivityCreated(activity: Activity, savedInstanceState: android.os.Bundle?) = Unit
+                override fun onActivitySaveInstanceState(activity: Activity, outState: android.os.Bundle) = Unit
+                override fun onActivityDestroyed(activity: Activity) = Unit
+            },
+        )
         scope.launch {
             // Restore the session regardless of the sync toggle. GetAccountState
-            // reads the live client, so a paused companion that skips the restore
+            // reads the live client, so a paused app that skips the restore
             // makes the tool report "Not signed in" while the session is fine.
-            if (ensureClient() != null) {
-                // Screen-state-aware start: a
-                // session restore that lands while the screen is dark must
-                // NOT long-poll — the boot-time sample above races the
-                // restore, and a SCREEN_OFF broadcast that fired before the
-                // receiver registered is gone. The shared entry point
-                // applies the cadence the screen actually calls for (battery
-                // saver: nothing while dark, full sync while on).
-                applySyncModeForScreenState()
-                // Push wake-up channel: register the Matrix
-                // HTTP pusher + hold the SSE subscription so idle sync has
-                // zero latency — see PushChannel. It is background keep-alive,
-                // so battery saver never starts it.
-                if (syncEnabled) PushChannel.start(app, client!!)
-            }
+            ensureClient()
         }
     }
 
     /**
-     * Toggles Battery Saver (Settings): when on, all sync machinery stops
-     * while the screen is dark — messages arrive only while the screen is
-     * on. Re-enabling restores the session if needed and restarts the loop.
-     * Persisted, so it survives reboots.
+     * Starts the open-only sync loop (the tool activity resumed). Respects the
+     * Settings → Sync toggle; restores the session first if needed. Idempotent.
+     */
+    fun startSync() {
+        syncWanted = true
+        if (!syncEnabled) return
+        scope.launch {
+            val c = client ?: ensureClient() ?: return@launch
+            if (syncWanted) startSyncLoop()
+        }
+    }
+
+    /**
+     * Stops the open-only sync loop (the tool activity paused): the long-poll
+     * ends and the process goes quiet — no FGS holds it alive anymore.
+     */
+    fun stopSync() {
+        syncWanted = false
+        val c = client ?: return
+        scope.launch {
+            runCatching { c.stopSync() }
+            inProcessSyncJob?.cancel()
+            inProcessSyncJob = null
+            inProcessSyncRunning = false
+            Diagnostics.record("sync stopped (tool closed)")
+        }
+    }
+
+    /**
+     * Toggles the Settings → Sync pause: when off, no sync loop runs at all
+     * (open-only sync's escape hatch). Re-enabling restarts the loop if the
+     * tool is foreground. Persisted, so it survives reboots.
      */
     suspend fun setSyncEnabled(enabled: Boolean) {
-        val ctx = appContext ?: return
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_SYNC_ENABLED, enabled).apply()
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.edit()?.putBoolean(KEY_SYNC_ENABLED, enabled)?.apply()
         syncEnabled = enabled
-        val c = client
-        // Cancel the dark-screen schedules in both branches (battery saver
-        // stops them; re-enabling restarts them below).
-        slowSyncJob?.cancel()
-        slowSyncJob = null
-        screenOffJob?.cancel()
-        screenOffJob = null
-        syncMode = SyncMode.ACTIVE
         if (!enabled) {
-            if (isScreenInteractive()) {
-                // Foreground sync keeps running while the screen is on — the
-                // dark-screen teardown happens on the next SCREEN_OFF.
-                PushChannel.stop()
-            } else {
-                stopBackgroundSync()
-                setConnectionState(ChatConnectionState.Offline("battery saver"))
-            }
-            android.util.Log.d(TAG, "battery saver on")
+            stopSync()
+            setConnectionState(ChatConnectionState.Offline("sync paused"))
+            android.util.Log.d(TAG, "sync paused by user")
         } else {
-            if (c == null) {
-                if (ensureClient() != null) startSyncLoop(ctx)
-            } else {
-                startSyncLoop(ctx)
-            }
-            client?.let { PushChannel.start(ctx, it) }
+            startSync()
             android.util.Log.d(TAG, "sync resumed by user")
         }
-    }
-
-    /**
-     * Stops every piece of sync machinery (battery saver with a dark screen):
-     * the long-poll, slow-sync rounds, the push channel and the FGS. The
-     * notification watcher and room-list resolver go dormant on their own
-     * (without sync the room flows never emit).
-     */
-    private suspend fun stopBackgroundSync() {
-        val ctx = appContext ?: return
-        runCatching { client?.stopSync() }
-        inProcessSyncJob?.cancel()
-        inProcessSyncJob = null
-        inProcessSyncRunning = false
-        PushChannel.stop()
-        ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
-        Diagnostics.record("sync stopped")
-    }
-
-    /**
-     * Single entry point for the screen-state → sync-cadence decision.
-     * Called from [init] after the client is ready, the SCREEN_ON/OFF
-     * receiver, and [ChatSyncService] before it starts a long-poll, so a sync
-     * loop never runs while the screen is dark. Screen on → active long-poll;
-     * dark → slow sync after the grace, or nothing at all under battery saver.
-     */
-    fun applySyncModeForScreenState() {
-        if (isScreenInteractive()) {
-            scope.launch { enterActiveSync() }
-        } else if (syncEnabled) {
-            scheduleSlowSync()
-        } else {
-            // Battery saver: nothing runs while the screen is dark.
-            scope.launch { stopBackgroundSync() }
-        }
-    }
-
-    /**
-     * Drops to the slow cadence once the screen has been dark for the grace
-     * period: stop the long-poll and run periodic [MatrixClient.syncOnce]
-     * rounds instead. The FGS stays (it keeps the process alive for the slow
-     * loop); battery saver (the toggle off) runs nothing at all while dark.
-     */
-    private fun scheduleSlowSync() {
-        screenOffJob?.cancel()
-        screenOffJob = scope.launch {
-            delay(SLOW_SYNC_GRACE_MS)
-            // Screen came back on during the grace — [enterActiveSync] already
-            // cancelled this job; this is just paranoia.
-            val power = appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager
-            if (power?.isInteractive == true) return@launch
-            enterSlowSync()
-        }
-    }
-
-    private suspend fun enterSlowSync() {
-        if (!syncEnabled || syncMode == SyncMode.SLOW) return
-        // The session restore may still be in flight when the grace fires (a
-        // process restart while dark — audit). Wait for it
-        // (bounded, screen re-checked) instead of bailing: a bail left syncMode
-        // ACTIVE and the restore's long-poll ran all night with no re-check.
-        var c = client
-        if (c == null) {
-            val deadline = android.os.SystemClock.elapsedRealtime() + SLOW_SYNC_GRACE_MS
-            while (c == null && !isScreenInteractive() &&
-                android.os.SystemClock.elapsedRealtime() < deadline
-            ) {
-                delay(250)
-                c = client
-            }
-            if (c == null) {
-                android.util.Log.w(
-                    TAG,
-                    "slow-sync grace: client still not ready after ${SLOW_SYNC_GRACE_MS / 1000}s — " +
-                        "applySyncModeForScreenState() re-arms on client-ready",
-                )
-                return
-            }
-            if (isScreenInteractive()) return // screen came back on — enterActiveSync owns sync
-            android.util.Log.w(TAG, "slow-sync grace: waited for client — engaging slow sync")
-        }
-        // Screen truth re-check: the grace's check above can race
-        // a SCREEN_ON broadcast (they fire in the same ms on a button press).
-        // With a live client (the c == null branch above is skipped) engaging
-        // slow mode then STOPS the long-poll while the screen is on — the
-        // "sync mode: active" + "sync mode: slow" back-to-back log + a dead
-        // loop until the next SCREEN_ON.
-        if (isScreenInteractive()) return // screen came back on — enterActiveSync owns sync
-        syncMode = SyncMode.SLOW // gate first: the watchdog must not restart the long-poll
-        runCatching { c.stopSync() }
-        Diagnostics.record("sync paused (slow mode)")
-        inProcessSyncJob?.cancel()
-        inProcessSyncJob = null
-        inProcessSyncRunning = false
-        slowSyncJob?.cancel()
-        slowSyncJob = startSlowSyncRounds(c)
-        // Catch up on pushes the previous process delivered but never synced
-        // (SYNC-PERF-SPEC §3.2) — slow sync is the cadence whose gaps the
-        // queue exists to close; active long-poll delivery needs no replay.
-        scope.launch { drainPushQueue() }
-        android.util.Log.d(
-            TAG,
-            "sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s)",
-        )
-        Diagnostics.record("sync mode: slow (syncOnce every ${SLOW_SYNC_INTERVAL_MS / 1000}s)")
     }
 
     /** One syncOnce round with a wall-clock duration log — the per-sync cost is
@@ -1108,9 +731,6 @@ object MatrixRepository {
             .onSuccess {
                 offlinePublishJob?.cancel() // a healthy round cancels a pending offline publish
                 setConnectionState(ChatConnectionState.Syncing)
-                // Any successful sync means the "checking failed" signal (if
-                // any) is stale (WAKE-COMPARISON.md #3).
-                appContext?.let { ChatNotifier.clearSyncPending(it) }
                 recordSyncRoundOk()
             }
             .onFailure {
@@ -1145,192 +765,6 @@ object MatrixRepository {
         appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()
             ?.putInt(KEY_SYNC_FAILURES, consecutiveSyncFailures)
             ?.apply()
-    }
-
-    /** The periodic syncOnce rounds (also restarted by a push-wake — see [onPushDelivered]). */
-    private fun startSlowSyncRounds(c: MatrixClient): Job {
-        val job = scope.launch {
-            var lastInterval = 0L
-            while (isActive) {
-                if (client !== c) return@launch // logged out / re-logged in under us
-                // Delay before the first round: a wake
-                // (push/send) cancels the rounds, runs its own syncOnce, then
-                // recreates this job — an immediate first round duplicated the
-                // wake's syncOnce (two /sync per wake, ~2x the per-push cost).
-                // The wake's own round already delivers; the cadence below is
-                // the redundancy net.
-                // Push-gated cadence: while the push
-                // channel is connected the rounds run lazy — pushes wake us
-                // for real messages, so a 15-min net is enough; when it's
-                // down we fall back to the 5-min cadence (a dead push must
-                // not mean a long receive delay, 08-28 lesson — the per-round
-                // re-check keeps that bounded to one lazy interval).
-                val interval =
-                    if (PushChannel.isConnected) SLOW_SYNC_LAZY_INTERVAL_MS else SLOW_SYNC_INTERVAL_MS
-                if (interval != lastInterval) {
-                    lastInterval = interval
-                    android.util.Log.d(
-                        TAG,
-                        "slow sync interval: ${interval / 1000}s (push ${if (PushChannel.isConnected) "connected" else "down"})",
-                    )
-                }
-                delay(interval)
-                timedSyncOnce(c, "round")
-                    .onFailure { android.util.Log.w(TAG, "slow sync round failed: ${it.message}") }
-            }
-        }
-        return job
-    }
-
-    /** Back to the real-time long-poll (screen on, or any reason sync restarts). */
-    private suspend fun enterActiveSync() {
-        // Foreground (screen on): any "checking failed" signal is stale now
-        // (WAKE-COMPARISON.md #3).
-        appContext?.let { ChatNotifier.clearSyncPending(it) }
-        screenOffJob?.cancel()
-        screenOffJob = null
-        slowSyncJob?.cancel()
-        slowSyncJob = null
-        // Skip only when ACTIVE mode already owns a live loop (in-process or
-        // the FGS's). syncMode starts ACTIVE in a fresh process with nothing
-        // running — bailing there (as the old `init`-independent guard did)
-        // would leave a fresh screen-on start with no sync at all.
-        if (syncMode == SyncMode.ACTIVE && (inProcessSyncRunning || ChatSyncService.isRunning)) return
-        syncMode = SyncMode.ACTIVE
-        val ctx = appContext ?: return
-        if (client != null) {
-            startSyncLoop(ctx)
-            android.util.Log.d(TAG, "sync mode: active (long-poll)")
-            Diagnostics.record("sync mode: active (long-poll)")
-        }
-    }
-
-    /**
-     * Push-wake: an SSE push notification
-     * arrived, so a message is waiting. While idle (slow sync, screen off)
-     * run ONE syncOnce round — the notification watcher then posts the local
-     * notification and the room flows update. While active the long-poll
-     * already delivers it, so the push is redundant and skipped. The slow-sync
-     * rounds are the fallback delivery (a silent SSE drop must not mean missed
-     * messages) — the same 5-min cadence with or without a live channel
-     * (PLAN §8.2: was a 30-min push-gated net; a silently-dead
-     * push meant a 30-min receive delay, and rounds are cheap with the sync
-     * filter).
-     * [countsOnly] = the push carried no room/event id (Beeper's read-receipt /
-     * unread-count payloads). Those must not each run a full ~30-50 s syncOnce
-     * — a group chat with N members generates one per read action. Bursts
-     * collapse to one sync per [COUNTS_WAKE_MIN_INTERVAL_MS]: the FIRST push
-     * still syncs (it can be the only signal for a real message, e.g.
-     * note-to-self on Beeper's fork), and an event push right before covers
-     * the state anyway. Real event pushes (message arriving) sync once per
-     * burst — trailing-edge debounced [PUSH_WAKE_DEBOUNCE_MS] so N messages
-     * cost one syncOnce (~1s latency). [eventId]/[roomId] come from the push
-     * payload (event_id_only format) and let the wake verify the sync actually
-     * reached the event (WAKE-COMPARISON.md #2).
-     */
-    suspend fun onPushDelivered(countsOnly: Boolean = false, eventId: String? = null, roomId: String? = null) {
-        val c = client ?: return
-        if (syncMode != SyncMode.SLOW) return
-        if (countsOnly) {
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now - lastPushWakeSyncAtMs < COUNTS_WAKE_MIN_INTERVAL_MS) {
-                android.util.Log.d(TAG, "counts push collapsed (last wake ${(now - lastPushWakeSyncAtMs) / 1000}s ago)")
-                return
-            }
-            runPushWake(c, eventId, roomId)
-            return
-        }
-        // Real-message push: coalesce bursts. The window's last push wins — the
-        // sync runs once at the end instead of once per push. The push is
-        // queued first: if the process dies before the wake's sync completes,
-        // drainPushQueue() re-wakes it on the next slow-sync engagement
-        // (SYNC-PERF-SPEC §3.2). Cleared by runPushWake once the event is
-        // proven in the store.
-        if (eventId != null && roomId != null) enqueuePush(eventId, roomId)
-        pushWakeJob?.cancel()
-        pushWakeJob = scope.launch {
-            delay(PUSH_WAKE_DEBOUNCE_MS)
-            if (client !== c || syncMode != SyncMode.SLOW) return@launch
-            runPushWake(c, eventId, roomId)
-        }
-    }
-
-    /** True when the event is already in the Room store — the store is the
-     *  only consistent truth for "did sync reach this event" (the same tables
-     *  readTimelineChainFromDb walks; single indexed point queries). Message
-     *  events land in TimelineEvent; state events (invites, member/topic
-     *  changes) land in RoomState's JSON `event` column instead — both are
-     *  pushable, so both are checked. */
-    private suspend fun isEventStored(c: MatrixClient, roomId: String, eventId: String): Boolean {
-        val db = runCatching {
-            c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class)
-        }.onFailure { e ->
-            android.util.Log.w(TAG, "isEventStored: TrixnityRoomDatabase not in DI", e)
-        }.getOrNull() ?: return false
-        return withContext(Dispatchers.IO) {
-            runCatching {
-                val reader = db.openHelper.readableDatabase
-                val inTimeline = reader.query(
-                    "SELECT count(*) FROM TimelineEvent WHERE roomId = ? AND eventId = ?",
-                    arrayOf<Any>(roomId, eventId),
-                ).use { it.moveToFirst() && it.getInt(0) > 0 }
-                if (inTimeline) return@withContext true
-                reader.query(
-                    "SELECT count(*) FROM RoomState WHERE roomId = ? AND json_extract(event, '$.event_id') = ?",
-                    arrayOf<Any>(roomId, eventId),
-                ).use { it.moveToFirst() && it.getInt(0) > 0 }
-            }.onFailure { e ->
-                android.util.Log.w(TAG, "isEventStored: store query failed", e)
-            }.getOrDefault(false)
-        }
-    }
-
-    /** The wake itself: cancel the fallback rounds, run ONE syncOnce, verify
-     *  it reached the pushed event (bounded retries with backoff), restart
-     *  the rounds if the screen is still dark. Shared by counts-only pushes
-     *  (immediate) and debounced real-message wakes. */
-    private suspend fun runPushWake(c: MatrixClient, eventId: String?, roomId: String?) {
-        // Skip-when-useless (WAKE-COMPARISON.md #4): a slow round or an
-        // earlier wake already delivered this event — no sync needed (the
-        // notification watcher posted it when it was stored).
-        if (eventId != null && roomId != null && isEventStored(c, roomId, eventId)) {
-            android.util.Log.d(TAG, "push wake skipped — event already in store")
-            clearPushQueue() // the round/sync that stored it already ran to the present
-            return
-        }
-        slowSyncJob?.cancel()
-        slowSyncJob = null
-        Diagnostics.record("push wake")
-        var caughtUp = false
-        // NOTE: `return@repeat` would NOT break here — repeat's inline lambda
-        // returning just continues the next index.
-        // A plain for loop with `break` stops the retries once caught up.
-        for (attempt in 0 until PUSH_WAKE_ATTEMPTS) {
-            timedSyncOnce(c, if (attempt == 0) "push" else "push-retry")
-                .onSuccess {
-                    // Caught up = the sync actually stored the pushed event;
-                    // counts-only wakes (no ids) have nothing to verify.
-                    caughtUp = eventId == null || roomId == null || isEventStored(c, roomId, eventId)
-                }
-                .onFailure { android.util.Log.w(TAG, "push-wake sync failed: ${it.message}") }
-            if (caughtUp) break
-            if (attempt < PUSH_WAKE_ATTEMPTS - 1) delay(PUSH_WAKE_RETRY_DELAY_MS * (attempt + 1))
-        }
-        // Retries exhausted without the event landing — tell the user
-        // something may be waiting (WAKE-COMPARISON.md #3). The fallback
-        // rounds keep retrying, and the next successful sync clears it.
-        if (!caughtUp) appContext?.let { ChatNotifier.notifySyncPending(it) } else clearPushQueue()
-        lastPushWakeSyncAtMs = android.os.SystemClock.elapsedRealtime()
-        // A push means events landed in the store — end the resolver's
-        // screen-off sleep so the next list read is fresh (feedback 2026-08-17).
-        wakeRoomList()
-        // Restart the fallback rounds. If the screen came back on mid-wake,
-        // enterActiveSync owns sync (its long-poll already delivers); only
-        // restart when it is still dark.
-        val power = appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager
-        if (syncEnabled && power?.isInteractive == false) {
-            slowSyncJob = startSlowSyncRounds(c)
-        }
     }
 
     /**
@@ -1382,44 +816,26 @@ object MatrixRepository {
     }
 
     /**
-     * Starts the Matrix sync loop with a foreground-service fallback. Android
-     * blocks `startForegroundService` while the server process boots in the
-     * background (mAllowStartForeground=false right after install/update), so
-     * first arm the loop in-process — that works as long as the tool is bound/
-     * foreground — then keep promoting to the foreground service so sync
-     * survives the tool closing. ChatSyncService treats an armed in-process
-     * loop as keep-alive-only instead of arming a second loop.
+     * Arms the Matrix sync loop in-process (open-only sync — no FGS fallback:
+     * the loop lives exactly as long as the tool is foreground).
      * Arm-once since: under Trixnity v5, [MatrixClient.startSync]
      * does NOT run the sync inline — it arms the client's internal sync loop
      * (the /sync rounds and their error retries happen inside the client) and
      * returns. The old restart-with-backoff loop was built on v4 semantics
      * (startSync suspended until the loop died), so on v5 it logged "loop
      * ended" after every arm and re-armed on a 1→30 s clock, aborting the
-     * in-flight round each time. A wedged loop is recovered by
-     * [ChatSyncService]'s syncState watchdog once the promotion lands.
+     * in-flight round each time.
      */
-    private fun startSyncLoop(context: Context) {
+    private fun startSyncLoop() {
         val c = client ?: return
         if (inProcessSyncRunning) return
         inProcessSyncJob?.cancel()
         inProcessSyncRunning = true
         inProcessSyncJob = scope.launch {
             runCatching { c.startSync(Presence.OFFLINE) }
-                .onFailure { android.util.Log.w(TAG, "in-process sync failed to arm: ${it.message}") }
+                .onFailure { android.util.Log.w(TAG, "sync failed to arm: ${it.message}") }
         }
-        android.util.Log.d(TAG, "in-process sync loop armed for ${c.userId.full}")
-        // Foreground-service promotion at a fixed cadence (the old 3→60 s
-        // geometric backoff stretched a blocked promotion to ~176 s — a fixed
-        // interval converges within one tick of the system allowing it).
-        scope.launch {
-            while (isActive && client === c && !ChatSyncService.isRunning) {
-                // Battery saver tore sync down with the screen dark — don't
-                // resurrect the FGS behind the teardown's back.
-                if (!syncEnabled && !isScreenInteractive()) return@launch
-                if (ChatSyncService.tryStart(context)) break
-                delay(FGS_PROMOTE_INTERVAL_MS)
-            }
-        }
+        android.util.Log.d(TAG, "sync loop armed for ${c.userId.full}")
     }
 
     /**
@@ -1528,7 +944,7 @@ object MatrixRepository {
                 contentType(ContentType.Application.Json)
             }
             if (init.status.value !in 200..299) error("Beeper login init failed (HTTP ${init.status.value})")
-            val requestId = pushQueueJson
+            val requestId = lenientJson
                 .parseToJsonElement(init.bodyAsText())
                 .jsonObject["request"]?.jsonPrimitive?.content
                 ?: error("missing request id")
@@ -1601,7 +1017,7 @@ object MatrixRepository {
                     // succeed, so drop the stored request id.
                     val body = runCatching { resp.bodyAsText() }.getOrNull()
                     val bodyJson = body?.let {
-                        runCatching { pushQueueJson.parseToJsonElement(it).jsonObject }.getOrNull()
+                        runCatching { lenientJson.parseToJsonElement(it).jsonObject }.getOrNull()
                     }
                     val detail = bodyJson?.get("error")?.jsonPrimitive?.content
                     when (resp.status.value) {
@@ -1623,7 +1039,7 @@ object MatrixRepository {
                             ?: "Beeper code verification failed (HTTP ${resp.status.value})")
                     }
                 }
-                val json = pushQueueJson.parseToJsonElement(resp.bodyAsText()).jsonObject
+                val json = lenientJson.parseToJsonElement(resp.bodyAsText()).jsonObject
                 val whoami = json["whoami"]?.jsonObject ?: error("missing whoami")
                 val userInfo = whoami["userInfo"]?.jsonObject ?: error("missing userInfo")
                 username = userInfo["username"]?.jsonPrimitive?.content ?: error("missing username")
@@ -1668,14 +1084,9 @@ object MatrixRepository {
         // A fresh login must not inherit the previous account's "all messages
         // restored" claim (2026-09-01; logout already clears all prefs).
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_RESTORE_COMPLETED).apply()
-        slowSyncJob?.cancel()
-        slowSyncJob = null
-        screenOffJob?.cancel()
-        screenOffJob = null
-        syncMode = SyncMode.ACTIVE
-        startSyncLoop(ctx)
-        // Background keep-alive — battery saver never starts it.
-        if (syncEnabled) PushChannel.start(ctx, newClient)
+        // Login happens with the tool foreground — start the open-only loop.
+        syncWanted = true
+        startSyncLoop()
         // Verification is part of login (Beeper's model) — but only when there
         // is something to verify against: the account has cross-signing keys
         // uploaded and this fresh session isn't trusted yet. The request goes
@@ -1720,7 +1131,7 @@ object MatrixRepository {
     }
 
     /** Whether the most recent login ended with device verification pending —
-     *  stamped by [finishLogin], read by ChatServiceMethods to add
+     *  stamped by [finishLogin], read by the tool to add
      *  `needsVerification` to the SetAccount/SetBeeperAccount responses. */
     @Volatile
     var lastLoginNeedsVerification: Boolean = false
@@ -1885,14 +1296,9 @@ object MatrixRepository {
                 )
             }
         }
-        // Restart the loop through the shared cadence entry points (same shape
-        // as the network-recovery reset): a dark screen must not start a
-        // long-poll — it goes through the screen → cadence decision instead.
-        if (isScreenInteractive()) {
-            startSyncLoop(appContext ?: error("companion not initialized"))
-        } else {
-            applySyncModeForScreenState()
-        }
+        // Restart the loop on the new full filter (same shape as the
+        // network-recovery reset) — only within the open-tool window.
+        if (syncWanted) startSyncLoop()
     }
 
     /**
@@ -2593,13 +1999,8 @@ object MatrixRepository {
             // re-observes (the attach path cancels + re-registers anyway).
             notificationWatcherJobs.forEach { it.cancel() }
             notificationWatcherJobs.clear()
-            slowSyncJob?.cancel()
-            slowSyncJob = null
-            screenOffJob?.cancel()
-            screenOffJob = null
             inProcessSyncJob?.cancel()
             inProcessSyncJob = null
-            syncMode = SyncMode.ACTIVE
             inProcessSyncRunning = false
             observedClient = null
             // Verification-first sync: a torn-down session must not leak the
@@ -2610,7 +2011,6 @@ object MatrixRepository {
             resetVerification()
             e2eeStateCache = null // logged out — no stale verified state
             activeRoomId = null
-            pendingNotifyRoomId = null
             stopAudioPlayback()
             resetRoomList()
             // Pending voice-note copies are app-private temp files — drop them
@@ -2618,11 +2018,6 @@ object MatrixRepository {
             pendingAudioEcho.values.forEach { room ->
                 room.values.forEach { pending -> pending.localFile?.let { runCatching { it.delete() } } }
             }
-            // Drop the push subscription and remove the pusher from the account
-            // (best-effort — an unguessable ntfy topic is harmless if it fails).
-            PushChannel.stop()
-            old?.let { runCatching { PushChannel.unregister(ctx, it) } }
-            ChatNotifier.clearAll(ctx)
             runCatching { old?.logout() } // API logout + clears Trixnity's store
                 .onFailure {
                     // A skipped/failed API logout leaks the device server-side
@@ -2632,7 +2027,6 @@ object MatrixRepository {
                     android.util.Log.w(TAG, "logout: API logout failed — device stays registered: ${it.message}")
                 }
             runCatching { old?.closeSuspending() }
-            ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
             ctx.deleteDatabase(DB_NAME)
             projectionTableReady = false
             ctx.cacheDir.resolve(MEDIA_DIR).deleteRecursively()
@@ -2646,7 +2040,7 @@ object MatrixRepository {
 
     /**
      * Restores a session from the Room store, if one exists (idempotent).
-     * Called by [ServerApplication] on boot and by [ChatSyncService] before sync.
+     * Called from [init] at process start and by [startSync].
      */
     suspend fun ensureClient(): MatrixClient? {
         initMutex.withLock {
@@ -2698,11 +2092,11 @@ object MatrixRepository {
         )
     }
 
-    /** Background-delivery health for the Account screen's status line. */
+    /** Sync health for the Account screen's status line. */
     fun deliveryHealth(): DeliveryHealth = DeliveryHealth(
         lastSuccessfulRoundAtMs = lastSyncOkAtMs,
         consecutiveFailures = consecutiveSyncFailures,
-        pushConnected = PushChannel.isConnected,
+        pushConnected = false, // push machinery removed (Rung 1)
     )
 
     data class DeliveryHealth(
@@ -2711,55 +2105,8 @@ object MatrixRepository {
         val pushConnected: Boolean,
     )
 
-    /** True when a live (non-expired) session exists — the backstop worker's
-     *  do-nothing gate (a dead token must not be restarted into). */
+    /** True when a live (non-expired) session exists. */
     fun isLoggedIn(): Boolean = client != null && !sessionExpired
-
-    /**
-     * One independent catch-up round for [DeliveryBackstopWorker]: a single
-     * syncOnce when slow sync owns the cadence (the screen-on long-poll is
-     * already delivering — a concurrent round would double-consume the sync
-     * stream), then the durable push queue is re-checked with its
-     * once-per-process flag reset, so a worker firing deep into a process's
-     * life can still re-wake a push whose catch-up never landed. The forced
-     * drain runs only while slow sync owns sync — with the screen on the
-     * long-poll is delivering and a forced drain's wake could run beside it.
-     * Battery saver (sync toggle off) makes this a no-op: without the gate a
-     * slow-mode race could leave the worker re-arming a cadence battery
-     * saver explicitly stopped.
-     *
-     * Follows the out-of-band-syncOnce invariant ([runPushWake],
-     * [enterActiveSync], the send-wake): in slow mode the rounds loop is a
-     * live timedSyncOnce caller, so it — and any in-flight screen-on stall
-     * repair ([stallRepairJob]) — is cancelled before the round and
-     * re-engaged afterwards — the cadence keeps running once this returns.
-     */
-    suspend fun backstopCatchUp(reason: String) {
-        if (!syncEnabled) return
-        val c = client ?: return
-        val wasSlow = syncMode == SyncMode.SLOW
-        slowSyncJob?.cancel()
-        slowSyncJob = null
-        stallRepairJob?.cancel()
-        try {
-            if (wasSlow) timedSyncOnce(c, reason)
-            // Slow sync owns sync: the queue's whole net. With the screen on,
-            // the active long-poll is delivering — a forced drain can fire
-            // runPushWake next to it (a drain's wake runs its own syncOnce).
-            if (wasSlow) drainPushQueue(forceReset = true)
-        } finally {
-            // Re-engage the cadence the way the wake pattern does: only while
-            // battery saver is off, slow mode still owns sync and the screen
-            // is still dark (an active long-poll — or enterActiveSync — owns
-            // sync when the screen is on). Skipped when the drain's push-wake
-            // already restarted the rounds (slowSyncJob != null).
-            if (syncEnabled && wasSlow && syncMode == SyncMode.SLOW && slowSyncJob == null &&
-                !isScreenInteractive()
-            ) {
-                slowSyncJob = startSlowSyncRounds(c)
-            }
-        }
-    }
 
     fun connectionState(): com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response {
         val state = _connectionState.value
@@ -2830,7 +2177,7 @@ object MatrixRepository {
         // ~1 MB binder transaction to cap against (INGEST-DERIVED-PLAN.md
         // Phase E); the old recency window + per-network prepend dropped
         // rooms whose row was still derived and is gone. Only the
-        // ChatServiceMethods GetRooms RPC (adb dev control) crosses a real
+        // The GetRooms read crosses a real
         // binder transaction — cap that path only if an account ever grows
         // past ~1,600 rooms (~1 MB encoded).
         return rooms.sortedWith(
@@ -5647,22 +4994,12 @@ object MatrixRepository {
             publishRoomList()
         }
         val c = client ?: return
-        // Battery saver skips only the dark-screen wake — a send with the
-        // screen on is foreground work and gets its catch-up sync.
-        if (!syncEnabled && !isScreenInteractive()) return
-        slowSyncJob?.cancel()
-        slowSyncJob = null
+        // The sync toggle skips the wake — a send with sync paused gets no
+        // catch-up round (the tool is open, so the loop is what's paused).
+        if (!syncEnabled) return
         scope.launch {
             timedSyncOnce(c, "send")
                 .onFailure { android.util.Log.w(TAG, "send-wake sync failed: ${it.message}") }
-            // Slow mode owns the rounds (active mode's long-poll restarts
-            // itself after the syncOnce). The screen may have come back on
-            // mid-wake — enterActiveSync owns sync then; restart the fallback
-            // rounds only while it is still dark.
-            val power = appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager
-            if (syncMode == SyncMode.SLOW && power?.isInteractive == false) {
-                slowSyncJob = startSlowSyncRounds(c)
-            }
         }
     }
 
@@ -6158,22 +5495,7 @@ object MatrixRepository {
         bumpMessagePageRevision(roomId)
     }
 
-    // --- Photos --------------------------------------------------
 
-    /**
-     * Records the room a photo attach should land in and returns the
-     * flattened component name of the companion's photo-picker activity, which
-     * the tool launches via `SimpleLightScreen.startServerActivity` (the tool
-     * runtime forbids startActivity; the companion can't launch activities
-     * from the background). The activity shows the system photo picker, then
-     * uploads and sends the chosen photo in [roomId] itself.
-     */
-    fun startPhotoSend(roomId: String): String {
-        PhotoSendActivity.register(roomId)
-        return PHOTO_PICKER_ACTIVITY
-    }
-
-    /** A photo ready to send: compressed JPEG + metadata for the Matrix event. */
     data class PhotoPayload(
         val jpeg: ByteArray,
         val fileName: String,
@@ -6292,12 +5614,6 @@ object MatrixRepository {
                 inProcessSyncJob?.cancel()
                 inProcessSyncJob = null
                 inProcessSyncRunning = false
-                slowSyncJob?.cancel()
-                slowSyncJob = null
-                screenOffJob?.cancel()
-                screenOffJob = null
-                syncMode = SyncMode.ACTIVE
-                PushChannel.stop()
                 // A fresh engine: the old one is the wedged layer, and every
                 // ktor client captures the engine at MatrixClient.create time
                 // (see [clientConfiguration]), so new clients must be built
@@ -6329,21 +5645,10 @@ object MatrixRepository {
                 // must not hang the heal and hold initMutex).
                 withTimeoutOrNull(10_000L) { runCatching { old.closeSuspending() } }
                 android.util.Log.w(TAG, "self-heal: HTTP stack rebuilt for ${restored.userId.full}")
-                if (syncEnabled) PushChannel.start(ctx, restored)
-                // Re-kick the service on the new client REGARDLESS of the
-                // sync toggle: the FGS keep-alive survived the heal, but its
-                // sync loop AND watchdog belong to the closed old client —
-                // enterActiveSync's guard trusts ChatSyncService.isRunning
-                // and would bail, leaving no long-poll and no push wakes
-                // (onPushDelivered skips in ACTIVE mode) → a stuck
-                // "Can't reach server" banner (seen 2026-09-08 under
-                // battery saver: the old syncEnabled gate skipped the
-                // re-kick, but toggle off now means only "no sync while
-                // dark" — the service's own onStartCommand guard applies
-                // the dark/battery-saver policy).
-                runCatching {
-                    ctx.startForegroundService(Intent(ctx, ChatSyncService::class.java))
-                }.onFailure { applySyncModeForScreenState() }
+                // Re-arm the loop on the new client — its loop belonged to the
+                // closed old one, and without this the tool sits with a stuck
+                // "Can't reach server" banner.
+                if (syncWanted) startSyncLoop()
             } finally {
                 mediaHealInFlight = false
                 mediaStackSick = false
@@ -7035,19 +6340,6 @@ object MatrixRepository {
     }
 
     /**
-     * Records the room a voice-note send should land in and returns the
-     * flattened component name of the companion's recording activity, which
-     * the tool launches via `SimpleLightScreen.startServerActivity` (same
-     * pattern as [startPhotoSend]). The activity records an ogg/Opus note and
-     * sends it.
-     */
-    fun startVoiceNoteSend(roomId: String): String {
-        android.util.Log.d(TAG, "startVoiceNoteSend: registering room $roomId")
-        VoiceNoteActivity.register(roomId)
-        return VOICE_NOTE_ACTIVITY
-    }
-
-    /**
      * Uploads and sends a recorded voice note (an ogg/Opus file) to the room —
      * encrypted media when the room is end-to-end encrypted (WhatsApp/Beeper),
      * plain otherwise. The content is hand-built as an
@@ -7570,8 +6862,6 @@ object MatrixRepository {
             }
             return
         }
-        // Opening the thread makes the room's notification moot.
-        appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
         recordReadMarker(roomId, markerId)
         projectionMarkRead(roomId)
         if (atHead) {
@@ -7766,7 +7056,7 @@ object MatrixRepository {
             when {
                 status == 200 -> {
                     val obj = runCatching {
-                        pushQueueJson.parseToJsonElement(resp.bodyAsText()).jsonObject
+                        lenientJson.parseToJsonElement(resp.bodyAsText()).jsonObject
                     }.getOrNull()
                     // Content is the body directly (spec); tolerate a wrap.
                     val content = (obj ?: JsonObject(emptyMap())).let {
@@ -7815,9 +7105,7 @@ object MatrixRepository {
     // --- Notifications --------------------------------------------
 
     /**
-     * Records the room the tool is currently showing. New-message
-     * notifications for it are suppressed, and any standing notification for
-     * it is removed (opening the thread marks it read). null = no room on
+     * Records the room the tool is currently showing. null = no room on
      * screen (list/settings/tool backgrounded).
      */
     fun setActiveRoom(roomId: String?) {
@@ -7826,60 +7114,11 @@ object MatrixRepository {
         // end the resolver's idle sleep so its next pass publishes promptly
         // instead of waiting out the screen-off 60 s breather.
         if (roomId == null) wakeRoomList()
-        val ctx = appContext ?: return
-        if (roomId != null) ChatNotifier.cancelRoom(ctx, roomId)
     }
 
     /** Screen truth for the speculative-work gates. */
     private fun isScreenInteractive(): Boolean =
         (appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive == true
-
-    /**
-     * One-shot read of the room a posted notification belongs to (set by
-     * [ChatNotifier]), so the tool can auto-open the right thread after a tap.
-     * Cleared on read.
-     */
-    fun takeNotifyRoom(): String? {
-        val roomId = pendingNotifyRoomId
-        pendingNotifyRoomId = null
-        return roomId
-    }
-
-    /** Last event id the notification watcher alerted for [roomKey], persisted
-     *  across process restarts ([KEY_LAST_NOTIFIED_PREFIX]); null = nothing
-     *  alerted yet (fresh install / new room). */
-    private fun lastNotifiedEventId(roomKey: String): String? =
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            ?.getString(KEY_LAST_NOTIFIED_PREFIX + roomKey, null)
-
-    /** Records that [eventId] was alerted in [roomKey] so a later watcher
-     *  registration (new process) does not re-alert it. */
-    private fun recordNotifiedEvent(roomKey: String, eventId: String) {
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            ?.edit()?.putString(KEY_LAST_NOTIFIED_PREFIX + roomKey, eventId)?.apply()
-    }
-
-    /** Trixnity external-notification update id → roomId.full, so a Remove
-     *  can cancel a posted alert (cross-device read). Entries live until the
-     *  cap clears the map or the process dies — not merely the alert's short
-     *  life. */
-    private val externalNotificationRooms = java.util.concurrent.ConcurrentHashMap<String, String>()
-    private const val EXTERNAL_NOTIFICATION_MAP_MAX = 256
-
-    /** Records one external-notification New/Update: the room (for a later
-     *  Remove). The stream carries no suppression signal — Trixnity only
-     *  emits Notify-worthy events (EvaluatePushRules skips the rest), so
-     *  suppression is evaluated directly in [notifyForEvent]. */
-    private fun rememberExternalNotification(
-        updateId: String,
-        content: NotificationUpdate.Content,
-    ) {
-        val te = (content as? NotificationUpdate.Content.Message)?.timelineEvent
-        if (te != null) {
-            if (externalNotificationRooms.size >= EXTERNAL_NOTIFICATION_MAP_MAX) externalNotificationRooms.clear()
-            externalNotificationRooms[updateId] = te.event.roomId.full
-        }
-    }
 
     /** Read marker this device last sent for [roomKey] ([markRead]), persisted
      *  across process restarts. The background sync filter drops m.receipt
@@ -7922,30 +7161,6 @@ object MatrixRepository {
             watch("flag watcher: push-rule collector ended") {
                 c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
                     .get(PushRulesEventContent::class).collect { invalidateAllRoomFlags() }
-            }
-            // External-notification stream (enableExternalNotifications — see
-            // [clientConfiguration]): the account's push rules as evaluated by
-            // Trixnity — the stream ONLY carries Notify-worthy events (its
-            // evaluator skips suppressed ones), so it signals nothing about
-            // muting; [notifyForEvent] evaluates the rules directly instead.
-            // New/Update record the event's room so a later Remove can find
-            // it; Remove = the event was read on this phone or elsewhere —
-            // cancel the posted alert (cross-device read). Ambiguous updates
-            // (no message content) change nothing.
-            watch("external-notification collector ended") {
-                c.notification.getAllUpdates().collect { update ->
-                    when (update) {
-                        is NotificationUpdate.Remove -> {
-                            val roomId = externalNotificationRooms.remove(update.id) ?: return@collect
-                            android.util.Log.d(TAG, "external notification: remove — cancel alert for $roomId")
-                            appContext?.let { ChatNotifier.cancelRoom(it, roomId) }
-                        }
-                        is NotificationUpdate.New ->
-                            rememberExternalNotification(update.id, update.content)
-                        is NotificationUpdate.Update ->
-                            rememberExternalNotification(update.id, update.content)
-                    }
-                }
             }
             // Settle flags (first-message ping drop fix): a room whose
             // newest message is already unread when its collector starts — or whose
@@ -8094,16 +7309,14 @@ object MatrixRepository {
                                             val proj = projectionRow(c, key)
                                             val projHead = proj?.lastRealEventId
                                             if (proj != null && projHead != null) {
-                                                val alreadyAlerted = lastNotifiedEventId(key) == projHead
                                                 val readHere = lastReadMarkerId(key) == projHead
-                                                if (proj.unreadCount > 0 && !alreadyAlerted && !readHere) {
+                                                if (proj.unreadCount > 0 && !readHere) {
                                                     android.util.Log.d(
                                                         TAG,
                                                         "notification watcher: $key registered with unread newest " +
                                                             "(${if (key in knownRooms) "known" else "new post-settle"}, " +
-                                                            "projection unread=${proj.unreadCount}) — notifying",
+                                                            "projection unread=${proj.unreadCount})",
                                                     )
-                                                    recordNotifiedEvent(key, projHead)
                                                     notifyForEvent(c, roomId, projHead, regRoom)
                                                 }
                                             }
@@ -8187,149 +7400,32 @@ object MatrixRepository {
         notificationWatcherJobs.add(watcher)
     }
 
-    /** Posts the notification for a new event in [room], if it is a message from someone else. */
+    /**
+     * A new relevant event arrived in [room] (the sync filter's
+     * lastRelevantEventFilter already narrows these to real messages —
+     * edits/reactions never advance lastRelevantEventId). With notifications
+     * gone (Rung 1) the remaining side effects are: Beeper's
+     * unarchive-on-message, and the page-revision bump that re-serves the
+     * open thread immediately.
+     */
     private suspend fun notifyForEvent(
         c: MatrixClient,
         roomId: RoomId,
         eventId: String,
         room: MatrixRoom,
     ) {
-        val ctx = appContext ?: return
-        // Notifications blocked (POST_NOTIFICATIONS not granted — requested from
-        // the tool via the SDK flow): skip the whole chain —
-        // the decrypt wait, flood/ghost walk and page warm built a preview the
-        // OS drops. The room list still updates (separate resolver path).
         // Archived room got a message — mirror the other Beeper clients:
         // unarchive (PUT {} to inbox.done). updateRoomFlagsLocal marks the
-        // room list dirty, so the row reappears in the main list, and the
-        // message below notifies like any other (muted still silences).
+        // room list dirty, so the row reappears in the main list.
         val flags = roomFlagsCache[roomId.full]
         if (flags?.archived == true) {
             android.util.Log.d(TAG, "notifyForEvent: archived room $roomId got a message — unarchiving")
             setRoomArchived(roomId.full, false)
         }
-        if (!ctx.getSystemService(NotificationManager::class.java).areNotificationsEnabled()) return
-        if (activeRoomId == roomId.full) return
-        if (room.membership != Membership.JOIN) return
-        // Muted room (chats /): stop notifying; the unread badge and the room
-        // list stay (muted). Checked before the decrypt wait so a muted room
-        // costs nothing per message.
-        if (flags?.muted == true) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping muted room $roomId")
-            return
-        }
-        // Cold-process miss (the whole-cache build waits on the room-list
-        // resolver): mute must not wait — the install-restart notified a
-        // MUTED room in this window. The miss path
-        // reads the push rules directly — one account-data store read, and
-        // it warms nothing (the resolver rebuild supersedes it). Archived
-        // still falls through to notify here: resolving it costs a network
-        // GET per event, and an archived room's unread event is rare.
-        if (flags == null && isRoomMutedByPushRule(c, roomId.full)) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping muted (cold-cache read) room $roomId")
-            return
-        }
-        // Wait briefly for decryption so the preview shows the real text (the
-        // raw m.room.encrypted payload resolves within milliseconds for live
-        // events once the megolm session is in the store).
-        val te = withTimeoutOrNull(ROOM_BUDGET_MS) {
-            c.room.getTimelineEvent(roomId, EventId(eventId)).filterNotNull().firstOrNull {
-                it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
-            }
-        } ?: return
-        // The account's push rules, evaluated directly with Trixnity's own
-        // evaluator (the external-notification stream never reports
-        // suppression — it only emits Notify-worthy events). Evaluated on the
-        // DECRYPTED event, the same shape Trixnity's pipeline feeds it
-        // (mergedEvent): rules match on plaintext (msgtype, mentions), and the
-        // raw event would stay m.room.encrypted and never match. No matching
-        // rule or a match without Notify means the rules say don't alert (a
-        // room rule with `actions: []`, mention-only without a mention, …) —
-        // an undecryptable event suppresses the same way (no preview would
-        // notify anyway) — in practice unreachable, since the decrypt-wait
-        // filter above only passes events with resolved (or unencrypted)
-        // content; suppressing is the safe fallback. Resolution/evaluation
-        // failure does NOT suppress — the checks above still decide, as
-        // before (fail open).
-        @OptIn(MSC4354::class)
-        val evaluationEvent =
-            te.content?.getOrNull()?.let { te.event.mergeContentOrNull(it) } ?: te.event
-        val rulesDecision = try {
-            val allRules = c.di.get<GlobalAccountDataStore>(GlobalAccountDataStore::class)
-                .get(PushRulesEventContent::class).first()?.content?.global?.toList().orEmpty()
-            SyncHealth.shouldSuppress(
-                c.di.get<EvaluatePushRules>(EvaluatePushRules::class)(evaluationEvent, allRules),
-            )
-        } catch (e: Exception) {
-            android.util.Log.d(TAG, "notifyForEvent: push-rule evaluation failed (${e::class.java.simpleName}) — not suppressing")
-            false
-        }
-        if (rulesDecision) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping push-rule-suppressed event $eventId in $roomId")
-            return
-        }
-        // Beeper re-imports old media as m.replace edits — each used to surface
-        // as a fresh image row + notification. Matrix semantics: an edit
-        // replaces its target, never a new message. Don't notify.
-        if (isReplaceEdit(te)) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping m.replace edit $eventId in $roomId")
-            return
-        }
-        // Bridge clock skew: re-delivered events stamped minutes-to-hours into
-        // the FUTURE (09-14: 1€ Doc Chat head at 17:41 vs phone clock 11:20)
-        // decrypt fine and sail past every undecryptable guard — notify anyway?
-        // No: a real message is stamped at send time; nothing notify-worthy
-        // arrives from the future. (The unread resolver applies the same rule.)
-        if (te.event.originTimestamp > System.currentTimeMillis() + UNREAD_FUTURE_SKEW_MS) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping future-stamped event $eventId in $roomId")
-            return
-        }
-        // Bridge re-import floods (the 7am wall) must not notify — a real
-        // conversation almost never reaches 30 messages per minute, so the
-        // density fallback skips the flood without touching real messages.
-        if (isFloodGhost(te, ghostContext(c, roomId))) {
-            android.util.Log.d(TAG, "notifyForEvent: skipping bridge-flood event $eventId in $roomId")
-            return
-        }
         // A new message means the user may open this thread. Bump the page
         // revision so the open thread re-serves immediately (the store page
         // the ingest writer wrote is already there or lands with its bump).
         bumpMessagePageRevision(roomId.full)
-        if (te.event.sender == c.userId) {
-            // Own account — no notification whether it was sent from THIS
-            // device (outbox echo) or from another Beeper/WhatsApp device:
-            // a message the user sent themselves needs no alert.
-            // (Previously only outbox-matched sends were suppressed and
-            // same-account other-device sends notified — reversed on request.)
-            return
-        }
-        val resolved = te.content?.getOrNull()
-        val isMessage = resolved is RoomMessageEventContent ||
-            (resolved == null && te.event.content is EncryptedMessageEventContent)
-        if (!isMessage) return
-        val preview = previewText(te) ?: return
-        val name = resolveRoomName(c, roomId, room)
-        ChatNotifier.notifyMessage(
-            context = ctx,
-            roomId = roomId.full,
-            roomName = name,
-            // No sender prefix in DMs, and never for our own account (a
-            // note-to-self message needs no "FENN:" prefix). Channel/broadcast
-            // rooms (≤2 members, e.g. a Telegram channel + its account) are
-            // treated the same way — every message comes from the channel.
-            senderName = if (room.isDirect || (room.joinedMemberCount ?: 0L) <= 2L ||
-                te.event.sender == c.userId
-            ) null else senderNameOf(c, roomId, te.event.sender),
-            preview = preview,
-            direct = room.isDirect,
-            // The projection's count (junk rules already applied at ingest);
-            // the sync's server count until the room is projected.
-            unreadCount = projectionRow(c, roomId.full)?.unreadCount
-                ?: (serverUnreadCounts[roomId.full]?.toLong() ?: 0L),
-        )
-        // Persist "alerted this event" so a later watcher registration (new
-        // process) doesn't re-alert it — the registration-time notify gate.
-        recordNotifiedEvent(roomId.full, eventId)
     }
 
     // --- Room-list cache ------------------------------------------
@@ -9988,7 +9084,7 @@ object MatrixRepository {
             // OTK regen + /keys/upload) froze the whole loop — name it. Slow
             // mode's deliberate inter-round delay (300 s / 900 s) is not a
             // stall — exclude it (a 505 s "gap" was just a slow round, 09-14).
-            if (lastSyncResponseAt > 0 && syncMode != SyncMode.SLOW) {
+            if (lastSyncResponseAt > 0) {
                 val ingestGap = android.os.SystemClock.elapsedRealtime() - lastSyncResponseAt
                 if (ingestGap > 35_000L) {
                     android.util.Log.w(TAG, "sync ingest gap: ${ingestGap}ms between last response and this request — emit path stalled the loop")
@@ -10196,17 +9292,8 @@ object MatrixRepository {
             val isMessage = content is RoomMessageEventContent || content is EncryptedMessageEventContent
             (!isReplace) && isMessage
         }
-        // Push-rule-driven notifications (BrightChat BeeperEngine.kt): Trixnity
-        // evaluates the account's server-side push rules and streams
-        // [NotificationUpdate]s to the external-notification collector in
-        // [observeNotifications]. The stream only carries Notify-worthy events
-        // (its evaluator skips suppressed ones), so it is used for the
-        // cross-device Remove only — the rules' suppression decision is
-        // evaluated directly in [notifyForEvent] ([EvaluatePushRules]). Mute /
-        // mention-only come from the account's own rules (changeable on any
-        // device) — our biggest notification gap. Posting stays with
-        // [notifyForEvent]; the stream only cancels.
-        enableExternalNotifications = true
+        // Notifications are gone (Rung 1): no external-notification stream
+        // (Trixnity's per-event push-rule evaluation costs CPU for nothing).
     }
 
     /**
@@ -10580,21 +9667,26 @@ object MatrixRepository {
                 }
                 when (state) {
                     SyncState.INITIAL_SYNC -> setConnectionState(ChatConnectionState.Connecting)
-                    SyncState.STARTED, SyncState.RUNNING -> setConnectionState(ChatConnectionState.Syncing)
-                    SyncState.ERROR, SyncState.TIMEOUT -> publishOfflineDebounced("sync $state")
+                    // A live loop state stamps delivery health (the Account
+                    // screen's status line) — the syncOnce round stamping the
+                    // old builds did covers only explicit rounds, and the
+                    // long-poll reports through these states instead.
+                    SyncState.STARTED, SyncState.RUNNING -> {
+                        setConnectionState(ChatConnectionState.Syncing)
+                        recordSyncRoundOk()
+                    }
+                    SyncState.ERROR, SyncState.TIMEOUT -> {
+                        recordSyncRoundFailed()
+                        publishOfflineDebounced("sync $state")
+                    }
                     SyncState.STOPPED -> when {
-                        // Slow sync (screen off) stops the long-poll between
-                        // periodic syncOnce rounds — that's still "syncing",
-                        // not an outage.
-                        isSlowSyncing -> setConnectionState(ChatConnectionState.Syncing)
-                        // Battery saver is the source of truth while it
+                        // The Settings toggle is the source of truth while it
                         // has sync stopped — the restored client reports
-                        // STOPPED until the screen comes back on, and
-                        // that must read as "battery saver", not
-                        // "stopped" (or, worse, the race with init's
-                        // explicit assignment).
-                        !syncEnabled -> setConnectionState(ChatConnectionState.Offline("battery saver"))
-                        c.loginState.value == MatrixClient.LoginState.LOGGED_IN -> setConnectionState(ChatConnectionState.Offline("sync stopped"))
+                        // STOPPED until it is re-enabled, and that must read
+                        // as "sync paused", not "stopped".
+                        !syncEnabled -> setConnectionState(ChatConnectionState.Offline("sync paused"))
+                        c.loginState.value == MatrixClient.LoginState.LOGGED_IN ->
+                            setConnectionState(if (syncWanted) ChatConnectionState.Offline("sync stopped") else ChatConnectionState.Offline("tool closed"))
                         sessionExpired -> setConnectionState(ChatConnectionState.Offline("session expired — sign in again"))
                         else -> setConnectionState(ChatConnectionState.LoggedOut)
                     }
@@ -10607,7 +9699,7 @@ object MatrixRepository {
      * Watches the session's login state. When the server invalidates the
      * session (expired token, logged out on another device) Trixnity drops to
      * LOGGED_OUT/LOGGED_OUT_SOFT; we surface "session expired" and stop the
-     * sync service (no point retrying a dead token). [logout]'s own transition
+     * sync loop (no point retrying a dead token). [logout]'s own transition
      * is excluded via [manualLogout].
      *
      * Only fires on a runtime transition AWAY from LOGGED_IN: a restored
@@ -10625,7 +9717,6 @@ object MatrixRepository {
                 }
                 if (!sawLoggedIn || manualLogout || sessionExpired) return@collect
                 sessionExpired = true
-                PushChannel.stop()
                 android.util.Log.w(TAG, "session no longer logged in ($state) — treating as expired")
                 Diagnostics.record("session expired — sync stopped")
                 setConnectionState(ChatConnectionState.Offline("session expired — sign in again"))
@@ -11710,18 +10801,14 @@ object MatrixRepository {
     // ---- end ingest-time projection -----------------------------------------
 
     /**
-     * Stops the sync service shortly after an expiry is detected. The delay
-     * matters: stopping a just-started foreground service (the start from
-     * `ensureClient` can race this) crashes it with
-     * ForegroundServiceDidNotStartInTimeException. The re-check also skips the
-     * stop if a re-login already reset the flag and started a fresh service.
+     * Stops the sync loop shortly after an expiry is detected (a dead token
+     * must not keep long-polling). The delay matters: stopping a just-started
+     * loop can race the arm from `ensureClient`. The re-check also skips the
+     * stop if a re-login already reset the flag.
      */
     private fun scheduleSyncStop() {
-        val ctx = appContext ?: return
         mainHandler.postDelayed({
-            if (sessionExpired) {
-                ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
-            }
+            if (sessionExpired) stopSync()
         }, SYNC_STOP_DELAY_MS)
     }
 
@@ -12393,14 +11480,6 @@ object MatrixRepository {
     /** A following note auto-plays only within this gap of the finished one
      *  ("immediately after" — feedback 2026-08-27). */
     private const val VOICE_AUTO_ADVANCE_WINDOW_MS = 60_000L
-    /** The tool's photo-picker activity, flattened for the tool to launch. The
-     *  package is the TOOL's own id — the single-APK merge made
-     *  the former companion a library inside com.lightphone.chats, so the old
-     *  com.lightphone.chats.server package no longer resolves. */
-    private const val PHOTO_PICKER_ACTIVITY = "com.lightphone.chats/.server.PhotoSendActivity"
-    /** The tool's voice-note recording activity, flattened for the tool. */
-    private const val VOICE_NOTE_ACTIVITY = "com.lightphone.chats/.server.VoiceNoteActivity"
-
     // Disk cache.
     // Versioned so a stale pre-ghost-filter cache (pages/lists polluted by the
     // bridge re-import) is never served after an upgrade.

@@ -4,7 +4,6 @@ import com.lightphone.chats.server.ChatsClipboard
 import com.lightphone.chats.server.Diagnostics
 import com.lightphone.chats.server.MatrixRepository
 import com.lightphone.chats.Snapshots
-import com.thelightphone.sdk.callRemoteServiceMethod
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.getOrNull
 import kotlinx.coroutines.CancellationException
@@ -13,10 +12,7 @@ import com.lightphone.chats.screens.clearThreadCaches
 /**
  * The app-side API over [MatrixRepository]. Chats is single-APK/single-process
  * (2026-08-19), so the UI calls the repository directly — no binder round
- * trip, no serialized dispatch (NO-SEAM, 2026-09-07). The [LightServiceMethod]
- * handlers in :server stay compiled for the vetted-tools contract (MainActivity
- * adb control, emulator pipeline); only the activity-launching flows and the
- * SDK-level volume read still ride the binder here.
+ * trip, no serialized dispatch (NO-SEAM, 2026-09-07).
  */
 object ChatClient {
 
@@ -215,19 +211,6 @@ object ChatClient {
         )
 
     /**
-     * Starts the attach-a-photo flow for [roomId]. @return the flattened
-     * component name of the photo-picker activity, which the tool
-     * launches via `SimpleLightScreen.startServerActivity` (the tool runtime
-     * forbids startActivity). Stays on the binder: the SDK's server-side
-     * activity flow owns the launch (NO-SEAM keeps this one).
-     */
-    suspend fun startPhotoSend(roomId: String): String? =
-        callRemoteServiceMethod(
-            LightServiceMethod.StartPhotoSend,
-            LightServiceMethod.StartPhotoSend.Request(roomId),
-        ).getOrNull()?.activityComponent
-
-    /**
      * Display-ready JPEG bytes for an image message, or null when unavailable.
      * [allowMobileData] false + a cellular connection = the download is
      * skipped (Settings → Mobile data downloads).
@@ -261,27 +244,6 @@ object ChatClient {
             .getOrElse { false to (it.message ?: "playback failed") }
 
     /**
-     * Media volume (level, max) for the in-app volume panel (feedback
-     * 2026-08-30): the SDK server answers GetVolumeLevel from the platform.
-     * Stays on the binder — this is an SDK-level method routed through the
-     * server's customServiceMethodResolver (NO-SEAM keeps this one).
-     */
-    suspend fun volumeLevel(): Pair<Int, Int>? =
-        callRemoteServiceMethod(LightServiceMethod.GetVolumeLevel, Unit)
-            .getOrNull()?.let { it.level to it.max }
-
-    /**
-     * Starts the record-a-voice-note flow for [roomId]. @return the flattened
-     * component name of the recording activity, which the tool
-     * launches via `SimpleLightScreen.startServerActivity`.
-     */
-    suspend fun startVoiceNoteSend(roomId: String): String? =
-        callRemoteServiceMethod(
-            LightServiceMethod.StartVoiceNoteSend,
-            LightServiceMethod.StartVoiceNoteSend.Request(roomId),
-        ).getOrNull()?.activityComponent
-
-    /**
      * Long-poll wait for the status revision (Phase C, 2026-09-06): the
      * repository bumps it wherever a connection-state or verification-state
      * fact commits. The Account/Verification/Settings screens refetch their
@@ -289,10 +251,9 @@ object ChatClient {
      * and page loops died with the NO-SEAM flows — this is the one wait left.)
      */
     suspend fun waitForStatusChange(lastSeen: Long, timeoutMs: Long = 25_000): Long =
-        callRemoteServiceMethod(
-            LightServiceMethod.WaitForChange,
-            LightServiceMethod.WaitForChange.Request("status", null, lastSeen, timeoutMs),
-        ).getOrNull()?.revision ?: lastSeen
+        runCatching {
+            MatrixRepository.waitForChange("status", null, lastSeen, timeoutMs)
+        }.getOrDefault(lastSeen)
 
     /** Copies [text] to the Android clipboard (context window COPY row). */
     fun copyToClipboard(text: String) {

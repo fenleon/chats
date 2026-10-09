@@ -52,7 +52,6 @@ dependencies {
         exclude(group = "com.google.mlkit")
         exclude(group = "androidx.camera")
     }
-    implementation(libs.unifiedpush.connector) // dev probe: capture LightOS's UP endpoint
     implementation(libs.compose.activity)
     implementation(libs.kotlinx.coroutines)
 
@@ -66,10 +65,6 @@ dependencies {
     // Room runtime for Trixnity's TrixnityRoomDatabase (session + event store).
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
-    // Delivery backstop: periodic WorkManager work survives process death,
-    // app update and reboot (JobScheduler's own store) — unlike the FGS.
-    implementation(libs.androidx.work.runtime)
-
     // Unit tests for MarkdownConverter (kotlin-test only — the workspace's
     // only allowed test framework; junit is its backend).
     testImplementation(libs.kotlin.test)

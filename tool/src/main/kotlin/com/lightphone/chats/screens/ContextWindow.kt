@@ -82,9 +82,9 @@ private val REACTION_ROWS = listOf(
  * ([LightServiceMethod.GetMessages.Message.canEdit] / `canUnsend`, the
  * bridge's capability gate).
  * Raw black/white + fixed sizes are deliberate: this replicates a system
- * overlay panel (see [com.lightphone.chats.server.VolumePanelOverlay]), not themed
- * app UI. The panel covers the bottom bar while open — the Phone tool's does
- * the same.
+ * overlay panel (see the workspace's shared `tools/volume-panel/` replica),
+ * not themed app UI. The panel covers the bottom bar while open — the Phone
+ * tool's does the same.
  */
 @Composable
 fun ContextWindowOverlay(

@@ -51,8 +51,6 @@ import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
 import com.lightphone.chats.MediaLoader
 import com.lightphone.chats.Snapshots
-import com.lightphone.chats.server.VolumePanelOverlay
-import com.lightphone.chats.server.VolumePanelState
 import com.lightphone.chats.contactIdentifier
 import com.lightphone.chats.dayOf
 import com.lightphone.chats.formatMessageTime
@@ -332,18 +330,6 @@ class ThreadViewModel(
         mediaLoader.load(eventId, allowMobileData)
 
     /**
-     * Component name of the companion's photo-picker activity to launch, set
-     * by [attachPhoto]; the screen launches it and calls [consumeAttachComponent].
-     */
-    val pendingAttachComponent = MutableStateFlow<String?>(null)
-
-    /**
-     * Component name of the companion's voice-note recording activity, set by
-     * [attachVoiceNote]; the screen launches it and calls [consumeVoiceComponent].
-     */
-    val pendingVoiceComponent = MutableStateFlow<String?>(null)
-
-    /**
      * Event id of the voice note playing in the companion. Fed by
      * the poll's `audioPlayingEventId` and the local PlayVoiceNote response,
      * so the audio row shows its playing state without extra RPCs.
@@ -411,67 +397,6 @@ class ThreadViewModel(
     private val unsentOverlays get() = caches.unsent
 
     /**
-     * In-app volume panel state (null = hidden), the shared LightOS replica
-     * replica: while a voice note is playing/paused the volume
-     * rocker shows this panel instead of LightOS's (which is ringer-only for
-     * third-party tools). The bar level is cached and stepped locally; the
-     * server adjusts the real media stream (see ServerBootstrapProvider).
-     */
-    val volumePanel = MutableStateFlow<VolumePanelState?>(null)
-    private var mediaVolumeLevel: Int? = null
-    private var mediaVolumeMax: Int = 0
-
-    fun dismissVolumePanel() {
-        volumePanel.value = null
-    }
-
-    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent): Boolean {
-        val volumeKey = keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP ||
-            keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN
-        val voiceActive = playingEventId.value != null || pausedEventId.value != null
-        if (volumeKey && voiceActive && event.action == android.view.KeyEvent.ACTION_DOWN &&
-            event.repeatCount == 0
-        ) {
-            if (mediaVolumeLevel == null) {
-                // Cold start: seed the cache first, then show the new level.
-                viewModelScope.launch {
-                    ChatClient.volumeLevel()?.let { (level, max) ->
-                        mediaVolumeLevel = level
-                        mediaVolumeMax = max
-                        showVolumePanel(keyCode)
-                    }
-                }
-            } else {
-                showVolumePanel(keyCode)
-            }
-            // Not handled here: the key falls through to the companion, which
-            // adjusts the media stream (one step per press — repeats are
-            // filtered above, and the server ignores them too).
-            return false
-        }
-        return super.onKeyDown(keyCode, event)
-    }
-
-    private fun showVolumePanel(keyCode: Int) {
-        val current = mediaVolumeLevel ?: return
-        val newLevel = when (keyCode) {
-            android.view.KeyEvent.KEYCODE_VOLUME_UP -> (current + 1).coerceAtMost(mediaVolumeMax.coerceAtLeast(1))
-            else -> (current - 1).coerceAtLeast(0)
-        }
-        mediaVolumeLevel = newLevel
-        volumePanel.value = VolumePanelState.Media(newLevel, mediaVolumeMax)
-    }
-
-    private fun refreshVolumeLevel() {
-        viewModelScope.launch {
-            ChatClient.volumeLevel()?.let { (level, max) ->
-                mediaVolumeLevel = level
-                mediaVolumeMax = max
-            }
-        }
-    }
-
-    /**
      * Optimistic rows from a send, waiting for their sync echo (feedback
      * pass). The poll replaces them with the real events as they land.
      */
@@ -520,7 +445,6 @@ class ThreadViewModel(
         viewModelScope.launch {
             e2eeVerified.value = ChatClient.e2eeState()?.verified
         }
-        refreshVolumeLevel()
         startPolling()
         startFlagSync()
     }
@@ -803,40 +727,6 @@ class ThreadViewModel(
     fun addOptimistic(message: LightServiceMethod.GetMessages.Message) {
         pendingMessages += message
         messages.value = messages.value + message
-    }
-
-    /**
-     * Starts the attach-a-photo flow: asks the companion for its photo-picker
-     * activity's component name (recording the room), which the screen then
-     * launches — the tool runtime forbids startActivity itself.
-     */
-    fun attachPhoto() {
-        if (pendingAttachComponent.value != null) return
-        viewModelScope.launch {
-            val component = ChatClient.startPhotoSend(room.id) ?: return@launch
-            pendingAttachComponent.value = component
-        }
-    }
-
-    fun consumeAttachComponent() {
-        pendingAttachComponent.value = null
-    }
-
-    /**
-     * Starts the record-a-voice-note flow: asks the companion for its
-     * recording activity's component name (recording the room), which the
-     * screen then launches — the tool runtime forbids startActivity itself.
-     */
-    fun attachVoiceNote() {
-        if (pendingVoiceComponent.value != null) return
-        viewModelScope.launch {
-            val component = ChatClient.startVoiceNoteSend(room.id) ?: return@launch
-            pendingVoiceComponent.value = component
-        }
-    }
-
-    fun consumeVoiceComponent() {
-        pendingVoiceComponent.value = null
     }
 
     /**
@@ -1472,8 +1362,6 @@ class ThreadScreen(
         val jumpToBottom by viewModel.jumpToBottom.collectAsState()
         val e2eeVerified by viewModel.e2eeVerified.collectAsState()
         val roomEncrypted by viewModel.roomEncrypted.collectAsState()
-        val attachComponent by viewModel.pendingAttachComponent.collectAsState()
-        val voiceComponent by viewModel.pendingVoiceComponent.collectAsState()
         val playingEventId by viewModel.playingEventId.collectAsState()
         val playingPositionMs by viewModel.playingPositionMs.collectAsState()
         val playingPositionAtMs by viewModel.playingPositionAtMs.collectAsState()
@@ -1545,22 +1433,6 @@ class ThreadScreen(
                 .filter { it.contentType == "image" || it.contentType == "video" }
                 .take(MEDIA_PREFETCH_COUNT)
                 .forEach { viewModel.ensureMedia(it.id, downloadOverMobile) }
-        }
-
-        // Attach-photo handoff: the companion's photo-picker activity was
-        // requested; launch it (the tool runtime forbids startActivity, so the
-        // foreground tool starts the companion's activity instead).
-        LaunchedEffect(attachComponent) {
-            val component = attachComponent ?: return@LaunchedEffect
-            startServerActivity(component)
-            viewModel.consumeAttachComponent()
-        }
-
-        // Voice-note handoff: same pattern for the recording activity.
-        LaunchedEffect(voiceComponent) {
-            val component = voiceComponent ?: return@LaunchedEffect
-            startServerActivity(component)
-            viewModel.consumeVoiceComponent()
         }
 
         // An empty page in an encrypted room means the stored events couldn't
@@ -1803,22 +1675,6 @@ class ThreadScreen(
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
-                        // Record a voice note — bottom left, like the built-in
-                        // Messages app's layout. Opens the
-                        // companion's recording activity.
-                        LightBarButton.LightIcon(
-                            icon = LightIcons.MICROPHONE,
-                            onClick = { viewModel.attachVoiceNote() },
-                            contentDescription = "Record voice note",
-                        ),
-                        // Attach a photo — bottom middle, like the built-in
-                        // Messages app's add slot. Opens the system photo
-                        // picker via the companion.
-                        LightBarButton.LightIcon(
-                            icon = LightIcons.ADD,
-                            onClick = { viewModel.attachPhoto() },
-                            contentDescription = "Attach photo",
-                        ),
                         LightBarButton.LightIcon(
                             icon = LightIcons.COMPOSE_MESSAGE,
                             onClick = { openComposer() },
@@ -1832,9 +1688,7 @@ class ThreadScreen(
             // REACT (+ EDIT/REMOVE REACTION once a reaction exists); own rows
             // get EDIT / UNSEND (gated per row by
             // the bridge caps). Actions act on the freshest polled snapshot
-            // so own-reaction detection never runs on a stale page. Rendered
-            // before the volume panel so the volume panel stays on top of
-            // everything.
+            // so own-reaction detection never runs on a stale page.
             ContextWindowOverlay(
                 message = contextTarget,
                 ownReaction = contextTarget?.let(::ownReactionKeys)?.firstOrNull(),
@@ -1862,14 +1716,7 @@ class ThreadScreen(
                     onDismiss = { unsendConfirm = null },
                 )
             }
-            // The in-app volume panel replica (feedback 2026-08-30): the volume
-            // rocker shows it over the thread while a voice note plays/pauses.
-            CopyFlashOverlay(visible = copyFlash, onDismiss = { copyFlash = false })
-            val volumePanel by viewModel.volumePanel.collectAsState()
-            VolumePanelOverlay(
-                state = volumePanel,
-                onDismiss = { viewModel.dismissVolumePanel() },
-            )
+
         }
 
         // Show the newest messages on open (and after sending); not on older
