@@ -352,8 +352,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                             )
                             AccountStatus(
                                 connection = connection,
-                                delivery = delivery,
-                                onManualSync = {
+                                delivery = delivery,                                onManualSync = {
                                     // Kick a real round now (startSync is
                                     // idempotent — the loop is already
                                     // running): the success stamps
@@ -363,6 +362,22 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                     navigateTo(screenFactory = { SyncingPanel(it) })
                                 },
                             )
+                            // Log Out as a plain action row (LP3 feedback
+                            // 2026-10-09) — it read as a mode switch in the
+                            // bottom bar; as a row it sits with the other
+                            // account actions.
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .lightClickable(enabled = !busy, onClick = {
+                                        navigateTo(screenFactory = { LogoutConfirmPanel(it) }) { confirmed ->
+                                            if (confirmed) viewModel.logout()
+                                        }
+                                    })
+                                    .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                            ) {
+                                LightText(text = "Log Out", variant = LightTextVariant.Heading)
+                            }
                         } else {
                             // Logged out: if the session just expired, say so
                             // instead of showing a bare login form (the user
@@ -459,16 +474,9 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
                         if (account?.loggedIn == true) {
-                            LightBarButton.Text(
-                                text = if (busy) "…" else "LOG OUT",
-                                onClick = if (busy) null else {
-                                    {
-                                        navigateTo(screenFactory = { LogoutConfirmPanel(it) }) { confirmed ->
-                                            if (confirmed) viewModel.logout()
-                                        }
-                                    }
-                                },
-                            )
+                            // Log Out moved to a row above (feedback
+                            // 2026-10-09) — the bar stays empty here.
+                            null
                         } else if (beeperMode) {
                             // Beeper flow: the bar's button sends the emailed
                             // code, then an overlay panel confirms it and the
@@ -887,8 +895,7 @@ class LogoutConfirmPanel(
  *     the store isn't caught up yet.
  *   The settled state ("Synced · up to date") is a dead status word —
  *     it renders as the Manual Sync Now button instead, with the
- *     last-updated age as its subtitle (LP3 feedback 2026-10-09); the
- *     background-sync availability line follows.
+ *     last-updated age as its subtitle (LP3 feedback 2026-10-09).
  *  Claiming Synced while the restore is still waiting on the backup
  *  secret read as a lie on the LP3 fresh login (2026-09-20) — the
  *  settled conditions below guard that. */
@@ -929,10 +936,6 @@ private fun AccountStatus(
                     )
                 }
             }
-            LightText(
-                text = "No background sync available",
-                variant = LightTextVariant.Fine,
-            )
         } else {
             val statusText = connection?.let { state ->
                 val backfillRunning = state.backfillRoomsTotal > 0 &&
@@ -958,7 +961,6 @@ private fun AccountStatus(
                 SyncHealth.healthLine(
                     lastOkAtMs = it.lastSuccessfulRoundAtMs,
                     failures = it.consecutiveFailures,
-                    pushConnected = it.pushConnected,
                     nowMs = System.currentTimeMillis(),
                 )
             }
