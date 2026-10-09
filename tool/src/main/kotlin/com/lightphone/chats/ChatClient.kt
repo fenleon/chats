@@ -296,4 +296,8 @@ object ChatClient {
     /** The clipboard's text, or null when it holds no readable text. */
     fun clipboardText(): String? =
         runCatching { ChatsClipboard.getText() }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /** Uploads a recorded voice note (ogg/opus, MSC3245) to [roomId]. */
+    suspend fun sendVoiceNote(roomId: String, file: java.io.File): Boolean =
+        runCatching { MatrixRepository.sendVoiceNote(roomId, file) }.getOrDefault(false)
 }

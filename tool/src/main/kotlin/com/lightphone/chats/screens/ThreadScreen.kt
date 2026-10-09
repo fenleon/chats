@@ -1678,11 +1678,21 @@ class ThreadScreen(
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
+                        // Record a voice note — bottom left, like the built-in
+                        // Messages app's layout (dev carried the same slot).
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.MICROPHONE,
+                            onClick = {
+                                navigateTo(screenFactory = { RecordVoiceNoteScreen(it, room.id) })
+                            },
+                            contentDescription = "Record voice note",
+                        ),
                         LightBarButton.LightIcon(
                             icon = LightIcons.COMPOSE_MESSAGE,
                             onClick = { openComposer() },
                             contentDescription = "New message",
                         ),
+                        null,
                     ),
                 )
             }
