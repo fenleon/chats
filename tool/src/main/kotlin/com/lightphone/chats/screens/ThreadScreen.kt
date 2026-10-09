@@ -2761,7 +2761,13 @@ private fun AudioMessageContent(
             // grammar).
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = { currentOnTogglePlay() },
+                    onTap = {
+                        // The play/pause toggle buzzes like every other row
+                        // (it was the only tap in the tool with no haptic —
+                        // LP3 feedback 2026-10-09).
+                        buzz()
+                        currentOnTogglePlay()
+                    },
                     onLongPress = {
                         buzz()
                         currentOnOpenContext?.invoke()

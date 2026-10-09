@@ -5735,7 +5735,16 @@ object MatrixRepository {
             android.util.Log.d(TAG, "playVoiceNote: resumed $eventId")
             return true to null
         }
-        stopAudioPlayback()
+        // Keep the audio focus across the note→note switch (releaseFocus=false):
+        // abandoning it here hands GAIN down to the paused system player
+        // (LightOS's own media app), which auto-resumes and immediately
+        // re-requests GAIN — we then get a spurious permanent LOSS ~200ms
+        // after our own request and the focus listener kills the note the
+        // user just started (LP3 2026-10-09: first tap on a voice note often
+        // died silently; the second tap worked because the system player had
+        // already resumed and didn't steal again). The focus is still released
+        // on logout/teardown and on player error.
+        stopAudioPlayback(releaseFocus = false)
         // A still-pending send: the echoed event isn't in the store yet, but
         // the server kept a copy of the recorded file when the note was sent
         // ([sendVoiceNote]) — play that instead of resolving by event id.
@@ -5954,6 +5963,15 @@ object MatrixRepository {
         }
         player.setOnErrorListener { _, _, _ -> stopAudioPlayback(); true }
         val audioManager = ctx.audioManager
+        // Reuse a focus request already held by a previous note in this
+        // session: re-requesting (after the switch-stop abandoned the old one)
+        // is what armed the system-player resume/steal race. See
+        // [playVoiceNote]. Genuine external focus losses still arrive — the
+        // held request's listener stays attached.
+        val heldFocus = audioFocusRequest
+        if (heldFocus != null) {
+            audioManager.requestAudioFocus(heldFocus)
+        } else {
         val focusRequest = android.media.AudioFocusRequest.Builder(
             android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
         )
@@ -5977,6 +5995,7 @@ object MatrixRepository {
             .build()
         audioManager.requestAudioFocus(focusRequest)
         audioFocusRequest = focusRequest
+        }
         runCatching {
             // Pass the FILE DESCRIPTOR, not the path: the media server is a
             // different uid and can't traverse the app's private cache dir —
