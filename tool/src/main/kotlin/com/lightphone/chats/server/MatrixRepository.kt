@@ -236,7 +236,6 @@ object MatrixRepository {
     private const val KEY_ACCESS_TOKEN = "access_token"
     private const val KEY_LOGIN_MODE = "login_mode"
     private const val KEY_BEEPER_REQUEST_ID = "beeper_request_id"
-    private const val KEY_SYNC_ENABLED = "sync_enabled"
     private const val KEY_MEDIA_EDIT_HEAL_DONE = "threadstore_media_edit_heal_done"
     /** When the one-shot megolm restore scan last ran (daily gate, 2026-08-15). */
     private const val KEY_RESTORE_LAST_RUN_MS = "restore_last_run_ms"
@@ -488,13 +487,6 @@ object MatrixRepository {
      *  and the post-verification relaunch can overlap. */
     private val restoreMutex = kotlinx.coroutines.sync.Mutex()
 
-    /** User pause for the sync loop (Settings → Sync, audit 2026-08-14): when
-     *  false, no sync loop runs at all — the battery escape hatch. */
-    @Volatile
-    private var syncEnabled = true
-
-    val isSyncEnabled: Boolean get() = syncEnabled
-
     /**
      * Open-only sync (Rung 1): true while the tool is foreground. Set by
      * [startSync] (the tool activity's resume, wired in ServerBootstrapProvider)
@@ -621,12 +613,7 @@ object MatrixRepository {
      *  tool screens' show/pause hooks drive it (open-only sync). */
     fun init(slc: SealedLightContext) {
         if (lightContext == null) lightContext = slc
-        Diagnostics.init(slc)
         enableTrixnityLogging()
-        // Settings → Sync pause (audit 2026-08-14): a paused app starts
-        // no sync loop — the battery escape hatch.
-        syncEnabled = slc.chatsPrefs()
-            .getBoolean(KEY_SYNC_ENABLED, true)
         // Seed the restore-completed flag from prefs: the crawl is
         // throttled to once per 24h, so after a restart the in-memory
         // [RestoreProgress] would claim "not completed" until the next real
@@ -650,7 +637,6 @@ object MatrixRepository {
         // and [stopSync] on the tool's activity pause. In-tool navigation
         // never pauses the activity, so the loop spans whole tool sessions;
         // leaving the tool (toolbox / home) pauses it and ends sync.
-        // [startSync] re-checks the battery-saver toggle.
         scope.launch {
             // Restore the session regardless of the sync toggle. GetAccountState
             // reads the live client, so a paused app that skips the restore
@@ -660,12 +646,11 @@ object MatrixRepository {
     }
 
     /**
-     * Starts the open-only sync loop (the tool activity resumed). Respects the
-     * Settings → Sync toggle; restores the session first if needed. Idempotent.
+     * Starts the open-only sync loop (the tool activity resumed); restores the
+     * session first if needed. Idempotent.
      */
     fun startSync() {
         syncWanted = true
-        if (!syncEnabled) return
         scope.launch {
             val c = client ?: ensureClient() ?: return@launch
             if (syncWanted) startSyncLoop()
@@ -685,25 +670,6 @@ object MatrixRepository {
             inProcessSyncJob = null
             inProcessSyncRunning = false
             Diagnostics.record("sync stopped (tool closed)")
-        }
-    }
-
-    /**
-     * Toggles the Settings → Sync pause: when off, no sync loop runs at all
-     * (open-only sync's escape hatch). Re-enabling restarts the loop if the
-     * tool is foreground. Persisted, so it survives reboots.
-     */
-    suspend fun setSyncEnabled(enabled: Boolean) {
-        lightContext?.chatsPrefs()
-            ?.edit()?.putBoolean(KEY_SYNC_ENABLED, enabled)?.apply()
-        syncEnabled = enabled
-        if (!enabled) {
-            stopSync()
-            setConnectionState(ChatConnectionState.Offline("sync paused"))
-            android.util.Log.d(TAG, "sync paused by user")
-        } else {
-            startSync()
-            android.util.Log.d(TAG, "sync resumed by user")
         }
     }
 
@@ -2128,7 +2094,7 @@ object MatrixRepository {
             detail = (state as? ChatConnectionState.Offline)?.detail,
             roomsTotal = roomsTotal,
             roomsResolved = roomsResolved,
-            syncEnabled = syncEnabled,
+            syncEnabled = true,
             restoreScanning = restore.scanning,
             restoreScanned = restore.scanned,
             restoreRoomsTotal = restore.roomsTotal,
@@ -4993,9 +4959,6 @@ object MatrixRepository {
             publishRoomList()
         }
         val c = client ?: return
-        // The sync toggle skips the wake — a send with sync paused gets no
-        // catch-up round (the tool is open, so the loop is what's paused).
-        if (!syncEnabled) return
         scope.launch {
             timedSyncOnce(c, "send")
                 .onFailure { android.util.Log.w(TAG, "send-wake sync failed: ${it.message}") }
@@ -5283,10 +5246,9 @@ object MatrixRepository {
                 // sync-state change. A successful round sets state RUNNING
                 // (SyncApiClient), which interrupts that sleep immediately, so
                 // re-fire the send-wake round every 5 s while the ack is
-                // missing. Battery saver + dark screen skips the send-wake
-                // (see [wakeAfterSend]) — stay consistent there.
+                // missing.
                 val now = android.os.SystemClock.elapsedRealtime()
-                if (now - lastKickAt >= SEND_KICK_INTERVAL_MS && (syncEnabled || isScreenInteractive())) {
+                if (now - lastKickAt >= SEND_KICK_INTERVAL_MS) {
                     lastKickAt = now
                     timedSyncOnce(c, "send-retry")
                         .onFailure { android.util.Log.w(TAG, "send-retry sync failed: ${it.message}") }
@@ -9673,11 +9635,6 @@ object MatrixRepository {
                         publishOfflineDebounced("sync $state")
                     }
                     SyncState.STOPPED -> when {
-                        // The Settings toggle is the source of truth while it
-                        // has sync stopped — the restored client reports
-                        // STOPPED until it is re-enabled, and that must read
-                        // as "sync paused", not "stopped".
-                        !syncEnabled -> setConnectionState(ChatConnectionState.Offline("sync paused"))
                         c.loginState.value == MatrixClient.LoginState.LOGGED_IN ->
                             setConnectionState(if (syncWanted) ChatConnectionState.Offline("sync stopped") else ChatConnectionState.Offline("tool closed"))
                         sessionExpired -> setConnectionState(ChatConnectionState.Offline("session expired — sign in again"))

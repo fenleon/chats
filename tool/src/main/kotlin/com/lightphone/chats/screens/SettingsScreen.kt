@@ -47,17 +47,14 @@ import kotlinx.coroutines.launch
 
 /**
  * Tool settings: the account panel (login setup + verification) lives behind
- * the Account row, Battery Saver turns off background notifications, and
- * toggles control the "seen" marker + data-saver media downloads. The
- * status-heavy content — account state, sync progress, encryption — moved to
- * [AccountScreen].
+ * the Account row, and toggles control the "seen" marker + data-saver media
+ * downloads. The status-heavy content — account state, sync progress,
+ * encryption — moved to [AccountScreen].
  */
 class SettingsViewModel : LightViewModel<Unit>() {
 
     val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
     val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
-    val diagnostics = MutableStateFlow(false)
-    val diagnosticsExport = MutableStateFlow<String?>(null)
 
     override fun onAppPause() {
         super.onAppPause()
@@ -70,7 +67,6 @@ class SettingsViewModel : LightViewModel<Unit>() {
         ChatClient.startSync()
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
-        diagnostics.value = ChatClient.diagnosticsEnabled()
         refresh()
     }
 
@@ -81,36 +77,10 @@ class SettingsViewModel : LightViewModel<Unit>() {
         }
     }
 
-    /** Toggles Battery Saver on the companion (audit 2026-08-14 — battery
-     *  escape hatch; semantics 2026-09-07: stops background sync only). */
-    fun setSyncEnabled(value: Boolean) {
-        viewModelScope.launch {
-            ChatClient.setSyncEnabled(value)
-            refresh()
-        }
-    }
-
     /** Persists a tool toggle (the screen supplies its DataStore). */
     fun setSetting(lightContext: SealedLightContext, flow: MutableStateFlow<Boolean>, value: Boolean) {
         viewModelScope.launch {
             ChatSettings.set(lightContext, flow, value)
-        }
-    }
-
-    /** Persists the diagnostics-logging toggle (server-side pref, off by default). */
-    fun setDiagnosticsEnabled(value: Boolean) {
-        viewModelScope.launch {
-            diagnostics.value = ChatClient.setDiagnosticsEnabled(value)
-        }
-    }
-
-    /** Copies the diagnostics log to Movies/Chats; the row shows the result. */
-    fun exportDiagnostics() {
-        viewModelScope.launch {
-            diagnosticsExport.value = when (val name = ChatClient.exportDiagnostics()) {
-                null -> if (ChatClient.diagnosticsHasLog()) "Save failed" else "No log yet"
-                else -> "Saved Movies/Chats/$name"
-            }
         }
     }
 }
@@ -128,8 +98,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
         val account by viewModel.account.collectAsState()
         val connection by viewModel.connection.collectAsState()
         val downloadOverMobile by ChatSettings.downloadOverMobile.collectAsState()
-        val diagnostics by viewModel.diagnostics.collectAsState()
-        val diagnosticsExport by viewModel.diagnosticsExport.collectAsState()
         val themeColors by LightThemeController.colors.collectAsState()
 
         // Load the persisted toggle once (idempotent) before rendering it.
@@ -163,9 +131,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                 } ?: "…",
                                 onClick = { navigateTo(screenFactory = { AccountScreen(it) }) },
                             )
-                            // Battery Saver: on = no sync while the screen is
-                            // dark; messages arrive whenever the screen is on.
-                            val syncEnabled = connection?.syncEnabled ?: true
                             // Features panel: the display toggles (reactions,
                             // seen status, room-list timestamps, markdown)
                             // moved there (feedback 2026-09-22).
@@ -180,14 +145,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                 LightText(text = "Features", variant = LightTextVariant.Heading)
                             }
                             ToggleRow(
-                                checked = !syncEnabled,
-                                title = "Battery Saver",
-                                subtitle = "Pause background notifications",
-                                onToggle = {
-                                    viewModel.setSyncEnabled(!syncEnabled)
-                                },
-                            )
-                            ToggleRow(
                                 checked = !downloadOverMobile,
                                 title = "Data Saver Mode",
                                 subtitle = "Only use Wifi for downloading media",
@@ -195,51 +152,6 @@ class SettingsScreen(sealedActivity: SealedLightActivity) :
                                     viewModel.setSetting(lightContext, ChatSettings.downloadOverMobile, !downloadOverMobile)
                                 },
                             )
-                            // Diagnostics (off by default): writes a sanitized
-                            // status/timing log the user can export for
-                            // troubleshooting (send delays, sync dropouts).
-                            ToggleRow(
-                                checked = diagnostics,
-                                title = "Diagnostics",
-                                subtitle = "Write a diagnostic log for troubleshooting",
-                                onToggle = {
-                                    viewModel.setDiagnosticsEnabled(!diagnostics)
-                                },
-                            )
-                            if (diagnostics) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .lightClickable(onClick = { viewModel.exportDiagnostics() })
-                                        .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                ) {
-                                    Column {
-                                        LightText(
-                                            text = "Save diagnostics file",
-                                            variant = LightTextVariant.Heading,
-                                        )
-                                        LightText(
-                                            text = "Copy the log to Movies/Chats",
-                                            variant = LightTextVariant.Detail,
-                                        )
-                                        // Transient result line — clears a few
-                                        // seconds after each save attempt.
-                                        diagnosticsExport?.let { result ->
-                                            LightText(
-                                                text = result,
-                                                variant = LightTextVariant.Detail,
-                                            )
-                                        }
-                                    }
-                                }
-                                LaunchedEffect(diagnosticsExport) {
-                                    if (diagnosticsExport != null) {
-                                        kotlinx.coroutines.delay(4000)
-                                        viewModel.diagnosticsExport.value = null
-                                    }
-                                }
-                            }
                         }
                     }
                 }

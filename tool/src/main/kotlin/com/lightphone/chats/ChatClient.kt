@@ -1,7 +1,6 @@
 package com.lightphone.chats
 
 import com.lightphone.chats.server.ChatsClipboard
-import com.lightphone.chats.server.Diagnostics
 import com.lightphone.chats.server.MatrixRepository
 import com.lightphone.chats.Snapshots
 import com.thelightphone.sdk.SealedLightContext
@@ -208,10 +207,6 @@ object ChatClient {
     suspend fun deliveryHealth(): MatrixRepository.DeliveryHealth? =
         runCatching { MatrixRepository.deliveryHealth() }.getOrNull()
 
-    /** Pauses/resumes the sync loop (Settings → Sync, audit 2026-08-14). */
-    suspend fun setSyncEnabled(enabled: Boolean): Boolean =
-        runCatching { MatrixRepository.setSyncEnabled(enabled) }.isSuccess
-
     suspend fun e2eeState(): LightServiceMethod.GetE2eeState.Response? =
         runCatching { MatrixRepository.e2eeState() }.getOrNull()
 
@@ -297,27 +292,6 @@ object ChatClient {
     fun copyToClipboard(text: String) {
         runCatching { ChatsClipboard.setText(text) }
     }
-
-    /** Toggles the privacy-safe diagnostics log (Settings, off by default). */
-    suspend fun setDiagnosticsEnabled(enabled: Boolean): Boolean =
-        runCatching {
-            Diagnostics.setEnabled(enabled)
-            Diagnostics.enabled
-        }.getOrDefault(false)
-
-    /** The diagnostics toggle's current state (persisted pref read at init). */
-    fun diagnosticsEnabled(): Boolean = Diagnostics.enabled
-
-    /** True when a non-empty diagnostics log exists (the "No log yet" case). */
-    fun diagnosticsHasLog(): Boolean = Diagnostics.hasLog()
-
-    /**
-     * Copies the diagnostics log to Movies/Chats (MediaStore, reachable over
-     * MTP). @return the exported file name, or null when there is no log yet
-     * or the export failed.
-     */
-    suspend fun exportDiagnostics(): String? =
-        runCatching { Diagnostics.export() }.getOrNull()
 
     /** The clipboard's text, or null when it holds no readable text. */
     fun clipboardText(): String? =

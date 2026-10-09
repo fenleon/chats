@@ -841,7 +841,6 @@ private fun AccountStatus(
                 state.state == "syncing" && storeCaughtUp && backfillSettled &&
                     state.restoreCompleted -> "Synced · up to date"
                 state.state == "syncing" -> "Syncing"
-                !state.syncEnabled -> "battery saver"
                 state.state == "offline" -> "offline"
                 // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
                 // the WHOLE first sync round — many minutes on a large
