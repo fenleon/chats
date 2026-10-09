@@ -3056,8 +3056,16 @@ object MatrixRepository {
                 backfillProgress.value = done to total
                 // The Account screen long-polls the status revision — without
                 // this bump the "Syncing messages… x of y" counter only moves
-                // when the user leaves and re-opens the screen.
-                bumpStatusRevision()
+                // when the user leaves and re-opens the screen. Coalesced: the
+                // per-room cadence would spin an in-process (Main-thread)
+                // waiter; 250 ms granularity + the final pair keep the counter
+                // honest. (ponytail: drop-last throttle; trailing bump is the
+                // done==total fast path)
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (done == total || now - lastBackfillStatusBumpMs >= 250) {
+                    lastBackfillStatusBumpMs = now
+                    bumpStatusRevision()
+                }
                 // The diagnostics log is the only record of this pass when
                 // the debug flag is off — the user-facing status line lives
                 // only while the Account screen is open.
@@ -7471,9 +7479,11 @@ object MatrixRepository {
      * the tool's long-poll wait returns in milliseconds instead of waiting
      * for its next fixed tick. tryEmit into a DROP_OLDEST buffer: the wait's
      * fast-path revision re-check makes a dropped signal harmless (worst case
-     * it lapses to the timeout).
+     * it lapses to the timeout). Carries (watch, roomId) so a waiter only
+     * wakes for its own scope — an in-process waiter runs on the caller's
+     * dispatcher (often Main), and a chatty foreign scope must not spin it.
      */
-    private val changeSignal = MutableSharedFlow<Unit>(
+    private val changeSignal = MutableSharedFlow<Pair<String, String?>>(
         replay = 0, extraBufferCapacity = 64,
         onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
     )
@@ -7494,7 +7504,7 @@ object MatrixRepository {
 
     private fun bumpMessagePageRevision(roomId: String) {
         messagePageRevision[roomId] = (messagePageRevision[roomId] ?: 0L) + 1
-        changeSignal.tryEmit(Unit)
+        changeSignal.tryEmit("page" to roomId)
         pageChangeSignal.tryEmit(roomId)
     }
 
@@ -7535,7 +7545,7 @@ object MatrixRepository {
     private fun bumpRoomFlagsRevision() {
         roomFlagsRevision++
         _roomFlags.value = roomFlagsCache + roomFlagsOverlay
-        changeSignal.tryEmit(Unit)
+        changeSignal.tryEmit("flags" to null)
     }
 
     /**
@@ -7550,20 +7560,29 @@ object MatrixRepository {
 
     private fun bumpStatusRevision() {
         statusRevision++
-        changeSignal.tryEmit(Unit)
+        changeSignal.tryEmit("status" to null)
     }
 
-    /** Commits [_connectionState] and wakes the status waiters. */
+    /** Commits [_connectionState] and wakes the status waiters. No-op when
+     *  the state is unchanged: an in-process status waiter runs on the
+     *  caller's dispatcher (Main), so same-value republishes from retry
+     *  loops must not wake it. */
     private fun setConnectionState(state: ChatConnectionState) {
+        if (_connectionState.value == state) return
         _connectionState.value = state
         bumpStatusRevision()
     }
 
-    /** Commits [_verification] and wakes the status waiters. */
+    /** Commits [_verification] and wakes the status waiters (unchanged = no-op, as [setConnectionState]). */
     private fun setVerificationUi(ui: VerificationUi) {
+        if (_verification.value == ui) return
         _verification.value = ui
         bumpStatusRevision()
     }
+
+    /** Last [bumpStatusRevision] fired from the backfill progress callback. */
+    @Volatile
+    private var lastBackfillStatusBumpMs = 0L
 
     /**
      * Holds the caller until a watched revision moves past [lastSeen] or
@@ -7585,7 +7604,9 @@ object MatrixRepository {
             if (now != lastSeen) return now
             val remaining = deadline - android.os.SystemClock.elapsedRealtime()
             if (remaining <= 0) return now
-            withTimeoutOrNull(remaining) { changeSignal.first() }
+            withTimeoutOrNull(remaining) {
+                changeSignal.first { it.first == watch && it.second == roomId }
+            }
         }
     }
 
@@ -7840,7 +7861,7 @@ object MatrixRepository {
         initialRoomCrawlDone = false
         networkHealLaunched = false
         roomListRevision++ // a reset IS a list change — the tool must re-fetch
-        changeSignal.tryEmit(Unit)
+        changeSignal.tryEmit("rooms" to null)
     }
 
     /**
@@ -9036,7 +9057,7 @@ object MatrixRepository {
         _roomList.value = rooms
         saveRoomListToDisk(rooms)
         roomListRevision++
-        changeSignal.tryEmit(Unit)
+        changeSignal.tryEmit("rooms" to null)
         if (debugLogging() && roomListDirtyAt > 0) {
             android.util.Log.d(
                 TAG,

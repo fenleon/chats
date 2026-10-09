@@ -251,9 +251,18 @@ object ChatClient {
      * and page loops died with the NO-SEAM flows — this is the one wait left.)
      */
     suspend fun waitForStatusChange(lastSeen: Long, timeoutMs: Long = 25_000): Long =
-        runCatching {
+        try {
             MatrixRepository.waitForChange("status", null, lastSeen, timeoutMs)
-        }.getOrDefault(lastSeen)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Rethrow: swallowing it here (runCatching) would turn the
+            // screens' while(true) poll loops into infinite undispatched
+            // spins on a cancelled coroutine (withTimeoutOrNull completes
+            // immediately on a cancelled job) — an instant ANR on screen
+            // hide. Found live 2026-10-09.
+            throw e
+        } catch (e: Exception) {
+            lastSeen
+        }
 
     /** Copies [text] to the Android clipboard (context window COPY row). */
     fun copyToClipboard(text: String) {
