@@ -350,7 +350,17 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                     verification !in VERIFICATION_TERMINAL_STATES,
                                 onClick = if (e2ee?.verified == true || !e2eeSettled) null else goVerify,
                             )
-                            AccountStatus(connection = connection, delivery = delivery)
+                            AccountStatus(
+                                connection = connection,
+                                delivery = delivery,
+                                onManualSync = {
+                                    // Kick a round (open-only sync is
+                                    // idempotent — a no-op while the loop
+                                    // runs) and confirm with the popover.
+                                    ChatClient.startSync()
+                                    navigateTo(screenFactory = { SyncingPanel(it) })
+                                },
+                            )
                         } else {
                             // Logged out: if the session just expired, say so
                             // instead of showing a bare login form (the user
@@ -747,6 +757,69 @@ class CodeSentPanel(
     }
 }
 
+/** The manual-sync confirmation popover: centered "Messages Syncing" +
+ *  subtitle, X dismiss bottom-centre, auto-dismiss after 3 s — the same
+ *  panel grammar as [CodeSentPanel]. */
+class SyncingPanel(
+    sealedActivity: SealedLightActivity,
+) : SimpleLightScreen<Unit>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+        val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
+
+        LaunchedEffect(Unit) {
+            delay(3_000L)
+            goBack()
+        }
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        LightText(
+                            text = "Messages Syncing",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                        Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                        LightText(
+                            text = "Your account data is being updated in the background",
+                            variant = LightTextVariant.Detail,
+                            align = TextAlign.Center,
+                        )
+                    }
+                }
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        null,
+                        LightBarButton.Icon(
+                            painter = confirmX,
+                            onClick = { goBack() },
+                            contentDescription = "Dismiss",
+                        ),
+                        null,
+                    ),
+                )
+            }
+        }
+    }
+}
+
 /** The logout confirmation overlay: centered
  *  "Do you want to log out of your account?" with the LP3 X (dismiss) and
  *  triangle (confirm) — same panel grammar as the verify confirm. Result:
@@ -801,71 +874,99 @@ class LogoutConfirmPanel(
     }
 }
 
-/** Background-delivery health folded into the status line — the separate
- *  "Sync 3m ago…" line read as two statuses (LP3 feedback 2026-09-25). */
+/** Background-delivery health folded into the status area — the separate
+ *  "Sync 3m ago…" line read as two statuses (LP3 feedback 2026-09-25).
+ *  Status semantics:
+ *   "Syncing messages… x of y" — the fresh-login backfill is
+ *     building the local store (drives the count; y = the pass's
+ *     room total).
+ *   "Syncing" — the key-backup restore crawl is working (the
+ *     "Restoring history… x of y" line below carries the count) or
+ *     the store isn't caught up yet.
+ *   The settled state ("Synced · up to date") is a dead status word —
+ *     it renders as the Manual Sync Now button instead, with the
+ *     last-updated age as its subtitle (LP3 feedback 2026-10-09); the
+ *     background-sync availability line follows.
+ *  Claiming Synced while the restore is still waiting on the backup
+ *  secret read as a lie on the LP3 fresh login (2026-09-20) — the
+ *  settled conditions below guard that. */
 @Composable
 private fun AccountStatus(
     connection: LightServiceMethod.GetConnectionState.Response?,
     delivery: MatrixRepository.DeliveryHealth?,
+    onManualSync: () -> Unit,
 ) {
     Column(
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
     ) {
-        // One line: the account status word joined with the delivery health
-        // suffix ("Syncing · 3m ago · push connected"). Either half can be
-        // absent (state/delivery not fetched yet). Status word semantics:
-        //   "Syncing messages… x of y" — the fresh-login backfill is
-        //     building the local store (drives the count; y = the pass's
-        //     room total).
-        //   "Syncing" — the key-backup restore crawl is working (the
-        //     "Restoring history… x of y" line below carries the count) or
-        //     the store isn't caught up yet.
-        //   "Synced · up to date" — sync running + store + room list
-        //     caught up AND the fresh-login work settled: the restore flow
-        //     completed (or settled with nothing to restore) and the
-        //     backfill pass ran its rooms. Claiming Synced while the
-        //     restore is still waiting on the backup secret read as a lie
-        //     on the LP3 fresh login (2026-09-20).
-        val statusText = connection?.let { state ->
-            val backfillRunning = state.backfillRoomsTotal > 0 &&
-                state.backfillRoomsDone < state.backfillRoomsTotal
+        val syncedSettled = connection?.let { state ->
             val backfillSettled = state.backfillRoomsTotal == 0 ||
                 state.backfillRoomsDone >= state.backfillRoomsTotal
-            val restoreRunning = state.restoreScanning && state.restoreRoomsTotal > 0
             val storeCaughtUp = state.roomsJoined > 0 &&
                 state.roomsProjected >= state.roomsJoined
-            when {
-                backfillRunning ->
-                    "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
-                restoreRunning -> "Syncing"
-                state.state == "syncing" && storeCaughtUp && backfillSettled &&
-                    state.restoreCompleted -> "Synced · up to date"
-                state.state == "syncing" -> "Syncing"
-                state.state == "offline" -> "offline"
-                // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
-                // the WHOLE first sync round — many minutes on a large
-                // account, while the room list is already visibly populated.
-                // Once rooms have landed, "connecting" reads as a lie: the
-                // sync is actively working — say Syncing.
-                state.state == "connecting" && state.roomsTotal > 0 -> "Syncing"
-                state.state == "connecting" -> "connecting"
-                else -> state.state.replaceFirstChar { it.uppercase() }
+            state.state == "syncing" && storeCaughtUp && backfillSettled &&
+                state.restoreCompleted
+        } == true
+        if (syncedSettled) {
+            // Manual Sync Now: kicks a sync round and opens the confirming
+            // popover. Subtitle = the age of the last successful round.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .lightClickable(onClick = onManualSync)
+                    .padding(vertical = 0.25f.gridUnitsAsDp()),
+            ) {
+                Column {
+                    LightText(text = "Manual Sync Now", variant = LightTextVariant.Heading)
+                    LightText(
+                        text = delivery?.lastSuccessfulRoundAtMs
+                            ?.takeIf { it > 0 }
+                            ?.let { "Last updated ${SyncHealth.ago(System.currentTimeMillis() - it)} ago" }
+                            ?: "Never synced",
+                        variant = LightTextVariant.Detail,
+                    )
+                }
             }
-        }
-        val healthText = delivery?.let {
-            SyncHealth.healthLine(
-                lastOkAtMs = it.lastSuccessfulRoundAtMs,
-                failures = it.consecutiveFailures,
-                pushConnected = it.pushConnected,
-                nowMs = System.currentTimeMillis(),
-            )
-        }
-        val line = listOfNotNull(statusText, healthText).joinToString(" · ")
-        if (line.isNotBlank()) {
             LightText(
-                text = line,
+                text = "No background sync available",
                 variant = LightTextVariant.Fine,
             )
+        } else {
+            val statusText = connection?.let { state ->
+                val backfillRunning = state.backfillRoomsTotal > 0 &&
+                    state.backfillRoomsDone < state.backfillRoomsTotal
+                val restoreRunning = state.restoreScanning && state.restoreRoomsTotal > 0
+                when {
+                    backfillRunning ->
+                        "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
+                    restoreRunning -> "Syncing"
+                    state.state == "syncing" -> "Syncing"
+                    state.state == "offline" -> "offline"
+                    // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
+                    // the WHOLE first sync round — many minutes on a large
+                    // account, while the room list is already visibly populated.
+                    // Once rooms have landed, "connecting" reads as a lie: the
+                    // sync is actively working — say Syncing.
+                    state.state == "connecting" && state.roomsTotal > 0 -> "Syncing"
+                    state.state == "connecting" -> "connecting"
+                    else -> state.state.replaceFirstChar { it.uppercase() }
+                }
+            }
+            val healthText = delivery?.let {
+                SyncHealth.healthLine(
+                    lastOkAtMs = it.lastSuccessfulRoundAtMs,
+                    failures = it.consecutiveFailures,
+                    pushConnected = it.pushConnected,
+                    nowMs = System.currentTimeMillis(),
+                )
+            }
+            val line = listOfNotNull(statusText, healthText).joinToString(" · ")
+            if (line.isNotBlank()) {
+                LightText(
+                    text = line,
+                    variant = LightTextVariant.Fine,
+                )
+            }
         }
         // Key-backup restore crawl: shown ONLY while it runs — a healthy
         // restore is silent, not a permanent third line.

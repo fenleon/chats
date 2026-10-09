@@ -79,11 +79,11 @@ class SyncHealthTest {
     @Test
     fun `failures appear only when above zero`() {
         assertEquals(
-            "14m ago · 3 failed · push disconnected",
+            "14m ago · 3 failed · No background sync available",
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 3, pushConnected = false, nowMs = 1_000L + 14 * 60_000L),
         )
         assertEquals(
-            "14m ago · push disconnected",
+            "14m ago · No background sync available",
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = false, nowMs = 1_000L + 14 * 60_000L),
         )
     }

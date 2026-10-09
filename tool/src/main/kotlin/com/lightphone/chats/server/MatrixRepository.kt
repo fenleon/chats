@@ -618,9 +618,16 @@ object MatrixRepository {
         // throttled to once per 24h, so after a restart the in-memory
         // [RestoreProgress] would claim "not completed" until the next real
         // crawl — the Account screen's "All messages restored" could never show.
+        // A stored session with NO flag at all is a legacy install logged in
+        // before the gate existed (emulator + LP3 upgrades, 2026-10-09): no
+        // fresh-login restore is pending on a boot, so default completed —
+        // otherwise the settled Account state (Synced / Manual Sync Now) is
+        // unreachable forever. A real fresh login removes the flag before its
+        // restore starts (see [KEY_RESTORE_COMPLETED] writers), so the gate
+        // still closes during that window.
         _restoreProgress.value = RestoreProgress(
             completed = slc.chatsPrefs()
-                .getBoolean(KEY_RESTORE_COMPLETED, false),
+                .getBoolean(KEY_RESTORE_COMPLETED, slc.chatsPrefs().contains(KEY_ACCESS_TOKEN)),
         )
         // Delivery-health seeds (Account screen line).
         lastSyncOkAtMs = slc.chatsPrefs()

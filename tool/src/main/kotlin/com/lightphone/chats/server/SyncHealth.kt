@@ -34,11 +34,11 @@ object SyncHealth {
     }
 
     /** The one Account-screen status suffix: last successful round age,
-     *  consecutive failures when any, push-channel state. Combined with the
-     *  account status word on a single line ("Syncing · 2m ago · push
-     *  connected"), so it carries no "Sync" prefix of its own. */
+     *  consecutive failures when any, background-sync availability. Combined
+     *  with the account status word on a single line ("Syncing · 2m ago · No
+     *  background sync available"), so it carries no "Sync" prefix of its own. */
     fun healthLine(lastOkAtMs: Long, failures: Int, pushConnected: Boolean, nowMs: Long): String {
-        val push = if (pushConnected) "push connected" else "push disconnected"
+        val push = if (pushConnected) "push connected" else "No background sync available"
         return when {
             lastOkAtMs == 0L -> "No sync round yet · $push"
             else -> {
@@ -48,7 +48,9 @@ object SyncHealth {
         }
     }
 
-    private fun ago(millis: Long): String {
+    /** Compact elapsed label ("<1m"/"3m"/"2h"/"5d") — shared with the Account
+     *  screen's Manual Sync Now subtitle. */
+    internal fun ago(millis: Long): String {
         val minutes = millis / 60_000
         return when {
             minutes < 1 -> "<1m"
