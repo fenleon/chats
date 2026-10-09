@@ -1,3 +1,26 @@
+val chatsR8Rules = File(buildDir, "chats-r8.pro").apply {
+    parentFile.mkdirs()
+    writeText(
+        """
+        # JNA — Trixnity's olm crypto wrapper loads libjnidispatch through JNA,
+        # which is reflection/JNI-heavy (field IDs looked up by name). R8 must
+        # not obfuscate or strip it, or E2EE login fails with:
+        #   UnsatisfiedLinkError: Can't obtain peer field ID for class com.sun.jna.Pointer
+        -keep class com.sun.jna.** { *; }
+        -dontwarn com.sun.jna.**
+
+        # Trixnity loads its olm crypto backend reflectively (optional engine) —
+        # without a keep, R8 strips it and session restore dies with:
+        #   NoClassDefFoundError: ...OlmLibraryWrapper (obfuscated as J5.d)
+        -keep class de.connect2x.trixnity.libolm.** { *; }
+
+        # Optional AndroidX window extensions (may be absent on some devices)
+        # and APIs not on the compile classpath.
+        -dontwarn androidx.window.**
+        """.trimIndent() + "\n",
+    )
+}
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -62,8 +85,12 @@ android {
             isShrinkResources = true    // drop unused resources
             signingConfig = signingConfigs.getByName("lightsdkDev")
             // R8 keeps ported from the former :server library's
-            // consumerProguardFiles (JNA / Trixnity libolm) — see the file.
-            proguardFile("chats-r8.pro")
+            // consumerProguardFiles (JNA / Trixnity libolm). Generated into
+            // build/ rather than checked in as a .pro file: the Tool Library
+            // builder extracts only build.gradle.kts + lighttool.toml +
+            // src/main/{kotlin,java,res,assets} — a .pro at the tool root
+            // never reaches Light's pipeline.
+            proguardFile(chatsR8Rules)
         }
     }
 
