@@ -4,9 +4,11 @@ import com.lightphone.chats.server.ChatsClipboard
 import com.lightphone.chats.server.Diagnostics
 import com.lightphone.chats.server.MatrixRepository
 import com.lightphone.chats.Snapshots
+import com.thelightphone.sdk.SealedLightContext
 import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.getOrNull
 import kotlinx.coroutines.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 import com.lightphone.chats.screens.clearThreadCaches
 
 /**
@@ -15,6 +17,33 @@ import com.lightphone.chats.screens.clearThreadCaches
  * trip, no serialized dispatch (NO-SEAM, 2026-09-07).
  */
 object ChatClient {
+
+    private val bootstrapOnce = AtomicBoolean(false)
+
+    /**
+     * One-shot tool bootstrap, called from the @InitialScreen's createViewModel
+     * with the screen's [SealedLightContext] — the job the former
+     * ServerBootstrapProvider did in its ContentProvider.onCreate (Rung-1
+     * fold, 2026-10): binds the clipboard and initializes MatrixRepository
+     * (session restore + the network-loss recovery observer). Idempotent —
+     * the list screen is recreated on back navigation, the process is not.
+     */
+    fun bootstrap(slc: SealedLightContext) {
+        if (!bootstrapOnce.compareAndSet(false, true)) return
+        ChatsClipboard.bind(slc)
+        MatrixRepository.init(slc)
+    }
+
+    /** Starts the open-only sync loop (a tool screen was shown / activity
+     *  resumed). Idempotent; respects the Settings → Sync toggle. */
+    fun startSync() {
+        runCatching { MatrixRepository.startSync() }
+    }
+
+    /** Ends sync while the tool is backgrounded (the tool's activity paused). */
+    fun stopSync() {
+        runCatching { MatrixRepository.stopSync() }
+    }
 
     suspend fun setAccount(
         homeserver: String,
@@ -272,7 +301,7 @@ object ChatClient {
     /** Toggles the privacy-safe diagnostics log (Settings, off by default). */
     suspend fun setDiagnosticsEnabled(enabled: Boolean): Boolean =
         runCatching {
-            Diagnostics.setEnabled(value = enabled)
+            Diagnostics.setEnabled(enabled)
             Diagnostics.enabled
         }.getOrDefault(false)
 

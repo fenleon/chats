@@ -1,23 +1,14 @@
 package com.lightphone.chats.server
 
-import android.app.Activity
-import android.app.Application
-import android.app.NotificationManager
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.os.Environment
-import android.os.PowerManager
 import android.provider.MediaStore as AndroidMediaStore
 import android.webkit.MimeTypeMap
-import android.content.ContentValues
-import androidx.room.Room
+import com.lightphone.chats.BuildConfig
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
+import com.thelightphone.sdk.SealedLightContext
+import com.thelightphone.sdk.roomDatabaseBuilder
 import com.thelightphone.sdk.shared.LightServiceMethod
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
@@ -232,6 +223,14 @@ object MatrixRepository {
     }
 
     private const val PREFS = "chats_account"
+
+    /**
+     * The app's SharedPreferences, reached through the screen context's
+     * [SealedLightContext.androidContext] (the tool plugin bans the
+     * android.content.Context import, so the constant is fully qualified).
+     */
+    private fun SealedLightContext.chatsPrefs(): android.content.SharedPreferences =
+        androidContext.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
     private const val KEY_HOMESERVER = "homeserver"
     private const val KEY_USER_ID = "user_id"
     private const val KEY_ACCESS_TOKEN = "access_token"
@@ -290,7 +289,7 @@ object MatrixRepository {
         }
 
     @Volatile
-    private var appContext: Context? = null
+    private var lightContext: SealedLightContext? = null
 
     /** Guards the one-shot megolm restore after verification. */
     @Volatile
@@ -583,83 +582,75 @@ object MatrixRepository {
     /**
      * Network-loss recovery: a transport drop can leave
      * Trixnity's sync loop dead until its internal retry —
-     * reset it as soon as the network is back. Registered on the app
-     * context in [init], process-lifetime.
+     * reset it as soon as the network is back. Driven by the SDK's
+     * LightConnectivity flow (the tool plugin bans receiver registration and
+     * raw ConnectivityManager use), started once from [init].
      */
-    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onLost(network: android.net.Network) {
-            // Don't act yet — the radio may flap; the reset fires once the
-            // next onAvailable proves the transport is really back.
-            networkWasLost = true
-        }
-
-        override fun onAvailable(network: android.net.Network) {
-            if (!networkWasLost) return
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now - lastNetworkResetAtMs < NETWORK_RESET_MIN_INTERVAL_MS) return
-            networkWasLost = false
-            lastNetworkResetAtMs = now
-            val c = client ?: return
-            scope.launch {
-                runCatching { c.stopSync() }
-                android.util.Log.d(TAG, "network back after loss — resetting sync loop")
-                Diagnostics.record("network back after loss — sync reset")
-                // The stopSync above un-armed the slot, so [startSyncLoop]
-                // must re-arm it. Never outside the open-tool window
-                // (open-only sync).
-                inProcessSyncRunning = false
-                if (syncWanted) startSyncLoop()
+    private fun observeNetworkLosses(slc: SealedLightContext) {
+        scope.launch {
+            slc.connectivity.observeNetworkStatus().collect { status ->
+                // A drop: arm the flag — don't act yet, the radio may flap;
+                // the reset fires once a later emission proves the transport
+                // is really back (the flow conflates flaps).
+                if (!status.isConnected) {
+                    networkWasLost = true
+                    return@collect
+                }
+                if (!networkWasLost) return@collect
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastNetworkResetAtMs < NETWORK_RESET_MIN_INTERVAL_MS) return@collect
+                networkWasLost = false
+                lastNetworkResetAtMs = now
+                val c = client ?: return@collect
+                scope.launch {
+                    runCatching { c.stopSync() }
+                    android.util.Log.d(TAG, "network back after loss — resetting sync loop")
+                    Diagnostics.record("network back after loss — sync reset")
+                    // The stopSync above un-armed the slot, so [startSyncLoop]
+                    // must re-arm it. Never outside the open-tool window
+                    // (open-only sync).
+                    inProcessSyncRunning = false
+                    if (syncWanted) startSyncLoop()
+                }
             }
         }
     }
 
-    /** Called once from [ServerBootstrapProvider] at process start; restores a
+    /** Called once from [ChatClient.bootstrap] at tool start; restores a
      *  stored session if there is one. Sync itself is NOT started here — the
-     *  tool activity's resume/pause drives it (open-only sync). */
-    fun init(context: Context) {
-        val app = context.applicationContext
-        if (appContext == null) appContext = app
-        Diagnostics.init(app)
+     *  tool screens' show/pause hooks drive it (open-only sync). */
+    fun init(slc: SealedLightContext) {
+        if (lightContext == null) lightContext = slc
+        Diagnostics.init(slc)
         enableTrixnityLogging()
         // Settings → Sync pause (audit 2026-08-14): a paused app starts
         // no sync loop — the battery escape hatch.
-        syncEnabled = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        syncEnabled = slc.chatsPrefs()
             .getBoolean(KEY_SYNC_ENABLED, true)
         // Seed the restore-completed flag from prefs: the crawl is
         // throttled to once per 24h, so after a restart the in-memory
         // [RestoreProgress] would claim "not completed" until the next real
         // crawl — the Account screen's "All messages restored" could never show.
         _restoreProgress.value = RestoreProgress(
-            completed = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            completed = slc.chatsPrefs()
                 .getBoolean(KEY_RESTORE_COMPLETED, false),
         )
         // Delivery-health seeds (Account screen line).
-        lastSyncOkAtMs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        lastSyncOkAtMs = slc.chatsPrefs()
             .getLong(KEY_LAST_SYNC_OK_MS, 0L)
-        consecutiveSyncFailures = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        consecutiveSyncFailures = slc.chatsPrefs()
             .getInt(KEY_SYNC_FAILURES, 0)
         // Network-loss recovery: reset the sync loop when the
         // transport returns — Trixnity can sit dead until its internal retry.
-        // The initial onAvailable for the current default network is a no-op
+        // The initial emission for the current network is a no-op
         // (networkWasLost starts false).
-        (app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
-            ?.registerDefaultNetworkCallback(networkCallback)
-        // Open-only sync driver: the tool activity's resume starts the loop,
-        // its pause stops it. In-tool navigation never pauses the activity,
-        // so the loop spans whole tool sessions; leaving the tool (toolbox /
-        // home) pauses the activity and ends sync. [startSync] re-checks the
-        // battery-saver toggle.
-        (app as? Application)?.registerActivityLifecycleCallbacks(
-            object : Application.ActivityLifecycleCallbacks {
-                override fun onActivityResumed(activity: Activity) = startSync()
-                override fun onActivityPaused(activity: Activity) = stopSync()
-                override fun onActivityStarted(activity: Activity) = Unit
-                override fun onActivityStopped(activity: Activity) = Unit
-                override fun onActivityCreated(activity: Activity, savedInstanceState: android.os.Bundle?) = Unit
-                override fun onActivitySaveInstanceState(activity: Activity, outState: android.os.Bundle) = Unit
-                override fun onActivityDestroyed(activity: Activity) = Unit
-            },
-        )
+        observeNetworkLosses(slc)
+        // Open-only sync driver: each tool screen calls [startSync] on show
+        // (every activity resume re-fires the shown screen's onScreenShow)
+        // and [stopSync] on the tool's activity pause. In-tool navigation
+        // never pauses the activity, so the loop spans whole tool sessions;
+        // leaving the tool (toolbox / home) pauses it and ends sync.
+        // [startSync] re-checks the battery-saver toggle.
         scope.launch {
             // Restore the session regardless of the sync toggle. GetAccountState
             // reads the live client, so a paused app that skips the restore
@@ -703,7 +694,7 @@ object MatrixRepository {
      * tool is foreground. Persisted, so it survives reboots.
      */
     suspend fun setSyncEnabled(enabled: Boolean) {
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        lightContext?.chatsPrefs()
             ?.edit()?.putBoolean(KEY_SYNC_ENABLED, enabled)?.apply()
         syncEnabled = enabled
         if (!enabled) {
@@ -754,7 +745,7 @@ object MatrixRepository {
     private fun recordSyncRoundOk() {
         lastSyncOkAtMs = System.currentTimeMillis()
         consecutiveSyncFailures = 0
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()
+        lightContext?.chatsPrefs()?.edit()
             ?.putLong(KEY_LAST_SYNC_OK_MS, lastSyncOkAtMs)
             ?.putInt(KEY_SYNC_FAILURES, 0)
             ?.apply()
@@ -762,7 +753,7 @@ object MatrixRepository {
 
     private fun recordSyncRoundFailed() {
         consecutiveSyncFailures++
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()
+        lightContext?.chatsPrefs()?.edit()
             ?.putInt(KEY_SYNC_FAILURES, consecutiveSyncFailures)
             ?.apply()
     }
@@ -796,7 +787,7 @@ object MatrixRepository {
      */
     private fun debugLogging(): Boolean =
         BuildConfig.DEBUG &&
-            (appContext?.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+            (lightContext?.chatsPrefs()
                 ?.getBoolean("debug_logging", false) ?: false)
 
     private class TrixnityLogcatHandler : java.util.logging.Handler() {
@@ -865,7 +856,7 @@ object MatrixRepository {
      * Call after [stopPreviousSession], inside [initMutex].
      */
     private suspend fun createAndStoreClient(
-        ctx: Context,
+        ctx: SealedLightContext,
         authProviderData: MatrixClientAuthProviderData,
         configName: String,
         baseUrl: String,
@@ -878,13 +869,13 @@ object MatrixRepository {
         pendingVerificationPhase = true
         verificationSyncSwapped.set(false)
         val loginResult = MatrixClient.create(
-            repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+            repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME)),
             mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
             cryptoDriverModule = CryptoDriverModule.libOlm(),
             authProviderData = authProviderData,
             configuration = clientConfiguration(configName),
         ).onFailure { pendingVerificationPhase = false }.getOrThrow()
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        ctx.chatsPrefs()
             .edit()
             .putString(KEY_HOMESERVER, baseUrl)
             .putString(KEY_USER_ID, loginResult.userId.full)
@@ -901,7 +892,7 @@ object MatrixRepository {
         passwordOrToken: String,
         tokenLogin: Boolean,
     ): Result<MatrixClient> = runCatching {
-        val ctx = appContext ?: error("companion not initialized")
+        val ctx = lightContext ?: error("companion not initialized")
         initMutex.withLock {
             stopPreviousSession()
 
@@ -936,7 +927,7 @@ object MatrixRepository {
      * between the two calls, so they cannot be one binder round-trip.)
      */
     suspend fun beeperRequestCode(email: String): Result<Unit> = runCatching {
-        val ctx = appContext ?: error("companion not initialized")
+        val ctx = lightContext ?: error("companion not initialized")
         val http = HttpClient()
         try {
             val init = http.post("$BEEPER_API_BASE/user/login") {
@@ -960,7 +951,7 @@ object MatrixRepository {
             if (emailReq.status.value !in 200..299) {
                 error("Beeper code request failed (HTTP ${emailReq.status.value})")
             }
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ctx.chatsPrefs()
                 .edit().putString(KEY_BEEPER_REQUEST_ID, requestId).apply()
         } finally {
             http.close()
@@ -991,11 +982,11 @@ object MatrixRepository {
 
     suspend fun beeperLogin(email: String, code: String): Result<MatrixClient> = runCatching {
         if (code.isBlank()) error("Enter the code from your email")
-        val ctx = appContext ?: error("companion not initialized")
+        val ctx = lightContext ?: error("companion not initialized")
         initMutex.withLock {
             stopPreviousSession()
 
-            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val prefs = ctx.chatsPrefs()
             val requestId = prefs.getString(KEY_BEEPER_REQUEST_ID, null)
                 ?: error("no pending code request — request a code first")
             val loginToken: String
@@ -1072,7 +1063,7 @@ object MatrixRepository {
      * resets per-session state, and starts the sync loop + push channel.
      * Call inside [initMutex] as the lock block's last expression.
      */
-    private suspend fun finishLogin(ctx: Context, newClient: MatrixClient): MatrixClient {
+    private suspend fun finishLogin(ctx: SealedLightContext, newClient: MatrixClient): MatrixClient {
         client = newClient
         sessionExpired = false
         manualLogout = false
@@ -1083,7 +1074,7 @@ object MatrixRepository {
         _restoreProgress.value = RestoreProgress()
         // A fresh login must not inherit the previous account's "all messages
         // restored" claim (2026-09-01; logout already clears all prefs).
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_RESTORE_COMPLETED).apply()
+        ctx.chatsPrefs().edit().remove(KEY_RESTORE_COMPLETED).apply()
         // Login happens with the tool foreground — start the open-only loop.
         syncWanted = true
         startSyncLoop()
@@ -1202,13 +1193,13 @@ object MatrixRepository {
      * cleared via SQL directly. Prefs-gated
      * once per account, keyed by [SYNC_FILTER_MAPPINGS_VERSION].
      */
-    private suspend fun migrateSyncFilterIfNeeded(ctx: Context) {
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private suspend fun migrateSyncFilterIfNeeded(ctx: SealedLightContext) {
+        val prefs = ctx.chatsPrefs()
         val userId = prefs.getString(KEY_USER_ID, null) ?: return
         val prefsKey = "sync_filter_mappings_v_$userId"
         if (prefs.getInt(prefsKey, 0) >= SYNC_FILTER_MAPPINGS_VERSION) return
         runCatching {
-            val db = databaseBuilder(ctx).build()
+            val db = ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME).build()
             try {
                 db.openHelper.writableDatabase.execSQL("UPDATE Account SET filter = NULL")
             } finally {
@@ -1391,7 +1382,7 @@ object MatrixRepository {
         outcome.exceptionOrNull()?.let { e ->
             // Failures were invisible in logcat (only success logged); log the
             // real detail so a rejected key shows up server-side too.
-            val detail = e.message ?: e.javaClass.simpleName
+            val detail = e.message ?: e.toString().substringBefore(':')
             android.util.Log.w(TAG, "recoverWithKey failed: $detail")
             // The raw MAC text ("expected mac …, but got …", "bad mac") or the
             // master-key comparison after a failed decrypt ("did not match") is
@@ -1622,7 +1613,7 @@ object MatrixRepository {
                 // cooldown. Clear it and retry on a short ladder so the crawl
                 // actually runs once the key is local.
                 scope.launch {
-                    val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return@launch
+                    val prefs = lightContext?.chatsPrefs() ?: return@launch
                     // The backup secret's arrival is out of our control: another
                     // device answers the secret request whenever it does — 25 s
                     // in the working run, never (5+ min) in the two failing
@@ -1823,8 +1814,8 @@ object MatrixRepository {
     }
 
     private suspend fun restoreMegolmSessionsLocked(attempt: Int) {
-        val ctx = appContext ?: return
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val ctx = lightContext ?: return
+        val prefs = ctx.chatsPrefs()
         val c = client ?: return
         if (!isDeviceVerified(c)) {
             // Mid-verification (fresh login): every room would log "skipping
@@ -1983,7 +1974,7 @@ object MatrixRepository {
     }
 
     suspend fun logout() {
-        val ctx = appContext ?: return
+        val ctx = lightContext ?: return
         initMutex.withLock {
             manualLogout = true
             val old = client
@@ -2027,10 +2018,10 @@ object MatrixRepository {
                     android.util.Log.w(TAG, "logout: API logout failed — device stays registered: ${it.message}")
                 }
             runCatching { old?.closeSuspending() }
-            ctx.deleteDatabase(DB_NAME)
+            ctx.androidContext.deleteDatabase(DB_NAME)
             projectionTableReady = false
-            ctx.cacheDir.resolve(MEDIA_DIR).deleteRecursively()
-            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+            ctx.androidContext.cacheDir.resolve(MEDIA_DIR).deleteRecursively()
+            ctx.chatsPrefs().edit().clear().apply()
             clearDiskCache()
             sessionExpired = false
             manualLogout = false
@@ -2045,14 +2036,14 @@ object MatrixRepository {
     suspend fun ensureClient(): MatrixClient? {
         initMutex.withLock {
             client?.let { return it }
-            val ctx = appContext ?: return null
+            val ctx = lightContext ?: return null
             // Clear a stale sync filter BEFORE the client is built — the
             // setup flow then uploads a fresh filter covering the current
             // room-account-data whitelist (one-time, prefs-gated).
             migrateSyncFilterIfNeeded(ctx)
             val restored = runCatching {
                 MatrixClient.create(
-                    repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+                    repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME)),
                     mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
                     cryptoDriverModule = CryptoDriverModule.libOlm(),
                     authProviderData = null, // restore from the store (built-in Account→Authentication migration)
@@ -2073,7 +2064,7 @@ object MatrixRepository {
                 if (_roomList.value.isEmpty()) preloadRoomListFromDisk()
                 restored
             } else {
-                ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+                ctx.chatsPrefs().edit().clear().apply()
                 null
             }
         }
@@ -2081,7 +2072,7 @@ object MatrixRepository {
 
     fun accountState(): com.thelightphone.sdk.shared.LightServiceMethod.GetAccountState.Response {
         val c = client
-        val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefs = lightContext?.chatsPrefs()
         return com.thelightphone.sdk.shared.LightServiceMethod.GetAccountState.Response(
             // An expired session counts as logged out for the UI: the user
             // should land on the login form, not on LOG OUT.
@@ -2242,7 +2233,7 @@ object MatrixRepository {
 
     /** One event id per line (ids are opaque; no secrets in here). */
     private fun unsentMessageFile(): java.io.File? =
-        appContext?.let { java.io.File(it.filesDir, "unsent_messages.txt") }
+        lightContext?.let { java.io.File(it.androidContext.filesDir, "unsent_messages.txt") }
 
     /** Records a message redaction so every later page build renders its
      *  tombstone. Capped — a marker only matters while the redacted event sits
@@ -2356,7 +2347,7 @@ object MatrixRepository {
     private var lastRoomListWriteAt = 0L
 
     private fun cacheDir(): java.io.File? =
-        appContext?.let { java.io.File(it.filesDir, DISK_CACHE_DIR) }
+        lightContext?.let { java.io.File(it.androidContext.filesDir, DISK_CACHE_DIR) }
 
     private fun roomListCacheFile(): java.io.File? =
         cacheDir()?.let { java.io.File(it, DISK_ROOM_LIST_FILE) }
@@ -4720,7 +4711,7 @@ object MatrixRepository {
                     val content = resolved.content
                     if (content?.isFailure == true) {
                         val ex = content.exceptionOrNull()
-                        android.util.Log.w(TAG, "collect: event ${resolved.event.id.full} still encrypted: ${ex?.javaClass?.simpleName}: ${ex?.message}")
+                        android.util.Log.w(TAG, "collect: event ${resolved.event.id.full} still encrypted: ${ex?.toString()}")
                     }
                     waitForDecrypt = resolved.content?.getOrNull() != null ||
                         resolved.event.content !is EncryptedMessageEventContent
@@ -5591,14 +5582,11 @@ object MatrixRepository {
     }
 
     /** Whether a validated default network exists (heal gate — a genuinely
-     *  dead/slow link must not look like an engine wedge). */
-    private fun networkIsUp(): Boolean {
-        val cm = appContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            ?: return false
-        val network = cm.activeNetwork ?: return false
-        return cm.getNetworkCapabilities(network)
-            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
-    }
+     *  dead/slow link must not look like an engine wedge). Delta vs the old
+     *  raw-ConnectivityManager check: the SDK's LightConnectivity exposes
+     *  NET_CAPABILITY_INTERNET, not VALIDATED. */
+    private fun networkIsUp(): Boolean =
+        lightContext?.connectivity?.currentStatus?.isConnected == true
 
     /**
      * In-process restart-equivalent for the HTTP stack: stops the current
@@ -5611,7 +5599,7 @@ object MatrixRepository {
      * store is untouched, only the client/engine are replaced.
      */
     private suspend fun selfHealHttpStack() {
-        val ctx = appContext ?: return
+        val ctx = lightContext ?: return
         if (!mediaHealInFlight) initMutex.withLock {
             if (mediaHealInFlight) return@withLock
             val old = client
@@ -5629,7 +5617,7 @@ object MatrixRepository {
                 httpClientEngine = buildHttpClientEngine()
                 val restored = runCatching {
                     MatrixClient.create(
-                        repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
+                        repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME)),
                         mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
                         cryptoDriverModule = CryptoDriverModule.libOlm(),
                         authProviderData = null, // restore from the store
@@ -5793,10 +5781,10 @@ object MatrixRepository {
             val txnId = eventId.removePrefix(LOCAL_PENDING_ID_PREFIX)
             val local = pendingAudioEcho[roomId]?.get(txnId)?.localFile
             if (local != null && local.exists()) {
-                val ctx = appContext ?: return false to "no context"
+                val ctx = lightContext ?: return false to "no context"
                 // Play from a fresh temp copy so stopping playback (which
                 // deletes the played file) doesn't consume the pending copy.
-                val tmp = java.io.File(ctx.cacheDir, "voice_$txnId")
+                val tmp = java.io.File(ctx.androidContext.cacheDir, "voice_$txnId")
                 if (runCatching { local.copyTo(tmp, overwrite = true) }.isSuccess) {
                     android.util.Log.d(TAG, "playVoiceNote: playing local pending audio (id=$eventId)")
                     return playLocalAudioFile(
@@ -5810,10 +5798,10 @@ object MatrixRepository {
         }
         // A previously-downloaded note plays from the cache — no network, no
         // "failed to download" on a note that played before.
-        val ctx = appContext ?: return false to "no context"
+        val ctx = lightContext ?: return false to "no context"
         voiceCacheFile(eventId)?.let { cached ->
             if (cached.exists()) {
-                val tmp = java.io.File(ctx.cacheDir, "voice_play_$eventId")
+                val tmp = java.io.File(ctx.androidContext.cacheDir, "voice_play_$eventId")
                 if (runCatching { cached.copyTo(tmp, overwrite = true) }.isSuccess) {
                     android.util.Log.d(TAG, "playVoiceNote: playing cached audio (id=$eventId)")
                     return playLocalAudioFile(
@@ -5872,7 +5860,7 @@ object MatrixRepository {
             // note — a bridge sending a different type would land here.
             android.util.Log.w(
                 TAG,
-                "playVoiceNote: content is ${content?.javaClass?.simpleName ?: "null"}, not FileBased.Audio",
+                "playVoiceNote: content is ${content?.toString()?.substringBefore(':') ?: "null"}, not FileBased.Audio",
             )
             return false to "not an audio message"
         }
@@ -5943,7 +5931,7 @@ object MatrixRepository {
         // extension so MediaExtractor sniffs the content instead of chasing a
         // wrong hint (see [sniffAudioExtension]).
         val tmp = java.io.File(
-            ctx.cacheDir,
+            ctx.androidContext.cacheDir,
             if (ext.isEmpty()) "voice_$eventId" else "voice_$eventId.$ext",
         )
         runCatching { tmp.writeBytes(playBytes) }.getOrElse { return false to "audio write failed" }
@@ -5968,7 +5956,7 @@ object MatrixRepository {
      * [stopAudioPlayback]). @return (playing, error).
      */
     private fun playLocalAudioFile(
-        ctx: Context,
+        ctx: SealedLightContext,
         roomId: String,
         eventId: String,
         tmp: java.io.File,
@@ -6003,7 +5991,7 @@ object MatrixRepository {
             }
         }
         player.setOnErrorListener { _, _, _ -> stopAudioPlayback(); true }
-        val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        val audioManager = ctx.audioManager
         val focusRequest = android.media.AudioFocusRequest.Builder(
             android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
         )
@@ -6181,8 +6169,7 @@ object MatrixRepository {
         if (!releaseFocus) return
         audioFocusRequest?.let { focus ->
             runCatching {
-                (appContext?.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager)
-                    .abandonAudioFocusRequest(focus)
+                lightContext?.audioManager?.abandonAudioFocusRequest(focus)
             }
             audioFocusRequest = null
         }
@@ -6198,7 +6185,7 @@ object MatrixRepository {
 
     /** Bounded voice-note cache dir (eventId-keyed files, LRU by mtime). */
     private fun voiceCacheDir(): java.io.File? =
-        appContext?.let { java.io.File(it.cacheDir, "voice_cache").apply { mkdirs() } }
+        lightContext?.let { java.io.File(it.androidContext.cacheDir, "voice_cache").apply { mkdirs() } }
 
     /** The cached file for [eventId], or null when the cache dir can't exist.
      *  The extension is unknown until the first download, so a file that
@@ -6225,7 +6212,7 @@ object MatrixRepository {
         eventId: String,
         content: RoomMessageEventContent.FileBased.Audio,
     ): java.io.File? {
-        val ctx = appContext ?: return null
+        val ctx = lightContext ?: return null
         val (file, url) = mediaSourceOf(content) ?: return null
         val bytes = fetchMediaRetrying(
             c, file, url, eventId,
@@ -6265,7 +6252,7 @@ object MatrixRepository {
      * builds; the exists/in-flight guards make repeated calls no-ops.
      */
     private fun prefetchVoiceNotes(c: MatrixClient, matrixRoomId: RoomId, events: List<TimelineEvent>) {
-        val ctx = appContext ?: return
+        val ctx = lightContext ?: return
         for (te in events.asSequence()
             .filter { it.content?.getOrNull() is RoomMessageEventContent.FileBased.Audio }
             .take(VOICE_PREFETCH_COUNT)
@@ -6456,7 +6443,7 @@ object MatrixRepository {
         // stay playable until the sync echo replaces it. Best-effort: a failed copy
         // just leaves the pending row unplayable, the send is unaffected.
         val localFile = runCatching {
-            java.io.File(appContext?.cacheDir ?: return@runCatching null, "voice_pending_$txnId.ogg")
+            java.io.File(lightContext?.androidContext?.cacheDir ?: return@runCatching null, "voice_pending_$txnId.ogg")
                 .also { file -> file.writeBytes(bytes) }
         }.getOrNull()
         roomPending[txnId] = PendingAudioSend(txnId, System.currentTimeMillis(), durationMs, localFile)
@@ -6611,7 +6598,7 @@ object MatrixRepository {
     suspend fun saveMessageImage(roomId: String, eventId: String): Boolean {
         val c = client ?: return false
         if (eventId.startsWith(LOCAL_PENDING_ID_PREFIX)) return false
-        val ctx = appContext ?: return false
+        val ctx = lightContext ?: return false
         val matrixRoomId = RoomId(roomId)
         val te = resolvedTimelineEvent(c, matrixRoomId, eventId)
         val content = when (val raw = te?.content?.getOrNull()) {
@@ -6633,39 +6620,27 @@ object MatrixRepository {
         val name = "chats-" +
             eventId.replace(Regex("[^A-Za-z0-9._-]"), "_") + "-" +
             System.currentTimeMillis() + "." + ext
-        val values = ContentValues().apply {
-            put(AndroidMediaStore.Images.Media.DISPLAY_NAME, name)
-            put(AndroidMediaStore.Images.Media.MIME_TYPE, mime)
-            put(AndroidMediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Chats")
-            put(AndroidMediaStore.Images.Media.IS_PENDING, 1)
-        }
-        val resolver = ctx.contentResolver
-        val uri = resolver.insert(AndroidMediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            ?: return false
-        try {
-            resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: run {
-                resolver.delete(uri, null, null)
-                return false
-            }
-        } catch (e: Exception) {
-            android.util.Log.w(TAG, "saveMessageImage: write failed for $eventId", e)
-            runCatching { resolver.delete(uri, null, null) }
-            return false
-        } finally {
-            values.clear()
-            values.put(AndroidMediaStore.Images.Media.IS_PENDING, 0)
-            runCatching { resolver.update(uri, values, null, null) }
-        }
-        return true
+        // The resolver access lives in the SDK (saveToMediaStore) — the tool
+        // plugin bans contentResolver in tool code. A failed write cleans up
+        // the pending row; return false without a recorded reason (the SDK
+        // logs it).
+        return ctx.saveToMediaStore(
+            collection = AndroidMediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            displayName = name,
+            mimeType = mime,
+            relativePath = Environment.DIRECTORY_PICTURES + "/Chats",
+            bytes = bytes,
+        ) != null
     }
 
     /** Whether the active network connection is cellular (mobile data). */
+    /** Whether the active network connection is cellular (mobile data). Delta
+     *  vs the old raw-ConnectivityManager check: LightConnectivity exposes
+     *  isWifi/isMetered, so cellular ≈ connected non-Wi-Fi (a metered
+     *  non-Wi-Fi transport like Bluetooth tethering would now count too). */
     private fun isOnCellularData(): Boolean {
-        val context = appContext ?: return false
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            ?: return false
-        val capabilities = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
-        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+        val status = lightContext?.connectivity?.currentStatus ?: return false
+        return status.isConnected && !status.isWifi
     }
 
     /**
@@ -7125,19 +7100,18 @@ object MatrixRepository {
     }
 
     /** Screen truth for the speculative-work gates. */
-    private fun isScreenInteractive(): Boolean =
-        (appContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive == true
+    private fun isScreenInteractive(): Boolean = lightContext?.screenInteractive == true
 
     /** Read marker this device last sent for [roomKey] ([markRead]), persisted
      *  across process restarts. The background sync filter drops m.receipt
      *  echoes, so the store's own receipt can't prove "already read" at a later
      *  watcher registration — this persisted marker can. */
     private fun lastReadMarkerId(roomKey: String): String? =
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        lightContext?.chatsPrefs()
             ?.getString(KEY_LAST_READ_PREFIX + roomKey, null)
 
     private fun recordReadMarker(roomKey: String, eventId: String) {
-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        lightContext?.chatsPrefs()
             ?.edit()?.putString(KEY_LAST_READ_PREFIX + roomKey, eventId)?.apply()
     }
 
@@ -8039,7 +8013,7 @@ object MatrixRepository {
                 } catch (e: Exception) {
                     android.util.Log.w(
                         TAG,
-                        "room list resolver pass failed: ${e.javaClass.simpleName}: ${e.message}" +
+                        "room list resolver pass failed: ${e.toString()}" +
                             "\n${e.stackTraceToString().lineSequence().take(6).joinToString("\n")}",
                     )
                 }
@@ -8801,12 +8775,12 @@ object MatrixRepository {
      *  no-auth → 404 M_UNRECOGNIZED, with bearer → 200). Sessions restored
      *  from before this key existed read it once from Trixnity's own
      *  `Authentication` table (Room, `value` JSON) and cache it in prefs. */
-    private fun accessToken(ctx: Context): String? {
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private fun accessToken(ctx: SealedLightContext): String? {
+        val prefs = ctx.chatsPrefs()
         prefs.getString(KEY_ACCESS_TOKEN, null)?.let { return it }
         val token = runCatching {
             val db = android.database.sqlite.SQLiteDatabase.openDatabase(
-                ctx.getDatabasePath(DB_NAME).path, null,
+                ctx.androidContext.getDatabasePath(DB_NAME).path, null,
                 android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
             )
             try {
@@ -8874,7 +8848,7 @@ object MatrixRepository {
         }
         if (now - (bridgeContactsFailedAtMs[bridgeId] ?: 0L) < BRIDGE_CONTACTS_RETRY_MS) return null
         val url = "$BEEPER_HOMESERVER/_matrix/client/unstable/com.beeper.bridge/$bridgeId/_matrix/provision/v3/contacts"
-        val token = appContext?.let { accessToken(it) }
+        val token = lightContext?.let { accessToken(it) }
         val outcome = bridgeHttpPermits.withPermit {
             withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
                 try {
@@ -8991,7 +8965,7 @@ object MatrixRepository {
         }
         val url = "$BEEPER_HOMESERVER/_matrix/client/unstable/com.beeper.bridge/$bridgeId/" +
             "_matrix/provision/v3/resolve_identifier/${id.encodeURLPathPart()}"
-        val token = appContext?.let { accessToken(it) }
+        val token = lightContext?.let { accessToken(it) }
         val outcome = bridgeHttpPermits.withPermit {
             withTimeoutOrNull(BRIDGE_CONTACTS_BUDGET_MS) {
                 try {
@@ -9367,10 +9341,8 @@ object MatrixRepository {
         }
     }
 
-    private fun databaseBuilder(context: Context) =
-        Room.databaseBuilder(context, TrixnityRoomDatabase::class.java, DB_NAME)
-
-    private fun mediaDir(context: Context) = (context.cacheDir.absolutePath + "/$MEDIA_DIR").toPath()
+    private fun mediaDir(slc: SealedLightContext) =
+        (slc.androidContext.cacheDir.absolutePath + "/$MEDIA_DIR").toPath()
 
     /** Attaches the sync-state + notification observers to a client, exactly once per instance. */
     private fun observeClient(c: MatrixClient) {
@@ -9472,7 +9444,7 @@ object MatrixRepository {
      *  ([ThreadRowStore.applyMediaEditHeal], idempotent); new edits classify
      *  correctly at ingest, so one convergent pass is enough. */
     private suspend fun repairStoreMediaEdits(c: MatrixClient) {
-        val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return
+        val prefs = lightContext?.chatsPrefs() ?: return
         if (prefs.getBoolean(KEY_MEDIA_EDIT_HEAL_DONE, false)) return
         val edits = ThreadRowStore.editRows(c)
         if (edits.isNotEmpty()) {
@@ -9913,7 +9885,7 @@ object MatrixRepository {
             ensureProjectionTable(c.di.get<TrixnityRoomDatabase>(TrixnityRoomDatabase::class))
         }
         yieldToSyncIngest()
-        val prefs = appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE) ?: return
+        val prefs = lightContext?.chatsPrefs() ?: return
         if (prefs.getBoolean("projection_backfilled", false)) {
             // Restore/restart: the projection is done, but a Part H backfill
             // pass interrupted by process death / rate-limit / reboot resumes

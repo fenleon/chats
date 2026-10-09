@@ -191,6 +191,9 @@ class ChatListViewModel : LightViewModel<Unit>() {
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
+        // Open-only sync driver: every activity resume re-fires the shown
+        // screen's onScreenShow, so start here; the pause hook stops it.
+        ChatClient.startSync()
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
         // The list only renders a slice (reveal-on-scroll); a restored position
@@ -209,6 +212,7 @@ class ChatListViewModel : LightViewModel<Unit>() {
 
     override fun onAppPause() {
         super.onAppPause()
+        ChatClient.stopSync()
         stopPolling()
     }
 
@@ -345,7 +349,13 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         get() = ChatListViewModel::class.java
 
     override fun createViewModel(): ChatListViewModel =
-        ChatListViewModel().also { it.seedRoomsFromSnapshot(lightContext.filesDir) }
+        ChatListViewModel().also {
+            // One-shot bootstrap (the former ServerBootstrapProvider's job):
+            // clipboard bind + MatrixRepository.init — idempotent, the screen
+            // is recreated on back navigation, the process is not.
+            ChatClient.bootstrap(lightContext)
+            it.seedRoomsFromSnapshot(lightContext.filesDir)
+        }
 
     @Composable
     override fun Content() {

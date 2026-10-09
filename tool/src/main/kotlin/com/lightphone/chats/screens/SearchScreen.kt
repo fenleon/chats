@@ -76,8 +76,15 @@ class SearchViewModel(
 
     private var pollJob: Job? = null
 
+    override fun onAppPause() {
+        super.onAppPause()
+        ChatClient.stopSync()
+    }
+
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
+        // Open-only sync driver (see ChatListScreen): resume re-fires this.
+        ChatClient.startSync()
         // No thread is on screen here; let the companion notify again.
         viewModelScope.launch { ChatClient.setActiveRoom(null) }
         startPolling()

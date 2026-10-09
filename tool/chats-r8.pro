@@ -1,3 +1,6 @@
+# Chats' R8 keeps — ported from the former :server library's
+# consumerProguardFiles when the module folded into :tool (Rung 1, 2026-10).
+
 # JNA — Trixnity's olm crypto wrapper loads libjnidispatch through JNA, which is
 # reflection/JNI-heavy (field IDs looked up by name). R8 must not obfuscate or
 # strip it, or E2EE login fails with:

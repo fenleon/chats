@@ -3,11 +3,15 @@ id = "com.lightphone.chats"
 label = "Messages"
 versionCode = 81
 versionName = "0.19.2"
-permissions = ["android.permission.INTERNET", "android.permission.POST_NOTIFICATIONS"]
-# Single-APK build (2026-08-19): the former :server companion is a library
-# merged into this APK, which hosts its own LightSdkService + the persistent
-# Matrix connection (sync loop, storage, notifications) and binds to itself —
-# serverPackage is the tool's own id, so no separate companion APK to install
-# and no dependency on Light shipping chat methods in com.lightos.
-serverPackage = "com.lightphone.chats"
+# ACCESS_NETWORK_STATE: the repository paces sync/media work off the live
+# connection state (LightConnectivity).
+permissions = ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE", "android.permission.POST_NOTIFICATIONS"]
+# Cleartext for LAN/self-hosted homeservers (10.x/192.168.x).
+capabilities = ["cleartext-http"]
+# Rung-1 fold (2026-10): no embedded server/companion — the tool talks to
+# LightOS (com.lightos) directly; the Matrix stack runs in-process and its
+# Trixnity Room store wants the larger heap.
+serverPackage = "com.lightos"
+# largeHeap: the Trixnity Room event store holds a full session in memory.
+largeHeap = true
 orientation = "portrait"

@@ -1,7 +1,6 @@
 package com.lightphone.chats.server
 
-import android.content.Context
-import android.provider.MediaStore
+import com.thelightphone.sdk.SealedLightContext
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -37,27 +36,25 @@ object Diagnostics {
         private set
 
     @Volatile
-    private var appContext: Context? = null
+    private var lightContext: SealedLightContext? = null
 
     private val timeFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
 
     private val exportNameFormat = SimpleDateFormat("yyyy-MM-dd-HHmmss", Locale.US)
 
-    /** Reads the persisted toggle and captures the app context. Called once from [MatrixRepository.init]. */
-    fun init(context: Context) {
-        val app = context.applicationContext
-        appContext = app
-        enabled = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    /** Reads the persisted toggle and captures the screen context. Called once
+     *  from [MatrixRepository.init] (the bootstrap path). */
+    fun init(slc: SealedLightContext) {
+        lightContext = slc
+        enabled = slc.androidContext.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
             .getBoolean(KEY_ENABLED, false)
     }
 
-    /** Persists the toggle and records the change. [context] may be null —
-     *  the appContext captured at [init] is used then (the tool calls this
-     *  in-process, NO-SEAM, without a Context). */
-    fun setEnabled(context: Context? = null, value: Boolean) {
-        val app = context?.applicationContext ?: appContext ?: return
-        appContext = app
-        app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    /** Persists the toggle and records the change (the tool calls this
+     *  in-process; the context captured at [init] is used). */
+    fun setEnabled(value: Boolean) {
+        val slc = lightContext ?: return
+        slc.androidContext.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_ENABLED, value).apply()
         enabled = value
         record(if (value) "diagnostics logging on" else "diagnostics logging off")
@@ -66,10 +63,10 @@ object Diagnostics {
     /** Appends one sanitized line when logging is on. Safe from any thread. */
     fun record(msg: String) {
         if (!enabled) return
-        val ctx = appContext ?: return
+        val slc = lightContext ?: return
         synchronized(this) {
             runCatching {
-                val file = File(ctx.filesDir, FILE_NAME)
+                val file = File(slc.androidContext.filesDir, FILE_NAME)
                 if (file.length() > MAX_FILE_BYTES) {
                     // ponytail: 1 MB ceiling is plenty for days of status
                     // lines; on overflow just delete and start fresh — a
@@ -87,13 +84,13 @@ object Diagnostics {
     /** Ids truncated to their first 12 chars (privacy: no full room/event/user ids). */
     fun short(id: String?): String = id?.take(12) ?: "?"
 
-    /** Exception text for the log — message or class name, truncated to 200 chars. */
+    /** Exception text for the log — message or exception string, truncated to 200 chars. */
     fun err(e: Throwable): String =
-        (e.message ?: e.javaClass.simpleName).take(MAX_ERROR_CHARS)
+        (e.message ?: e.toString().substringBefore(':')).take(MAX_ERROR_CHARS)
 
     /** True when a non-empty log file exists (the "No log yet" UI case). */
     fun hasLog(): Boolean {
-        val file = appContext?.let { File(it.filesDir, FILE_NAME) } ?: return false
+        val file = lightContext?.let { File(it.androidContext.filesDir, FILE_NAME) } ?: return false
         return file.exists() && file.length() > 0
     }
 
@@ -105,9 +102,9 @@ object Diagnostics {
      * @return the display name of the exported file, or null when there is no
      *  log yet or the media-store write failed (reason recorded).
      */
-    fun export(context: Context? = null): String? {
-        val ctx = context?.applicationContext ?: appContext ?: return null
-        val file = File(ctx.filesDir, FILE_NAME)
+    fun export(): String? {
+        val slc = lightContext ?: return null
+        val file = File(slc.androidContext.filesDir, FILE_NAME)
         if (!file.exists() || file.length() == 0L) {
             record("export skipped — no log")
             return null
@@ -118,39 +115,21 @@ object Diagnostics {
             // 2026-09-21 — the export always failed with "Save failed"), and
             // the Files collection only allows Download/Documents, which the
             // LP3's MTP surface does not expose (root AGENTS.md: MTP shows
-            // only Pictures/Movies). The extension stays .log; the post-commit
-            // scan corrects the row's MIME from the extension.
-            val name = "chats-diagnostics-${exportNameFormat.format(Date())}.log"
-            val values = android.content.ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/Chats")
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
-            }
-            val resolver = ctx.contentResolver
-            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                ?: error("media store insert returned null")
-            resolver.openOutputStream(uri)?.use { out ->
-                out.write(file.readBytes())
-            } ?: error("no output stream for $uri")
-            resolver.update(
-                uri,
-                android.content.ContentValues().apply {
-                    put(MediaStore.Video.Media.IS_PENDING, 0)
-                },
-                null,
-                null,
-            )
-            // MediaProvider appends ".mp4" when the display name's extension
-            // doesn't match the video/* MIME — report the ACTUAL stored name
-            // (it is what the Settings row shows and what MTP serves).
-            resolver.query(
-                uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null,
-            )?.use { cur -> if (cur.moveToFirst()) cur.getString(0) else null } ?: name
+            // only Pictures/Movies). The extension stays .log; MediaProvider
+            // may append ".mp4" when the display name's extension doesn't
+            // match the video/* MIME — the SDK's save returns the ACTUAL
+            // stored name (it is what the Settings row shows and what MTP
+            // serves).
+            slc.saveToMediaStore(
+                collection = android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                displayName = "chats-diagnostics-${exportNameFormat.format(Date())}.log",
+                mimeType = "video/mp4",
+                relativePath = "Movies/Chats",
+                bytes = file.readBytes(),
+            ) ?: error("media store save returned null")
         }.onFailure {
             android.util.Log.w("Diagnostics", "diagnostics export failed: ${it.message}")
             record("export failed: ${err(it)}")
         }.getOrNull()
     }
 }
-

@@ -426,6 +426,8 @@ class ThreadViewModel(
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
+        // Open-only sync driver (see ChatListScreen): resume re-fires this.
+        ChatClient.startSync()
         // While this room is on screen the companion suppresses its
         // new-message notifications.
         viewModelScope.launch { ChatClient.setActiveRoom(room.id) }
@@ -469,6 +471,7 @@ class ThreadViewModel(
 
     override fun onAppPause() {
         super.onAppPause()
+        ChatClient.stopSync()
         retainThread()
         // The tool is no longer visible (standby/another app); messages in
         // this room may notify again.

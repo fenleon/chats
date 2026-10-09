@@ -95,8 +95,15 @@ class ComposerViewModel(
         replyToEventId.value = null
     }
 
+    override fun onAppPause() {
+        super.onAppPause()
+        ChatClient.stopSync()
+    }
+
     override fun onScreenShow(screen: SimpleLightScreen<ComposerResult>) {
         super.onScreenShow(screen)
+        // Open-only sync driver (see ChatListScreen): resume re-fires this.
+        ChatClient.startSync()
         // The composer is the only place the tool types; announce it for the
         // whole time the screen is up, until the message is sent or dismissed.
         // An edit is not typing — no indicator for the contact.

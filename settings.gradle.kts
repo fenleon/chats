@@ -23,15 +23,13 @@ dependencyResolutionManagement {
 rootProject.name = "chats"
 
 include(":tool")
-include(":server")
 
-// Chats is a single-APK project since 2026-08-19: `:tool` is the real LightOS
-// tool (lighttool.toml + the light-sdk tool plugin, LightScreen UI); `:server`
-// is the merged companion as an Android LIBRARY whose manifest contributes the
-// SDK server components (LightSdkService, ChatSyncService, photo/voice
-// activities) and whose ServerBootstrapProvider wires the SDK server + Matrix
-// sync at app start. The tool binds to itself (lighttool.toml serverPackage =
-// com.lightphone.chats). Both consume the SDK as an included build.
+// Chats is a single scanned :tool module (Rung-1 fold, 2026-10): the Matrix
+// stack (Trixnity, Room) runs in-process behind the tool's SealedLightContext,
+// the former :server companion module is gone, and lighttool.toml points at
+// com.lightos. History: it was a tool + companion APK pair until 2026-08-19,
+// then a merged single APK with an embedded :server library module. Details
+// in chats/PLAN.md.
 includeBuild("../light-sdk") {
     dependencySubstitution {
         substitute(module("com.thelightphone:sdk-ui")).using(project(":sdk:ui"))

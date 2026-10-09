@@ -73,8 +73,15 @@ class VerificationViewModel : LightViewModel<Unit>() {
      */
     val starting = MutableStateFlow(false)
 
+    override fun onAppPause() {
+        super.onAppPause()
+        ChatClient.stopSync()
+    }
+
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
+        // Open-only sync driver (see ChatListScreen): resume re-fires this.
+        ChatClient.startSync()
         // One-shot fetch on entry, then a long-poll wait on the companion's
         // status revision (bumped wherever the server-side verification state
         // machine commits) — the screen never polls. The e2ee read includes a
