@@ -29,14 +29,17 @@ A messaging tool for the Light Phone III. Connects all your chats, WhatsApp, Sig
 
 - Connect to all your **Networks** through your Beeper account: WhatsApp, Instagram, Telegram, Signal, Messenger, X, Google Messages (SMS/RCS), Google Chat, Google Voice, LinkedIn, Discord, Slack
 - 1:1 and group chats, with archive, pin, mute, search, reactions, delivery status support
-- Notifications; a push channel delivers messages instantly
-- Voice notes and photos
-- Battery-conscious background sync, pausable from Settings
+- Messages sync while Chats is open; the phone stays fully quiet when you close it
+- Voice-note playback
 - End-to-end encrypted, with device verification
+
+This `main` branch is the LightOS **Tool Library** build: a single scanned tool
+module, buildable by Light's own pipeline. Background sync, notifications, and
+photo/voice-note *sending* are planned follow-ups (see *Branches* below).
 
 ## Install
 
-The APK is signed with a development key, so it needs the community-ADB sideload route and the most permissive external-tools tier on the phone:
+Until Chats is available in the Tool Library, installs go through the sideload route. The APK is signed with a development key, so it needs the community-ADB sideload route and the most permissive external-tools tier on the phone:
 
 1. Download the latest APK from [Releases](https://github.com/fenleon/chats/releases/latest)
 2. Enable USB debugging (Settings → Developer options) and install it: `adb install -r app-release.apk`
@@ -59,16 +62,18 @@ tools/build --dir chats :tool:assembleRelease    # release (R8-minified)
 
 The build consumes `../light-sdk` as a composite build; the SDK's chat service methods are additive patches carried in the workspace's fork of the SDK.
 
-The app reuses `:server`'s `VolumePanelOverlay` and `VolumePanelState`. If you
-run the workspace's external `tools/sync-volume-panel`, configure Chats to
-receive only the server copy; do not regenerate an app copy. That generator
-is maintained outside this repository.
+## Branches & releases
+
+- **`main`** — the Light-built release line: the stripped Tool Library build (this README). Sync runs while the app is open; notifications and photo/voice-note sending are planned follow-ups.
+- **`dev`** — the full-featured development build for sideloading: background sync, notifications, photo/voice-note sending.
+
+Both are released together when an update affects them, under one shared, increasing version code. Which build you have is easiest to tell by behavior (notifications on = `dev`).
 
 ## Limitations
 
 - Bridged networks (WhatsApp, Instagram, ...) arrive through Beeper, an unofficial path, not an official Meta client.
 - Requires the **All tools** external-tools tier on a real Light Phone III (dev-signed APKs are treated as unknown by LightOS).
-- Without a configured push endpoint, new messages arrive at the next scheduled sync round.
+- On `main`, messages arrive only while Chats is open (screen on); there are no notifications and no photo/voice-note sending yet.
 
 ## Legal
 
