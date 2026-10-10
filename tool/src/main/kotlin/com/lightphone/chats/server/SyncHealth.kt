@@ -43,18 +43,21 @@ object SyncHealth {
         return when {
             lastOkAtMs == 0L -> "No sync round yet"
             else -> {
+                val age = ago(nowMs - lastOkAtMs)
+                // "just now" carries no "ago" ("Last updated just now").
+                val agePart = if (age == "just now") age else "$age ago"
                 val failuresPart = if (failures > 0) " · $failures failed" else ""
-                "${ago(nowMs - lastOkAtMs)} ago$failuresPart"
+                agePart + failuresPart
             }
         }
     }
 
-    /** Compact elapsed label ("<1m"/"3m"/"2h"/"5d") — shared with the Account
-     *  screen's Manual Sync Now subtitle. */
+    /** Compact elapsed label ("just now"/"3m"/"2h"/"5d") — shared with the
+     *  Account screen's Manual Sync Now subtitle. */
     internal fun ago(millis: Long): String {
         val minutes = millis / 60_000
         return when {
-            minutes < 1 -> "<1m"
+            minutes < 1 -> "just now"
             minutes < 60 -> "${minutes}m"
             minutes < 60 * 24 -> "${minutes / 60}h"
             else -> "${minutes / (60 * 24)}d"

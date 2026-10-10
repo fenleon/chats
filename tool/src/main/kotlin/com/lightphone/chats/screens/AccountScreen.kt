@@ -930,7 +930,10 @@ private fun AccountStatus(
                     LightText(
                         text = delivery?.lastSuccessfulRoundAtMs
                             ?.takeIf { it > 0 }
-                            ?.let { "Last updated ${SyncHealth.ago(System.currentTimeMillis() - it)} ago" }
+                            ?.let {
+                                val age = SyncHealth.ago(System.currentTimeMillis() - it)
+                                if (age == "just now") "Last updated $age" else "Last updated $age ago"
+                            }
                             ?: "Never synced",
                         variant = LightTextVariant.Detail,
                     )

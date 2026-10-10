@@ -89,9 +89,9 @@ class SyncHealthTest {
     }
 
     @Test
-    fun `under a minute reads as less than one minute`() {
+    fun `under a minute reads as just now`() {
         assertEquals(
-            "<1m ago",
+            "just now",
             SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, nowMs = 1_000L + 5_000L),
         )
     }
