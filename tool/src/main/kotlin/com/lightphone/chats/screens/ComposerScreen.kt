@@ -309,7 +309,7 @@ class ComposerScreen(
                     )
                 }
                 // Clear-draft X, bottom-right corner of the screen. The composer keyboard
-                // (submitInTopBar) reserves the 5-gu bottom-bar row below the
+                // The bottom-bar row below the
                 // keys, so the X sits in that row at the far right, vertically
                 // centered like a native bottom-bar icon. Always visible
                 // while the composer is open; with an

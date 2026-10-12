@@ -428,9 +428,6 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                                 // The code editor submits (was
                                                 // SAVE — feedback 2026-08-19).
                                                 submitLabel = "SUBMIT",
-                                                // Codes are digits — the
-                                                // numbers-only lockscreen pad.
-                                                numericKeyboard = true,
                                             ) { code ->
                                                 if (code.isNotBlank()) viewModel.login(goVerify)
                                             }
@@ -516,11 +513,10 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
         title: String,
         field: MutableStateFlow<String>,
         submitLabel: String = "SAVE",
-        numericKeyboard: Boolean = false,
         onResult: (String) -> Unit = {},
     ) {
         navigateTo(screenFactory = {
-            FieldEditorScreen(it, title, field.value, submitLabel, numericKeyboard = numericKeyboard)
+            FieldEditorScreen(it, title, field.value, submitLabel)
         }) { value ->
             field.value = value
             onResult(value)
@@ -1032,8 +1028,6 @@ class FieldEditorScreen(
     private val initial: String,
     private val submitLabel: String = "SAVE",
     private val submitIcon: LightIconConfiguration? = null,
-    // Numbers-only lockscreen pad instead of QWERTY (the Beeper code entry).
-    private val numericKeyboard: Boolean = false,
 ) : SimpleLightScreen<String>(sealedActivity) {
 
     @Composable
@@ -1064,7 +1058,6 @@ class FieldEditorScreen(
                 modifier = Modifier.background(LightThemeTokens.colors.background),
                 submitLabel = submitLabel,
                 submitIcon = submitIcon,
-                numericKeyboard = numericKeyboard,
             )
         }
     }
