@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
@@ -41,7 +42,6 @@ import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.shared.LightResult
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
@@ -75,10 +75,10 @@ private const val LOADING_TEXT = "loading…"
 
 class ChatListViewModel : LightViewModel<Unit>() {
 
-    val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
+    val rooms = MutableStateFlow<List<ChatsMethods.GetRooms.Room>>(emptyList())
     val loading = MutableStateFlow(true)
-    val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
-    val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
+    val account = MutableStateFlow<ChatsMethods.GetAccountState.Response?>(null)
+    val connection = MutableStateFlow<ChatsMethods.GetConnectionState.Response?>(null)
     /**
      * How many rooms the list currently shows. Starts small (the user only ever
      * reads the newest few) and grows as the list is scrolled to the bottom.
@@ -89,7 +89,7 @@ class ChatListViewModel : LightViewModel<Unit>() {
      * notifyWillShow, which reads the launch-intent extra); consumed by the
      * view model once the room is loaded.
      */
-    val openRoom = MutableStateFlow<LightServiceMethod.GetRooms.Room?>(null)
+    val openRoom = MutableStateFlow<ChatsMethods.GetRooms.Room?>(null)
     /** Selected bridged-network label (Phase 7); null = all networks. */
     val networkFilter = MutableStateFlow<String?>(null)
 
@@ -122,7 +122,7 @@ class ChatListViewModel : LightViewModel<Unit>() {
     }
 
     /** Seeds the panel from the row (the flow's fresher value wins). */
-    fun openContactPanel(room: LightServiceMethod.GetRooms.Room) {
+    fun openContactPanel(room: ChatsMethods.GetRooms.Room) {
         panelRoomId = room.id
         MatrixRepository.roomFlags.value[room.id]?.let { f ->
             panelMuted.value = f.muted
@@ -314,9 +314,9 @@ class ChatListViewModel : LightViewModel<Unit>() {
      *  logged-out-while-restoring, or logged-in but the cold room cache hasn't
      *  warmed — the first getRooms can return empty) keeps refetching. */
     private fun isSettled(
-        account: LightServiceMethod.GetAccountState.Response?,
-        rooms: List<LightServiceMethod.GetRooms.Room>,
-        connection: LightServiceMethod.GetConnectionState.Response?,
+        account: ChatsMethods.GetAccountState.Response?,
+        rooms: List<ChatsMethods.GetRooms.Room>,
+        connection: ChatsMethods.GetConnectionState.Response?,
     ): Boolean = account != null && (
         (account.loggedIn == true && rooms.isNotEmpty()) ||
             (account.userId == null && rooms.isEmpty()) ||
@@ -617,7 +617,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
         }
     }
 
-    private fun openThread(room: LightServiceMethod.GetRooms.Room) {
+    private fun openThread(room: ChatsMethods.GetRooms.Room) {
         navigateTo(screenFactory = { ThreadScreen(it, room) })
     }
 
@@ -627,7 +627,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
      * the row's flags and polling the companion while open; the X pops back to
      * the list.
      */
-    private fun openContact(room: LightServiceMethod.GetRooms.Room) {
+    private fun openContact(room: ChatsMethods.GetRooms.Room) {
         viewModel.openContactPanel(room)
         navigateTo(screenFactory = {
             ContactScreen(
@@ -665,7 +665,7 @@ class ChatListScreen(sealedActivity: SealedLightActivity) :
 
 @Composable
 private fun RoomRow(
-    room: LightServiceMethod.GetRooms.Room,
+    room: ChatsMethods.GetRooms.Room,
     onOpen: () -> Unit,
     onLongPress: () -> Unit,
 ) {

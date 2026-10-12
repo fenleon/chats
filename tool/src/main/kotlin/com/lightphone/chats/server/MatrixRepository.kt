@@ -1,5 +1,6 @@
 package com.lightphone.chats.server
 
+import com.lightphone.chats.ChatsMethods
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Environment
@@ -9,7 +10,7 @@ import com.lightphone.chats.BuildConfig
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
 import com.thelightphone.sdk.SealedLightContext
 import com.thelightphone.sdk.roomDatabaseBuilder
-import com.thelightphone.sdk.shared.LightServiceMethod
+import com.thelightphone.sdk.shared.lightJson
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.request.delete
@@ -1447,12 +1448,12 @@ object MatrixRepository {
     private var e2eeStateCache: Triple<Long, Boolean, Int>? = null
 
     /** E2EE status: whether this device is cross-signing verified, and whether other devices exist to verify with. */
-    suspend fun e2eeState(): com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response {
-        val c = client ?: return com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response(
+    suspend fun e2eeState(): ChatsMethods.GetE2eeState.Response {
+        val c = client ?: return ChatsMethods.GetE2eeState.Response(
             verified = false, canVerify = false, detail = "not logged in",
         )
         fun response(verified: Boolean, devices: Int) =
-            com.thelightphone.sdk.shared.LightServiceMethod.GetE2eeState.Response(
+            ChatsMethods.GetE2eeState.Response(
                 verified = verified,
                 canVerify = devices > 0,
                 detail = if (verified) null else "not verified",
@@ -1510,9 +1511,9 @@ object MatrixRepository {
         }
     }
 
-    fun verificationState(): com.thelightphone.sdk.shared.LightServiceMethod.GetVerificationState.Response {
+    fun verificationState(): ChatsMethods.GetVerificationState.Response {
         val ui = _verification.value
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetVerificationState.Response(
+        return ChatsMethods.GetVerificationState.Response(
             state = when (ui) {
                 VerificationUi.Idle -> "none"
                 VerificationUi.Waiting -> "waiting"
@@ -2062,10 +2063,10 @@ object MatrixRepository {
         }
     }
 
-    fun accountState(): com.thelightphone.sdk.shared.LightServiceMethod.GetAccountState.Response {
+    fun accountState(): ChatsMethods.GetAccountState.Response {
         val c = client
         val prefs = lightContext?.chatsPrefs()
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetAccountState.Response(
+        return ChatsMethods.GetAccountState.Response(
             // An expired session counts as logged out for the UI: the user
             // should land on the login form, not on LOG OUT.
             loggedIn = c != null && !sessionExpired,
@@ -2091,7 +2092,7 @@ object MatrixRepository {
     /** True when a live (non-expired) session exists. */
     fun isLoggedIn(): Boolean = client != null && !sessionExpired
 
-    fun connectionState(): com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response {
+    fun connectionState(): ChatsMethods.GetConnectionState.Response {
         val state = _connectionState.value
         val roomsTotal = roomListCache.size
         val roomsResolved = roomListCache.values.count { it.nameResolved }
@@ -2110,7 +2111,7 @@ object MatrixRepository {
                     }
             }.getOrDefault(0)
         } ?: 0
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetConnectionState.Response(
+        return ChatsMethods.GetConnectionState.Response(
             state = when (state) {
                 ChatConnectionState.LoggedOut -> "logged_out"
                 ChatConnectionState.Connecting -> "connecting"
@@ -2134,7 +2135,7 @@ object MatrixRepository {
     }
 
     /** Newest activity first — a pure read of the background-refreshed cache. */
-    suspend fun getRooms(): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
+    suspend fun getRooms(): List<ChatsMethods.GetRooms.Room> {
         if (client == null) return emptyList()
         // latency timer (SYNC-PERF-SPEC.md): how long after the revision
         // bump the tool's fetch arrives — includes the poll-tick wait + binder
@@ -2164,7 +2165,7 @@ object MatrixRepository {
         // binder transaction — cap that path only if an account ever grows
         // past ~1,600 rooms (~1 MB encoded).
         return rooms.sortedWith(
-            compareByDescending<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> { it.pinned == true }
+            compareByDescending<ChatsMethods.GetRooms.Room> { it.pinned == true }
                 .thenBy(String.CASE_INSENSITIVE_ORDER) { if (it.pinned == true) it.name else "" }
                 .thenByDescending { it.lastTimestampMs }
         )
@@ -2174,7 +2175,7 @@ object MatrixRepository {
      * The full room census for the tool's contacts list + search — every
      * room, trimmed (no previews/unreads; contacts/search rows don't show
      * previews, so the whole account crosses trimmed, chats). */
-    suspend fun getAllRooms(): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
+    suspend fun getAllRooms(): List<ChatsMethods.GetRooms.Room> {
         if (client == null) return emptyList()
         if (_roomList.value.isEmpty()) preloadRoomListFromDisk()
         return _roomList.value.map { it.copy(lastMessage = "", unreadCount = 0, lastEventId = null) }
@@ -2194,7 +2195,7 @@ object MatrixRepository {
      * lands).
      */
     data class MessagesPage(
-        val messages: List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>,
+        val messages: List<ChatsMethods.GetMessages.Message>,
         val hasMore: Boolean,
         val encrypted: Boolean = false,
         val nextBeforeEventId: String? = null,
@@ -2345,15 +2346,15 @@ object MatrixRepository {
         cacheDir()?.let { java.io.File(it, DISK_ROOM_LIST_FILE) }
 
     @Synchronized
-    private fun saveRoomListToDisk(rooms: List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>) {
+    private fun saveRoomListToDisk(rooms: List<ChatsMethods.GetRooms.Room>) {
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastRoomListWriteAt < DISK_WRITE_THROTTLE_MS) return
         val file = roomListCacheFile() ?: return
         runCatching {
             file.parentFile?.mkdirs()
             file.writeText(
-                com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.encodeResponse(
-                    com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Response(rooms),
+                lightJson.encodeToString(
+                    ChatsMethods.GetRooms.Response(rooms),
                 ),
             )
             lastRoomListWriteAt = now
@@ -2361,11 +2362,11 @@ object MatrixRepository {
     }
 
     @Synchronized
-    private fun loadRoomListFromDisk(): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
+    private fun loadRoomListFromDisk(): List<ChatsMethods.GetRooms.Room> {
         val file = roomListCacheFile() ?: return emptyList()
         return runCatching {
-            com.thelightphone.sdk.shared.LightServiceMethod.GetRooms
-                .decodeResponse(file.readText())
+            lightJson
+                .decodeFromString<ChatsMethods.GetRooms.Response>(file.readText())
                 .rooms
         }.getOrDefault(emptyList())
     }
@@ -2612,7 +2613,7 @@ object MatrixRepository {
         if (pendingAudioEcho[roomId] == null && pendingTextEcho[roomId] == null && pendingImageEcho[roomId] == null) return page
         val result = page.messages.toMutableList()
         val existing = result.mapTo(HashSet()) { it.id }
-        fun addIfMissing(message: com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message) {
+        fun addIfMissing(message: ChatsMethods.GetMessages.Message) {
             if (existing.add(message.id)) result += message
         }
         // [pendingEchoRow]: an acked send renders with its real event id (sent),
@@ -2710,7 +2711,7 @@ object MatrixRepository {
             receiptReadEventIds(c, matrixRoomId, rows.map { it.eventId })
         } else emptySet()
         var features: RoomFeatures? = null
-        val messages = ArrayList<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>(oldestFirst.size)
+        val messages = ArrayList<ChatsMethods.GetMessages.Message>(oldestFirst.size)
         for (row in oldestFirst) {
             val sender = row.sender ?: continue
             val senderName = senderNames[sender] ?: sender
@@ -2719,7 +2720,7 @@ object MatrixRepository {
             // its conversation slot — no reactions/status/read apply
             // (mirrors [redactedRow]).
             if (row.contentType == ThreadRowLogic.CONTENT_REDACTED) {
-                messages += com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+                messages += ChatsMethods.GetMessages.Message(
                     id = row.eventId,
                     sender = sender,
                     senderName = senderName,
@@ -2750,7 +2751,7 @@ object MatrixRepository {
                 canUnsend = f.deleteSupported &&
                     (f.deleteMaxAgeMs == null || ageMs < f.deleteMaxAgeMs)
             }
-            messages += com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+            messages += ChatsMethods.GetMessages.Message(
                 id = row.eventId,
                 sender = sender,
                 senderName = senderName,
@@ -3257,7 +3258,7 @@ object MatrixRepository {
      * `encrypted=1` placeholder (body null) so the recheck heals it. */
     private fun fallbackMessageRow(
         roomId: String,
-        msg: com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message,
+        msg: ChatsMethods.GetMessages.Message,
     ): ThreadRowValues {
         val placeholder = ThreadRowLogic.isStuckDecryptBody(msg.body)
         return ThreadRowValues(
@@ -3292,7 +3293,7 @@ object MatrixRepository {
      * the ingest writer. */
     private fun seedSideRowsAll(
         roomId: String,
-        msgs: List<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>,
+        msgs: List<ChatsMethods.GetMessages.Message>,
     ): List<ThreadRowValues> {
         val sides = ArrayList<ThreadRowValues>(msgs.size * 2)
         for (msg in msgs) {
@@ -3726,7 +3727,7 @@ object MatrixRepository {
         /** Event id the send replies to — sender/excerpt resolve below so the
          *  pending row's header renders immediately. */
         replyToEventId: String? = null,
-    ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message {
+    ): ChatsMethods.GetMessages.Message {
         val outbox = withTimeoutOrNull(OUTBOX_READ_TIMEOUT_MS) {
             c.room.getOutbox(matrixRoomId, txnId).first()
         }
@@ -3746,7 +3747,7 @@ object MatrixRepository {
                 }
             }
         }
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+        return ChatsMethods.GetMessages.Message(
             id = outbox?.eventId?.full ?: cachedEventId ?: "$LOCAL_PENDING_ID_PREFIX$txnId",
             sender = c.userId.full,
             senderName = "",
@@ -3990,7 +3991,7 @@ object MatrixRepository {
         // in-flight notes, so every 3 s poll costs nothing here.
         prefetchVoiceNotes(c, matrixRoomId, events)
 
-        val result = mutableListOf<com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message>()
+        val result = mutableListOf<ChatsMethods.GetMessages.Message>()
         val startIndex = if (keepCursor) 0 else 1 // drop the boundary cursor on older pages
         // Delivery status only matters for the newest page (what the user just
         // sent): the status events sit right after the message in the timeline.
@@ -4111,7 +4112,7 @@ object MatrixRepository {
         suspend fun insertPendingEchoes(
             pendings: List<PendingSend>,
             removeFrom: (String) -> Unit,
-            rowFactory: suspend (PendingSend) -> com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message,
+            rowFactory: suspend (PendingSend) -> ChatsMethods.GetMessages.Message,
         ) {
             for (pending in pendings) {
                 // The loop skips the echo only while its content is unresolved —
@@ -5159,7 +5160,7 @@ object MatrixRepository {
         roomId: String,
         body: String,
         replyToEventId: String?,
-    ): com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response {
+    ): ChatsMethods.SendMessage.Response {
         try {
         val c = client ?: error("not logged in")
         val sendT0 = android.os.SystemClock.elapsedRealtime()
@@ -5291,7 +5292,7 @@ object MatrixRepository {
         // model renders the echo immediately, network ack invisibly later.
         // Event id is null here; the sync echo replaces the optimistic row
         // (matched by txn id) ~1-3 s later.
-        return com.thelightphone.sdk.shared.LightServiceMethod.SendMessage.Response(
+        return ChatsMethods.SendMessage.Response(
             transactionId = txnId,
             eventId = null,
         ).also {
@@ -7426,20 +7427,20 @@ object MatrixRepository {
 
     /** One cache row: the room's snapshot plus internal resolution flags. */
     private data class RoomListEntry(
-        val room: com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room,
+        val room: ChatsMethods.GetRooms.Room,
         val nameResolved: Boolean,
         val previewResolved: Boolean,
     )
 
     private val roomListCache = java.util.concurrent.ConcurrentHashMap<String, RoomListEntry>()
-    private val _roomList = MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>(emptyList())
+    private val _roomList = MutableStateFlow<List<ChatsMethods.GetRooms.Room>>(emptyList())
 
     /**
      * The live room census (newest-first) as a flow (NO-SEAM):
      * the tool's list/search/contacts collect this instead of polling the
      * binder. Same truth [getRooms]/[getAllRooms] read.
      */
-    val roomList: StateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>> =
+    val roomList: StateFlow<List<ChatsMethods.GetRooms.Room>> =
         _roomList.asStateFlow()
 
     /**
@@ -7567,7 +7568,7 @@ object MatrixRepository {
 
     /**
      * Holds the caller until a watched revision moves past [lastSeen] or
-     * [timeoutMs] elapses (the server half of [LightServiceMethod.WaitForChange]).
+     * [timeoutMs] elapses (the server half of [ChatsMethods.WaitForChange]).
      * Returns the current revision either
      * way; the caller compares and refetches. Fast path first: an already-
      * moved revision (raced signal) returns immediately.
@@ -8057,7 +8058,7 @@ object MatrixRepository {
             val key = roomId.full
             if (roomListCache.containsKey(key)) continue
             roomListCache[key] = RoomListEntry(
-                room = com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room(
+                room = ChatsMethods.GetRooms.Room(
                     id = key,
                     name = ROOM_NAME_PLACEHOLDER, // filled in by the resolver
                     lastMessage = "",
@@ -8207,7 +8208,7 @@ object MatrixRepository {
         }
 
         roomListCache[key] = RoomListEntry(
-            room = com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room(
+            room = ChatsMethods.GetRooms.Room(
                 id = key,
                 name = name,
                 lastMessage = preview,
@@ -9011,8 +9012,8 @@ object MatrixRepository {
      * distinct contacts can share a name).
      */
     private fun hideStaleCommunityDuplicates(
-        rooms: List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>,
-    ): List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> {
+        rooms: List<ChatsMethods.GetRooms.Room>,
+    ): List<ChatsMethods.GetRooms.Room> {
         val inCommunity = rooms
             .asSequence()
             .filter { it.community != null }
@@ -9032,7 +9033,7 @@ object MatrixRepository {
     private fun publishRoomList() {
         val rooms = hideStaleCommunityDuplicates(roomListCache.values.map { it.room })
             .sortedWith(
-                compareByDescending<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room> { it.pinned == true }
+                compareByDescending<ChatsMethods.GetRooms.Room> { it.pinned == true }
                     .thenByDescending { it.lastTimestampMs }
             )
         _roomList.value = rooms
@@ -10146,14 +10147,14 @@ object MatrixRepository {
         c: MatrixClient,
         roomId: RoomId,
         eventIds: List<String>,
-        rendered: Map<String, LightServiceMethod.GetMessages.Message>? = null,
+        rendered: Map<String, ChatsMethods.GetMessages.Message>? = null,
     ): List<ThreadRowValues> {
         val stored = readStoredTimelineEvents(c, roomId, eventIds)
         if (stored.isEmpty()) return emptyList()
         // Broadcast own-name: stored bodies are PRE-STRIP (the same value the
         // read path uses), so store-served pages render raw with parity.
         val ownName = broadcastOwnNameOf(c, roomId)
-        val renderedMap: HashMap<String, LightServiceMethod.GetMessages.Message> =
+        val renderedMap: HashMap<String, ChatsMethods.GetMessages.Message> =
             rendered?.let { HashMap(it) } ?: HashMap(stored.size)
         val inputs = ArrayList<RawEventInput>(stored.size)
         // healOwnEcho pays one bounded API re-read per own unresolved echo —
@@ -10402,10 +10403,10 @@ object MatrixRepository {
     }
 
     /** The store's mediaMeta JSON (SPEC §1): the media fields the current page
-     *  rows serve ([LightServiceMethod.GetMessages.Message.durationMs /
+     *  rows serve ([ChatsMethods.GetMessages.Message.durationMs /
      *  caption / forwarded]), derived by [messageFrom] exactly as the read
      *  path derives them. */
-    private fun mediaMetaJsonOf(msg: LightServiceMethod.GetMessages.Message): String? {
+    private fun mediaMetaJsonOf(msg: ChatsMethods.GetMessages.Message): String? {
         val json = buildJsonObject {
             msg.durationMs?.let { put("durationMs", it) }
             msg.caption?.let { put("caption", it) }
@@ -10836,9 +10837,9 @@ object MatrixRepository {
         c: MatrixClient,
         roomId: RoomId,
         te: TimelineEvent,
-    ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message {
+    ): ChatsMethods.GetMessages.Message {
         val sender = te.event.sender
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+        return ChatsMethods.GetMessages.Message(
             id = te.event.id.full,
             sender = sender.full,
             senderName = senderNameOf(c, roomId, sender),
@@ -10860,7 +10861,7 @@ object MatrixRepository {
         editedContent: RoomMessageEventContent? = null,
         edited: Boolean = false,
         ownName: String? = null,
-    ): com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message? {
+    ): ChatsMethods.GetMessages.Message? {
         // The resolved content decides the row type: a decrypted image event
         // renders as an image row (its bytes fetched via GetMessageMedia), an
         // audio event as a playable voice-note row (played via PlayVoiceNote);
@@ -11005,7 +11006,7 @@ object MatrixRepository {
                 replyToExcerpt = replyExcerptFor(target.content?.getOrNull() as? RoomMessageEventContent)
             }
         }
-        return com.thelightphone.sdk.shared.LightServiceMethod.GetMessages.Message(
+        return ChatsMethods.GetMessages.Message(
             id = te.event.id.full,
             sender = sender.full,
             senderName = senderNameOf(c, roomId, sender),

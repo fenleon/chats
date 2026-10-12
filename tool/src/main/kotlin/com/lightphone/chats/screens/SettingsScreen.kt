@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,7 +28,6 @@ import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SealedLightContext
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcon
@@ -53,8 +53,8 @@ import kotlinx.coroutines.launch
  */
 class SettingsViewModel : LightViewModel<Unit>() {
 
-    val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
-    val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
+    val account = MutableStateFlow<ChatsMethods.GetAccountState.Response?>(null)
+    val connection = MutableStateFlow<ChatsMethods.GetConnectionState.Response?>(null)
 
     override fun onAppPause() {
         super.onAppPause()

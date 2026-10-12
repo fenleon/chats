@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,7 +24,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightText
@@ -76,10 +76,10 @@ class ComposerViewModel(
     /** When set, the composer EDITS this message:
      *  SEND routes to [ChatClient.editMessage] and pops back with the edit
      *  result instead of sending a new message. */
-    private val editTarget: LightServiceMethod.GetMessages.Message? = null,
+    private val editTarget: ChatsMethods.GetMessages.Message? = null,
     /** The message SEND replies to (m.in_reply_to); mutable state so the
      *  header's tap cancels the reply back to a plain compose. */
-    replyTarget: LightServiceMethod.GetMessages.Message? = null,
+    replyTarget: ChatsMethods.GetMessages.Message? = null,
 ) : LightViewModel<ComposerResult>() {
 
     val busy = MutableStateFlow(false)
@@ -169,11 +169,11 @@ class ComposerScreen(
     private val roomName: String,
     /** When set, the composer prefills this message's body and SEND edits it
      *  (Phase C, 2026-09-03, opened from the thread's context window). */
-    private val editTarget: LightServiceMethod.GetMessages.Message? = null,
+    private val editTarget: ChatsMethods.GetMessages.Message? = null,
     /** When set (and not editing), SEND sends this draft as a reply to the
      *  message (m.in_reply_to); the one-line header above the input cancels
      *  on tap. */
-    private val replyTarget: LightServiceMethod.GetMessages.Message? = null,
+    private val replyTarget: ChatsMethods.GetMessages.Message? = null,
 ) : LightScreen<ComposerResult, ComposerViewModel>(sealedActivity) {
 
     override val viewModelClass: Class<ComposerViewModel>

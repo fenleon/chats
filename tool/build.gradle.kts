@@ -144,10 +144,13 @@ dependencies {
 
     // Trixnity Matrix SDK (the protocol layer: login/sync, room repositories, media).
     // Version pair proven by the Beeper4LightOS bootstrap on LightOS (see chats/PLAN.md).
-    implementation(libs.trixnity.client)
-    implementation(libs.trixnity.repository.room)
-    implementation(libs.trixnity.media.okio)
-    implementation(libs.trixnity.cryptodriver.libolm) // libOlm driver — same pickle format as v4
+    // Literal coordinates, not catalog aliases: Light's builder extracts only
+    // tool/ and builds against the upstream SDK catalog, which has no
+    // trixnity aliases — but the dependency allowlist does (PR #274).
+    implementation("de.connect2x.trixnity:trixnity-client:5.8.0")
+    implementation("de.connect2x.trixnity:trixnity-client-repository-room:5.8.0")
+    implementation("de.connect2x.trixnity:trixnity-client-media-okio:5.8.0")
+    implementation("de.connect2x.trixnity:trixnity-client-cryptodriver-libolm:5.8.0") // libOlm driver — same pickle format as v4
     implementation(libs.ktor.client.okhttp)
     // Room runtime for Trixnity's TrixnityRoomDatabase (session + event store).
     implementation(libs.androidx.room.runtime)

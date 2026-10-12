@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,7 +35,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcon
@@ -80,10 +80,10 @@ class AccountViewModel : LightViewModel<Unit>() {
     val password = MutableStateFlow("")
     val tokenLogin = MutableStateFlow(false)
 
-    val account = MutableStateFlow<LightServiceMethod.GetAccountState.Response?>(null)
-    val connection = MutableStateFlow<LightServiceMethod.GetConnectionState.Response?>(null)
+    val account = MutableStateFlow<ChatsMethods.GetAccountState.Response?>(null)
+    val connection = MutableStateFlow<ChatsMethods.GetConnectionState.Response?>(null)
     val delivery = MutableStateFlow<MatrixRepository.DeliveryHealth?>(null)
-    val e2ee = MutableStateFlow<LightServiceMethod.GetE2eeState.Response?>(null)
+    val e2ee = MutableStateFlow<ChatsMethods.GetE2eeState.Response?>(null)
     /**
      * Whether the e2ee verdict has settled. The first read on a cold trust
      * store can lag a poll behind the truth, so "Verify Device" only shows
@@ -901,7 +901,7 @@ class LogoutConfirmPanel(
  *  settled conditions below guard that. */
 @Composable
 private fun AccountStatus(
-    connection: LightServiceMethod.GetConnectionState.Response?,
+    connection: ChatsMethods.GetConnectionState.Response?,
     delivery: MatrixRepository.DeliveryHealth?,
     onManualSync: () -> Unit,
 ) {
@@ -998,7 +998,7 @@ private fun AccountStatus(
  *  "Verify Device". The old "Encrypted messages" label is gone. */
 @Composable
 private fun EncryptionRow(
-    e2ee: LightServiceMethod.GetE2eeState.Response?,
+    e2ee: ChatsMethods.GetE2eeState.Response?,
     settled: Boolean,
     verifying: Boolean,
     onClick: (() -> Unit)?,

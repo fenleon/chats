@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -32,7 +33,6 @@ import androidx.compose.ui.unit.sp
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.ChatSettings
 import com.lightphone.chats.R
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightThemeTokens
@@ -79,7 +79,7 @@ private val REACTION_ROWS = listOf(
  * their own (feedback 2026-09-12). One own reaction at a time (replace
  * semantics).
  * Each row only shows while the message still allows it
- * ([LightServiceMethod.GetMessages.Message.canEdit] / `canUnsend`, the
+ * ([ChatsMethods.GetMessages.Message.canEdit] / `canUnsend`, the
  * bridge's capability gate).
  * Raw black/white + fixed sizes are deliberate: this replicates a system
  * overlay panel (see the workspace's shared `tools/volume-panel/` replica),
@@ -88,7 +88,7 @@ private val REACTION_ROWS = listOf(
  */
 @Composable
 fun ContextWindowOverlay(
-    message: LightServiceMethod.GetMessages.Message?,
+    message: ChatsMethods.GetMessages.Message?,
     ownReaction: String?,
     onLike: () -> Unit,
     onReact: (String) -> Unit,

@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -41,7 +42,7 @@ fun rememberHapticBuzz(): () -> Unit {
  */
 fun collectRoomCensus(
     scope: CoroutineScope,
-    rooms: MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>,
+    rooms: MutableStateFlow<List<ChatsMethods.GetRooms.Room>>,
 ): Job = scope.launch {
     MatrixRepository.roomList.collect { census ->
         census.map { it.copy(lastMessage = "", unreadCount = 0, lastEventId = null) }

@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,7 +27,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightLazyScrollView
@@ -67,14 +67,14 @@ class ContactsViewModel(
     /** The census the panel was opened from — seeds the first frame so the
      *  panel renders instantly instead of flashing the empty state while the
      *  first GetRooms round-trips. */
-    seedRooms: List<LightServiceMethod.GetRooms.Room> = emptyList(),
+    seedRooms: List<ChatsMethods.GetRooms.Room> = emptyList(),
 ) : LightViewModel<Unit>() {
 
     enum class Tab { DIRECT, GROUP }
 
     /** One list entry: the row key (the dedup id for contacts, the room id
      *  for groups) and the room it opens. */
-    data class Contact(val key: String, val room: LightServiceMethod.GetRooms.Room)
+    data class Contact(val key: String, val room: ChatsMethods.GetRooms.Room)
 
     /** Active tab — DIRECT by default (each visit starts fresh). */
     val tab = MutableStateFlow(Tab.DIRECT)
@@ -125,7 +125,7 @@ class ContactsViewModel(
      *  [tab] and [query] are passed in from the screen's collected state —
      *  reading the flows' .value directly never recomposes when they change. */
     fun entries(
-        rooms: List<LightServiceMethod.GetRooms.Room>,
+        rooms: List<ChatsMethods.GetRooms.Room>,
         tab: Tab,
         query: String,
     ): List<Contact> {
@@ -161,7 +161,7 @@ class ContactsScreen(
     private val network: String? = null,
     /** The census the panel was opened from — seeds the first frame (see
      *  [ContactsViewModel]). */
-    private val seedRooms: List<LightServiceMethod.GetRooms.Room> = emptyList(),
+    private val seedRooms: List<ChatsMethods.GetRooms.Room> = emptyList(),
 ) : LightScreen<Unit, ContactsViewModel>(sealedActivity) {
 
     override val viewModelClass: Class<ContactsViewModel>
