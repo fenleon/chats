@@ -226,12 +226,54 @@ object MatrixRepository {
     private const val PREFS = "chats_account"
 
     /**
-     * The app's SharedPreferences, reached through the screen context's
-     * [SealedLightContext.androidContext] (the tool plugin bans the
-     * android.content.Context import, so the constant is fully qualified).
+     * The app's preferences, a plain properties file under the SDK-exposed
+     * [SealedLightContext.filesDir] (no androidContext — the tool plugin bans
+     * the android.content.Context import). One-time migration from the old
+     * SharedPreferences file is not possible without a Context — pre-0.19.3
+     * test installs sign in again.
      */
-    private fun SealedLightContext.chatsPrefs(): android.content.SharedPreferences =
-        androidContext.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+    private fun SealedLightContext.chatsPrefs(): ChatsPrefs =
+        ChatsPrefs(java.io.File(filesDir, "$PREFS.properties"))
+
+    private class ChatsPrefs(private val file: java.io.File) {
+        private val props = java.util.Properties()
+
+        init {
+            runCatching { file.inputStream().use { props.load(it) } }
+        }
+
+        private fun save() {
+            runCatching {
+                file.parentFile?.mkdirs()
+                file.outputStream().use { props.store(it, null) }
+            }
+        }
+
+        fun getString(key: String, def: String?): String? = props.getProperty(key) ?: def
+        fun getBoolean(key: String, def: Boolean): Boolean =
+            props.getProperty(key)?.toBooleanStrictOrNull() ?: def
+        fun getInt(key: String, def: Int): Int =
+            props.getProperty(key)?.toIntOrNull() ?: def
+        fun getLong(key: String, def: Long): Long =
+            props.getProperty(key)?.toLongOrNull() ?: def
+        fun contains(key: String): Boolean = props.containsKey(key)
+        fun edit(): Editor = Editor()
+
+        inner class Editor {
+            fun putString(key: String, value: String?) = apply { set(key, value) }
+            fun putBoolean(key: String, value: Boolean) = apply { set(key, value.toString()) }
+            fun putInt(key: String, value: Int) = apply { set(key, value.toString()) }
+            fun putLong(key: String, value: Long) = apply { set(key, value.toString()) }
+            fun remove(key: String) = apply { props.remove(key); save() }
+            fun clear() = apply { props.clear(); save() }
+            fun apply() = save()
+            fun commit(): Boolean = runCatching { save(); true }.getOrDefault(false)
+            private fun set(key: String, value: String?) {
+                if (value == null) props.remove(key) else props.setProperty(key, value)
+                save()
+            }
+        }
+    }
     private const val KEY_HOMESERVER = "homeserver"
     private const val KEY_USER_ID = "user_id"
     private const val KEY_ACCESS_TOKEN = "access_token"
@@ -254,6 +296,16 @@ object MatrixRepository {
     private const val KEY_LAST_READ_PREFIX = "last_read_"
     private const val DB_NAME = "matrix_client"
     private const val MEDIA_DIR = "matrix_media"
+
+    /**
+     * The Room database lives under the SDK-exposed [SealedLightContext.filesDir]
+     * (absolute path as the Room "name"), so logout cleanup is a plain file
+     * delete — no Context needed. Room creates `-wal`/`-shm` siblings.
+     */
+    private fun dbFile(slc: SealedLightContext) = java.io.File(slc.filesDir, "$DB_NAME.db")
+
+    /** Cache scratch space (voice temps, media cache) under filesDir. */
+    private fun SealedLightContext.cacheDir() = java.io.File(filesDir, "cache")
 
 
     // PRIVATE Beeper integration — Beeper's private API (undocumented, unstable).
@@ -862,7 +914,7 @@ object MatrixRepository {
         pendingVerificationPhase = true
         verificationSyncSwapped.set(false)
         val loginResult = MatrixClient.create(
-            repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME)),
+            repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath)),
             mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
             cryptoDriverModule = CryptoDriverModule.libOlm(),
             authProviderData = authProviderData,
@@ -1192,7 +1244,7 @@ object MatrixRepository {
         val prefsKey = "sync_filter_mappings_v_$userId"
         if (prefs.getInt(prefsKey, 0) >= SYNC_FILTER_MAPPINGS_VERSION) return
         runCatching {
-            val db = ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME).build()
+            val db = ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath).build()
             try {
                 db.openHelper.writableDatabase.execSQL("UPDATE Account SET filter = NULL")
             } finally {
@@ -1789,7 +1841,7 @@ object MatrixRepository {
      * events, and a later trigger can still run the crawl: the last-run
      * cooldown stays cleared).
      */
-    private fun settleRestoreFlow(prefs: android.content.SharedPreferences) {
+    private fun settleRestoreFlow(prefs: ChatsPrefs) {
         prefs.edit().putBoolean(KEY_RESTORE_COMPLETED, true).apply()
         _restoreProgress.value = RestoreProgress(completed = true)
         Diagnostics.record("restore flow settled without a backup")
@@ -2011,9 +2063,14 @@ object MatrixRepository {
                     android.util.Log.w(TAG, "logout: API logout failed — device stays registered: ${it.message}")
                 }
             runCatching { old?.closeSuspending() }
-            ctx.androidContext.deleteDatabase(DB_NAME)
+            runCatching {
+                dbFile(ctx).let { db ->
+                    listOf(db, java.io.File(db.path + "-wal"), java.io.File(db.path + "-shm"))
+                        .forEach { it.delete() }
+                }
+            }
             projectionTableReady = false
-            ctx.androidContext.cacheDir.resolve(MEDIA_DIR).deleteRecursively()
+            ctx.cacheDir().resolve(MEDIA_DIR).deleteRecursively()
             ctx.chatsPrefs().edit().clear().apply()
             clearDiskCache()
             sessionExpired = false
@@ -2036,7 +2093,7 @@ object MatrixRepository {
             migrateSyncFilterIfNeeded(ctx)
             val restored = runCatching {
                 MatrixClient.create(
-                    repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME)),
+                    repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath)),
                     mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
                     cryptoDriverModule = CryptoDriverModule.libOlm(),
                     authProviderData = null, // restore from the store (built-in Account→Authentication migration)
@@ -2226,7 +2283,7 @@ object MatrixRepository {
 
     /** One event id per line (ids are opaque; no secrets in here). */
     private fun unsentMessageFile(): java.io.File? =
-        lightContext?.let { java.io.File(it.androidContext.filesDir, "unsent_messages.txt") }
+        lightContext?.let { java.io.File(it.filesDir, "unsent_messages.txt") }
 
     /** Records a message redaction so every later page build renders its
      *  tombstone. Capped — a marker only matters while the redacted event sits
@@ -2340,7 +2397,7 @@ object MatrixRepository {
     private var lastRoomListWriteAt = 0L
 
     private fun cacheDir(): java.io.File? =
-        lightContext?.let { java.io.File(it.androidContext.filesDir, DISK_CACHE_DIR) }
+        lightContext?.let { java.io.File(it.filesDir, DISK_CACHE_DIR) }
 
     private fun roomListCacheFile(): java.io.File? =
         cacheDir()?.let { java.io.File(it, DISK_ROOM_LIST_FILE) }
@@ -5606,7 +5663,7 @@ object MatrixRepository {
                 httpClientEngine = buildHttpClientEngine()
                 val restored = runCatching {
                     MatrixClient.create(
-                        repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, DB_NAME)),
+                        repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath)),
                         mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
                         cryptoDriverModule = CryptoDriverModule.libOlm(),
                         authProviderData = null, // restore from the store
@@ -5782,7 +5839,7 @@ object MatrixRepository {
                 val ctx = lightContext ?: return false to "no context"
                 // Play from a fresh temp copy so stopping playback (which
                 // deletes the played file) doesn't consume the pending copy.
-                val tmp = java.io.File(ctx.androidContext.cacheDir, "voice_$txnId")
+                val tmp = java.io.File(ctx.cacheDir(), "voice_$txnId")
                 if (runCatching { local.copyTo(tmp, overwrite = true) }.isSuccess) {
                     android.util.Log.d(TAG, "playVoiceNote: playing local pending audio (id=$eventId)")
                     return playLocalAudioFile(
@@ -5799,7 +5856,7 @@ object MatrixRepository {
         val ctx = lightContext ?: return false to "no context"
         voiceCacheFile(eventId)?.let { cached ->
             if (cached.exists()) {
-                val tmp = java.io.File(ctx.androidContext.cacheDir, "voice_play_$eventId")
+                val tmp = java.io.File(ctx.cacheDir(), "voice_play_$eventId")
                 if (runCatching { cached.copyTo(tmp, overwrite = true) }.isSuccess) {
                     android.util.Log.d(TAG, "playVoiceNote: playing cached audio (id=$eventId)")
                     return playLocalAudioFile(
@@ -5929,7 +5986,7 @@ object MatrixRepository {
         // extension so MediaExtractor sniffs the content instead of chasing a
         // wrong hint (see [sniffAudioExtension]).
         val tmp = java.io.File(
-            ctx.androidContext.cacheDir,
+            ctx.cacheDir(),
             if (ext.isEmpty()) "voice_$eventId" else "voice_$eventId.$ext",
         )
         runCatching { tmp.writeBytes(playBytes) }.getOrElse { return false to "audio write failed" }
@@ -6193,7 +6250,7 @@ object MatrixRepository {
 
     /** Bounded voice-note cache dir (eventId-keyed files, LRU by mtime). */
     private fun voiceCacheDir(): java.io.File? =
-        lightContext?.let { java.io.File(it.androidContext.cacheDir, "voice_cache").apply { mkdirs() } }
+        lightContext?.let { java.io.File(it.cacheDir(), "voice_cache").apply { mkdirs() } }
 
     /** The cached file for [eventId], or null when the cache dir can't exist.
      *  The extension is unknown until the first download, so a file that
@@ -6451,7 +6508,7 @@ object MatrixRepository {
         // stay playable until the sync echo replaces it. Best-effort: a failed copy
         // just leaves the pending row unplayable, the send is unaffected.
         val localFile = runCatching {
-            java.io.File(lightContext?.androidContext?.cacheDir ?: return@runCatching null, "voice_pending_$txnId.ogg")
+            java.io.File(lightContext?.cacheDir() ?: return@runCatching null, "voice_pending_$txnId.ogg")
                 .also { file -> file.writeBytes(bytes) }
         }.getOrNull()
         roomPending[txnId] = PendingAudioSend(txnId, System.currentTimeMillis(), durationMs, localFile)
@@ -8788,7 +8845,7 @@ object MatrixRepository {
         prefs.getString(KEY_ACCESS_TOKEN, null)?.let { return it }
         val token = runCatching {
             val db = android.database.sqlite.SQLiteDatabase.openDatabase(
-                ctx.androidContext.getDatabasePath(DB_NAME).path, null,
+                dbFile(ctx).absolutePath, null,
                 android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
             )
             try {
@@ -9350,7 +9407,7 @@ object MatrixRepository {
     }
 
     private fun mediaDir(slc: SealedLightContext) =
-        (slc.androidContext.cacheDir.absolutePath + "/$MEDIA_DIR").toPath()
+        (slc.cacheDir().absolutePath + "/$MEDIA_DIR").toPath()
 
     /** Attaches the sync-state + notification observers to a client, exactly once per instance. */
     private fun observeClient(c: MatrixClient) {

@@ -298,9 +298,12 @@ class RecordVoiceNoteViewModel(
     }
 
     private fun startRecording() {
-        val file = File(lightContext.androidContext.cacheDir, "voice_${System.currentTimeMillis()}.ogg")
+        val cacheDir = File(lightContext.filesDir, "cache").apply { mkdirs() }
+        val file = File(cacheDir, "voice_${System.currentTimeMillis()}.ogg")
         val r = runCatching {
-            MediaRecorder(lightContext.androidContext).apply {
+            // No-arg constructor (deprecated on API 31+): avoids needing a
+            // Context — the SDK only exposes filesDir/dataStore to tools.
+            MediaRecorder().apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
                 // Opus in an ogg container (MSC3245 voice messages). Opus
                 // native sample rates are 8/12/16/24/48 kHz; 48 kHz is the
