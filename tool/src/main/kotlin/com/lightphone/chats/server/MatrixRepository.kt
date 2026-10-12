@@ -391,8 +391,7 @@ object MatrixRepository {
      * without explicit attributes some builds route voice notes to a stream
      * the rocker doesn't touch.
      */
-    @Volatile
-    private var audioFocusRequest: android.media.AudioFocusRequest? = null
+
 
     fun audioPlayingEventId(): String? = playingAudioEventId
 
@@ -6046,40 +6045,8 @@ object MatrixRepository {
             }
         }
         player.setOnErrorListener { _, _, _ -> stopAudioPlayback(); true }
-        val audioManager = ctx.audioManager
-        // Reuse a focus request already held by a previous note in this
-        // session: re-requesting (after the switch-stop abandoned the old one)
-        // is what armed the system-player resume/steal race. See
-        // [playVoiceNote]. Genuine external focus losses still arrive — the
-        // held request's listener stays attached.
-        val heldFocus = audioFocusRequest
-        if (heldFocus != null) {
-            audioManager.requestAudioFocus(heldFocus)
-        } else {
-        val focusRequest = android.media.AudioFocusRequest.Builder(
-            android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
-        )
-            .setAudioAttributes(mediaAttributes)
-            .setOnAudioFocusChangeListener { change ->
-                // Focus loss (another app / a call) stops the note; the row
-                // state follows via the poll's audioPlayingEventId. A PAUSED
-                // note survives the loss untouched (the recorder's own focus
-                // take must not kill its pause point). The held focus is KEPT
-                // on a loss-stop — abandoning it here would hand GAIN down
-                // the stack to the app we had paused, which auto-resumes on
-                // GAIN (feedback 2026-09-08: recording a voice note restarted
-                // paused background audio). Same contract as natural
-                // completion: the next [stopAudioPlayback] releases it.
-                if (change != android.media.AudioManager.AUDIOFOCUS_GAIN) {
-                    mainHandler.post {
-                        if (playingAudioEventId != null) stopAudioPlayback(releaseFocus = false)
-                    }
-                }
-            }
-            .build()
-        audioManager.requestAudioFocus(focusRequest)
-        audioFocusRequest = focusRequest
-        }
+    // No audio focus on the Tool Library build: the audioManager wrap isn't
+    // upstream. Other media keeps playing over voice notes.
         runCatching {
             // Pass the FILE DESCRIPTOR, not the path: the media server is a
             // different uid and can't traverse the app's private cache dir —
@@ -6219,9 +6186,7 @@ object MatrixRepository {
         return out
     }
 
-    /** Stops any in-flight voice-note playback and clears its state. The audio
-     *  focus is kept when [releaseFocus] is false (natural completion — see
-     *  [releaseFinishedPlayback]). */
+    /** Stops any in-flight voice-note playback and clears its state. */
     private fun stopAudioPlayback(releaseFocus: Boolean = true) {
         playingAudioEventId = null
         pausedAudioEventId = null
@@ -6231,13 +6196,6 @@ object MatrixRepository {
         audioPlayer = null
         audioPlayerFile?.delete()
         audioPlayerFile = null
-        if (!releaseFocus) return
-        audioFocusRequest?.let { focus ->
-            runCatching {
-                lightContext?.audioManager?.abandonAudioFocusRequest(focus)
-            }
-            audioFocusRequest = null
-        }
     }
 
     // --- Voice-note download cache + auto-advance -----

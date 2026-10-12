@@ -340,23 +340,13 @@ class RecordVoiceNoteViewModel(
 
     /** Builds + requests transient media focus with speech content (the
      *  shared shape of the recorder and pre-send-preview blocks). */
-    private fun requestTransientSpeechFocus(): AudioFocusRequest {
-        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build(),
-            )
-            .build()
-        runCatching { lightContext.audioManager.requestAudioFocus(request) }
-        return request
+    private fun requestTransientSpeechFocus(): AudioFocusRequest? {
+        // No audio focus (no audioManager wrap in the Tool Library build) —
+        // other media keeps playing while a note records.
+        return null
     }
 
-    private fun abandonFocus(request: AudioFocusRequest?) {
-        request ?: return
-        runCatching { lightContext.audioManager.abandonAudioFocusRequest(request) }
-    }
+    private fun abandonFocus(request: AudioFocusRequest?) = Unit
 
     /** Stops + releases the recorder (idempotent). */
     private fun releaseRecorder() {
