@@ -1062,7 +1062,6 @@ class FieldEditorScreen(
                 onSubmit = { result -> goBack(result.toString().trim()) },
                 onBack = { goBack() },
                 modifier = Modifier.background(LightThemeTokens.colors.background),
-                centered = true,
                 submitLabel = submitLabel,
                 submitIcon = submitIcon,
                 numericKeyboard = numericKeyboard,

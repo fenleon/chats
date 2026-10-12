@@ -3,8 +3,6 @@ package com.lightphone.chats.server
 import com.lightphone.chats.ChatsMethods
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.os.Environment
-import android.provider.MediaStore as AndroidMediaStore
 import android.webkit.MimeTypeMap
 import com.lightphone.chats.BuildConfig
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
@@ -6638,22 +6636,10 @@ object MatrixRepository {
             eventId = eventId,
         )?.takeIf { it.isNotEmpty() } ?: return false
 
-        val mime = content.info?.mimeType ?: "image/jpeg"
-        val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: "jpg"
-        val name = "chats-" +
-            eventId.replace(Regex("[^A-Za-z0-9._-]"), "_") + "-" +
-            System.currentTimeMillis() + "." + ext
-        // The resolver access lives in the SDK (saveToMediaStore) — the tool
-        // plugin bans contentResolver in tool code. A failed write cleans up
-        // the pending row; return false without a recorded reason (the SDK
-        // logs it).
-        return ctx.saveToMediaStore(
-            collection = AndroidMediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            displayName = name,
-            mimeType = mime,
-            relativePath = Environment.DIRECTORY_PICTURES + "/Chats",
-            bytes = bytes,
-        ) != null
+        // Save-to-gallery needs MediaStore (ContentResolver) — no tool-accessible
+        // equivalent upstream (LightFileShare is a share dir, not the gallery).
+        // The action stays but reports failure until an upstream wrap exists.
+        return false
     }
 
     /** Whether the active network connection is cellular (mobile data). */
@@ -7123,7 +7109,10 @@ object MatrixRepository {
     }
 
     /** Screen truth for the speculative-work gates. */
-    private fun isScreenInteractive(): Boolean = lightContext?.screenInteractive == true
+    // No PowerManager in the Tool Library build — assume the slow pacing.
+    // Resolver passes are event-driven, so this only spaces the fallback
+    // passes; revisit if list staleness shows up on the LP3.
+    private fun isScreenInteractive(): Boolean = false
 
     /** Read marker this device last sent for [roomKey] ([markRead]), persisted
      *  across process restarts. The background sync filter drops m.receipt

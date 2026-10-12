@@ -19,22 +19,17 @@ import com.thelightphone.sdk.SealedLightContext
  */
 object ChatsClipboard {
 
-    @Volatile private var lightContext: SealedLightContext? = null
-
     @Volatile private var copied: String? = null
 
     /** Call once at bootstrap. */
     fun bind(slc: SealedLightContext) {
-        lightContext = slc
-        // A copy from another app invalidates our shadowed copy (the system
-        // clip changed → the newest copy is theirs, not ours).
-        slc.clipboard.addChangedListener { copied = null }
+        // No system-clipboard access in the Tool Library build (the SDK's
+        // LightClipboard wrap isn't upstream): copies stay in-app.
     }
 
     /** The clipboard's text, or null when it holds no text. */
     fun getText(): String? {
-        copied?.takeIf { it.isNotEmpty() }?.let { return it }
-        return lightContext?.clipboard?.text
+        return copied?.takeIf { it.isNotEmpty() }
     }
 
     fun setText(text: String) {

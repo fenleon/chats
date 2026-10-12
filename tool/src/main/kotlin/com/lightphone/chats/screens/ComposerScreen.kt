@@ -264,40 +264,8 @@ class ComposerScreen(
                     modifier = Modifier.background(LightThemeTokens.colors.background),
                     submitLabel = "Send",
                     submitIcon = LightIcons.SEND,
-                    // Notes-style entry (feedback pass): small wrapping text
-                    // anchored at the bottom, growing upward, keyboard flush at
-                    // the bottom; the return key makes newlines, not sends.
-                    // Send lives in the top-right bar.
-                    // The keyboard opens in caps mode — a new message starts
-                    // with a capital letter like the native composer.
                     singleLine = false,
-                    submitOnReturn = false,
-                    bottomAligned = true,
-                    submitInTopBar = true,
-                    topBarSubmitIcon = LightIcons.SEND,
                     initialCaps = true,
-                    // Reply toptag (feedback 2026-09-12, second pass): one
-                    // Superfine line quoting the target message — `"…"` — with
-                    // no name prefix, rendered by the editor directly above the
-                    // input text (it sat over the keyboard when the composer
-                    // drew it itself). The quote alone identifies the target.
-                    // A tap cancels the reply.
-                    topTag = if (replyingTo != null) {
-                        {
-                            val excerpt = replyTarget?.body?.lineSequence()
-                                ?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-                            LightText(
-                                text = if (excerpt.isEmpty()) "\"…\"" else "\"${cappedReplyExcerpt(excerpt)}\"",
-                                variant = LightTextVariant.Superfine,
-                                maxLines = 1,
-                                modifier = Modifier
-                                    .padding(bottom = 0.5f.gridUnitsAsDp())
-                                    .lightClickable { viewModel.cancelReply() },
-                            )
-                        }
-                    } else {
-                        null
-                    },
                 )
                 // Half-panel COPY/PASTE over the keyboard zone; the composer
                 // text above it stays interactive (cursor moves are taps on the

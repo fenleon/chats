@@ -227,9 +227,6 @@ private fun QueryView(
         submitLabel = "Search",
         submitIcon = LightIcons.SEARCH,
         singleLine = true,
-        // The input centers vertically between the top bar and the keyboard —
-        // the same treatment as the login field editors (design standard).
-        centered = true,
     )
 }
 
