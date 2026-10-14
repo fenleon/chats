@@ -338,29 +338,35 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                         modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                     ) {
                         if (account?.loggedIn == true) {
-                            // Logged in: just the account status + actions — the
-                            // login form (email/code) would be dead weight here.
-                            // The device-verification row leads the panel;
-                            // the account name is not
-                            // shown, only the sync status.
+                            // Logged in: four rows (LP3 feedback 2026-10-14) —
+                            // read-only sync status, Manual Sync Now,
+                            // verification status, Log Out. The login form
+                            // (email/code) would be dead weight here.
+                            SyncStatusRow(
+                                connection = connection,
+                                delivery = delivery,
+                            )
+                            // Manual Sync Now: kicks a real round now — the
+                            // success stamps last-updated and bumps the
+                            // revision, which refetches this screen — then
+                            // opens the confirming popover.
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .lightClickable(onClick = {
+                                        ChatClient.syncNow()
+                                        navigateTo(screenFactory = { SyncingPanel(it) })
+                                    })
+                                    .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                            ) {
+                                LightText(text = "Manual Sync Now", variant = LightTextVariant.Heading)
+                            }
                             EncryptionRow(
                                 e2ee = e2ee,
                                 settled = e2eeSettled,
                                 verifying = verification != null &&
                                     verification !in VERIFICATION_TERMINAL_STATES,
                                 onClick = if (e2ee?.verified == true || !e2eeSettled) null else goVerify,
-                            )
-                            AccountStatus(
-                                connection = connection,
-                                delivery = delivery,                                onManualSync = {
-                                    // Kick a real round now (startSync is
-                                    // idempotent — the loop is already
-                                    // running): the success stamps
-                                    // last-updated and bumps the revision,
-                                    // which refetches this screen.
-                                    ChatClient.syncNow()
-                                    navigateTo(screenFactory = { SyncingPanel(it) })
-                                },
                             )
                             // Log Out as a plain action row (LP3 feedback
                             // 2026-10-09) — it read as a mode switch in the
@@ -880,30 +886,29 @@ class LogoutConfirmPanel(
     }
 }
 
-/** Background-delivery health folded into the status area — the separate
- *  "Sync 3m ago…" line read as two statuses (LP3 feedback 2026-09-25).
- *  Status semantics:
+/** Item 1 of the logged-in Account panel (LP3 feedback 2026-10-14): a
+ *  read-only status row — the "Message sync status" label over the current
+ *  status; once settled that reads "Last updated X ago" (the age of the last
+ *  successful round). Not clickable — Manual Sync Now is its own row below.
+ *  Status semantics while sync is working:
  *   "Syncing messages… x of y" — the fresh-login backfill is
  *     building the local store (drives the count; y = the pass's
  *     room total).
  *   "Syncing" — the key-backup restore crawl is working (the
  *     "Restoring history… x of y" line below carries the count) or
  *     the store isn't caught up yet.
- *   The settled state ("Synced · up to date") is a dead status word —
- *     it renders as the Manual Sync Now button instead, with the
- *     last-updated age as its subtitle (LP3 feedback 2026-10-09).
  *  Claiming Synced while the restore is still waiting on the backup
  *  secret read as a lie on the LP3 fresh login (2026-09-20) — the
  *  settled conditions below guard that. */
 @Composable
-private fun AccountStatus(
+private fun SyncStatusRow(
     connection: ChatsMethods.GetConnectionState.Response?,
     delivery: MatrixRepository.DeliveryHealth?,
-    onManualSync: () -> Unit,
 ) {
     Column(
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
     ) {
+        LightText(text = "Message sync status", variant = LightTextVariant.Detail)
         val syncedSettled = connection?.let { state ->
             val backfillSettled = state.backfillRoomsTotal == 0 ||
                 state.backfillRoomsDone >= state.backfillRoomsTotal
@@ -912,29 +917,14 @@ private fun AccountStatus(
             state.state == "syncing" && storeCaughtUp && backfillSettled &&
                 state.restoreCompleted
         } == true
-        if (syncedSettled) {
-            // Manual Sync Now: kicks a sync round and opens the confirming
-            // popover. Subtitle = the age of the last successful round.
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .lightClickable(onClick = onManualSync)
-                    .padding(vertical = 0.25f.gridUnitsAsDp()),
-            ) {
-                Column {
-                    LightText(text = "Manual Sync Now", variant = LightTextVariant.Heading)
-                    LightText(
-                        text = delivery?.lastSuccessfulRoundAtMs
-                            ?.takeIf { it > 0 }
-                            ?.let {
-                                val age = SyncHealth.ago(System.currentTimeMillis() - it)
-                                if (age == "just now") "Last updated $age" else "Last updated $age ago"
-                            }
-                            ?: "Never synced",
-                        variant = LightTextVariant.Detail,
-                    )
+        val value = if (syncedSettled) {
+            delivery?.lastSuccessfulRoundAtMs
+                ?.takeIf { it > 0 }
+                ?.let {
+                    val age = SyncHealth.ago(System.currentTimeMillis() - it)
+                    if (age == "just now") "Last updated $age" else "Last updated $age ago"
                 }
-            }
+                ?: "Never synced"
         } else {
             val statusText = connection?.let { state ->
                 val backfillRunning = state.backfillRoomsTotal > 0 &&
@@ -963,14 +953,15 @@ private fun AccountStatus(
                     nowMs = System.currentTimeMillis(),
                 )
             }
-            val line = listOfNotNull(statusText, healthText).joinToString(" · ")
-            if (line.isNotBlank()) {
-                LightText(
-                    text = line,
-                    variant = LightTextVariant.Fine,
-                )
-            }
+            listOfNotNull(statusText, healthText).joinToString(" · ").ifBlank { "…" }
         }
+        LightText(
+            text = value,
+            variant = LightTextVariant.Heading,
+            // The value sits almost touching the label — pulled up into the
+            // label's descender space (same value-row anatomy as ServerRow).
+            modifier = Modifier.offset(y = (-3).dp),
+        )
         // Key-backup restore crawl: shown ONLY while it runs — a healthy
         // restore is silent, not a permanent third line.
         connection?.let { state ->
@@ -985,13 +976,14 @@ private fun AccountStatus(
     }
 }
 
-/** Device-verification row: the action reads "Verify Device"
- *  while unverified, and is a status-only row once verified. No toggle — the
- *  state reads "Device Verified" / "Verifying" (mid-verification, so a
- *  back-out keeps the process visible) / "Verify Device". While the verdict
- *  hasn't settled (a cold trust store can lag a poll)
- *  it reads "Checking…" and is not tappable, so launch never claims a false
- *  "Verify Device". The old "Encrypted messages" label is gone. */
+/** Device-verification row (LP3 feedback 2026-10-14): the "Verification
+ *  status" label over the action — "Device Verified" once verified (a
+ *  status-only row; the verdict persists companion-side, see
+ *  MatrixRepository.e2eeState), "Verify Device" while unverified. No toggle —
+ *  the state reads "Verifying" mid-verification (so a back-out keeps the
+ *  process visible). While the verdict hasn't settled (a cold trust store can
+ *  lag a poll) it reads "Checking…" and is not tappable, so launch never
+ *  claims a false "Verify Device". The old "Encrypted messages" label is gone. */
 @Composable
 private fun EncryptionRow(
     e2ee: ChatsMethods.GetE2eeState.Response?,
@@ -999,19 +991,24 @@ private fun EncryptionRow(
     verifying: Boolean,
     onClick: (() -> Unit)?,
 ) {
-    LightText(
-        text = when {
-            e2ee?.verified == true -> "Device Verified"
-            verifying -> "Verifying"
-            !settled -> "Checking…"
-            else -> "Verify Device"
-        },
-        variant = LightTextVariant.Heading,
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(enabled = onClick != null, onClick = { onClick?.invoke() })
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
-    )
+    ) {
+        LightText(text = "Verification status", variant = LightTextVariant.Detail)
+        LightText(
+            text = when {
+                e2ee?.verified == true -> "Device Verified"
+                verifying -> "Verifying"
+                !settled -> "Checking…"
+                else -> "Verify Device"
+            },
+            variant = LightTextVariant.Heading,
+            modifier = Modifier.offset(y = (-3).dp),
+        )
+    }
 }
 
 /** The LP3 keyboard editor for a single settings field. Result: the edited

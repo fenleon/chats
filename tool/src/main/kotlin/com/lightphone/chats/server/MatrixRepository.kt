@@ -285,6 +285,10 @@ object MatrixRepository {
      *  the crawl runs at most once per 24h, so the in-memory flag alone could
      *  never show after a reboot/install/force-stop. Cleared at login. */
     private const val KEY_RESTORE_COMPLETED = "restore_completed"
+    /** Device id whose cross-signing verification has settled — see
+     *  [e2eeState] (a fresh login mints a new device id and rechecks;
+     *  logout clears all prefs). */
+    private const val KEY_E2EE_VERIFIED_DEVICE = "e2ee_verified_device"
     /** Wall-clock of the last successful syncOnce round (any reason: slow
      *  round, push wake, send wake, backstop). Persisted — the Account
      *  screen's health line must survive process restarts, and the screen-on
@@ -1511,6 +1515,18 @@ object MatrixRepository {
         e2eeStateCache?.let { (fetchedAt, verified, devices) ->
             if (now - fetchedAt < E2EE_STATE_TTL_MS) return response(verified, devices)
         }
+        // Persisted verdict (LP3 feedback 2026-10-14): once this device has
+        // been cross-signing verified, it stays verified — reopening Account
+        // must show "Device Verified" immediately, not re-run the cold trust
+        // read behind "Checking…". Keyed by device id so a fresh login (new
+        // device id) rechecks; logout wipes all prefs.
+        lightContext?.chatsPrefs()?.getString(KEY_E2EE_VERIFIED_DEVICE, null)?.let { verifiedDevice ->
+            if (verifiedDevice == c.deviceId) {
+                val devices = e2eeStateCache?.third ?: 1
+                e2eeStateCache = Triple(now, true, devices)
+                return response(true, devices)
+            }
+        }
         // Same policy as [isDeviceVerified]: a timed-out trust read must NOT
         // read as "unverified" — on the LP3 the first read after opening the
         // screen can exceed the budget on a cold trust store, and the Account
@@ -1525,6 +1541,9 @@ object MatrixRepository {
         val devices = runCatching {
             c.api.device.getDevices().getOrNull()?.map { it.deviceId }?.filter { it != c.deviceId }?.size ?: 0
         }.getOrDefault(0)
+        if (verified) {
+            lightContext?.chatsPrefs()?.edit()?.putString(KEY_E2EE_VERIFIED_DEVICE, c.deviceId)?.apply()
+        }
         e2eeStateCache = Triple(now, verified, devices)
         return response(verified, devices)
     }
