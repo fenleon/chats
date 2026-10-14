@@ -323,4 +323,7 @@ object ChatClient {
     /** The clipboard's text, or null when it holds no readable text. */
     fun clipboardText(): String? =
         runCatching { ChatsClipboard.getText() }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /** Kicks one immediate sync round (Manual Sync Now). */
+    fun syncNow() = MatrixRepository.syncNow()
 }

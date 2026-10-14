@@ -335,11 +335,29 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                         modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
                     ) {
                         if (account?.loggedIn == true) {
-                            // Logged in: just the account status + actions — the
-                            // login form (email/code) would be dead weight here.
-                            // The device-verification row leads the panel;
-                            // the account name is not
-                            // shown, only the sync status.
+                            // Logged in: four rows (LP3 feedback 2026-10-14) —
+                            // read-only sync status, Manual Sync Now,
+                            // verification status, Log Out. The login form
+                            // (email/code) would be dead weight here.
+                            SyncStatusRow(
+                                connection = connection,
+                                delivery = delivery,
+                            )
+                            // Manual Sync Now: kicks a real sync round — the
+                            // success stamps last-updated and bumps the
+                            // revision, which refetches this screen — then
+                            // opens the confirming popover.
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .lightClickable(onClick = {
+                                        ChatClient.syncNow()
+                                        navigateTo(screenFactory = { SyncingPanel(it) })
+                                    })
+                                    .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                            ) {
+                                LightText(text = "Manual Sync Now", variant = LightTextVariant.Heading)
+                            }
                             EncryptionRow(
                                 e2ee = e2ee,
                                 settled = e2eeSettled,
@@ -347,7 +365,22 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                     verification !in VERIFICATION_TERMINAL_STATES,
                                 onClick = if (e2ee?.verified == true || !e2eeSettled) null else goVerify,
                             )
-                            AccountStatus(connection = connection, delivery = delivery)
+                            // Log Out as a plain action row (LP3 feedback
+                            // 2026-10-09) — it read as a mode switch in the
+                            // bottom bar; as a row it sits with the other
+                            // account actions.
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .lightClickable(enabled = !busy, onClick = {
+                                        navigateTo(screenFactory = { LogoutConfirmPanel(it) }) { confirmed ->
+                                            if (confirmed) viewModel.logout()
+                                        }
+                                    })
+                                    .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                            ) {
+                                LightText(text = "Log Out", variant = LightTextVariant.Heading)
+                            }
                         } else {
                             // Logged out: if the session just expired, say so
                             // instead of showing a bare login form (the user
@@ -444,16 +477,9 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
                         if (account?.loggedIn == true) {
-                            LightBarButton.Text(
-                                text = if (busy) "…" else "LOG OUT",
-                                onClick = if (busy) null else {
-                                    {
-                                        navigateTo(screenFactory = { LogoutConfirmPanel(it) }) { confirmed ->
-                                            if (confirmed) viewModel.logout()
-                                        }
-                                    }
-                                },
-                            )
+                            // Log Out moved to a row above (feedback
+                            // 2026-10-14) — the bar stays empty here.
+                            null
                         } else if (beeperMode) {
                             // Beeper flow: the bar's button sends the emailed
                             // code, then an overlay panel confirms it and the
@@ -744,6 +770,69 @@ class CodeSentPanel(
     }
 }
 
+/** The manual-sync confirmation popover: centered "Messages Syncing" +
+ *  subtitle, X dismiss bottom-centre, auto-dismiss after 3 s — the same
+ *  panel grammar as [CodeSentPanel]. */
+class SyncingPanel(
+    sealedActivity: SealedLightActivity,
+) : SimpleLightScreen<Unit>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+        val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
+
+        LaunchedEffect(Unit) {
+            delay(3_000L)
+            goBack()
+        }
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        LightText(
+                            text = "Messages Syncing",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                        Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                        LightText(
+                            text = "Your account data is being updated in the background",
+                            variant = LightTextVariant.Detail,
+                            align = TextAlign.Center,
+                        )
+                    }
+                }
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        null,
+                        LightBarButton.Icon(
+                            painter = confirmX,
+                            onClick = { goBack() },
+                            contentDescription = "Dismiss",
+                        ),
+                        null,
+                    ),
+                )
+            }
+        }
+    }
+}
+
 /** The logout confirmation overlay: centered
  *  "Do you want to log out of your account?" with the LP3 X (dismiss) and
  *  triangle (confirm) — same panel grammar as the verify confirm. Result:
@@ -798,73 +887,84 @@ class LogoutConfirmPanel(
     }
 }
 
-/** Background-delivery health folded into the status line — the separate
- *  "Sync 3m ago…" line read as two statuses (LP3 feedback 2026-09-25). */
+/** Item 1 of the logged-in Account panel (LP3 feedback 2026-10-14): a
+ *  read-only status row — the "Message sync status" label over the current
+ *  status; once settled that reads "Last updated X ago" (the age of the last
+ *  successful round). Not clickable — Manual Sync Now is its own row below.
+ *  Status semantics while sync is working:
+ *   "Syncing messages… x of y" — the fresh-login backfill is
+ *     building the local store (drives the count; y = the pass's
+ *     room total).
+ *   "Syncing" — the key-backup restore crawl is working (the
+ *     "Restoring history… x of y" line below carries the count) or
+ *     the store isn't caught up yet.
+ *  Claiming Synced while the restore is still waiting on the backup
+ *  secret read as a lie on the LP3 fresh login (2026-09-20) — the
+ *  settled conditions below guard that. */
 @Composable
-private fun AccountStatus(
+private fun SyncStatusRow(
     connection: LightServiceMethod.GetConnectionState.Response?,
     delivery: MatrixRepository.DeliveryHealth?,
 ) {
     Column(
         modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
     ) {
-        // One line: the account status word joined with the delivery health
-        // suffix ("Syncing · 3m ago · push connected"). Either half can be
-        // absent (state/delivery not fetched yet). Status word semantics:
-        //   "Syncing messages… x of y" — the fresh-login backfill is
-        //     building the local store (drives the count; y = the pass's
-        //     room total).
-        //   "Syncing" — the key-backup restore crawl is working (the
-        //     "Restoring history… x of y" line below carries the count) or
-        //     the store isn't caught up yet.
-        //   "Synced · up to date" — sync running + store + room list
-        //     caught up AND the fresh-login work settled: the restore flow
-        //     completed (or settled with nothing to restore) and the
-        //     backfill pass ran its rooms. Claiming Synced while the
-        //     restore is still waiting on the backup secret read as a lie
-        //     on the LP3 fresh login (2026-09-20).
-        val statusText = connection?.let { state ->
-            val backfillRunning = state.backfillRoomsTotal > 0 &&
-                state.backfillRoomsDone < state.backfillRoomsTotal
+        LightText(text = "Message sync status", variant = LightTextVariant.Detail)
+        val syncedSettled = connection?.let { state ->
             val backfillSettled = state.backfillRoomsTotal == 0 ||
                 state.backfillRoomsDone >= state.backfillRoomsTotal
-            val restoreRunning = state.restoreScanning && state.restoreRoomsTotal > 0
             val storeCaughtUp = state.roomsJoined > 0 &&
                 state.roomsProjected >= state.roomsJoined
-            when {
-                backfillRunning ->
-                    "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
-                restoreRunning -> "Syncing"
-                state.state == "syncing" && storeCaughtUp && backfillSettled &&
-                    state.restoreCompleted -> "Synced · up to date"
-                state.state == "syncing" -> "Syncing"
-                !state.syncEnabled -> "battery saver"
-                state.state == "offline" -> "offline"
-                // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
-                // the WHOLE first sync round — many minutes on a large
-                // account, while the room list is already visibly populated.
-                // Once rooms have landed, "connecting" reads as a lie: the
-                // sync is actively working — say Syncing.
-                state.state == "connecting" && state.roomsTotal > 0 -> "Syncing"
-                state.state == "connecting" -> "connecting"
-                else -> state.state.replaceFirstChar { it.uppercase() }
+            state.state == "syncing" && storeCaughtUp && backfillSettled &&
+                state.restoreCompleted
+        } == true
+        val value = if (syncedSettled) {
+            delivery?.lastSuccessfulRoundAtMs
+                ?.takeIf { it > 0 }
+                ?.let {
+                    val age = SyncHealth.ago(System.currentTimeMillis() - it)
+                    if (age == "just now") "Last updated $age" else "Last updated $age ago"
+                }
+                ?: "Never synced"
+        } else {
+            val statusText = connection?.let { state ->
+                val backfillRunning = state.backfillRoomsTotal > 0 &&
+                    state.backfillRoomsDone < state.backfillRoomsTotal
+                val restoreRunning = state.restoreScanning && state.restoreRoomsTotal > 0
+                when {
+                    backfillRunning ->
+                        "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
+                    restoreRunning -> "Syncing"
+                    state.state == "syncing" -> "Syncing"
+                    !state.syncEnabled -> "battery saver"
+                    state.state == "offline" -> "offline"
+                    // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
+                    // the WHOLE first sync round — many minutes on a large
+                    // account, while the room list is already visibly populated.
+                    // Once rooms have landed, "connecting" reads as a lie: the
+                    // sync is actively working — say Syncing.
+                    state.state == "connecting" && state.roomsTotal > 0 -> "Syncing"
+                    state.state == "connecting" -> "connecting"
+                    else -> state.state.replaceFirstChar { it.uppercase() }
+                }
             }
+            val healthText = delivery?.let {
+                SyncHealth.healthLine(
+                    lastOkAtMs = it.lastSuccessfulRoundAtMs,
+                    failures = it.consecutiveFailures,
+                    pushConnected = it.pushConnected,
+                    nowMs = System.currentTimeMillis(),
+                )
+            }
+            listOfNotNull(statusText, healthText).joinToString(" · ").ifBlank { "…" }
         }
-        val healthText = delivery?.let {
-            SyncHealth.healthLine(
-                lastOkAtMs = it.lastSuccessfulRoundAtMs,
-                failures = it.consecutiveFailures,
-                pushConnected = it.pushConnected,
-                nowMs = System.currentTimeMillis(),
-            )
-        }
-        val line = listOfNotNull(statusText, healthText).joinToString(" · ")
-        if (line.isNotBlank()) {
-            LightText(
-                text = line,
-                variant = LightTextVariant.Fine,
-            )
-        }
+        LightText(
+            text = value,
+            variant = LightTextVariant.Heading,
+            // The value sits almost touching the label — pulled up into the
+            // label's descender space (same value-row anatomy as ServerRow).
+            modifier = Modifier.offset(y = (-3).dp),
+        )
         // Key-backup restore crawl: shown ONLY while it runs — a healthy
         // restore is silent, not a permanent third line.
         connection?.let { state ->
@@ -879,13 +979,14 @@ private fun AccountStatus(
     }
 }
 
-/** Device-verification row: the action reads "Verify Device"
- *  while unverified, and is a status-only row once verified. No toggle — the
- *  state reads "Device Verified" / "Verifying" (mid-verification, so a
- *  back-out keeps the process visible) / "Verify Device". While the verdict
- *  hasn't settled (a cold trust store can lag a poll)
- *  it reads "Checking…" and is not tappable, so launch never claims a false
- *  "Verify Device". The old "Encrypted messages" label is gone. */
+/** Device-verification row (LP3 feedback 2026-10-14): the "Verification
+ *  status" label over the action — "Device Verified" once verified (a
+ *  status-only row; the verdict persists server-side, see
+ *  MatrixRepository.e2eeState), "Verify Device" while unverified. No toggle —
+ *  the state reads "Verifying" mid-verification (so a back-out keeps the
+ *  process visible). While the verdict hasn't settled (a cold trust store can
+ *  lag a poll) it reads "Checking…" and is not tappable, so launch never
+ *  claims a false "Verify Device". The old "Encrypted messages" label is gone. */
 @Composable
 private fun EncryptionRow(
     e2ee: LightServiceMethod.GetE2eeState.Response?,
@@ -893,19 +994,24 @@ private fun EncryptionRow(
     verifying: Boolean,
     onClick: (() -> Unit)?,
 ) {
-    LightText(
-        text = when {
-            e2ee?.verified == true -> "Device Verified"
-            verifying -> "Verifying"
-            !settled -> "Checking…"
-            else -> "Verify Device"
-        },
-        variant = LightTextVariant.Heading,
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .lightClickable(enabled = onClick != null, onClick = { onClick?.invoke() })
             .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
-    )
+    ) {
+        LightText(text = "Verification status", variant = LightTextVariant.Detail)
+        LightText(
+            text = when {
+                e2ee?.verified == true -> "Device Verified"
+                verifying -> "Verifying"
+                !settled -> "Checking…"
+                else -> "Verify Device"
+            },
+            variant = LightTextVariant.Heading,
+            modifier = Modifier.offset(y = (-3).dp),
+        )
+    }
 }
 
 /** The LP3 keyboard editor for a single settings field. Result: the edited

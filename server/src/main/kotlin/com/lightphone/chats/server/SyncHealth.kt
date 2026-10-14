@@ -48,7 +48,7 @@ object SyncHealth {
         }
     }
 
-    private fun ago(millis: Long): String {
+    fun ago(millis: Long): String {
         val minutes = millis / 60_000
         return when {
             minutes < 1 -> "<1m"
