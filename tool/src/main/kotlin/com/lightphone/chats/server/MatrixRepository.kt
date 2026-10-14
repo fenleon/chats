@@ -2107,7 +2107,7 @@ object MatrixRepository {
             // setup flow then uploads a fresh filter covering the current
             // room-account-data whitelist (one-time, prefs-gated).
             migrateSyncFilterIfNeeded(ctx)
-            val restored = runCatching {
+            suspend fun buildClient(): MatrixClient? = runCatching {
                 MatrixClient.create(
                     repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath)),
                     mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
@@ -2118,6 +2118,15 @@ object MatrixRepository {
             }.onFailure { e ->
                 android.util.Log.w(TAG, "ensureClient: session restore failed: $e")
             }.getOrNull()
+            var restored = buildClient()
+            if (restored == null) {
+                // One-time legacy-store migration (dd7db87 moved the Room DB
+                // from Room's default databases/ dir into filesDir and the
+                // login prefs from SharedPreferences into the properties
+                // file): a pre-migration install opens an EMPTY new store and
+                // restore fails. Copy the old store over and retry once.
+                if (migrateLegacyStore(ctx)) restored = buildClient()
+            }
             return if (restored != null) {
                 client = restored
                 observeClient(restored)
@@ -2134,6 +2143,58 @@ object MatrixRepository {
                 null
             }
         }
+    }
+
+    /** One-time legacy-store migration (2026-10-14): dd7db87 moved the Room
+     *  DB from Room's default databases/ directory into filesDir and the
+     *  login prefs from SharedPreferences into the properties file. A
+     *  pre-migration install opens an empty new store and its restore fails
+     *  ("authProviderData must not be null when repositories are empty") —
+     *  this copies the old DB (+ legacy prefs, whose per-room last-read
+     *  markers exist nowhere else) over the new paths. Runs ONLY from
+     *  [ensureClient]'s failed-restore path, so it can never overwrite a
+     *  store created after the migration. The legacy files stay on disk
+     *  (space can be reclaimed manually once the migrated session is
+     *  confirmed healthy). */
+    private fun migrateLegacyStore(ctx: SealedLightContext): Boolean {
+        val legacyDb = java.io.File(ctx.filesDir.parentFile, "databases/$DB_NAME")
+        if (!legacyDb.exists()) return false
+        android.util.Log.i(TAG, "ensureClient: migrating legacy store ${legacyDb.path} → ${dbFile(ctx).path}")
+        val target = dbFile(ctx)
+        return runCatching {
+            val targetWal = java.io.File(target.path + "-wal")
+            val targetShm = java.io.File(target.path + "-shm")
+            target.delete(); targetWal.delete(); targetShm.delete()
+            legacyDb.copyTo(target, overwrite = true)
+            java.io.File(legacyDb.path + "-wal").takeIf { it.exists() }
+                ?.copyTo(targetWal, overwrite = true)
+            java.io.File(legacyDb.path + "-shm").takeIf { it.exists() }
+                ?.copyTo(targetShm, overwrite = true)
+            // Legacy SharedPreferences → ChatsPrefs (the per-room last-read
+            // markers live only there). Values already in the properties
+            // file win — it's the newer store.
+            val legacyPrefs = java.io.File(ctx.filesDir.parentFile, "shared_prefs/$PREFS.xml")
+            if (legacyPrefs.exists()) {
+                val prefs = ctx.chatsPrefs()
+                val editor = prefs.edit()
+                val xml = legacyPrefs.readText()
+                Regex("<string name=\"([^\"]+)\">([^<]*)</string>").findAll(xml).forEach { m ->
+                    val key = m.groupValues[1]
+                    if (!prefs.contains(key)) editor.putString(key, m.groupValues[2])
+                }
+                Regex("<int name=\"([^\"]+)\" value=\"([^\"]+)\"").findAll(xml).forEach { m ->
+                    val key = m.groupValues[1]
+                    if (!prefs.contains(key)) editor.putInt(key, m.groupValues[2].toInt())
+                }
+                Regex("<boolean name=\"([^\"]+)\" value=\"([^\"]+)\"").findAll(xml).forEach { m ->
+                    val key = m.groupValues[1]
+                    if (!prefs.contains(key)) editor.putBoolean(key, m.groupValues[2].toBoolean())
+                }
+                editor.apply()
+            }
+            true
+        }.onFailure { android.util.Log.w(TAG, "legacy store migration failed: $it") }
+            .getOrDefault(false)
     }
 
     fun accountState(): ChatsMethods.GetAccountState.Response {
