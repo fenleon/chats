@@ -343,7 +343,6 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 connection = connection,
                                 delivery = delivery,
                             )
-                            RecoveryRow(connection = connection)
                             // Manual Sync Now: kicks a real sync round — the
                             // success stamps last-updated and bumps the
                             // revision, which refetches this screen — then
@@ -359,6 +358,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                             ) {
                                 LightText(text = "Manual Sync Now", variant = LightTextVariant.Heading)
                             }
+                            RecoveryRow(connection = connection)
                             EncryptionRow(
                                 e2ee = e2ee,
                                 settled = e2eeSettled,
@@ -953,7 +953,7 @@ private fun SyncStatusRow(
 
 /** The history-recovery row (LP3 feedback 2026-10-14): the "Recovery status"
  *  label over the key-backup restore crawl — "restoring x of y rooms" while
- *  it runs, "history restored" once settled (the flag is persisted, so a
+ *  it runs, "History Restored" once settled (the flag is persisted, so a
  *  healthy install shows it immediately). Not clickable. */
 @Composable
 private fun RecoveryRow(connection: LightServiceMethod.GetConnectionState.Response?) {
@@ -965,7 +965,7 @@ private fun RecoveryRow(connection: LightServiceMethod.GetConnectionState.Respon
             when {
                 state.restoreScanning && state.restoreRoomsTotal > 0 ->
                     "restoring ${state.restoreScanned} of ${state.restoreRoomsTotal} rooms"
-                state.restoreCompleted -> "history restored"
+                state.restoreCompleted -> "History Restored"
                 else -> "checking…"
             }
         } ?: "checking…"
