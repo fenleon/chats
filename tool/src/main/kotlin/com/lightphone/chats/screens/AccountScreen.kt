@@ -346,6 +346,7 @@ class AccountScreen(sealedActivity: SealedLightActivity) :
                                 connection = connection,
                                 delivery = delivery,
                             )
+                            RecoveryRow(connection = connection)
                             // Manual Sync Now: kicks a real round now — the
                             // success stamps last-updated and bumps the
                             // revision, which refetches this screen — then
@@ -888,18 +889,12 @@ class LogoutConfirmPanel(
 
 /** Item 1 of the logged-in Account panel (LP3 feedback 2026-10-14): a
  *  read-only status row — the "Message sync status" label over the current
- *  status; once settled that reads "Last updated X ago" (the age of the last
- *  successful round). Not clickable — Manual Sync Now is its own row below.
- *  Status semantics while sync is working:
- *   "Syncing messages… x of y" — the fresh-login backfill is
- *     building the local store (drives the count; y = the pass's
- *     room total).
- *   "Syncing" — the key-backup restore crawl is working (the
- *     "Restoring history… x of y" line below carries the count) or
- *     the store isn't caught up yet.
- *  Claiming Synced while the restore is still waiting on the backup
- *  secret read as a lie on the LP3 fresh login (2026-09-20) — the
- *  settled conditions below guard that. */
+ *  status: "last updated X ago" once the round is settled, else the working
+ *  word alone ("syncing", "offline" — no health suffix; the age lives in the
+ *  settled value, LP3 feedback 2026-10-14). Not clickable — Manual Sync Now
+ *  is its own row below. History recovery is a separate row ([RecoveryRow]),
+ *  so settled no longer waits on the key-backup restore. Values lowercase —
+ *  dynamic status words read as state, not headings. */
 @Composable
 private fun SyncStatusRow(
     connection: ChatsMethods.GetConnectionState.Response?,
@@ -914,46 +909,35 @@ private fun SyncStatusRow(
                 state.backfillRoomsDone >= state.backfillRoomsTotal
             val storeCaughtUp = state.roomsJoined > 0 &&
                 state.roomsProjected >= state.roomsJoined
-            state.state == "syncing" && storeCaughtUp && backfillSettled &&
-                state.restoreCompleted
+            state.state == "syncing" && storeCaughtUp && backfillSettled
         } == true
         val value = if (syncedSettled) {
             delivery?.lastSuccessfulRoundAtMs
                 ?.takeIf { it > 0 }
                 ?.let {
                     val age = SyncHealth.ago(System.currentTimeMillis() - it)
-                    if (age == "just now") "Last updated $age" else "Last updated $age ago"
+                    if (age == "just now") "last updated $age" else "last updated $age ago"
                 }
-                ?: "Never synced"
+                ?: "never synced"
         } else {
-            val statusText = connection?.let { state ->
+            connection?.let { state ->
                 val backfillRunning = state.backfillRoomsTotal > 0 &&
                     state.backfillRoomsDone < state.backfillRoomsTotal
-                val restoreRunning = state.restoreScanning && state.restoreRoomsTotal > 0
                 when {
                     backfillRunning ->
-                        "Syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
-                    restoreRunning -> "Syncing"
-                    state.state == "syncing" -> "Syncing"
+                        "syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
                     state.state == "offline" -> "offline"
                     // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
                     // the WHOLE first sync round — many minutes on a large
                     // account, while the room list is already visibly populated.
                     // Once rooms have landed, "connecting" reads as a lie: the
-                    // sync is actively working — say Syncing.
-                    state.state == "connecting" && state.roomsTotal > 0 -> "Syncing"
+                    // sync is actively working — say syncing.
+                    state.state == "connecting" && state.roomsTotal > 0 -> "syncing"
                     state.state == "connecting" -> "connecting"
-                    else -> state.state.replaceFirstChar { it.uppercase() }
+                    state.state == "syncing" -> "syncing"
+                    else -> state.state
                 }
-            }
-            val healthText = delivery?.let {
-                SyncHealth.healthLine(
-                    lastOkAtMs = it.lastSuccessfulRoundAtMs,
-                    failures = it.consecutiveFailures,
-                    nowMs = System.currentTimeMillis(),
-                )
-            }
-            listOfNotNull(statusText, healthText).joinToString(" · ").ifBlank { "…" }
+            } ?: "…"
         }
         LightText(
             text = value,
@@ -962,17 +946,32 @@ private fun SyncStatusRow(
             // label's descender space (same value-row anatomy as ServerRow).
             modifier = Modifier.offset(y = (-3).dp),
         )
-        // Key-backup restore crawl: shown ONLY while it runs — a healthy
-        // restore is silent, not a permanent third line.
-        connection?.let { state ->
-            if (state.restoreScanning && state.restoreRoomsTotal > 0) {
-                LightText(
-                    text = "Restoring history… ${state.restoreScanned} of ${state.restoreRoomsTotal}",
-                    variant = LightTextVariant.Fine,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
+    }
+}
+
+/** The history-recovery row (LP3 feedback 2026-10-14): the "Recovery status"
+ *  label over the key-backup restore crawl — "restoring x of y rooms" while
+ *  it runs, "history restored" once settled (the flag is persisted, so a
+ *  healthy install shows it immediately). Not clickable. */
+@Composable
+private fun RecoveryRow(connection: ChatsMethods.GetConnectionState.Response?) {
+    Column(
+        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+    ) {
+        LightText(text = "Recovery status", variant = LightTextVariant.Detail)
+        val value = connection?.let { state ->
+            when {
+                state.restoreScanning && state.restoreRoomsTotal > 0 ->
+                    "restoring ${state.restoreScanned} of ${state.restoreRoomsTotal} rooms"
+                state.restoreCompleted -> "history restored"
+                else -> "checking…"
             }
-        }
+        } ?: "checking…"
+        LightText(
+            text = value,
+            variant = LightTextVariant.Heading,
+            modifier = Modifier.offset(y = (-3).dp),
+        )
     }
 }
 
