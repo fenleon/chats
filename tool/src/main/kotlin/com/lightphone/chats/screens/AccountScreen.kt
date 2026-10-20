@@ -43,6 +43,7 @@ import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightScrollView
 import com.thelightphone.sdk.ui.LightText
 import com.thelightphone.sdk.ui.LightTextInputEditor
+import com.thelightphone.sdk.ui.LightTextOneLine
 import com.thelightphone.sdk.ui.LightTextField
 import com.thelightphone.sdk.ui.LightTextVariant
 import com.thelightphone.sdk.ui.LightTheme
@@ -941,9 +942,12 @@ private fun SyncStatusRow(
                 }
             } ?: "…"
         }
-        LightText(
+        LightTextOneLine(
             text = value,
-            variant = LightTextVariant.Heading,
+            // One line always (LP3 feedback 2026-10-20): a long value
+            // ("syncing messages… 0 of 230") steps down from Heading instead
+            // of wrapping.
+            variants = listOf(LightTextVariant.Heading, LightTextVariant.Subheading, LightTextVariant.Fine),
             // The value sits almost touching the label — pulled up into the
             // label's descender space (same value-row anatomy as ServerRow).
             modifier = Modifier.offset(y = (-3).dp),
@@ -969,9 +973,11 @@ private fun RecoveryRow(connection: LightServiceMethod.GetConnectionState.Respon
                 else -> "checking…"
             }
         } ?: "checking…"
-        LightText(
+        LightTextOneLine(
             text = value,
-            variant = LightTextVariant.Heading,
+            // Same one-line rule as SyncStatusRow: "restoring 12 of 230 rooms"
+            // steps down from Heading instead of wrapping (LP3 2026-10-20).
+            variants = listOf(LightTextVariant.Heading, LightTextVariant.Subheading, LightTextVariant.Fine),
             modifier = Modifier.offset(y = (-3).dp),
         )
     }
