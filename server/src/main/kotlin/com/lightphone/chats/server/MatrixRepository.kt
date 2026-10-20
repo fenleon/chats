@@ -37,6 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -271,7 +272,14 @@ object MatrixRepository {
     private const val BEEPER_HOMESERVER = "https://matrix.beeper.com"
     private const val BEEPER_API_TOKEN = "BEEPER-PRIVATE-API-PLEASE-DONT-USE"
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // The handler keeps a failing scope.launch child (restore crawl, sync
+    // ladder, …) from killing the process — #46: Trixnity's timeline-loop
+    // guard surfaced as an uncaught FATAL on a DefaultDispatcher worker.
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default + CoroutineExceptionHandler { _, e ->
+            android.util.Log.w(TAG, "uncaught sync-scope failure", e)
+        },
+    )
     private val initMutex = Mutex()
 
     /** Main-thread handler for the delayed sync-service stop (see [scheduleSyncStop]). */
@@ -4386,10 +4394,23 @@ object MatrixRepository {
         timeoutMs: Long,
     ): List<TimelineEvent>? = withTimeoutOrNull(timeoutMs) {
         val list = mutableListOf<TimelineEvent>()
-        c.room.getLastTimelineEvents(matrixRoomId, config).filterNotNull().first()
-            .collect { eventFlow ->
-                eventFlow.filterNotNull().firstOrNull()?.let { list.add(it) }
-            }
+        try {
+            c.room.getLastTimelineEvents(matrixRoomId, config).filterNotNull().first()
+                .collect { eventFlow ->
+                    eventFlow.filterNotNull().firstOrNull()?.let { list.add(it) }
+                }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // A Trixnity flow failure (e.g. the timeline-loop guard, #46) must
+            // not kill the process — serve the partial list like a budget
+            // expiry would.
+            android.util.Log.w(
+                TAG,
+                "collectNewestEvents: flow failed for $matrixRoomId, serving ${list.size} partial: " +
+                    "${e.javaClass.simpleName}: ${e.message}",
+            )
+        }
         list
     }
 
@@ -5381,26 +5402,39 @@ object MatrixRepository {
             // room (31 events × 3s blows the whole fetch budget). Once one
             // event decrypts, the session is loaded and the rest follow fast.
             var waitForDecrypt = true
-            eventFlows.collect { eventFlow ->
-                // Reading a timeline triggers decryption; the event flow re-emits
-                // once the content resolves (first emission may carry null or a
-                // failure while the decrypt is pending), so wait for the
-                // decrypted emission (bounded), falling back to the first.
-                val resolved = withTimeoutOrNull(if (waitForDecrypt) DECRYPT_WAIT_MS else QUICK_DECRYPT_WAIT_MS) {
-                    eventFlow.filterNotNull().firstOrNull {
-                        it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
+            try {
+                eventFlows.collect { eventFlow ->
+                    // Reading a timeline triggers decryption; the event flow re-emits
+                    // once the content resolves (first emission may carry null or a
+                    // failure while the decrypt is pending), so wait for the
+                    // decrypted emission (bounded), falling back to the first.
+                    val resolved = withTimeoutOrNull(if (waitForDecrypt) DECRYPT_WAIT_MS else QUICK_DECRYPT_WAIT_MS) {
+                        eventFlow.filterNotNull().firstOrNull {
+                            it.content?.getOrNull() != null || it.event.content !is EncryptedMessageEventContent
+                        }
+                    } ?: eventFlow.filterNotNull().firstOrNull()
+                    if (resolved != null) {
+                        val content = resolved.content
+                        if (content?.isFailure == true) {
+                            val ex = content.exceptionOrNull()
+                            android.util.Log.w(TAG, "collect: event ${resolved.event.id.full} still encrypted: ${ex?.javaClass?.simpleName}: ${ex?.message}")
+                        }
+                        waitForDecrypt = resolved.content?.getOrNull() != null ||
+                            resolved.event.content !is EncryptedMessageEventContent
+                        events.add(resolved)
                     }
-                } ?: eventFlow.filterNotNull().firstOrNull()
-                if (resolved != null) {
-                    val content = resolved.content
-                    if (content?.isFailure == true) {
-                        val ex = content.exceptionOrNull()
-                        android.util.Log.w(TAG, "collect: event ${resolved.event.id.full} still encrypted: ${ex?.javaClass?.simpleName}: ${ex?.message}")
-                    }
-                    waitForDecrypt = resolved.content?.getOrNull() != null ||
-                        resolved.event.content !is EncryptedMessageEventContent
-                    events.add(resolved)
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // A Trixnity flow failure (e.g. the timeline-loop guard, #46)
+                // must not kill the process — the partial page below is served
+                // the same way a budget expiry is.
+                android.util.Log.w(
+                    TAG,
+                    "collectTimelineEvents: flow failed for $matrixRoomId (before=$beforeEventId), serving ${events.size} partial: " +
+                        "${e.javaClass.simpleName}: ${e.message}",
+                )
             }
         }
         // Even if the budget expires mid-collect, hand back what we got (the
