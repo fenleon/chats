@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.text.input.rememberTextFieldState
+import androidx.compose.foundation.text.TextAutoSize
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -21,9 +23,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewModelScope
 import com.lightphone.chats.ChatClient
 import com.lightphone.chats.R
@@ -941,14 +946,39 @@ private fun SyncStatusRow(
                 }
             } ?: "…"
         }
-        LightText(
+        OneLineValue(
             text = value,
-            variant = LightTextVariant.Heading,
             // The value sits almost touching the label — pulled up into the
             // label's descender space (same value-row anatomy as ServerRow).
             modifier = Modifier.offset(y = (-3).dp),
         )
     }
+}
+
+/** Status value that never wraps: the font steps down from Heading toward
+ *  Fine (the SDK's own typography tokens) until the text fits one line —
+ *  "syncing messages… 0 of 230" shrinks instead of wrapping (LP3 feedback
+ *  2026-10-20). Compose's TextAutoSize scales continuously between the two
+ *  token sizes; the tokens are design units the SDK scales by screen height
+ *  (LightGrid's private ×screenHeight/600 rule, reproduced here because
+ *  `scaledForScreenHeight` is internal — revisit if the SDK grows a public
+ *  one-line-fit helper). Gate-safe: no local SDK patch involved. */
+@Composable
+private fun OneLineValue(text: String, modifier: Modifier = Modifier) {
+    val typography = LightThemeTokens.typography
+    val scale = LocalConfiguration.current.screenHeightDp.toFloat() / 600f
+    fun scaled(style: TextStyle) = style.copy(fontSize = (style.fontSize.value * scale).sp)
+    Text(
+        text = text,
+        modifier = modifier,
+        color = LightThemeTokens.colors.content,
+        style = scaled(typography.heading),
+        maxLines = 1,
+        autoSize = TextAutoSize.StepBased(
+            scaled(typography.fine).fontSize,
+            scaled(typography.heading).fontSize,
+        ),
+    )
 }
 
 /** The history-recovery row (LP3 feedback 2026-10-14): the "Recovery status"
@@ -969,9 +999,8 @@ private fun RecoveryRow(connection: LightServiceMethod.GetConnectionState.Respon
                 else -> "checking…"
             }
         } ?: "checking…"
-        LightText(
+        OneLineValue(
             text = value,
-            variant = LightTextVariant.Heading,
             modifier = Modifier.offset(y = (-3).dp),
         )
     }
