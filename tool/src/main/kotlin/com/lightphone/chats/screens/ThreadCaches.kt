@@ -1,9 +1,9 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import com.lightphone.chats.RetainedThreads
 import com.lightphone.chats.server.BoundedCache
 import com.lightphone.chats.server.MatrixRepository
-import com.thelightphone.sdk.shared.LightServiceMethod
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /** Each session gets separate objects: old jobs cannot populate the next account's caches. */
@@ -15,7 +15,7 @@ internal class ThreadCaches(val generation: Long) {
     val bitmaps = BoundedCache<DecodedBitmap>(24L * 1024 * 1024) {
         it.bitmap.width.toLong() * it.bitmap.height * 4
     }
-    val threads = RetainedThreads<LightServiceMethod.GetMessages.Message>()
+    val threads = RetainedThreads<ChatsMethods.GetMessages.Message>()
     val edits = MutableStateFlow<Map<String, String>>(emptyMap())
     val unsent = MutableStateFlow<Set<String>>(emptySet())
     val resends = ResendChainState()

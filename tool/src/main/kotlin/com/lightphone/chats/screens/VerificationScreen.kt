@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,7 +28,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
@@ -59,8 +59,8 @@ private const val WAITING_TEXT = "Waiting for your other device to accept..."
  */
 class VerificationViewModel : LightViewModel<Unit>() {
 
-    val state = MutableStateFlow<LightServiceMethod.GetVerificationState.Response?>(null)
-    val e2ee = MutableStateFlow<LightServiceMethod.GetE2eeState.Response?>(null)
+    val state = MutableStateFlow<ChatsMethods.GetVerificationState.Response?>(null)
+    val e2ee = MutableStateFlow<ChatsMethods.GetE2eeState.Response?>(null)
     val busy = MutableStateFlow(false)
     val error = MutableStateFlow<String?>(null)
 

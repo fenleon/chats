@@ -5,7 +5,7 @@ versionCode = 81
 versionName = "0.19.2"
 # ACCESS_NETWORK_STATE: the repository paces sync/media work off the live
 # connection state (LightConnectivity).
-permissions = ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE", "android.permission.POST_NOTIFICATIONS"]
+permissions = ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE", "android.permission.POST_NOTIFICATIONS", "android.permission.RECORD_AUDIO"]
 # Cleartext for LAN/self-hosted homeservers (10.x/192.168.x).
 capabilities = ["cleartext-http"]
 # Rung-1 fold (2026-10): no embedded server/companion — the tool talks to

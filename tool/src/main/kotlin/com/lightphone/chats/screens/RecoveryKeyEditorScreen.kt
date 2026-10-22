@@ -17,7 +17,6 @@ import com.thelightphone.sdk.ui.LightTextInputEditor
 import com.thelightphone.sdk.ui.LightTheme
 import com.thelightphone.sdk.ui.LightThemeController
 import com.thelightphone.sdk.ui.LightThemeTokens
-import com.thelightphone.sdk.ui.scaledForScreenHeight
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /**
@@ -73,24 +72,12 @@ class RecoveryKeyEditorScreen(
                 title = recoveryTitle(text.toString()),
                 state = textState,
                 keyboardOptionsFlow = keyboardOptionsFlow,
-                // Notes-style entry: the key sits just above the keyboard in
-                // small centered text, lines growing upward. The typography
-                // tokens carry no color, so copy the active content color —
-                // without it BasicText falls back to black-on-black on the dark
-                // theme and the key is unreadable. Copy-sized — slightly bigger
-                // than paragraph, so the 3-line key still fits above the keyboard.
-                inputTextStyle = LightThemeTokens.typography.copy
-                    .copy(color = themeColors.content, textAlign = TextAlign.Center)
-                    .scaledForScreenHeight(),
                 onSubmit = { result ->
                     // Submit the clean key (case preserved, no separators).
                     goBack(result.toString().filter { it.isLetterOrDigit() })
                 },
                 onBack = { goBack() },
                 modifier = Modifier.background(LightThemeTokens.colors.background),
-                // Feedback pass: the action lives in the bottom bar (SUBMIT —
-                // bar text buttons are uppercase), the key stays bottom-anchored.
-                bottomAligned = true,
             )
         }
     }

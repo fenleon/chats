@@ -1,12 +1,16 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import com.lightphone.chats.server.MatrixRepository
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.TextUnit
 import com.thelightphone.sdk.ui.LocalHapticsEnabled
+import com.thelightphone.sdk.ui.designVerticalPxToSp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -21,6 +25,22 @@ import kotlinx.coroutines.launch
  * haptic API.) The state stays fresh across recompositions, so a gesture
  * handler can just call the returned lambda.
  */
+/**
+ * Chats-local copy of the SDK's internal text-height scaling: upstream keeps
+ * `TextStyle.scaledForScreenHeight()` internal, but its math is public
+ * ([designVerticalPxToSp]) — same result, no SDK change needed.
+ */
+@Composable
+fun TextStyle.scaledForScreenHeight(): TextStyle {
+    @Composable fun TextUnit.scaled(): TextUnit =
+        if (this == TextUnit.Unspecified) this else value.designVerticalPxToSp()
+    return copy(
+        fontSize = fontSize.scaled(),
+        lineHeight = lineHeight.scaled(),
+        letterSpacing = letterSpacing.scaled(),
+    )
+}
+
 @Composable
 fun rememberHapticBuzz(): () -> Unit {
     val haptic = LocalHapticFeedback.current
@@ -41,7 +61,7 @@ fun rememberHapticBuzz(): () -> Unit {
  */
 fun collectRoomCensus(
     scope: CoroutineScope,
-    rooms: MutableStateFlow<List<com.thelightphone.sdk.shared.LightServiceMethod.GetRooms.Room>>,
+    rooms: MutableStateFlow<List<ChatsMethods.GetRooms.Room>>,
 ): Job = scope.launch {
     MatrixRepository.roomList.collect { census ->
         census.map { it.copy(lastMessage = "", unreadCount = 0, lastEventId = null) }

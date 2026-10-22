@@ -1,7 +1,7 @@
 package com.lightphone.chats
 
+import com.lightphone.chats.ChatsMethods
 import android.telephony.PhoneNumberUtils
-import com.thelightphone.sdk.shared.LightServiceMethod
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -100,7 +100,7 @@ private fun formatBridgePhone(raw: String): String {
  * feedback 2026-08-21; shared by the thread and the room list's long-press
  * panel 2026-08-29). The companion resolves the real identifier via the
  * bridge's contact API (WhatsApp numbers incl. LID, Instagram usernames) and
- * rides it in [LightServiceMethod.GetRooms.Room.contactPhone] — that value
+ * rides it in [ChatsMethods.GetRooms.Room.contactPhone] — that value
  * wins here. The heuristic below is the fallback when the bridge doesn't
  * serve one. NOTE: the m.bridge channel's `fi.mau.receiver` is the USER'S
  * OWN number, not the contact's (verified 2026-08-22 across many LID DMs) —
@@ -146,11 +146,11 @@ private fun String.isPhoneLike(): Boolean {
 /**
  * Whether a room row matches a search query: its name, its resolved contact
  * identifier (number/username — the companion fills
- * [LightServiceMethod.GetRooms.Room.contactPhone] from the bridge), or a
+ * [ChatsMethods.GetRooms.Room.contactPhone] from the bridge), or a
  * digit-only partial match of that identifier (a phone typed with
  * spaces/plus). Shared by the Search + Contacts screens (2026-09-01).
  */
-fun roomMatchesQuery(room: LightServiceMethod.GetRooms.Room, q: String): Boolean {
+fun roomMatchesQuery(room: ChatsMethods.GetRooms.Room, q: String): Boolean {
     if (room.name.contains(q, ignoreCase = true)) return true
     val id = room.contactPhone
     if (id?.contains(q, ignoreCase = true) == true) return true

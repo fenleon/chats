@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,7 +26,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcons
@@ -67,7 +67,7 @@ class SearchViewModel(
 
     val query = MutableStateFlow("")
     /** All rooms the companion reports; filtered + sorted by [matchingRooms]. */
-    val rooms = MutableStateFlow<List<LightServiceMethod.GetRooms.Room>>(emptyList())
+    val rooms = MutableStateFlow<List<ChatsMethods.GetRooms.Room>>(emptyList())
     /** Exclusive mode: true (default) = direct, non-archived chats only;
      *  false = everything (groups + archived). The bottom toggle flips it. */
     val dmsOnly = MutableStateFlow(true)
@@ -121,7 +121,7 @@ class SearchViewModel(
      * the screen's collected state — reading the flow's .value directly
      * would never recompose when the fetch lands.
      */
-    fun matchingRooms(rooms: List<LightServiceMethod.GetRooms.Room>): List<LightServiceMethod.GetRooms.Room> {
+    fun matchingRooms(rooms: List<ChatsMethods.GetRooms.Room>): List<ChatsMethods.GetRooms.Room> {
         val q = query.value.trim()
         return rooms
             .filter { room ->
@@ -183,7 +183,7 @@ class SearchScreen(
         }
     }
 
-    private fun openThread(room: LightServiceMethod.GetRooms.Room) {
+    private fun openThread(room: ChatsMethods.GetRooms.Room) {
         // Returning from a thread opened via search closes the search: the
         // thread's back pops with a Unit result, so this callback pops the
         // search screen too — back from the thread lands on the MAIN list, not
@@ -227,9 +227,6 @@ private fun QueryView(
         submitLabel = "Search",
         submitIcon = LightIcons.SEARCH,
         singleLine = true,
-        // The input centers vertically between the top bar and the keyboard —
-        // the same treatment as the login field editors (design standard).
-        centered = true,
     )
 }
 
@@ -242,8 +239,8 @@ private fun ColumnScope.ResultsView(
     dmsOnly: Boolean,
     onToggleDmsOnly: () -> Unit,
     onBackToQuery: () -> Unit,
-    onOpenRoom: (LightServiceMethod.GetRooms.Room) -> Unit,
-    results: List<LightServiceMethod.GetRooms.Room>,
+    onOpenRoom: (ChatsMethods.GetRooms.Room) -> Unit,
+    results: List<ChatsMethods.GetRooms.Room>,
     query: String,
 ) {
     LightTopBar(
@@ -287,7 +284,7 @@ private fun ColumnScope.ResultsView(
 
 @Composable
 private fun SearchResultRow(
-    room: LightServiceMethod.GetRooms.Room,
+    room: ChatsMethods.GetRooms.Room,
     onOpen: () -> Unit,
 ) {
     LightText(

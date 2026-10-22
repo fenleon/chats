@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,7 +24,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightText
@@ -76,10 +76,10 @@ class ComposerViewModel(
     /** When set, the composer EDITS this message:
      *  SEND routes to [ChatClient.editMessage] and pops back with the edit
      *  result instead of sending a new message. */
-    private val editTarget: LightServiceMethod.GetMessages.Message? = null,
+    private val editTarget: ChatsMethods.GetMessages.Message? = null,
     /** The message SEND replies to (m.in_reply_to); mutable state so the
      *  header's tap cancels the reply back to a plain compose. */
-    replyTarget: LightServiceMethod.GetMessages.Message? = null,
+    replyTarget: ChatsMethods.GetMessages.Message? = null,
 ) : LightViewModel<ComposerResult>() {
 
     val busy = MutableStateFlow(false)
@@ -169,11 +169,11 @@ class ComposerScreen(
     private val roomName: String,
     /** When set, the composer prefills this message's body and SEND edits it
      *  (Phase C, 2026-09-03, opened from the thread's context window). */
-    private val editTarget: LightServiceMethod.GetMessages.Message? = null,
+    private val editTarget: ChatsMethods.GetMessages.Message? = null,
     /** When set (and not editing), SEND sends this draft as a reply to the
      *  message (m.in_reply_to); the one-line header above the input cancels
      *  on tap. */
-    private val replyTarget: LightServiceMethod.GetMessages.Message? = null,
+    private val replyTarget: ChatsMethods.GetMessages.Message? = null,
 ) : LightScreen<ComposerResult, ComposerViewModel>(sealedActivity) {
 
     override val viewModelClass: Class<ComposerViewModel>
@@ -264,40 +264,8 @@ class ComposerScreen(
                     modifier = Modifier.background(LightThemeTokens.colors.background),
                     submitLabel = "Send",
                     submitIcon = LightIcons.SEND,
-                    // Notes-style entry (feedback pass): small wrapping text
-                    // anchored at the bottom, growing upward, keyboard flush at
-                    // the bottom; the return key makes newlines, not sends.
-                    // Send lives in the top-right bar.
-                    // The keyboard opens in caps mode — a new message starts
-                    // with a capital letter like the native composer.
                     singleLine = false,
-                    submitOnReturn = false,
-                    bottomAligned = true,
-                    submitInTopBar = true,
-                    topBarSubmitIcon = LightIcons.SEND,
                     initialCaps = true,
-                    // Reply toptag (feedback 2026-09-12, second pass): one
-                    // Superfine line quoting the target message — `"…"` — with
-                    // no name prefix, rendered by the editor directly above the
-                    // input text (it sat over the keyboard when the composer
-                    // drew it itself). The quote alone identifies the target.
-                    // A tap cancels the reply.
-                    topTag = if (replyingTo != null) {
-                        {
-                            val excerpt = replyTarget?.body?.lineSequence()
-                                ?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-                            LightText(
-                                text = if (excerpt.isEmpty()) "\"…\"" else "\"${cappedReplyExcerpt(excerpt)}\"",
-                                variant = LightTextVariant.Superfine,
-                                maxLines = 1,
-                                modifier = Modifier
-                                    .padding(bottom = 0.5f.gridUnitsAsDp())
-                                    .lightClickable { viewModel.cancelReply() },
-                            )
-                        }
-                    } else {
-                        null
-                    },
                 )
                 // Half-panel COPY/PASTE over the keyboard zone; the composer
                 // text above it stays interactive (cursor moves are taps on the
@@ -341,7 +309,7 @@ class ComposerScreen(
                     )
                 }
                 // Clear-draft X, bottom-right corner of the screen. The composer keyboard
-                // (submitInTopBar) reserves the 5-gu bottom-bar row below the
+                // The bottom-bar row below the
                 // keys, so the X sits in that row at the far right, vertically
                 // centered like a native bottom-bar icon. Always visible
                 // while the composer is open; with an

@@ -1,11 +1,9 @@
 package com.lightphone.chats
 
 import com.lightphone.chats.server.ChatsClipboard
-import com.lightphone.chats.server.Diagnostics
 import com.lightphone.chats.server.MatrixRepository
 import com.lightphone.chats.Snapshots
 import com.thelightphone.sdk.SealedLightContext
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.getOrNull
 import kotlinx.coroutines.CancellationException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -50,12 +48,12 @@ object ChatClient {
         user: String,
         passwordOrToken: String,
         tokenLogin: Boolean = false,
-    ): LightServiceMethod.SetAccount.Response? =
+    ): ChatsMethods.SetAccount.Response? =
         runCatching {
             MatrixRepository.loginAsUnit(homeserver, user, passwordOrToken, tokenLogin).getOrThrow()
             clearThreadCaches()
             Snapshots.clearAll()
-            LightServiceMethod.SetAccount.Response(
+            ChatsMethods.SetAccount.Response(
                 userId = MatrixRepository.lastLoginUserId ?: "",
                 deviceId = MatrixRepository.lastLoginDeviceId ?: "",
                 needsVerification = MatrixRepository.lastLoginNeedsVerification,
@@ -68,21 +66,21 @@ object ChatClient {
 
     /**
      * Beeper login, step 2: completes the login with the emailed [code]. The
-     * response carries [LightServiceMethod.SetBeeperAccount.Response.needsVerification].
+     * response carries [ChatsMethods.SetBeeperAccount.Response.needsVerification].
      * @return the response on success, else the error message.
      */
-    suspend fun beeperLogin(email: String, code: String): Result<LightServiceMethod.SetBeeperAccount.Response> =
+    suspend fun beeperLogin(email: String, code: String): Result<ChatsMethods.SetBeeperAccount.Response> =
         MatrixRepository.beeperLoginAsUnit(email, code).mapCatching { _ ->
             clearThreadCaches()
             Snapshots.clearAll()
-            LightServiceMethod.SetBeeperAccount.Response(
+            ChatsMethods.SetBeeperAccount.Response(
                 userId = MatrixRepository.lastLoginUserId ?: "",
                 deviceId = MatrixRepository.lastLoginDeviceId ?: "",
                 needsVerification = MatrixRepository.lastLoginNeedsVerification,
             )
         }
 
-    suspend fun accountState(): LightServiceMethod.GetAccountState.Response? =
+    suspend fun accountState(): ChatsMethods.GetAccountState.Response? =
         runCatching { MatrixRepository.accountState() }.getOrNull()
 
     suspend fun logout() {
@@ -94,12 +92,12 @@ object ChatClient {
         }
     }
 
-    suspend fun getRooms(): List<LightServiceMethod.GetRooms.Room> =
+    suspend fun getRooms(): List<ChatsMethods.GetRooms.Room> =
         MatrixRepository.getRooms()
 
     /**
      * A page of messages, oldest first; [beforeEventId] pages further back.
-     * The response carries [LightServiceMethod.GetMessages.Response.hasMore],
+     * The response carries [ChatsMethods.GetMessages.Response.hasMore],
      * which the thread uses instead of page-size heuristics (a page of mostly
      * state events would otherwise end pagination early).
      */
@@ -107,10 +105,10 @@ object ChatClient {
         roomId: String,
         beforeEventId: String? = null,
         limit: Int = 30,
-    ): LightServiceMethod.GetMessages.Response? =
+    ): ChatsMethods.GetMessages.Response? =
         runCatching {
             val page = MatrixRepository.getMessages(roomId, beforeEventId, limit)
-            LightServiceMethod.GetMessages.Response(
+            ChatsMethods.GetMessages.Response(
                 messages = page.messages,
                 hasMore = page.hasMore,
                 encrypted = page.encrypted,
@@ -134,7 +132,7 @@ object ChatClient {
         roomId: String,
         body: String,
         replyToEventId: String? = null,
-    ): LightServiceMethod.SendMessage.Response? =
+    ): ChatsMethods.SendMessage.Response? =
         runCatching { MatrixRepository.sendMessage(roomId, body, replyToEventId) }.getOrNull()
 
     /**
@@ -201,29 +199,25 @@ object ChatClient {
         runCatching { MatrixRepository.setActiveRoom(roomId) }
     }
 
-    suspend fun connectionState(): LightServiceMethod.GetConnectionState.Response? =
+    suspend fun connectionState(): ChatsMethods.GetConnectionState.Response? =
         runCatching { MatrixRepository.connectionState() }.getOrNull()
 
     /** Background-delivery health for the Account screen's status line. */
     suspend fun deliveryHealth(): MatrixRepository.DeliveryHealth? =
         runCatching { MatrixRepository.deliveryHealth() }.getOrNull()
 
-    /** Pauses/resumes the sync loop (Settings → Sync, audit 2026-08-14). */
-    suspend fun setSyncEnabled(enabled: Boolean): Boolean =
-        runCatching { MatrixRepository.setSyncEnabled(enabled) }.isSuccess
-
-    suspend fun e2eeState(): LightServiceMethod.GetE2eeState.Response? =
+    suspend fun e2eeState(): ChatsMethods.GetE2eeState.Response? =
         runCatching { MatrixRepository.e2eeState() }.getOrNull()
 
-    suspend fun startDeviceVerification(): LightServiceMethod.StartDeviceVerification.Response? =
+    suspend fun startDeviceVerification(): ChatsMethods.StartDeviceVerification.Response? =
         MatrixRepository.startDeviceVerification().fold(
-            onSuccess = { LightServiceMethod.StartDeviceVerification.Response(started = true) },
+            onSuccess = { ChatsMethods.StartDeviceVerification.Response(started = true) },
             onFailure = {
-                LightServiceMethod.StartDeviceVerification.Response(started = false, error = it.message)
+                ChatsMethods.StartDeviceVerification.Response(started = false, error = it.message)
             },
         )
 
-    suspend fun verificationState(): LightServiceMethod.GetVerificationState.Response? =
+    suspend fun verificationState(): ChatsMethods.GetVerificationState.Response? =
         runCatching { MatrixRepository.verificationState() }.getOrNull()
 
     suspend fun verifyAction(action: String): String? =
@@ -298,28 +292,14 @@ object ChatClient {
         runCatching { ChatsClipboard.setText(text) }
     }
 
-    /** Toggles the privacy-safe diagnostics log (Settings, off by default). */
-    suspend fun setDiagnosticsEnabled(enabled: Boolean): Boolean =
-        runCatching {
-            Diagnostics.setEnabled(enabled)
-            Diagnostics.enabled
-        }.getOrDefault(false)
-
-    /** The diagnostics toggle's current state (persisted pref read at init). */
-    fun diagnosticsEnabled(): Boolean = Diagnostics.enabled
-
-    /** True when a non-empty diagnostics log exists (the "No log yet" case). */
-    fun diagnosticsHasLog(): Boolean = Diagnostics.hasLog()
-
-    /**
-     * Copies the diagnostics log to Movies/Chats (MediaStore, reachable over
-     * MTP). @return the exported file name, or null when there is no log yet
-     * or the export failed.
-     */
-    suspend fun exportDiagnostics(): String? =
-        runCatching { Diagnostics.export() }.getOrNull()
-
     /** The clipboard's text, or null when it holds no readable text. */
     fun clipboardText(): String? =
         runCatching { ChatsClipboard.getText() }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    /** Uploads a recorded voice note (ogg/opus, MSC3245) to [roomId]. */
+    suspend fun sendVoiceNote(roomId: String, file: java.io.File): Boolean =
+        runCatching { MatrixRepository.sendVoiceNote(roomId, file) }.getOrDefault(false)
+
+    /** Kicks one immediate sync round (Manual Sync Now). */
+    fun syncNow() = MatrixRepository.syncNow()
 }

@@ -1,5 +1,6 @@
 package com.lightphone.chats.screens
 
+import com.lightphone.chats.ChatsMethods
 import android.graphics.BitmapFactory
 import android.text.format.DateUtils
 import androidx.compose.foundation.Image
@@ -60,7 +61,6 @@ import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightFullscreenModal
@@ -75,7 +75,6 @@ import com.thelightphone.sdk.ui.LightTopBar
 import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
-import com.thelightphone.sdk.ui.scaledForScreenHeight
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -207,7 +206,7 @@ internal class ResendChainState {
 }
 
 class ThreadViewModel(
-    private val room: LightServiceMethod.GetRooms.Room,
+    private val room: ChatsMethods.GetRooms.Room,
 ) : LightViewModel<Unit>() {
 
     internal val caches = threadCaches()
@@ -238,7 +237,7 @@ class ThreadViewModel(
     val hasMore = MutableStateFlow(false)
     /**
      * The newest page served EMPTY off a warm store that may still be filling
-     * ([LightServiceMethod.GetMessages.Response.pendingSeed]): the thread
+     * ([ChatsMethods.GetMessages.Response.pendingSeed]): the thread
      * keeps "Loading messages…" instead of "No messages yet." until a
      * page-revision bump delivers rows or the one-shot backstop retry
      * ([pendingSeedRetryFired]) lands. Cleared on any non-empty merge.
@@ -400,7 +399,7 @@ class ThreadViewModel(
      * Optimistic rows from a send, waiting for their sync echo (feedback
      * pass). The poll replaces them with the real events as they land.
      */
-    private val pendingMessages = mutableListOf<LightServiceMethod.GetMessages.Message>()
+    private val pendingMessages = mutableListOf<ChatsMethods.GetMessages.Message>()
 
     /**
      * Thread scroll position, saved continuously by the screen and restored on
@@ -560,7 +559,7 @@ class ThreadViewModel(
             // catch-up (startPolling) must still see a delta.
             val revBefore = MatrixRepository.messagePageRevision(room.id)
             if (!quiet) loading.value = true
-            var loaded: List<LightServiceMethod.GetMessages.Message>
+            var loaded: List<ChatsMethods.GetMessages.Message>
             try {
                 val page = ChatClient.getMessages(room.id, null, PAGE_SIZE)
                 servedRevision = revBefore
@@ -667,9 +666,9 @@ class ThreadViewModel(
      * wins over a stale one in the old tail.
      */
     private fun mergeNewestPage(
-        page: List<LightServiceMethod.GetMessages.Message>,
-        current: List<LightServiceMethod.GetMessages.Message>,
-    ): List<LightServiceMethod.GetMessages.Message> {
+        page: List<ChatsMethods.GetMessages.Message>,
+        current: List<ChatsMethods.GetMessages.Message>,
+    ): List<ChatsMethods.GetMessages.Message> {
         if (current.isEmpty()) return page
         if (page.isEmpty()) return current
         val freshIds = page.mapTo(HashSet()) { it.id }
@@ -689,8 +688,8 @@ class ThreadViewModel(
      * leaving a stale optimistic copy at the oldest end) visibly shuffled and
      * duplicated the rows until every send had echoed.
      */
-    private fun mergeWithPending(loaded: List<LightServiceMethod.GetMessages.Message>):
-        List<LightServiceMethod.GetMessages.Message> {
+    private fun mergeWithPending(loaded: List<ChatsMethods.GetMessages.Message>):
+        List<ChatsMethods.GetMessages.Message> {
         if (pendingMessages.isEmpty()) return loaded
         val realIds = loaded.mapTo(HashSet()) { it.id }
         val result = loaded.toMutableList()
@@ -727,7 +726,7 @@ class ThreadViewModel(
     }
 
     /** Inserts the just-sent message immediately (optimistic echo). */
-    fun addOptimistic(message: LightServiceMethod.GetMessages.Message) {
+    fun addOptimistic(message: ChatsMethods.GetMessages.Message) {
         pendingMessages += message
         messages.value = messages.value + message
     }
@@ -801,7 +800,7 @@ class ThreadViewModel(
      * Trixnity re-sends it; the poll replaces the row with the echo when it
      * lands, or the label stays if the retry can't succeed.
      */
-    fun retrySend(message: LightServiceMethod.GetMessages.Message) {
+    fun retrySend(message: ChatsMethods.GetMessages.Message) {
         if (!message.id.startsWith(LOCAL_ROW_PREFIX)) return
         viewModelScope.launch {
             ChatClient.retrySend(room.id, message.id.removePrefix(LOCAL_ROW_PREFIX))
@@ -814,7 +813,7 @@ class ThreadViewModel(
      * it); a second double-tap removes it. Own rows
      * never react (nothing to like back — restraint).
      */
-    fun toggleLike(message: LightServiceMethod.GetMessages.Message) {
+    fun toggleLike(message: ChatsMethods.GetMessages.Message) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         if (LIKE_KEY in effectiveOwnKeys(message)) removeReaction(message)
         else setReaction(message, LIKE_KEY)
@@ -828,7 +827,7 @@ class ThreadViewModel(
      * shows the quiet row error (the voice-note error pattern). Own rows
      * never react.
      */
-    fun toggleReaction(message: LightServiceMethod.GetMessages.Message, key: String) {
+    fun toggleReaction(message: ChatsMethods.GetMessages.Message, key: String) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         // The toggle must see its own optimistic overlay: a quick re-tap before
         // the poll catches up reads the overlay's target state, not the stale
@@ -893,7 +892,7 @@ class ThreadViewModel(
      * the send fails after the unsend succeeded, the reaction is lost
      * server-side — the error tag says so implicitly and the user can re-react.
      */
-    fun setReaction(message: LightServiceMethod.GetMessages.Message, key: String) {
+    fun setReaction(message: ChatsMethods.GetMessages.Message, key: String) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         val own = effectiveOwnKeys(message)
         if (own == listOf(key)) return // already this exact reaction
@@ -925,7 +924,7 @@ class ThreadViewModel(
      * window's REMOVE REACTION row). Optimistic overlay, revert + quiet row
      * error on failure — the [toggleReaction] pattern.
      */
-    fun removeReaction(message: LightServiceMethod.GetMessages.Message) {
+    fun removeReaction(message: ChatsMethods.GetMessages.Message) {
         if (message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         val own = effectiveOwnKeys(message)
         if (own.isEmpty()) return
@@ -952,7 +951,7 @@ class ThreadViewModel(
      * real state instead of the stale page (the [toggleReaction] overlay read,
      * generalized for the replace semantics of [toggleLike]/[setReaction]).
      */
-    private fun effectiveOwnKeys(message: LightServiceMethod.GetMessages.Message): List<String> {
+    private fun effectiveOwnKeys(message: ChatsMethods.GetMessages.Message): List<String> {
         val keys = ownReactionKeys(message).toMutableList()
         reactionOverlays.value[message.id]?.forEach { (key, added) ->
             if (added) {
@@ -983,7 +982,7 @@ class ThreadViewModel(
      * surfaces the quiet row error (the reaction pattern). The overlay drops
      * once a served page shows the row redacted.
      */
-    fun unsendMessage(message: LightServiceMethod.GetMessages.Message) {
+    fun unsendMessage(message: ChatsMethods.GetMessages.Message) {
         if (!message.isMine || message.id.startsWith(LOCAL_ROW_PREFIX)) return
         unsentOverlays.value = unsentOverlays.value + message.id
         // An unsend supersedes any pending edit overlay on the same row.
@@ -1004,8 +1003,8 @@ class ThreadViewModel(
      * action, which [dropReflectedOverlays] handles first).
      */
     private fun applyReactionOverlays(
-        page: List<LightServiceMethod.GetMessages.Message>,
-    ): List<LightServiceMethod.GetMessages.Message> {
+        page: List<ChatsMethods.GetMessages.Message>,
+    ): List<ChatsMethods.GetMessages.Message> {
         val overlays = reactionOverlays.value
         if (overlays.isEmpty()) return page
         return page.map { m ->
@@ -1031,8 +1030,8 @@ class ThreadViewModel(
      * also holds the context panel's target stable.
      */
     private fun applyMessageOverlays(
-        page: List<LightServiceMethod.GetMessages.Message>,
-    ): List<LightServiceMethod.GetMessages.Message> {
+        page: List<ChatsMethods.GetMessages.Message>,
+    ): List<ChatsMethods.GetMessages.Message> {
         val edits = editOverlays.value
         val unsent = unsentOverlays.value
         if (edits.isEmpty() && unsent.isEmpty()) return page
@@ -1062,7 +1061,7 @@ class ThreadViewModel(
      *  with the RPC; the overlay only bridges the gap). Covers the reaction,
      *  edit, and unsend overlays (Phase A/C). */
     private fun dropReflectedOverlays(
-        page: List<LightServiceMethod.GetMessages.Message>,
+        page: List<ChatsMethods.GetMessages.Message>,
     ) {
         reactionOverlays.value = reactionOverlays.value.mapNotNull { (eventId, keys) ->
             val served = page.firstOrNull { it.id == eventId } ?: return@mapNotNull eventId to keys
@@ -1091,14 +1090,14 @@ class ThreadViewModel(
      * Capped at [MAX_RESEND_ATTEMPTS] per chain — each resend is a new
      * message, so an endless loop would spam duplicates.
      */
-    fun resendAsNew(message: LightServiceMethod.GetMessages.Message) {
+    fun resendAsNew(message: ChatsMethods.GetMessages.Message) {
         if (message.body.isBlank()) return
         if (resendChainState.attemptsFor(message.id) >= MAX_RESEND_ATTEMPTS) return
         viewModelScope.launch {
             val response = ChatClient.sendMessage(room.id, message.body) ?: return@launch
             resendChainState.recordResend(message.id, response.eventId ?: "local-${response.transactionId}")
             addOptimistic(
-                LightServiceMethod.GetMessages.Message(
+                ChatsMethods.GetMessages.Message(
                     id = response.eventId ?: "local-${response.transactionId}",
                     sender = "",
                     senderName = "",
@@ -1124,7 +1123,7 @@ class ThreadViewModel(
     /**
      * The timeline-chain position the last older-page fetch stopped at — the
      * cursor the companion hands back with each page
-     * ([LightServiceMethod.GetMessages.Response.nextBeforeEventId]).
+     * ([ChatsMethods.GetMessages.Response.nextBeforeEventId]).
      *
      * Deriving the cursor from the visible list instead
      * (`messages.value.firstOrNull()`) breaks in bridged rooms: the companion
@@ -1325,7 +1324,7 @@ private const val OWN_REACTION_TAG_PREFIX = "You reacted "
  * reacted …" merge, where this misses it — the same ceiling as the Phase A
  * toggle.
  */
-private fun ownReactionKeys(message: LightServiceMethod.GetMessages.Message): List<String> =
+private fun ownReactionKeys(message: ChatsMethods.GetMessages.Message): List<String> =
     message.reactions
         .filter { it.startsWith(OWN_REACTION_TAG_PREFIX) }
         .map { it.removePrefix(OWN_REACTION_TAG_PREFIX) }
@@ -1345,7 +1344,7 @@ private const val RESEND_MAX_AGE_MS = 4L * 60 * 60 * 1000
 
 class ThreadScreen(
     sealedActivity: SealedLightActivity,
-    private val room: LightServiceMethod.GetRooms.Room,
+    private val room: ChatsMethods.GetRooms.Room,
 ) : LightScreen<Unit, ThreadViewModel>(sealedActivity) {
 
     override val viewModelClass: Class<ThreadViewModel>
@@ -1391,8 +1390,8 @@ class ThreadScreen(
         // Context window: the long-pressed message
         // (null = the panel is hidden). Own rows (EDIT / UNSEND) park their
         // target here for the confirm panel.
-        var contextMessage by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
-        var unsendConfirm by remember { mutableStateOf<LightServiceMethod.GetMessages.Message?>(null) }
+        var contextMessage by remember { mutableStateOf<ChatsMethods.GetMessages.Message?>(null) }
+        var unsendConfirm by remember { mutableStateOf<ChatsMethods.GetMessages.Message?>(null) }
         // COPY confirmation flash (feedback 2026-09-09) — fullscreen "copy".
         var copyFlash by remember { mutableStateOf(false) }
         // The panel's target resolved against the freshest polled snapshot (so
@@ -1678,11 +1677,21 @@ class ThreadScreen(
                 LightBottomBar(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
+                        // Record a voice note — bottom left, like the built-in
+                        // Messages app's layout (dev carried the same slot).
+                        LightBarButton.LightIcon(
+                            icon = LightIcons.MICROPHONE,
+                            onClick = {
+                                navigateTo(screenFactory = { RecordVoiceNoteScreen(it, room.id) })
+                            },
+                            contentDescription = "Record voice note",
+                        ),
                         LightBarButton.LightIcon(
                             icon = LightIcons.COMPOSE_MESSAGE,
                             onClick = { openComposer() },
                             contentDescription = "New message",
                         ),
+                        null,
                     ),
                 )
             }
@@ -1756,8 +1765,8 @@ class ThreadScreen(
     }
 
     private fun openComposer(
-        edit: LightServiceMethod.GetMessages.Message? = null,
-        reply: LightServiceMethod.GetMessages.Message? = null,
+        edit: ChatsMethods.GetMessages.Message? = null,
+        reply: ChatsMethods.GetMessages.Message? = null,
     ) {
         navigateTo(screenFactory = { ComposerScreen(it, room.id, room.name, edit, reply) }) { result ->
             if (result != null) {
@@ -1771,7 +1780,7 @@ class ThreadScreen(
                     // renders its header from the first frame (the sync echo
                     // re-resolves sender/excerpt server-side).
                     viewModel.addOptimistic(
-                        LightServiceMethod.GetMessages.Message(
+                        ChatsMethods.GetMessages.Message(
                             id = result.id,
                             sender = "",
                             senderName = "",
@@ -1836,7 +1845,7 @@ private const val DECRYPTION_NOTICE_KEYS_PENDING =
  */
 @Composable
 private fun UnsendConfirmPanel(
-    target: LightServiceMethod.GetMessages.Message,
+    target: ChatsMethods.GetMessages.Message,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1905,7 +1914,7 @@ private fun DecryptionNotice(text: String) {
  *  ("Yesterday", weekday, "Aug 12") when the message isn't from today
  */
 private data class ThreadRow(
-    val message: LightServiceMethod.GetMessages.Message,
+    val message: ChatsMethods.GetMessages.Message,
     val showTime: Boolean,
 ) {
     val key: String get() = message.id
@@ -1919,10 +1928,10 @@ private data class ThreadRow(
  * timestamp carries the day tag ("Yesterday", the weekday, or "Aug 12" —
  * never "Today").
  */
-private fun buildThreadRows(messages: List<LightServiceMethod.GetMessages.Message>): List<ThreadRow> {
+private fun buildThreadRows(messages: List<ChatsMethods.GetMessages.Message>): List<ThreadRow> {
     val rows = mutableListOf<ThreadRow>()
     var prevDay: LocalDate? = null
-    var prevMessage: LightServiceMethod.GetMessages.Message? = null
+    var prevMessage: ChatsMethods.GetMessages.Message? = null
     for (message in messages) { // oldest-first, as the view model stores them
         if (message.timestampMs <= 0) {
         rows += ThreadRow(message, showTime = true)
@@ -2023,7 +2032,7 @@ private fun OutgoingBodyText(
  *  event carried a formatted variant (and Basic Markdown is on). */
 @Composable
 private fun IncomingBodyText(
-    message: LightServiceMethod.GetMessages.Message,
+    message: ChatsMethods.GetMessages.Message,
     modifier: Modifier = Modifier,
 ) {
     // Basic Markdown off (Features): the plain body renders, no spans
@@ -2073,17 +2082,17 @@ private data class VoiceState(
 
 @Composable
 private fun MessageRow(
-    message: LightServiceMethod.GetMessages.Message,
+    message: ChatsMethods.GetMessages.Message,
     showSender: Boolean,
     showTime: Boolean,
     statusTag: String?,
     media: MediaState,
     voice: VoiceState,
     reactionError: Pair<String, String>?,
-    onRetrySend: (LightServiceMethod.GetMessages.Message) -> Unit,
-    onResendAsNew: (LightServiceMethod.GetMessages.Message) -> Unit,
-    onToggleLike: (LightServiceMethod.GetMessages.Message) -> Unit,
-    onOpenContext: (LightServiceMethod.GetMessages.Message) -> Unit,
+    onRetrySend: (ChatsMethods.GetMessages.Message) -> Unit,
+    onResendAsNew: (ChatsMethods.GetMessages.Message) -> Unit,
+    onToggleLike: (ChatsMethods.GetMessages.Message) -> Unit,
+    onOpenContext: (ChatsMethods.GetMessages.Message) -> Unit,
     onOpenImage: (ByteArray) -> Unit,
 ) {
     // Features toggles (feedback 2026-09-22): reaction tags/double-tap like,
@@ -2530,7 +2539,7 @@ private fun ForwardedArrowGlyph(modifier: Modifier = Modifier) {
  *  block. */
 @Composable
 private fun ForwardedMediaRow(
-    message: LightServiceMethod.GetMessages.Message,
+    message: ChatsMethods.GetMessages.Message,
     caption: String?,
     content: @Composable () -> Unit,
 ) {
@@ -2596,7 +2605,7 @@ private fun ForwardedMediaRow(
  *  Tapping the thumbnail opens the fullscreen viewer. */
 @Composable
 private fun ImageMessageContent(
-    message: LightServiceMethod.GetMessages.Message,
+    message: ChatsMethods.GetMessages.Message,
     media: MediaState,
     onOpenImage: ((ByteArray) -> Unit)?,
     onOpenContext: (() -> Unit)?,
@@ -2707,7 +2716,7 @@ private fun ImageMessageContent(
  *  a silent no-op. */
 @Composable
 private fun AudioMessageContent(
-    message: LightServiceMethod.GetMessages.Message,
+    message: ChatsMethods.GetMessages.Message,
     playing: Boolean,
     playingPositionMs: Long?,
     playingPositionAtMs: Long,
@@ -2761,7 +2770,13 @@ private fun AudioMessageContent(
             // grammar).
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onTap = { currentOnTogglePlay() },
+                    onTap = {
+                        // The play/pause toggle buzzes like every other row
+                        // (it was the only tap in the tool with no haptic —
+                        // LP3 feedback 2026-10-09).
+                        buzz()
+                        currentOnTogglePlay()
+                    },
                     onLongPress = {
                         buzz()
                         currentOnOpenContext?.invoke()

@@ -61,38 +61,38 @@ class SyncHealthTest {
     // --- healthLine (Account screen status line) ---
 
     @Test
-    fun `no round yet says so and carries the push state`() {
+    fun `no round yet says so`() {
         assertEquals(
-            "No sync round yet · push connected",
-            SyncHealth.healthLine(lastOkAtMs = 0L, failures = 0, pushConnected = true, nowMs = 1_000L),
+            "No sync round yet",
+            SyncHealth.healthLine(lastOkAtMs = 0L, failures = 0, nowMs = 1_000L),
         )
     }
 
     @Test
-    fun `healthy line is last-round age plus push state`() {
+    fun `healthy line is last-round age`() {
         assertEquals(
-            "2m ago · push connected",
-            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = true, nowMs = 1_000L + 120_000L),
+            "2m ago",
+            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, nowMs = 1_000L + 120_000L),
         )
     }
 
     @Test
     fun `failures appear only when above zero`() {
         assertEquals(
-            "14m ago · 3 failed · push disconnected",
-            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 3, pushConnected = false, nowMs = 1_000L + 14 * 60_000L),
+            "14m ago · 3 failed",
+            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 3, nowMs = 1_000L + 14 * 60_000L),
         )
         assertEquals(
-            "14m ago · push disconnected",
-            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = false, nowMs = 1_000L + 14 * 60_000L),
+            "14m ago",
+            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, nowMs = 1_000L + 14 * 60_000L),
         )
     }
 
     @Test
-    fun `under a minute reads as less than one minute`() {
+    fun `under a minute reads as just now`() {
         assertEquals(
-            "<1m ago · push connected",
-            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, pushConnected = true, nowMs = 1_000L + 5_000L),
+            "just now",
+            SyncHealth.healthLine(lastOkAtMs = 1_000L, failures = 0, nowMs = 1_000L + 5_000L),
         )
     }
 }

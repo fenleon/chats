@@ -33,25 +33,31 @@ object SyncHealth {
         return elapsed > STALL_MULTIPLIER * expectedIntervalMs
     }
 
-    /** The one Account-screen status suffix: last successful round age,
-     *  consecutive failures when any, push-channel state. Combined with the
-     *  account status word on a single line ("Syncing · 2m ago · push
-     *  connected"), so it carries no "Sync" prefix of its own. */
-    fun healthLine(lastOkAtMs: Long, failures: Int, pushConnected: Boolean, nowMs: Long): String {
-        val push = if (pushConnected) "push connected" else "push disconnected"
+    /** The one Account-screen status suffix: last successful round age and
+     *  consecutive failures when any. Combined with the account status word
+     *  on a single line ("Syncing · 2m ago"), so it carries no "Sync" prefix
+     *  of its own. (The push half is gone: Rung 1 has no push at all, and
+     *  the "No background sync available" wording read as noise — LP3
+     *  feedback 2026-10-09.) */
+    fun healthLine(lastOkAtMs: Long, failures: Int, nowMs: Long): String {
         return when {
-            lastOkAtMs == 0L -> "No sync round yet · $push"
+            lastOkAtMs == 0L -> "No sync round yet"
             else -> {
+                val age = ago(nowMs - lastOkAtMs)
+                // "just now" carries no "ago" ("Last updated just now").
+                val agePart = if (age == "just now") age else "$age ago"
                 val failuresPart = if (failures > 0) " · $failures failed" else ""
-                "${ago(nowMs - lastOkAtMs)} ago$failuresPart · $push"
+                agePart + failuresPart
             }
         }
     }
 
-    private fun ago(millis: Long): String {
+    /** Compact elapsed label ("just now"/"3m"/"2h"/"5d") — shared with the
+     *  Account screen's Manual Sync Now subtitle. */
+    internal fun ago(millis: Long): String {
         val minutes = millis / 60_000
         return when {
-            minutes < 1 -> "<1m"
+            minutes < 1 -> "just now"
             minutes < 60 -> "${minutes}m"
             minutes < 60 * 24 -> "${minutes / 60}h"
             else -> "${minutes / (60 * 24)}d"

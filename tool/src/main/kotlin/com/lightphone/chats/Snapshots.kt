@@ -1,6 +1,5 @@
 package com.lightphone.chats
 
-import com.thelightphone.sdk.shared.LightServiceMethod
 import com.thelightphone.sdk.shared.lightJson
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,7 +53,7 @@ object Snapshots {
     @Serializable
     private data class RoomsFile(
         val userId: String? = null,
-        val rooms: List<LightServiceMethod.GetRooms.Room> = emptyList(),
+        val rooms: List<ChatsMethods.GetRooms.Room> = emptyList(),
     )
 
     /** The account the currently seeded rooms belong to (from the file's tag;
@@ -71,7 +70,7 @@ object Snapshots {
      * no usable snapshot exists. Called synchronously at ViewModel creation —
      * the read is a small file, and the first frame must already carry it.
      */
-    fun seedRooms(): List<LightServiceMethod.GetRooms.Room> {
+    fun seedRooms(): List<ChatsMethods.GetRooms.Room> {
         val d = dir ?: return emptyList()
         val file = File(d, ROOMS_FILE)
         if (!file.exists()) return emptyList()
@@ -89,7 +88,7 @@ object Snapshots {
      * repository order, tagged with the account userId). Content-deduped: a
      * quiet refresh that changed nothing rewrites nothing.
      */
-    fun saveRooms(userId: String?, rooms: List<LightServiceMethod.GetRooms.Room>) {
+    fun saveRooms(userId: String?, rooms: List<ChatsMethods.GetRooms.Room>) {
         val d = dir ?: return
         if (rooms.isEmpty()) return
         val kept = rooms.take(MAX_ROOMS)
@@ -109,7 +108,7 @@ object Snapshots {
     private data class ThreadRoom(
         val roomId: String,
         val lastOpenAtMs: Long,
-        val messages: List<LightServiceMethod.GetMessages.Message> = emptyList(),
+        val messages: List<ChatsMethods.GetMessages.Message> = emptyList(),
     )
 
     @Serializable
@@ -121,7 +120,7 @@ object Snapshots {
     private val threadSignatures = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     /** The saved newest page for [roomId] (oldest-first), or empty. */
-    fun seedThread(roomId: String): List<LightServiceMethod.GetMessages.Message> {
+    fun seedThread(roomId: String): List<ChatsMethods.GetMessages.Message> {
         val d = dir ?: return emptyList()
         val file = File(d, THREADS_FILE)
         if (!file.exists()) return emptyList()
@@ -140,7 +139,7 @@ object Snapshots {
      * Content-deduped per room: an open whose newest row didn't change
      * rewrites nothing.
      */
-    fun saveThread(userId: String?, roomId: String, messages: List<LightServiceMethod.GetMessages.Message>) {
+    fun saveThread(userId: String?, roomId: String, messages: List<ChatsMethods.GetMessages.Message>) {
         val d = dir ?: return
         if (messages.isEmpty()) return
         val kept = messages.takeLast(MAX_THREAD_ROWS)
