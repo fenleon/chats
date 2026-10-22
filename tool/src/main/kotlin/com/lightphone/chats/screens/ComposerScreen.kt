@@ -264,7 +264,15 @@ class ComposerScreen(
                     modifier = Modifier.background(LightThemeTokens.colors.background),
                     submitLabel = "Send",
                     submitIcon = LightIcons.SEND,
+                    submitInTopBar = true,
+                    topBarSubmitIcon = LightIcons.SEND,
                     singleLine = false,
+                    // Notes-style entry (same grammar as dev, feedback
+                    // 2026-10-22): small wrapping text anchored above the
+                    // keyboard, growing upward, newest line pinned while
+                    // typing; return makes newlines, not sends.
+                    submitOnReturn = false,
+                    bottomAligned = true,
                     initialCaps = true,
                 )
                 // Half-panel COPY/PASTE over the keyboard zone; the composer
