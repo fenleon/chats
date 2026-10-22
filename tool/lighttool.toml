@@ -1,8 +1,8 @@
 [tool]
 id = "com.lightphone.chats"
 label = "Messages"
-versionCode = 81
-versionName = "0.19.2"
+versionCode = 82
+versionName = "0.20.0"
 # ACCESS_NETWORK_STATE: the repository paces sync/media work off the live
 # connection state (LightConnectivity).
 permissions = ["android.permission.INTERNET", "android.permission.ACCESS_NETWORK_STATE", "android.permission.POST_NOTIFICATIONS", "android.permission.RECORD_AUDIO"]
