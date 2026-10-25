@@ -2671,7 +2671,8 @@ object MatrixRepository {
                 }
             runCatching { old?.closeSuspending() }
             ctx.stopService(android.content.Intent(ctx, ChatSyncService::class.java))
-            ctx.deleteDatabase(DB_NAME)
+            runCatching { dbFile(ctx).let { it.delete(); java.io.File(it.path + "-wal").delete(); java.io.File(it.path + "-shm").delete() } }
+            ctx.deleteDatabase(DB_NAME) // legacy pre-alignment copy — reclaim
             projectionTableReady = false
             ctx.cacheDir.resolve(MEDIA_DIR).deleteRecursively()
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
@@ -2694,6 +2695,7 @@ object MatrixRepository {
             // setup flow then uploads a fresh filter covering the current
             // room-account-data whitelist (one-time, prefs-gated).
             migrateSyncFilterIfNeeded(ctx)
+            migrateLegacyDb(ctx)
             val restored = runCatching {
                 MatrixClient.create(
                     repositoriesModule = RepositoriesModule.room(databaseBuilder(ctx)),
@@ -9753,7 +9755,10 @@ object MatrixRepository {
         prefs.getString(KEY_ACCESS_TOKEN, null)?.let { return it }
         val token = runCatching {
             val db = android.database.sqlite.SQLiteDatabase.openDatabase(
-                ctx.getDatabasePath(DB_NAME).path, null,
+                // Shared store first; the pre-alignment legacy copy is the
+                // fallback until a logout reclaims it.
+                dbFile(ctx).takeIf { it.exists() }?.path
+                    ?: ctx.getDatabasePath(DB_NAME).path, null,
                 android.database.sqlite.SQLiteDatabase.OPEN_READONLY,
             )
             try {
@@ -10071,6 +10076,14 @@ object MatrixRepository {
                 TAG,
                 "sync response: ${response.header("Content-Length") ?: "chunked"}B in ${t1 - t0}ms",
             )
+            // Delivery-health stamp for the long-poll loop — timedSyncOnce
+            // only covers slow mode; without this the Account row read
+            // "never synced" while the screen-on loop was actively syncing.
+            if (response.code in 200..299 &&
+                chain.request().url.encodedPath.endsWith("/sync")
+            ) {
+                recordSyncRoundOk()
+            }
             return@Interceptor response
         }
         // Off by default (efficiency ): the body buffering +
@@ -10323,8 +10336,36 @@ object MatrixRepository {
         }
     }
 
+    /** Session DB path — SHARED with main (dd7db87 moved the store into
+     *  filesDir there; dev used Room's default databases/ path until
+     *  2026-10-25, so switching installs between lines opened two different
+     *  stores and logged the user out. [migrateLegacyDb] copies the old
+     *  store over once.) */
+    private fun dbFile(context: Context) = java.io.File(context.filesDir, "$DB_NAME.db")
+
     private fun databaseBuilder(context: Context) =
-        Room.databaseBuilder(context, TrixnityRoomDatabase::class.java, DB_NAME)
+        Room.databaseBuilder(context, TrixnityRoomDatabase::class.java, dbFile(context).absolutePath)
+
+    /** One-time copy of the pre-alignment store (databases/matrix_client, the
+     *  Room default) onto the shared filesDir path — mirror of main's
+     *  migrateLegacyStore. Skipped when the new store already exists (that
+     *  means a main-line install created it; its session is the live one).
+     *  Runs only from ensureClient's pre-build, so a torn copy can never
+     *  clobber a healthy store. */
+    private fun migrateLegacyDb(context: Context) {
+        val target = dbFile(context)
+        if (target.exists()) return
+        val legacyDb = java.io.File(context.getDatabasePath(DB_NAME).path)
+        if (!legacyDb.exists()) return
+        runCatching {
+            legacyDb.copyTo(target, overwrite = true)
+            java.io.File(legacyDb.path + "-wal").takeIf { it.exists() }
+                ?.copyTo(java.io.File(target.path + "-wal"), overwrite = true)
+            java.io.File(legacyDb.path + "-shm").takeIf { it.exists() }
+                ?.copyTo(java.io.File(target.path + "-shm"), overwrite = true)
+            android.util.Log.i(TAG, "ensureClient: migrated legacy store ${legacyDb.path} → ${target.path}")
+        }.onFailure { android.util.Log.w(TAG, "legacy store migration failed: $it") }
+    }
 
     private fun mediaDir(context: Context) = (context.cacheDir.absolutePath + "/$MEDIA_DIR").toPath()
 
