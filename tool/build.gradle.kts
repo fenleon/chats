@@ -44,6 +44,7 @@ android {
         getByName("release") {
             isMinifyEnabled = true      // R8: dead-code elimination + obfuscation
             isShrinkResources = true    // drop unused resources
+            proguardFiles("proguard-rules.pro")  // optional-dep -dontwarn rules (netty tcnative et al.)
             signingConfig = signingConfigs.getByName("lightsdkDev")
         }
     }
