@@ -270,8 +270,8 @@ class ComposerScreen(
                     // Notes-style entry (same grammar as dev, feedback
                     // 2026-10-22): small wrapping text anchored above the
                     // keyboard, growing upward, newest line pinned while
-                    // typing; return makes newlines, not sends.
-                    submitOnReturn = false,
+                    // typing; return makes newlines, not sends (multi-line
+                    // default upstream too).
                     bottomAligned = true,
                     initialCaps = true,
                 )
