@@ -1678,7 +1678,7 @@ class ThreadScreen(
                     modifier = Modifier.navigationBarsPadding(),
                     items = listOf(
                         // Record a voice note — bottom left, like the built-in
-                        // Messages app's layout (dev: mic · photo · compose).
+                        // Messages app's layout (dev carried the same slot).
                         LightBarButton.LightIcon(
                             icon = LightIcons.MICROPHONE,
                             onClick = {
@@ -1686,14 +1686,12 @@ class ThreadScreen(
                             },
                             contentDescription = "Record voice note",
                         ),
-                        // main has no photo attach (Rung-1 strip) — the empty
-                        // center slot keeps compose on the right, same as dev.
-                        null,
                         LightBarButton.LightIcon(
                             icon = LightIcons.COMPOSE_MESSAGE,
                             onClick = { openComposer() },
                             contentDescription = "New message",
                         ),
+                        null,
                     ),
                 )
             }
