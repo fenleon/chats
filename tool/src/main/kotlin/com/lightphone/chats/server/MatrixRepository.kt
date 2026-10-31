@@ -7,7 +7,7 @@ import android.webkit.MimeTypeMap
 import com.lightphone.chats.BuildConfig
 import com.lightphone.chats.server.MatrixRepository.ChatConnectionState
 import com.thelightphone.sdk.SealedLightContext
-import com.thelightphone.sdk.roomDatabaseBuilder
+import com.thelightphone.sdk.buildDatabase
 import com.thelightphone.sdk.shared.lightJson
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
@@ -306,6 +306,20 @@ object MatrixRepository {
      * delete — no Context needed. Room creates `-wal`/`-shm` siblings.
      */
     private fun dbFile(slc: SealedLightContext) = java.io.File(slc.filesDir, "$DB_NAME.db")
+    // The builder form of buildDatabase via upstream's configure lambda
+    // (Light's API after #291; our roomDatabaseBuilder PR #281 was reverted in
+    // that merge): capture the Builder in the lambda, hand it to Trixnity's
+    // RepositoriesModule.room(builder). buildDatabase still builds a phantom
+    // instance — Room only opens on first query, and the phantom never gets
+    // one. Revisit if upstream restores the builder-returning form.
+    private fun trixnityDbBuilderViaConfigure(slc: SealedLightContext): androidx.room.RoomDatabase.Builder<TrixnityRoomDatabase> {
+        lateinit var builder: androidx.room.RoomDatabase.Builder<TrixnityRoomDatabase>
+        slc.buildDatabase(TrixnityRoomDatabase::class.java, dbFile(slc).absolutePath) {
+            builder = this
+            this
+        }
+        return builder
+    }
 
     /** Cache scratch space (voice temps, media cache) under filesDir. */
     private fun SealedLightContext.cacheDir() = java.io.File(filesDir, "cache")
@@ -923,7 +937,7 @@ object MatrixRepository {
         pendingVerificationPhase = true
         verificationSyncSwapped.set(false)
         val loginResult = MatrixClient.create(
-            repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath)),
+            repositoriesModule = RepositoriesModule.room(trixnityDbBuilderViaConfigure(ctx)),
             mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
             cryptoDriverModule = CryptoDriverModule.libOlm(),
             authProviderData = authProviderData,
@@ -1253,7 +1267,7 @@ object MatrixRepository {
         val prefsKey = "sync_filter_mappings_v_$userId"
         if (prefs.getInt(prefsKey, 0) >= SYNC_FILTER_MAPPINGS_VERSION) return
         runCatching {
-            val db = ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath).build()
+            val db = trixnityDbBuilderViaConfigure(ctx).build()
             try {
                 db.openHelper.writableDatabase.execSQL("UPDATE Account SET filter = NULL")
             } finally {
@@ -2117,7 +2131,7 @@ object MatrixRepository {
             migrateSyncFilterIfNeeded(ctx)
             suspend fun buildClient(): MatrixClient? = runCatching {
                 MatrixClient.create(
-                    repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath)),
+                    repositoriesModule = RepositoriesModule.room(trixnityDbBuilderViaConfigure(ctx)),
                     mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
                     cryptoDriverModule = CryptoDriverModule.libOlm(),
                     authProviderData = null, // restore from the store (built-in Account→Authentication migration)
@@ -5773,7 +5787,7 @@ object MatrixRepository {
                 httpClientEngine = buildHttpClientEngine()
                 val restored = runCatching {
                     MatrixClient.create(
-                        repositoriesModule = RepositoriesModule.room(ctx.roomDatabaseBuilder(TrixnityRoomDatabase::class.java, dbFile(ctx).absolutePath)),
+                        repositoriesModule = RepositoriesModule.room(trixnityDbBuilderViaConfigure(ctx)),
                         mediaStoreModule = MediaStoreModule.okio(mediaDir(ctx)),
                         cryptoDriverModule = CryptoDriverModule.libOlm(),
                         authProviderData = null, // restore from the store
