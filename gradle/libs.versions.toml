@@ -7,7 +7,7 @@ ktor = "3.5.2"
 room = "2.8.4"
 work = "2.10.0"
 trixnity = "5.8.0"
-sdk = "0.1.0"
+sdk = "0.2.3"
 connector = "3.3.2"
 
 [libraries]
