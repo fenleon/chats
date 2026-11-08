@@ -10,8 +10,8 @@ matrix homeserver (Beeper)                 ntfy.sh (Matrix Push Gateway)       L
 ┌──────────────────┐  POST /_matrix/   ┌──────────────────────┐  SSE /json  ┌──────────────┐
 │ message arrives  │ push/v1/notify    │ routes by pushkey →  │ ◄────────── │ companion    │
 │ push rules match │ ─────────────────►│ private topic        │  holds open │ wakes, one   │
-│ pusher data.url  │                    │ (per install)       │             │ /sync, notif │
-└──────────────────┘                    └──────────────────────┘             └──────────────┘
+│ pusher data.url  │                   │ (per install)        │             │ /sync, notif │
+└──────────────────┘                   └──────────────────────┘             └──────────────┘
 ```
 
 No tokens or message content leave the phone: the notify payload is
