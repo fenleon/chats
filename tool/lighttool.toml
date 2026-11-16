@@ -1,5 +1,5 @@
 [tool]
-id = "com.lightphone.chats"
+id = "com.fenleon.chats"
 label = "Messages"
 versionCode = 84
 versionName = "0.21.0"
