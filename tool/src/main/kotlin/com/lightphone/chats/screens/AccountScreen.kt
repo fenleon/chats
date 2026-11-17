@@ -1,0 +1,1089 @@
+package com.lightphone.chats.screens
+
+import com.lightphone.chats.ChatsMethods
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.input.rememberTextFieldState
+import androidx.compose.foundation.text.TextAutoSize
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewModelScope
+import com.lightphone.chats.ChatClient
+import com.lightphone.chats.R
+import com.lightphone.chats.server.MatrixRepository
+import com.lightphone.chats.server.SyncHealth
+import com.thelightphone.lp3Keyboard.ui.KeyboardOptions
+import com.thelightphone.sdk.LightScreen
+import com.thelightphone.sdk.LightViewModel
+import com.thelightphone.sdk.SealedLightActivity
+import com.thelightphone.sdk.SimpleLightScreen
+import com.thelightphone.sdk.ui.LightBarButton
+import com.thelightphone.sdk.ui.LightBottomBar
+import com.thelightphone.sdk.ui.LightIcon
+import com.thelightphone.sdk.ui.LightIconConfiguration
+import com.thelightphone.sdk.ui.LightIcons
+import com.thelightphone.sdk.ui.LightScrollView
+import com.thelightphone.sdk.ui.LightText
+import com.thelightphone.sdk.ui.LightTextInputEditor
+import com.thelightphone.sdk.ui.LightTextField
+import com.thelightphone.sdk.ui.LightTextVariant
+import com.thelightphone.sdk.ui.LightTheme
+import com.thelightphone.sdk.ui.LightThemeController
+import com.thelightphone.sdk.ui.LightThemeTokens
+import com.thelightphone.sdk.ui.LightTopBar
+import com.thelightphone.sdk.ui.LightTopBarCenter
+import com.thelightphone.sdk.ui.gridUnitsAsDp
+import com.thelightphone.sdk.ui.lightClickable
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+
+/**
+ * The account panel: login setup, account status, and device verification —
+ * moved out of Settings. Reachable from Settings → Account.
+ */
+class AccountViewModel : LightViewModel<Unit>() {
+
+    // Login form; credentials live only on the companion, these are transient.
+    // "beeper" is the v1 login (WhatsApp via a Beeper account); "homeserver"
+    // stays in the UI as dev/test tooling (the emulator runs against Synapse).
+    val beeperMode = MutableStateFlow(true)
+    val beeperEmail = MutableStateFlow("")
+    val beeperCode = MutableStateFlow("")
+    val codeStatus = MutableStateFlow<String?>(null)
+    /** True once REQUEST CODE succeeded — the bar button reads REQUEST AGAIN
+     *  until a login (or logout) resets the flow (2026-08-29). */
+    val codeRequested = MutableStateFlow(false)
+
+    val homeserver = MutableStateFlow("")
+    val user = MutableStateFlow("")
+    val password = MutableStateFlow("")
+    val tokenLogin = MutableStateFlow(false)
+
+    val account = MutableStateFlow<ChatsMethods.GetAccountState.Response?>(null)
+    val connection = MutableStateFlow<ChatsMethods.GetConnectionState.Response?>(null)
+    val delivery = MutableStateFlow<MatrixRepository.DeliveryHealth?>(null)
+    val e2ee = MutableStateFlow<ChatsMethods.GetE2eeState.Response?>(null)
+    /**
+     * Whether the e2ee verdict has settled. The first read on a cold trust
+     * store can lag a poll behind the truth, so "Verify Device" only shows
+     * after a verified read OR two consecutive unverified reads — until then
+     * the row reads "Checking…".
+     */
+    val e2eeSettled = MutableStateFlow(false)
+    /** The verification state machine's state string ("none" | "waiting" |
+     *  "accept" | "start" | "verifying" | "compare" | …) — the Verify Device
+     *  row reads it to show "Verifying" mid-process. */
+    val verification = MutableStateFlow<String?>(null)
+    val busy = MutableStateFlow(false)
+    val error = MutableStateFlow<String?>(null)
+
+    override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
+        super.onScreenShow(screen)
+        // Open-only sync driver (see ChatListScreen): resume re-fires this.
+        ChatClient.startSync()
+        // No thread is on screen here; let the companion notify again.
+        viewModelScope.launch { ChatClient.setActiveRoom(null) }
+        refreshStatus()
+        startPolling()
+    }
+
+    override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
+        super.onScreenHide(screen)
+        stopPolling()
+    }
+
+    override fun onAppPause() {
+        super.onAppPause()
+        ChatClient.stopSync()
+        stopPolling()
+    }
+
+    /** Keeps the status fresh while Account is visible (sync state, rooms).
+     *  A long-poll wait on the companion's status revision (bumped wherever a
+     *  connection/verification fact commits) replaces the fixed 5 s tick; the
+     *  wait's timeout window doubles as the dead-man re-check that settles
+     *  the e2ee verdict (two consecutive reads). */
+    private fun startPolling() {
+        if (pollJob?.isActive == true) return
+        pollJob = viewModelScope.launch {
+            var last = 0L
+            while (true) {
+                val revision = ChatClient.waitForStatusChange(last)
+                if (revision != last) last = revision
+                refreshStatus()
+            }
+        }
+    }
+
+    private fun stopPolling() {
+        pollJob?.cancel()
+        pollJob = null
+    }
+
+    fun refreshStatus() {
+        viewModelScope.launch {
+            val state = ChatClient.accountState()
+            account.value = state
+            connection.value = ChatClient.connectionState()
+            delivery.value = ChatClient.deliveryHealth()
+            val newE2ee = ChatClient.e2eeState()
+            val prev = e2ee.value
+            e2ee.value = newE2ee
+            // A verified read settles immediately; an unverified one only after
+            // two consecutive reads agree (the first read on a cold trust
+            // store can lag — see [e2eeSettled]).
+            e2eeSettled.value = newE2ee?.verified == true ||
+                (prev != null && prev.verified == false && newE2ee?.verified == false)
+            verification.value = ChatClient.verificationState()?.state
+            // Keep the homeserver field in step with the account that's active.
+            state?.homeserver?.takeIf { it.isNotBlank() }?.let {
+                homeserver.value = it
+            }
+            state?.loginMode?.let { beeperMode.value = (it == "beeper") }
+        }
+    }
+
+    fun setLoginMode(beeper: Boolean) {
+        if (beeperMode.value == beeper) return
+        beeperMode.value = beeper
+        error.value = null
+    }
+
+    /** Beeper login, step 1: emails a code, then opens the code-entry panel via
+     *  [onSuccess] (which receives the email, for the panel's "code sent"
+     *  caption) once the request is confirmed — the feedback flow: the bottom
+     *  bar's "request code" both sends the code and opens the code panel.
+     *  Runs off-main: the in-process binder executes the server's handler on
+     *  the caller's thread, and these are multi-second network calls (the
+     *  login also starts the foreground sync service — a main-thread block
+     *  past its 5 s window crashed the app). */
+    fun requestCode(onSuccess: (email: String) -> Unit) {
+        if (busy.value) return
+        val email = beeperEmail.value.trim()
+        if (email.isBlank()) {
+            error.value = "Enter your Beeper email first."
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            busy.value = true
+            error.value = null
+            codeStatus.value = null
+            try {
+                val failure = ChatClient.beeperRequestCode(email)
+                if (failure != null) {
+                    error.value = failure
+                } else {
+                    codeRequested.value = true
+                    codeStatus.value = "Code sent to $email"
+                    onSuccess(email)
+                }
+            } finally {
+                // A binder exception must not leave the button dead — busy always clears.
+                busy.value = false
+            }
+        }
+    }
+
+    fun login(onNeedsVerification: () -> Unit = {}) {
+        if (busy.value) return
+        viewModelScope.launch(Dispatchers.IO) {
+            busy.value = true
+            error.value = null
+            try {
+                val needsVerification: Boolean
+                val failure: String?
+                if (beeperMode.value) {
+                    val result = ChatClient.beeperLogin(beeperEmail.value.trim(), beeperCode.value.trim())
+                    needsVerification = result.getOrNull()?.needsVerification == true
+                    failure = result.exceptionOrNull()?.message
+                } else {
+                    val response = ChatClient.setAccount(
+                        homeserver = homeserver.value.trim(),
+                        user = user.value.trim(),
+                        passwordOrToken = password.value,
+                        tokenLogin = tokenLogin.value,
+                    )
+                    needsVerification = response?.needsVerification == true
+                    failure = if (response != null) null
+                    else "Couldn't log in. Check the homeserver and credentials."
+                }
+                if (failure == null) {
+                    password.value = ""
+                    beeperCode.value = ""
+                    codeStatus.value = null
+                    codeRequested.value = false
+                    refreshStatus()
+                    // Verification is part of login when there is something to
+                    // verify against — the companion already started the request,
+                    // so go straight into the verify flow. The X on the screen
+                    // still skips; landing in the normal app is fine.
+                    if (needsVerification) onNeedsVerification()
+                } else {
+                    error.value = failure
+                }
+            } finally {
+                busy.value = false
+            }
+        }
+    }
+
+    fun logout() {
+        if (busy.value) return
+        viewModelScope.launch(Dispatchers.IO) {
+            busy.value = true
+            try {
+                ChatClient.logout()
+                password.value = ""
+                beeperCode.value = ""
+                codeStatus.value = null
+                codeRequested.value = false
+                refreshStatus()
+            } finally {
+                busy.value = false
+            }
+        }
+    }
+
+    fun toggleTokenLogin() {
+        tokenLogin.value = !tokenLogin.value
+    }
+
+    private var pollJob: Job? = null
+}
+
+class AccountScreen(sealedActivity: SealedLightActivity) :
+    LightScreen<Unit, AccountViewModel>(sealedActivity) {
+
+    override val viewModelClass: Class<AccountViewModel>
+        get() = AccountViewModel::class.java
+
+    override fun createViewModel(): AccountViewModel = AccountViewModel()
+
+    /** Password/token display mask — the plaintext only lives in the editor
+     *  once submitted (feedback 2026-08-19). */
+    private companion object {
+        const val MASKED_SECRET = "••••••••"
+
+        /** Verification states that mean "not in progress" — everything else
+         *  (waiting/accept/start/verifying/compare) reads "Verifying". */
+        val VERIFICATION_TERMINAL_STATES = setOf("none", "done", "cancelled", "error")
+    }
+
+    @Composable
+    override fun Content() {
+        val beeperMode by viewModel.beeperMode.collectAsState()
+        val beeperEmail by viewModel.beeperEmail.collectAsState()
+        val beeperCode by viewModel.beeperCode.collectAsState()
+        val codeStatus by viewModel.codeStatus.collectAsState()
+        val codeRequested by viewModel.codeRequested.collectAsState()
+        val homeserver by viewModel.homeserver.collectAsState()
+        val user by viewModel.user.collectAsState()
+        val password by viewModel.password.collectAsState()
+        val tokenLogin by viewModel.tokenLogin.collectAsState()
+        val account by viewModel.account.collectAsState()
+        val connection by viewModel.connection.collectAsState()
+        val delivery by viewModel.delivery.collectAsState()
+        val e2ee by viewModel.e2ee.collectAsState()
+        val e2eeSettled by viewModel.e2eeSettled.collectAsState()
+        val verification by viewModel.verification.collectAsState()
+        val error by viewModel.error.collectAsState()
+        val busy by viewModel.busy.collectAsState()
+        val themeColors by LightThemeController.colors.collectAsState()
+
+        // Shared navigation into the verify flow (post-login auto-entry and
+        // the Verify Device row).
+        val goVerify: () -> Unit = { navigateTo(screenFactory = { VerificationScreen(it) }) }
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                LightTopBar(
+                    leftButton = LightBarButton.LightIcon(
+                        icon = LightIcons.BACK,
+                        onClick = { goBack() },
+                        contentDescription = "Back to settings",
+                    ),
+                    center = LightTopBarCenter.Text("Account"),
+                )
+                Box(modifier = Modifier.weight(1f)) {
+                    // Settings rows start 0.5 gu below the top bar (its scroll
+                    // Column carries vertical 0.5 gu padding) — match it so the
+                    // "Server" row sits at the same height as Settings'
+                    // "Account" row.
+                    LightScrollView(
+                        modifier = Modifier.padding(top = 0.5f.gridUnitsAsDp()),
+                    ) {
+                        if (account?.loggedIn == true) {
+                            // Logged in: four rows (LP3 feedback 2026-10-14) —
+                            // read-only sync status, Manual Sync Now,
+                            // verification status, Log Out. The login form
+                            // (email/code) would be dead weight here.
+                            SyncStatusRow(
+                                connection = connection,
+                                delivery = delivery,
+                            )
+                            // Manual Sync Now: kicks a real round now — the
+                            // success stamps last-updated and bumps the
+                            // revision, which refetches this screen — then
+                            // opens the confirming popover.
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .lightClickable(onClick = {
+                                        ChatClient.syncNow()
+                                        navigateTo(screenFactory = { SyncingPanel(it) })
+                                    })
+                                    .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                            ) {
+                                LightText(text = "Manual Sync Now", variant = LightTextVariant.Heading)
+                            }
+                            RecoveryRow(connection = connection)
+                            EncryptionRow(
+                                e2ee = e2ee,
+                                settled = e2eeSettled,
+                                verifying = verification != null &&
+                                    verification !in VERIFICATION_TERMINAL_STATES,
+                                onClick = if (e2ee?.verified == true || !e2eeSettled) null else goVerify,
+                            )
+                            // Log Out as a plain action row (LP3 feedback
+                            // 2026-10-09) — it read as a mode switch in the
+                            // bottom bar; as a row it sits with the other
+                            // account actions.
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .lightClickable(enabled = !busy, onClick = {
+                                        navigateTo(screenFactory = { LogoutConfirmPanel(it) }) { confirmed ->
+                                            if (confirmed) viewModel.logout()
+                                        }
+                                    })
+                                    .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+                            ) {
+                                LightText(text = "Log Out", variant = LightTextVariant.Heading)
+                            }
+                        } else {
+                            // Logged out: if the session just expired, say so
+                            // instead of showing a bare login form (the user
+                            // should re-login directly, not hunt for LOG OUT).
+                            val conn = connection
+                            if (conn?.state == "offline" &&
+                                conn.detail?.startsWith("session expired") == true
+                            ) {
+                                LightText(
+                                    text = "Your session expired — sign in again.",
+                                    variant = LightTextVariant.Detail,
+                                    modifier = Modifier.padding(
+                                        horizontal = 2f.gridUnitsAsDp(),
+                                        vertical = 0.5f.gridUnitsAsDp(),
+                                    ),
+                                )
+                            }
+                            // The Server row opens the picker (Beeper vs Matrix
+                            // homeserver); the flow's fields render below it.
+                            ServerRow(
+                                beeperMode = beeperMode,
+                                onClick = {
+                                    navigateTo(screenFactory = { ServerScreen(it, beeperMode) }) { selected ->
+                                        viewModel.setLoginMode(selected)
+                                    }
+                                },
+                            )
+                            if (beeperMode) {
+                                FormField(
+                                    label = "Beeper email",
+                                    value = beeperEmail,
+                                    placeholder = "you@example.com",
+                                    onClick = { editField("Beeper email", viewModel.beeperEmail) },
+                                )
+                                // The Enter code entry appears once a code has
+                                // been requested.
+                                // No email in the label/title — privacy on
+                                // shared screens.
+                                if (codeStatus != null || beeperCode.isNotEmpty()) {
+                                    FormField(
+                                        label = "Enter code sent to your email",
+                                        value = beeperCode,
+                                        placeholder = "6-digit code",
+                                        onClick = {
+                                            editField(
+                                                title = "Enter Beeper code",
+                                                field = viewModel.beeperCode,
+                                                // The code editor submits (was
+                                                // SAVE — feedback 2026-08-19).
+                                                submitLabel = "SUBMIT",
+                                            ) { code ->
+                                                if (code.isNotBlank()) viewModel.login(goVerify)
+                                            }
+                                        },
+                                    )
+                                }
+                            } else {
+                                FormField(
+                                    label = "Homeserver:",
+                                    value = homeserver,
+                                    placeholder = "matrix.example.org",
+                                    onClick = { editField("Homeserver", viewModel.homeserver) },
+                                )
+                                FormField(
+                                    label = "Username:",
+                                    value = user,
+                                    placeholder = "@user:server",
+                                    onClick = { editField("Username", viewModel.user) },
+                                )
+                                FormField(
+                                    label = if (tokenLogin) "Access token:" else "Password:",
+                                    // Masked once submitted — the plaintext only
+                                    // lives in the editor (feedback 2026-08-19).
+                                    value = if (password.isBlank()) password else MASKED_SECRET,
+                                    placeholder = if (tokenLogin) "syt_…" else "password",
+                                    onClick = { editField("Password", viewModel.password) },
+                                )
+                                TokenToggleRow(
+                                    tokenLogin = tokenLogin,
+                                    onToggle = viewModel::toggleTokenLogin,
+                                )
+                            }
+                            error?.let { message -> StatusLine(message) }
+                            // "Code sent to…" line removed — the Enter code field's label
+                            // carries the email now; codeStatus still gates
+                            // the field's appearance.
+                        }
+                    }
+                }
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        if (account?.loggedIn == true) {
+                            // Log Out moved to a row above (feedback
+                            // 2026-10-09) — the bar stays empty here.
+                            null
+                        } else if (beeperMode) {
+                            // Beeper flow: the bar's button sends the emailed
+                            // code, then an overlay panel confirms it and the
+                            // user enters the code via the Enter code field.
+                            LightBarButton.Text(
+                                text = if (busy) "…" else if (codeRequested) "REQUEST AGAIN" else "REQUEST CODE",
+                                onClick = if (busy) null else {
+                                    {
+                                        viewModel.requestCode { email ->
+                                            navigateTo(screenFactory = {
+                                                CodeSentPanel(it, email)
+                                            })
+                                        }
+                                    }
+                                },
+                            )
+                        } else {
+                            LightBarButton.Text(
+                                text = if (busy) "…" else "LOG IN",
+                                onClick = if (busy) null else {
+                                    { viewModel.login(goVerify) }
+                                },
+                            )
+                        },
+                    ),
+                )
+            }
+        }
+    }
+
+    /** Opens the LP3 keyboard editor for one login field; the trimmed result
+     *  replaces the field, an explicit back (no result) keeps the old value.
+     *  [onResult] fires with the accepted value (e.g. the beeper login after
+     *  the code). [submitLabel] — SAVE for field editors, SUBMIT for the code
+     *  entry. */
+    private fun editField(
+        title: String,
+        field: MutableStateFlow<String>,
+        submitLabel: String = "SAVE",
+        onResult: (String) -> Unit = {},
+    ) {
+        navigateTo(screenFactory = {
+            FieldEditorScreen(it, title, field.value, submitLabel)
+        }) { value ->
+            field.value = value
+            onResult(value)
+        }
+    }
+}
+
+/** A login-form field row: the LightTextField with the standard row padding. */
+@Composable
+private fun FormField(
+    label: String,
+    value: String,
+    placeholder: String,
+    onClick: () -> Unit,
+) {
+    LightTextField(
+        label = label,
+        value = value,
+        placeholder = placeholder,
+        onClick = onClick,
+        modifier = Modifier.padding(
+            horizontal = 2f.gridUnitsAsDp(),
+            vertical = 0.75f.gridUnitsAsDp(),
+        ),
+    )
+}
+
+/** A Detail-sized status line under the form (login error / code status). */
+@Composable
+private fun StatusLine(text: String) {
+    LightText(
+        text = text,
+        variant = LightTextVariant.Detail,
+        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.5f.gridUnitsAsDp()),
+    )
+}
+
+@Composable
+private fun TokenToggleRow(
+    tokenLogin: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .lightClickable(onClick = onToggle)
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+        // The toggle sits immediately left of its action label, the row
+        // top-aligned so it lines up with the main label (same as Audiobooks
+        // Settings).
+        verticalAlignment = Alignment.Top,
+    ) {
+        Box(
+            modifier = Modifier.size(36.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            LightIcon(
+                icon = if (tokenLogin) LightIcons.TOGGLE_STATE_ON else LightIcons.TOGGLE_STATE_OFF,
+                // 2 gu ≈ the native switch pill (feedback 2026-08-19: the
+                // 1.5-gu toggles were too small).
+                size = 2f,
+                contentDescription = if (tokenLogin) {
+                    "Log in with an access token"
+                } else {
+                    "Log in with a password"
+                },
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Column {
+            LightText(
+                text = "Use access token",
+                // A settings toggle row — Heading title like the Settings
+                // page's toggles (feedback 2026-08-19).
+                variant = LightTextVariant.Heading,
+            )
+            LightText(
+                text = "instead of password",
+                variant = LightTextVariant.Detail,
+            )
+        }
+    }
+}
+
+/** Login path row: a single "Server" entry whose value is the active
+ *  selection (Beeper or Matrix homeserver); tapping opens [ServerScreen].
+ *  Value-row anatomy — "Server" is the Copy-sized top text, the selection the
+ *  Heading-sized main text, flush-left (DESIGN.md §6). */
+@Composable
+private fun ServerRow(
+    beeperMode: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .lightClickable(onClick = onClick)
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column {
+            LightText(
+                text = "Server",
+                // Value-row top-text label — Detail-sized (DESIGN.md §6,
+                // feedback 2026-08-19).
+                variant = LightTextVariant.Detail,
+            )
+            LightText(
+                text = if (beeperMode) "Beeper" else "Matrix homeserver",
+                // The value sits almost touching the label — pulled up into the
+                // label's descender space (feedback 2026-08-19).
+                variant = LightTextVariant.Heading,
+                modifier = Modifier.offset(y = (-3).dp),
+            )
+        }
+    }
+}
+
+/** The Server picker (feedback 2026-08-19): "Beeper" vs "Matrix homeserver",
+ *  the current selection underlined. Result: the chosen [AccountViewModel.beeperMode]. */
+class ServerScreen(
+    sealedActivity: SealedLightActivity,
+    private val beeperMode: Boolean,
+) : SimpleLightScreen<Boolean>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                LightTopBar(
+                    leftButton = LightBarButton.LightIcon(
+                        icon = LightIcons.BACK,
+                        onClick = { goBack() },
+                        contentDescription = "Back to account",
+                    ),
+                    center = LightTopBarCenter.Text("Server"),
+                )
+                LightScrollView {
+                    ServerOptionRow(
+                        label = "Beeper",
+                        active = beeperMode,
+                        onClick = { goBack(true) },
+                    )
+                    ServerOptionRow(
+                        label = "Matrix homeserver",
+                        active = !beeperMode,
+                        onClick = { goBack(false) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ServerOptionRow(
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+) {
+    LightText(
+        text = label,
+        variant = LightTextVariant.Heading,
+        // Every row full color; the selected one is underlined — selection is
+        // conveyed by underline, not color (design rule, feedback 2026-08-21).
+        underline = active,
+        modifier = Modifier
+            .fillMaxWidth()
+            .lightClickable(onClick = onClick)
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+    )
+}
+
+/** The request-code confirmation overlay: centered
+ *  "A code has been sent to <email>." / "Check your email." on separate lines
+ * with an X dismiss in the bottom centre; dismissing returns to
+ *  the account panel, where the Enter code field now appears. */
+class CodeSentPanel(
+    sealedActivity: SealedLightActivity,
+    private val email: String,
+) : SimpleLightScreen<Unit>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+        val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
+
+        // Auto-dismiss (feedback 2026-09-06): the panel is a confirmation, not
+        // a roadblock — the Enter code field waits on the account panel.
+        LaunchedEffect(Unit) {
+            delay(3_000L)
+            goBack()
+        }
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        LightText(
+                            text = "A code has been sent to $email",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                        Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                        LightText(
+                            text = "Check your email",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                    }
+                }
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        null,
+                        LightBarButton.Icon(
+                            painter = confirmX,
+                            onClick = { goBack() },
+                            contentDescription = "Dismiss",
+                        ),
+                        null,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/** The manual-sync confirmation popover: centered "Messages Syncing" +
+ *  subtitle, X dismiss bottom-centre, auto-dismiss after 3 s — the same
+ *  panel grammar as [CodeSentPanel]. */
+class SyncingPanel(
+    sealedActivity: SealedLightActivity,
+) : SimpleLightScreen<Unit>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+        val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
+
+        LaunchedEffect(Unit) {
+            delay(3_000L)
+            goBack()
+        }
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        LightText(
+                            text = "Messages Syncing",
+                            variant = LightTextVariant.Copy,
+                            align = TextAlign.Center,
+                        )
+                        Spacer(Modifier.height(1f.gridUnitsAsDp()))
+                        LightText(
+                            text = "Your account data is being updated in the background",
+                            variant = LightTextVariant.Detail,
+                            align = TextAlign.Center,
+                        )
+                    }
+                }
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        null,
+                        LightBarButton.Icon(
+                            painter = confirmX,
+                            onClick = { goBack() },
+                            contentDescription = "Dismiss",
+                        ),
+                        null,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/** The logout confirmation overlay: centered
+ *  "Do you want to log out of your account?" with the LP3 X (dismiss) and
+ *  triangle (confirm) — same panel grammar as the verify confirm. Result:
+ *  true = log out. */
+class LogoutConfirmPanel(
+    sealedActivity: SealedLightActivity,
+) : SimpleLightScreen<Boolean>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+        val confirmX = painterResource(R.drawable.ic_lp3_confirm_x)
+        val confirmTriangle = painterResource(R.drawable.ic_lp3_confirm_triangle)
+
+        LightTheme(colors = themeColors) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(LightThemeTokens.colors.background),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    LightText(
+                        text = "Are you sure you want to log out of your account?",
+                        variant = LightTextVariant.Copy,
+                        align = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 3f.gridUnitsAsDp()),
+                    )
+                }
+                LightBottomBar(
+                    modifier = Modifier.navigationBarsPadding(),
+                    items = listOf(
+                        LightBarButton.Icon(
+                            painter = confirmX,
+                            onClick = { goBack(false) },
+                            contentDescription = "Cancel",
+                        ),
+                        null,
+                        LightBarButton.Icon(
+                            painter = confirmTriangle,
+                            onClick = { goBack(true) },
+                            contentDescription = "Log out",
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/** Item 1 of the logged-in Account panel (LP3 feedback 2026-10-14): a
+ *  read-only status row — the "Message sync status" label over the current
+ *  status: "last updated X ago" once the round is settled, else the working
+ *  word alone ("syncing", "offline" — no health suffix; the age lives in the
+ *  settled value, LP3 feedback 2026-10-14). Not clickable — Manual Sync Now
+ *  is its own row below. History recovery is a separate row ([RecoveryRow]),
+ *  so settled no longer waits on the key-backup restore. Values lowercase —
+ *  dynamic status words read as state, not headings. */
+@Composable
+private fun SyncStatusRow(
+    connection: ChatsMethods.GetConnectionState.Response?,
+    delivery: MatrixRepository.DeliveryHealth?,
+) {
+    Column(
+        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+    ) {
+        LightText(text = "Message sync status", variant = LightTextVariant.Detail)
+        val syncedSettled = connection?.let { state ->
+            val backfillSettled = state.backfillRoomsTotal == 0 ||
+                state.backfillRoomsDone >= state.backfillRoomsTotal
+            val storeCaughtUp = state.roomsJoined > 0 &&
+                state.roomsProjected >= state.roomsJoined
+            state.state == "syncing" && storeCaughtUp && backfillSettled
+        } == true
+        val value = if (syncedSettled) {
+            delivery?.lastSuccessfulRoundAtMs
+                ?.takeIf { it > 0 }
+                ?.let {
+                    val age = SyncHealth.ago(System.currentTimeMillis() - it)
+                    if (age == "just now") "last updated $age" else "last updated $age ago"
+                }
+                ?: "never synced"
+        } else {
+            connection?.let { state ->
+                val backfillRunning = state.backfillRoomsTotal > 0 &&
+                    state.backfillRoomsDone < state.backfillRoomsTotal
+                when {
+                    backfillRunning ->
+                        "syncing messages… ${state.backfillRoomsDone} of ${state.backfillRoomsTotal}"
+                    state.state == "offline" -> "offline"
+                    // Trixnity reports INITIAL_SYNC (mapped to "connecting") for
+                    // the WHOLE first sync round — many minutes on a large
+                    // account, while the room list is already visibly populated.
+                    // Once rooms have landed, "connecting" reads as a lie: the
+                    // sync is actively working — say syncing.
+                    state.state == "connecting" && state.roomsTotal > 0 -> "syncing"
+                    state.state == "connecting" -> "connecting"
+                    state.state == "syncing" -> "syncing"
+                    else -> state.state
+                }
+            } ?: "…"
+        }
+        OneLineValue(
+            text = value,
+            // The value sits almost touching the label — pulled up into the
+            // label's descender space (same value-row anatomy as ServerRow).
+            modifier = Modifier.offset(y = (-3).dp),
+        )
+    }
+}
+
+/** Status value that never wraps: the font steps down from Heading toward
+ *  Fine (the SDK's own typography tokens) until the text fits one line —
+ *  "syncing messages… 0 of 230" shrinks instead of wrapping (LP3 feedback
+ *  2026-10-20). Compose's TextAutoSize scales continuously between the two
+ *  token sizes; the tokens are design units the SDK scales by screen height
+ *  (LightGrid's private ×screenHeight/600 rule, reproduced here because
+ *  `scaledForScreenHeight` is internal — revisit if the SDK grows a public
+ *  one-line-fit helper). Gate-safe: no local SDK patch involved. */
+@Composable
+private fun OneLineValue(text: String, modifier: Modifier = Modifier) {
+    val typography = LightThemeTokens.typography
+    val scale = LocalConfiguration.current.screenHeightDp.toFloat() / 600f
+    fun scaled(style: TextStyle) = style.copy(fontSize = (style.fontSize.value * scale).sp)
+    Text(
+        text = text,
+        modifier = modifier,
+        color = LightThemeTokens.colors.content,
+        style = scaled(typography.heading),
+        maxLines = 1,
+        autoSize = TextAutoSize.StepBased(
+            scaled(typography.fine).fontSize,
+            scaled(typography.heading).fontSize,
+        ),
+    )
+}
+
+/** The history-recovery row (LP3 feedback 2026-10-14): the "Recovery status"
+ *  label over the key-backup restore crawl — "restoring x of y rooms" while
+ *  it runs, "History Restored" once settled (the flag is persisted, so a
+ *  healthy install shows it immediately). Not clickable. */
+@Composable
+private fun RecoveryRow(connection: ChatsMethods.GetConnectionState.Response?) {
+    Column(
+        modifier = Modifier.padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+    ) {
+        LightText(text = "Recovery status", variant = LightTextVariant.Detail)
+        val value = connection?.let { state ->
+            when {
+                state.restoreScanning && state.restoreRoomsTotal > 0 ->
+                    "restoring ${state.restoreScanned} of ${state.restoreRoomsTotal} rooms"
+                state.restoreCompleted -> "History Restored"
+                else -> "checking…"
+            }
+        } ?: "checking…"
+        OneLineValue(
+            text = value,
+            modifier = Modifier.offset(y = (-3).dp),
+        )
+    }
+}
+
+/** Device-verification row (LP3 feedback 2026-10-14): the "Verification
+ *  status" label over the action — "Device Verified" once verified (a
+ *  status-only row; the verdict persists companion-side, see
+ *  MatrixRepository.e2eeState), "Verify Device" while unverified. No toggle —
+ *  the state reads "Verifying" mid-verification (so a back-out keeps the
+ *  process visible). While the verdict hasn't settled (a cold trust store can
+ *  lag a poll) it reads "Checking…" and is not tappable, so launch never
+ *  claims a false "Verify Device". The old "Encrypted messages" label is gone. */
+@Composable
+private fun EncryptionRow(
+    e2ee: ChatsMethods.GetE2eeState.Response?,
+    settled: Boolean,
+    verifying: Boolean,
+    onClick: (() -> Unit)?,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .lightClickable(enabled = onClick != null, onClick = { onClick?.invoke() })
+            .padding(horizontal = 2f.gridUnitsAsDp(), vertical = 0.75f.gridUnitsAsDp()),
+    ) {
+        LightText(text = "Verification status", variant = LightTextVariant.Detail)
+        LightText(
+            text = when {
+                e2ee?.verified == true -> "Device Verified"
+                verifying -> "Verifying"
+                !settled -> "Checking…"
+                else -> "Verify Device"
+            },
+            variant = LightTextVariant.Heading,
+            modifier = Modifier.offset(y = (-3).dp),
+        )
+    }
+}
+
+/** The LP3 keyboard editor for a single settings field. Result: the edited
+ *  text (trimmed; "" clears the field). The keyboard is stripped — no emoji,
+ *  return, or voice keys (the passes code-entry style);
+ *  the input centers vertically between the top bar and the keyboard. The
+ *  submit label defaults to SAVE (field editors); the code entry passes
+ *  SUBMIT; an optional [submitIcon] renders the
+ *  submit as an icon instead of the label button (contacts search).
+ */
+class FieldEditorScreen(
+    sealedActivity: SealedLightActivity,
+    private val title: String,
+    private val initial: String,
+    private val submitLabel: String = "SAVE",
+    private val submitIcon: LightIconConfiguration? = null,
+) : SimpleLightScreen<String>(sealedActivity) {
+
+    @Composable
+    override fun Content() {
+        val themeColors by LightThemeController.colors.collectAsState()
+        // Fixed options — no remote fetch, so the mic/emoji/return keys stay
+        // off even when the platform server would enable them.
+        val keyboardOptionsFlow = remember {
+            MutableStateFlow(
+                KeyboardOptions(
+                    emojis = emptyList(),
+                    displayReturn = false,
+                    displayVoice = false,
+                    enableKeyAnimation = true,
+                    swipeEnabled = false,
+                ),
+            )
+        }
+        val textState = rememberTextFieldState(initial)
+
+        LightTheme(colors = themeColors) {
+            LightTextInputEditor(
+                title = title,
+                state = textState,
+                keyboardOptionsFlow = keyboardOptionsFlow,
+                onSubmit = { result -> goBack(result.toString().trim()) },
+                onBack = { goBack() },
+                modifier = Modifier.background(LightThemeTokens.colors.background),
+                submitLabel = submitLabel,
+                submitIcon = submitIcon,
+            )
+        }
+    }
+}
